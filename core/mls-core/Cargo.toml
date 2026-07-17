@@ -19,3 +19,7 @@ openmls_rust_crypto = "0.5"
 openmls_basic_credential = "0.5"
 openmls_traits = "0.5"
 thiserror = "1"
+# Durable client state (crash-safe state machine): serialize the coupled MLS-store snapshot +
+# message/queue metadata as one atomically-committed blob. No crypto here — persistence only.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
