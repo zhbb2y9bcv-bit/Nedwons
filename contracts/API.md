@@ -168,6 +168,12 @@ direction. Idempotent. A subsequent `POST /v1/friends/request` between the two (
 `403 blocked` while the block stands.
 ### `POST /v1/blocks/remove` → `204`  `{ account_id }` — unblock (does not restore prior friendship)
 
+### `POST /v1/reports` → `200 { "report_id": <int> }`
+`{ "account_id": "<16B hex>", "reason": "…(1–500)…", "evidence": "…(optional, ≤16 KiB)…" }`.
+Files an abuse report. Because messages are E2EE, `evidence` is **only** what the reporting client
+chose to submit (a rendered excerpt) — the server never derives it from message content. Cannot
+report yourself (`400`).
+
 Note: `POST /v1/friends/request` may now also return `403 {"error":"blocked"}`. `services/api/tests/social.rs`
 covers the full block flow (sever, refuse both directions, list, reversible).
 
