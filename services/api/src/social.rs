@@ -422,6 +422,33 @@ impl PgSocial {
             .collect()
     }
 
+    // ----- reports -------------------------------------------------------------------
+
+    /// Record a user report. `evidence` is only what the reporter chose to submit (the server
+    /// cannot read E2EE content). Returns the new report id.
+    pub fn create_report(
+        &self,
+        reporter: &AccountId,
+        reported: &AccountId,
+        reason: &str,
+        evidence: Option<&str>,
+    ) -> StoreResult<i64> {
+        let mut conn = self.conn()?;
+        let row = conn
+            .query_one(
+                "INSERT INTO reports (reporter, reported, reason, evidence)
+                 VALUES ($1, $2, $3, $4) RETURNING id",
+                &[
+                    &reporter.as_bytes(),
+                    &reported.as_bytes(),
+                    &reason,
+                    &evidence,
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(row.get(0))
+    }
+
     /// True iff EVERY pair among `members` is friends (a complete clique). One query:
     /// count the friendships whose both endpoints are in the set and compare to C(n,2).
     /// This is the gate for group creation — a group only forms among people who have all

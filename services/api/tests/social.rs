@@ -418,3 +418,45 @@ async fn block_severs_and_refuses_friend_requests() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(res["status"], "requested");
 }
+
+/// Reporting: a report is recorded (server stores only what the reporter submits); self-report is
+/// rejected.
+#[tokio::test]
+async fn report_is_recorded_and_rejects_self() {
+    let app = make_app(100_000).await;
+    let (_a, alice) = http_register(&app, &unique_username("repa")).await;
+    let (_b, bob) = http_register(&app, &unique_username("repb")).await;
+    let alice_token = alice["access_token"].as_str().unwrap();
+    let alice_acct = alice["account_id"].as_str().unwrap();
+    let bob_acct = bob["account_id"].as_str().unwrap();
+
+    let (status, res) = post_json_auth(
+        &app,
+        "/v1/reports",
+        alice_token,
+        json!({ "account_id": bob_acct, "reason": "spam", "evidence": "reporter-chosen excerpt" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(res["report_id"].as_i64().unwrap() >= 1);
+
+    // Reason is required.
+    let (status, _) = post_json_auth(
+        &app,
+        "/v1/reports",
+        alice_token,
+        json!({ "account_id": bob_acct, "reason": "   " }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Cannot report yourself.
+    let (status, _) = post_json_auth(
+        &app,
+        "/v1/reports",
+        alice_token,
+        json!({ "account_id": alice_acct, "reason": "x" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}

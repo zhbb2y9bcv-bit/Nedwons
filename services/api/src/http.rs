@@ -125,6 +125,7 @@ pub fn build_router_cfg(
         .route("/v1/friends/remove", post(friend_remove))
         .route("/v1/blocks", get(list_blocked).post(block_user))
         .route("/v1/blocks/remove", post(unblock_user))
+        .route("/v1/reports", post(create_report))
         .route("/v1/groups", post(create_group))
         .layer(RequestBodyLimitLayer::new(MAX_RELAY_BODY_BYTES));
 
@@ -1091,6 +1092,52 @@ async fn list_blocked(
     let social = state.social.clone();
     let blocked = blocking_store(move || social.list_blocked(&me.account_id)).await?;
     Ok(Json(blocked.into_iter().map(summary_dto).collect()))
+}
+
+const MAX_REPORT_REASON_CHARS: usize = 500;
+const MAX_REPORT_EVIDENCE_CHARS: usize = 16_384;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReportBody {
+    account_id: String,
+    reason: String,
+    /// Optional reporter-chosen excerpt. The server never derives this from E2EE content.
+    #[serde(default)]
+    evidence: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ReportDto {
+    report_id: i64,
+}
+
+async fn create_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ReportBody>,
+) -> Result<Json<ReportDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let target = AccountId(id16_from_hex(&body.account_id)?);
+    if target.0 == me.account_id.0 {
+        return Err(bad_request());
+    }
+    let reason = body.reason.trim().to_string();
+    if reason.is_empty() || reason.chars().count() > MAX_REPORT_REASON_CHARS {
+        return Err(bad_request());
+    }
+    if let Some(ev) = &body.evidence {
+        if ev.chars().count() > MAX_REPORT_EVIDENCE_CHARS {
+            return Err(bad_request());
+        }
+    }
+    let social = state.social.clone();
+    let evidence = body.evidence.clone();
+    let id = blocking_store(move || {
+        social.create_report(&me.account_id, &target, &reason, evidence.as_deref())
+    })
+    .await?;
+    Ok(Json(ReportDto { report_id: id }))
 }
 
 async fn friend_accept(
