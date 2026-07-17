@@ -80,6 +80,11 @@ fn main() {
     let relay = Arc::new(sentinel_api::relay::PgRelay::new(stores.pool_clone()));
     let social = Arc::new(sentinel_api::social::PgSocial::new(stores.pool_clone()));
     let groups = Arc::new(sentinel_api::groups::PgGroups::new(stores.pool_clone()));
+    let log_signing_key = load_or_generate_log_key();
+    let transparency = Arc::new(sentinel_api::transparency::PgTransparency::new(
+        stores.pool_clone(),
+        log_signing_key,
+    ));
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -93,6 +98,7 @@ fn main() {
         relay,
         social,
         groups,
+        transparency,
     ));
 }
 
@@ -105,6 +111,7 @@ async fn serve(
     relay: Arc<sentinel_api::relay::PgRelay>,
     social: Arc<sentinel_api::social::PgSocial>,
     groups: Arc<sentinel_api::groups::PgGroups>,
+    transparency: Arc<sentinel_api::transparency::PgTransparency>,
 ) {
     // Retention hygiene (DATA_RETENTION.md): every minute purge expired challenges/access
     // tokens AND stale envelopes past the 30-day queue TTL. Failure is logged and retried
@@ -150,6 +157,7 @@ async fn serve(
         relay,
         social,
         groups,
+        transparency,
         rate_per_min,
         trusted_ip_header,
     );
@@ -173,4 +181,24 @@ async fn serve(
         tracing::error!("server error: {e}");
         std::process::exit(1);
     }
+}
+
+/// The transparency log's ECDSA-P256 signing key. Production loads this from a KMS/HSM via
+/// `SENTINEL_LOG_SIGNING_KEY` (32-byte hex scalar); if unset, an ephemeral key is generated and a
+/// warning is logged — clients would then see a changing log public key across restarts, which is
+/// only acceptable in dev.
+fn load_or_generate_log_key() -> p256::ecdsa::SigningKey {
+    if let Ok(hex_key) = std::env::var("SENTINEL_LOG_SIGNING_KEY") {
+        if let Ok(bytes) = hex::decode(hex_key.trim()) {
+            if let Ok(key) = p256::ecdsa::SigningKey::from_slice(&bytes) {
+                return key;
+            }
+        }
+        tracing::error!("SENTINEL_LOG_SIGNING_KEY is set but invalid; refusing to start");
+        std::process::exit(2);
+    }
+    tracing::warn!(
+        "no SENTINEL_LOG_SIGNING_KEY: generating an EPHEMERAL transparency log key (dev only)"
+    );
+    p256::ecdsa::SigningKey::random(&mut rand_core::OsRng)
 }

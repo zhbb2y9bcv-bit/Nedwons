@@ -19,7 +19,7 @@ use std::sync::Arc;
 use auth_core::ids::{AccountId, DeviceId, TxnId};
 use auth_core::store::AccountDevice;
 use auth_core::{AuthError, AuthService, RegisterRequest};
-use axum::extract::{ConnectInfo, Path, Request, State};
+use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -35,6 +35,7 @@ use crate::groups::{InviteOutcome, PgGroups};
 use crate::notify::DeliveryNotifier;
 use crate::relay::{FanoutOutcome, PgRelay};
 use crate::social::{FriendRequestOutcome, PgSocial};
+use crate::transparency::PgTransparency;
 
 type IpLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 
@@ -52,6 +53,7 @@ pub struct AppState {
     pub relay: Arc<PgRelay>,
     pub social: Arc<PgSocial>,
     pub groups: Arc<PgGroups>,
+    pub transparency: Arc<PgTransparency>,
     notifier: DeliveryNotifier,
     limiter: Arc<IpLimiter>,
     /// When `Some(h)`, the client IP for rate limiting is taken from header `h` — which MUST be
@@ -62,14 +64,24 @@ pub struct AppState {
 
 /// Build the router with per-IP rate limiting keyed on the **peer** socket IP (correct when the
 /// service is directly exposed or in tests). Behind a proxy, use [`build_router_cfg`].
+#[allow(clippy::too_many_arguments)]
 pub fn build_router(
     service: Arc<AuthService>,
     relay: Arc<PgRelay>,
     social: Arc<PgSocial>,
     groups: Arc<PgGroups>,
+    transparency: Arc<PgTransparency>,
     per_ip_per_minute: u32,
 ) -> Router {
-    build_router_cfg(service, relay, social, groups, per_ip_per_minute, None)
+    build_router_cfg(
+        service,
+        relay,
+        social,
+        groups,
+        transparency,
+        per_ip_per_minute,
+        None,
+    )
 }
 
 /// As [`build_router`], but `trusted_ip_header` selects where the client IP comes from for rate
@@ -84,11 +96,13 @@ pub fn build_router(
 ///   (fail safe — still limited, just by the proxy). **Only enable this behind such a proxy**
 ///   (ABUSE_MODEL.md, RISK_REGISTER R-306) — otherwise clients could forge the header to evade
 ///   per-IP limits.
+#[allow(clippy::too_many_arguments)]
 pub fn build_router_cfg(
     service: Arc<AuthService>,
     relay: Arc<PgRelay>,
     social: Arc<PgSocial>,
     groups: Arc<PgGroups>,
+    transparency: Arc<PgTransparency>,
     per_ip_per_minute: u32,
     trusted_ip_header: Option<HeaderName>,
 ) -> Router {
@@ -99,6 +113,7 @@ pub fn build_router_cfg(
         relay,
         social,
         groups,
+        transparency,
         notifier: DeliveryNotifier::default(),
         limiter: Arc::new(RateLimiter::keyed(quota)),
         trusted_ip_header,
@@ -163,6 +178,16 @@ pub fn build_router_cfg(
         .route("/v1/session/refresh", post(refresh))
         .route("/v1/session/logout", post(logout))
         .route("/v1/session/whoami", get(whoami))
+        // key transparency (R-201): the log is auditable; reads require a bearer token.
+        .route("/v1/transparency/sth", get(transparency_sth))
+        .route(
+            "/v1/transparency/consistency",
+            get(transparency_consistency),
+        )
+        .route(
+            "/v1/transparency/account/{account_id}",
+            get(transparency_account),
+        )
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .merge(relay_routes)
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
@@ -275,6 +300,109 @@ async fn security_headers(request: Request, next: Next) -> Response {
         HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
     );
     response
+}
+
+// ----- key transparency (R-201) --------------------------------------------------------
+
+#[derive(Serialize)]
+struct SthDto {
+    tree_size: u64,
+    root_hash: String,
+    timestamp: u64,
+    /// ECDSA-P256 over encode_sth(tree_size, root, timestamp), 64-byte r‖s (hex).
+    signature: String,
+    /// The log's SEC1 public key (hex). Clients PIN this out of band; it is echoed for convenience.
+    log_public_key: String,
+}
+
+async fn transparency_sth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SthDto>, ApiError> {
+    let _ = authed_device(&state, &headers).await?;
+    let transparency = state.transparency.clone();
+    let sth = blocking_store(move || transparency.signed_tree_head()).await?;
+    Ok(Json(SthDto {
+        tree_size: sth.tree_size,
+        root_hash: hex::encode(sth.root),
+        timestamp: sth.timestamp,
+        signature: hex::encode(sth.signature),
+        log_public_key: hex::encode(state.transparency.log_public_key_sec1()),
+    }))
+}
+
+#[derive(Deserialize)]
+struct ConsistencyQuery {
+    first: u64,
+    second: u64,
+}
+
+#[derive(Serialize)]
+struct ConsistencyDto {
+    proof: Vec<String>,
+}
+
+async fn transparency_consistency(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<ConsistencyQuery>,
+) -> Result<Json<ConsistencyDto>, ApiError> {
+    let _ = authed_device(&state, &headers).await?;
+    let transparency = state.transparency.clone();
+    let proof = blocking_store(move || transparency.consistency(q.first, q.second))
+        .await?
+        .ok_or_else(bad_request)?;
+    Ok(Json(ConsistencyDto {
+        proof: proof.iter().map(hex::encode).collect(),
+    }))
+}
+
+#[derive(Serialize)]
+struct AccountBindingDto {
+    leaf_index: u64,
+    device_id: String,
+    public_key: String,
+    /// The canonical leaf INPUT (hex); leaf hash = H(0x00 || entry).
+    entry: String,
+    proof: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct AccountViewDto {
+    tree_size: u64,
+    bindings: Vec<AccountBindingDto>,
+}
+
+#[derive(Deserialize)]
+struct AtSizeQuery {
+    #[serde(default)]
+    tree_size: Option<u64>,
+}
+
+async fn transparency_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_hex): Path<String>,
+    Query(q): Query<AtSizeQuery>,
+) -> Result<Json<AccountViewDto>, ApiError> {
+    let _ = authed_device(&state, &headers).await?;
+    let account = AccountId(id16_from_hex(&account_hex)?);
+    let transparency = state.transparency.clone();
+    let view = blocking_store(move || transparency.account_view(&account, q.tree_size)).await?;
+    Ok(Json(AccountViewDto {
+        tree_size: view.tree_size,
+        bindings: view
+            .bindings
+            .into_iter()
+            .map(|b| AccountBindingDto {
+                leaf_index: b.leaf_index,
+                device_id: hex::encode(b.device_id),
+                public_key: hex::encode(b.public_key),
+                entry: hex::encode(b.entry),
+                proof: b.proof.iter().map(hex::encode).collect(),
+            })
+            .collect(),
+    }))
 }
 
 // ----- hex helpers ---------------------------------------------------------------------
@@ -426,6 +554,7 @@ async fn register_finish(
     let signature = hex_exact(&body.signature, 64)?;
 
     let service = state.service.clone();
+    let public_key_for_log = device_public_key.clone();
     let session = blocking(move || {
         service.register_finish(RegisterRequest {
             username: body.username,
@@ -436,6 +565,21 @@ async fn register_finish(
         })
     })
     .await?;
+
+    // Publish the account→device-key binding to the transparency log (R-201). Best-effort: the
+    // CLIENT self-monitors and is the real check, so a transient log fault must not block a user
+    // from registering. A gap here is a monitorable error (production couples this atomically).
+    let account = session.account_id;
+    let device = session.device_id;
+    let transparency = state.transparency.clone();
+    if blocking_store(move || transparency.append_binding(&account, &device, &public_key_for_log))
+        .await
+        .is_err()
+    {
+        tracing::error!(
+            "transparency log append failed at registration (log gap — must reconcile)"
+        );
+    }
     Ok(Json(session.into()))
 }
 
