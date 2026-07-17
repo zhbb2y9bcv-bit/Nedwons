@@ -79,12 +79,21 @@ fn main() {
 
     let relay = Arc::new(sentinel_api::relay::PgRelay::new(stores.pool_clone()));
     let social = Arc::new(sentinel_api::social::PgSocial::new(stores.pool_clone()));
+    let groups = Arc::new(sentinel_api::groups::PgGroups::new(stores.pool_clone()));
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
-    runtime.block_on(serve(bind, rate_per_min, stores, service, relay, social));
+    runtime.block_on(serve(
+        bind,
+        rate_per_min,
+        stores,
+        service,
+        relay,
+        social,
+        groups,
+    ));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -95,6 +104,7 @@ async fn serve(
     service: Arc<AuthService>,
     relay: Arc<sentinel_api::relay::PgRelay>,
     social: Arc<sentinel_api::social::PgSocial>,
+    groups: Arc<sentinel_api::groups::PgGroups>,
 ) {
     // Retention hygiene (DATA_RETENTION.md): every minute purge expired challenges/access
     // tokens AND stale envelopes past the 30-day queue TTL. Failure is logged and retried
@@ -135,7 +145,14 @@ async fn serve(
         .ok()
         .filter(|s| !s.trim().is_empty())
         .and_then(|s| axum::http::HeaderName::from_bytes(s.trim().as_bytes()).ok());
-    let app = http::build_router_cfg(service, relay, social, rate_per_min, trusted_ip_header);
+    let app = http::build_router_cfg(
+        service,
+        relay,
+        social,
+        groups,
+        rate_per_min,
+        trusted_ip_header,
+    );
     let listener = match tokio::net::TcpListener::bind(bind).await {
         Ok(l) => l,
         Err(e) => {

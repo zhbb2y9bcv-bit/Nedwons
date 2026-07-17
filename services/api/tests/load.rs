@@ -9,7 +9,9 @@ mod common;
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use common::{db_url, get_auth, http_register, make_app, post_json_auth, unique_username};
+use common::{
+    befriend, db_url, get_auth, http_register, make_app, post_json_auth, unique_username,
+};
 use serde_json::json;
 
 async fn count_envelopes_for(device_hex: String) -> i64 {
@@ -34,6 +36,7 @@ async fn group_fanout_delivers_to_all_members() {
     let app = make_app(100_000).await;
     let (_a, alice) = http_register(&app, &unique_username("gowner")).await;
     let alice_token = alice["access_token"].as_str().unwrap();
+    let alice_account = alice["account_id"].as_str().unwrap();
     let (_, conv) = post_json_auth(&app, "/v1/conversations", alice_token, json!({})).await;
     let conv_id = conv["conversation_id"].as_str().unwrap().to_string();
 
@@ -41,6 +44,8 @@ async fn group_fanout_delivers_to_all_members() {
     for i in 0..MEMBERS {
         let (_d, member) = http_register(&app, &unique_username(&format!("gm{i}"))).await;
         let account = member["account_id"].as_str().unwrap();
+        let member_token = member["access_token"].as_str().unwrap();
+        befriend(&app, alice_token, alice_account, member_token, account).await;
         let (status, _) = post_json_auth(
             &app,
             &format!("/v1/conversations/{conv_id}/members"),
@@ -74,6 +79,9 @@ async fn concurrent_duplicate_sends_dedup_to_one() {
     let alice_token = alice["access_token"].as_str().unwrap().to_string();
     let bob_device = bob["device_id"].as_str().unwrap().to_string();
     let bob_account = bob["account_id"].as_str().unwrap();
+    let bob_token = bob["access_token"].as_str().unwrap();
+    let alice_account = alice["account_id"].as_str().unwrap();
+    befriend(&app, &alice_token, alice_account, bob_token, bob_account).await;
     let (_, conv) = post_json_auth(&app, "/v1/conversations", &alice_token, json!({})).await;
     let conv_id = conv["conversation_id"].as_str().unwrap().to_string();
     let (status, _) = post_json_auth(
@@ -127,6 +135,7 @@ async fn idle_waiters_exceed_pool_without_deadlock() {
     let app = make_app(100_000).await;
     let (_a, alice) = http_register(&app, &unique_username("wowner")).await;
     let alice_token = alice["access_token"].as_str().unwrap().to_string();
+    let alice_account = alice["account_id"].as_str().unwrap().to_string();
     let (_, conv) = post_json_auth(&app, "/v1/conversations", &alice_token, json!({})).await;
     let conv_id = conv["conversation_id"].as_str().unwrap().to_string();
 
@@ -139,6 +148,7 @@ async fn idle_waiters_exceed_pool_without_deadlock() {
         let (_d, member) = http_register(&app, &unique_username(&format!("w{i}"))).await;
         let token = member["access_token"].as_str().unwrap().to_string();
         let account = member["account_id"].as_str().unwrap();
+        befriend(&app, &alice_token, &alice_account, &token, account).await;
         let (status, _) = post_json_auth(
             &app,
             &format!("/v1/conversations/{conv_id}/members"),

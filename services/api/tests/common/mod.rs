@@ -79,9 +79,16 @@ pub fn shared_relay() -> Arc<PgRelay> {
     Arc::new(PgRelay::new(shared_stores().pool_clone()))
 }
 
-/// Social store (profiles/friends/groups) over the shared pool.
+/// Social store (profiles/friends/blocks) over the shared pool.
 pub fn shared_social() -> Arc<sentinel_api::social::PgSocial> {
     Arc::new(sentinel_api::social::PgSocial::new(
+        shared_stores().pool_clone(),
+    ))
+}
+
+/// Group governance store (roles/invites/join requests) over the shared pool.
+pub fn shared_groups() -> Arc<sentinel_api::groups::PgGroups> {
+    Arc::new(sentinel_api::groups::PgGroups::new(
         shared_stores().pool_clone(),
     ))
 }
@@ -165,6 +172,7 @@ pub async fn make_app(per_ip_per_minute: u32) -> Router {
             service,
             shared_relay(),
             shared_social(),
+            shared_groups(),
             per_ip_per_minute,
         )
     })
@@ -182,12 +190,38 @@ pub async fn make_app_with_trusted_ip_header(per_ip_per_minute: u32) -> Router {
             service,
             shared_relay(),
             shared_social(),
+            shared_groups(),
             per_ip_per_minute,
             Some(axum::http::HeaderName::from_static("x-real-client-ip")),
         )
     })
     .await
     .expect("app setup")
+}
+
+/// Make two accounts friends (request + accept). Direct adds to a conversation require the adder
+/// to be friends with the target (ADR-0009), so relay/ws/load tests befriend before adding.
+pub async fn befriend(app: &Router, token_a: &str, acct_a: &str, token_b: &str, acct_b: &str) {
+    let (status, _) = post_json_auth(
+        app,
+        "/v1/friends/request",
+        token_a,
+        json!({ "account_id": acct_b }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "friend request should succeed");
+    let (status, _) = post_json_auth(
+        app,
+        "/v1/friends/accept",
+        token_b,
+        json!({ "account_id": acct_a }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "friend accept should succeed"
+    );
 }
 
 /// POST JSON carrying an `x-real-client-ip` header (a simulated proxy-forwarded client IP).

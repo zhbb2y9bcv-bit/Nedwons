@@ -170,54 +170,8 @@ impl PgRelay {
         Ok(())
     }
 
-    /// Leave a conversation: remove ALL of the account's devices from routing membership (a
-    /// person leaves, not one device), and purge their queued undelivered envelopes for that
-    /// conversation in the same transaction — consent withdrawn means no further content is
-    /// deliverable. If no members remain, the conversation row and its leftover envelopes are
-    /// deleted (hygiene). Idempotent: leaving a conversation you're not in is a no-op.
-    pub fn leave_conversation(
-        &self,
-        conversation_id: &[u8; 16],
-        account: &AccountId,
-    ) -> StoreResult<()> {
-        let mut conn = self.conn()?;
-        let mut txn = conn.transaction().map_err(db_err)?;
-        txn.execute(
-            "DELETE FROM envelopes
-             WHERE conversation_id = $1 AND NOT delivered
-               AND recipient_device IN (
-                   SELECT device_id FROM conversation_members
-                   WHERE conversation_id = $1 AND account_id = $2)",
-            &[&conversation_id.as_slice(), &account.as_bytes()],
-        )
-        .map_err(db_err)?;
-        txn.execute(
-            "DELETE FROM conversation_members WHERE conversation_id = $1 AND account_id = $2",
-            &[&conversation_id.as_slice(), &account.as_bytes()],
-        )
-        .map_err(db_err)?;
-        let remaining: i64 = txn
-            .query_one(
-                "SELECT count(*) FROM conversation_members WHERE conversation_id = $1",
-                &[&conversation_id.as_slice()],
-            )
-            .map_err(db_err)?
-            .get(0);
-        if remaining == 0 {
-            txn.execute(
-                "DELETE FROM envelopes WHERE conversation_id = $1",
-                &[&conversation_id.as_slice()],
-            )
-            .map_err(db_err)?;
-            txn.execute(
-                "DELETE FROM conversations WHERE conversation_id = $1",
-                &[&conversation_id.as_slice()],
-            )
-            .map_err(db_err)?;
-        }
-        txn.commit().map_err(db_err)?;
-        Ok(())
-    }
+    // NOTE: leaving/removal moved to `groups::PgGroups::leave_conversation` (ADR-0009), which
+    // additionally handles admin-role cleanup and auto-promotion. The relay stays mail-only.
 
     /// List the conversations a device belongs to, most recent first, each with its member
     /// account ids. Rows for one conversation are contiguous (ordered by created_at then

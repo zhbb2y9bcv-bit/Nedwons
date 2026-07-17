@@ -8,7 +8,7 @@ mod common;
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use common::{get_auth, http_register, make_app, post_json_auth, unique_username};
+use common::{befriend, get_auth, http_register, make_app, post_json_auth, unique_username};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -48,6 +48,8 @@ async fn websocket_pushes_new_envelopes_instantly() {
     let alice_token = alice["access_token"].as_str().unwrap();
     let bob_token = bob["access_token"].as_str().unwrap().to_string();
     let bob_account = bob["account_id"].as_str().unwrap();
+    let alice_account = alice["account_id"].as_str().unwrap();
+    befriend(&app, alice_token, alice_account, &bob_token, bob_account).await;
     let (_, conv) = post_json_auth(&app, "/v1/conversations", alice_token, json!({})).await;
     let conversation_id = conv["conversation_id"].as_str().unwrap().to_string();
     let (status, _) = post_json_auth(

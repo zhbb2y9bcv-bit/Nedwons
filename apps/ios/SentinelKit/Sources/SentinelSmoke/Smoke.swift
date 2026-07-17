@@ -118,33 +118,49 @@ struct SentinelSmoke {
                 fail("group missing from a member's conversation list")
             }
 
-            // A group including a NON-friend now succeeds (ADR-0009: no friend-clique requirement).
+            // Directly listing a NON-friend is refused (ADR-0009: direct add = consent by proxy,
+            // so it requires friendship with the adder). Strangers join via invite links instead.
             let strangerSigner = SoftwareDeviceSigner()
             let stranger = try await client.register(
                 username: randomName("smokestr"), password: password, signer: strangerSigner
             )
-            let mixedGroup = try await client.createGroup(
-                accessToken: registered.accessToken,
-                memberAccountIDs: [bob.accountID, stranger.accountID]
-            )
-            guard !mixedGroup.conversationID.isEmpty else {
-                fail("a group with a non-friend should now be allowed")
+            do {
+                _ = try await client.createGroup(
+                    accessToken: registered.accessToken,
+                    memberAccountIDs: [bob.accountID, stranger.accountID]
+                )
+                fail("directly adding a non-friend must be refused")
+            } catch let SentinelClient.ClientError.http(status, _) where status == 403 {
+                // expected: not_friends
+            } catch {
+                fail("unexpected error on non-friend direct add: \(error)")
             }
 
-            // The stranger leaves (consent): the group disappears from their Chats list but
-            // remains for the others.
+            // The admin (Alice) mints an invite link; the stranger joins by their OWN consent.
+            let inviteToken = try await client.createInvite(
+                accessToken: registered.accessToken, conversationID: group.conversationID
+            )
+            let joined = try await client.acceptInvite(
+                accessToken: stranger.accessToken, inviteToken: inviteToken
+            )
+            guard joined.status == "joined", joined.conversationID == group.conversationID else {
+                fail("stranger failed to join via invite link")
+            }
+
+            // …and then leaves (consent withdrawal): the group disappears from their Chats list
+            // but remains for the others.
             try await client.leaveConversation(
-                accessToken: stranger.accessToken, conversationID: mixedGroup.conversationID
+                accessToken: stranger.accessToken, conversationID: group.conversationID
             )
             let strangerConvos = try await client.listConversations(accessToken: stranger.accessToken)
-            guard !strangerConvos.contains(where: { $0.conversationID == mixedGroup.conversationID })
+            guard !strangerConvos.contains(where: { $0.conversationID == group.conversationID })
             else {
                 fail("left conversation still listed for the leaver")
             }
             let aliceConvosAfterLeave = try await client.listConversations(
                 accessToken: registered.accessToken
             )
-            guard aliceConvosAfterLeave.contains(where: { $0.conversationID == mixedGroup.conversationID })
+            guard aliceConvosAfterLeave.contains(where: { $0.conversationID == group.conversationID })
             else {
                 fail("conversation should remain for the other members")
             }
@@ -162,14 +178,15 @@ struct SentinelSmoke {
                 fail("block did not sever the friendship")
             }
 
-            // With Bob blocked, a new group containing Bob is refused (blocked pair, ADR-0009).
+            // With Bob blocked (which also severed the friendship), a new group listing Bob is
+            // refused with 403 (not_friends/blocked_member — both gates protect here, ADR-0009).
             do {
                 _ = try await client.createGroup(
                     accessToken: registered.accessToken, memberAccountIDs: [bob.accountID]
                 )
                 fail("a group containing a blocked member must be rejected")
             } catch let SentinelClient.ClientError.http(status, _) where status == 403 {
-                // expected: blocked_member
+                // expected
             } catch {
                 fail("unexpected error on blocked-member group: \(error)")
             }

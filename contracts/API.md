@@ -109,8 +109,45 @@ that doesn't exist) is a `204` no-op; ids are opaque random values so nothing is
 the last member leaves, the conversation row and any leftover envelopes are deleted.
 
 ### `POST /v1/conversations/{id}/members` → `204` | `403`
-`{ "account_id": "<16B hex>" }` — add a target account's active device to routing membership.
-Caller must be a member; the target device is resolved server-side (never client-asserted).
+`{ "account_id": "<16B hex>" }` — direct-add a target account's active device to routing.
+Direct add is consent-by-proxy, so it is tightly gated (ADR-0009): the caller must be an **admin**
+of the conversation **and friends with the target**, and no block may exist between the target and
+any current member. Strangers join via invite links (their own consent). The target device is
+resolved server-side (never client-asserted).
+
+### `POST /v1/conversations/{id}/members/remove` → `204` | `403`
+`{ "account_id" }` — **admin** removes a member: same exit path as leave (routing removal, queued
+mail purged, role dropped). Removing yourself is a `leave` (`400`).
+
+## Group governance (ADR-0009): admins, invites, join requests
+
+The group creator is its first **admin**. All of the following except `invites/accept` require the
+caller to be a member **and** admin (else a generic `403`).
+
+### `POST /v1/conversations/{id}/invites` → `200`
+`{ "expires_in_secs"?: <60..2592000, default 604800>, "max_uses"?: <1..1000, default 100> }` →
+`{ "invite_token": "<32B hex>", "expires_at": <unix>, "max_uses", "uses" }`. Mint an invite-link
+token (high-entropy bearer value — treat it like a credential).
+### `GET /v1/conversations/{id}/invites` → active invites `[ { invite_token, expires_at, max_uses, uses }, … ]`
+### `POST /v1/conversations/{id}/invites/revoke` → `204`  `{ "invite_token" }`
+
+### `POST /v1/invites/accept` → `200` | `403`
+`{ "invite_token": "<32B hex>" }` → `{ "conversation_id", "status": "joined" | "requested" }`.
+Present a token as yourself (**the joiner's own consent**). Joins immediately, or files a join
+request when the group requires approval. One generic `403` on any refusal (invalid/expired/
+revoked/exhausted token, already a member, or a block against any current member) — the token must
+not become an oracle for group/block state. Each successful join/request consumes one use.
+
+### `GET /v1/conversations/{id}/requests` → pending join requests `[ "<account_id hex>", … ]`
+### `POST /v1/conversations/{id}/requests/approve` → `204` | `404 no_request`  `{ account_id }`
+Blocks are re-checked at approval time; a now-blocked requester's request is consumed without joining.
+### `POST /v1/conversations/{id}/requests/deny` → `204`  `{ account_id }`
+
+### `POST /v1/conversations/{id}/admins` → `204` | `404 not_member`  `{ account_id }` — promote
+### `POST /v1/conversations/{id}/admins/demote` → `204` | `409 last_admin`  `{ account_id }`
+Demoting the last admin is refused. When the last admin **leaves**, the earliest remaining member
+is auto-promoted, so a populated group is never unmanageable.
+### `POST /v1/conversations/{id}/settings` → `204`  `{ "join_approval": <bool> }`
 
 ### `POST /v1/conversations/{id}/messages` → `200` | `403`
 `{ "ciphertext": "<hex>", "idempotency_key": "<16B hex>" }`. One MLS application ciphertext,
@@ -185,9 +222,11 @@ report yourself (`400`).
 Note: `POST /v1/friends/request` may now also return `403 {"error":"blocked"}`. `services/api/tests/social.rs`
 covers the full block flow (sever, refuse both directions, list, reversible).
 
-### `POST /v1/groups` → `200` | `403 blocked_member`
-`{ "member_account_ids": [ "<16B hex>", … ] }`. Creates a group. Members need **not** be friends
-(ADR-0009); the only membership gate is that no pair within the group has blocked each other —
-otherwise `403 blocked_member`. Returns `{ "conversation_id", "member_account_ids" }` and adds all
-members' active devices to routing, so the group's messages reach everyone.
-`services/api/tests/social.rs` covers non-friend groups being allowed and blocked-pair rejection.
+### `POST /v1/groups` → `200` | `403 not_friends` | `403 blocked_member`
+`{ "member_account_ids": [ "<16B hex>", … ] }`. Creates a group; the creator becomes its first
+**admin**. Listing someone is a direct add, so the creator must be **friends with each listed
+member** (`403 not_friends` otherwise — strangers join via invite links, their own consent).
+Members need **not** be friends with each other (no clique). No pair within the group may have
+blocked each other (`403 blocked_member`). Returns `{ "conversation_id", "member_account_ids" }`
+and adds all members' active devices to routing. `services/api/tests/social.rs` and
+`services/api/tests/groups.rs` cover the gates end to end.
