@@ -9,7 +9,7 @@ Xcode 26.6.
 | Part | How it builds/tests | Status |
 |------|---------------------|--------|
 | `SentinelKit/` (crypto/protocol, Keychain, device signer, HTTP client) | `swift build` / `swift test` (macOS) | ✅ builds + 7 tests pass here |
-| `SentinelUI/` (design tokens, components, app screens) | `swift build` (macOS) | ✅ builds here |
+| `SentinelUI/` (design tokens, components, **wired app screens + AppModel**) | `swift build` (macOS) | ✅ builds here |
 | Cross-language transcript vector + signature | `swift test` + Rust pipeline | ✅ INTEROP_OK |
 | **`SentinelClient` ↔ live backend** (register/login/whoami over HTTP) | `scripts/swift_backend_smoke.sh` | ✅ **SMOKE_OK** against the real Rust server + Postgres, incl. INV-2 negative check |
 | `Sentinel/` app target (`@main`, App Attest, APNs, entitlements) | Xcode app target | ⚠️ requires Xcode; not built in this environment (RISK_REGISTER R-101) |
@@ -65,8 +65,26 @@ let s = try await client.login(username: name, password: pass, signer: signer2)
 - For messaging, the app calls the relay endpoints (contracts/API.md) with envelopes produced
   by the MLS core via its UniFFI binding (ADR-0007).
 
-## What is deliberately not here yet
+## Functional UI (wired to the backend)
 
-Real networking, App Attest wiring, notification handling, and the post-enrollment message
-UI are Milestone 1–2 work. Network-dependent controls in the scaffold are **disabled with an
-explanation** (see `FeatureFlags`), never shown as dead buttons.
+`AppModel` (SentinelUI) wraps `SentinelClient` and backs every button with a real backend
+call — these are functional, not decorative:
+
+- **Sign in / Create account** (`SignInView`) → register/login.
+- **Search people** — a magnifying-glass button in the **top-right** of Contacts opens
+  `SearchView`, which searches by username and sends friend requests.
+- **Friend requests** — accept/decline in `ContactsView`; friends list refreshes live.
+- **Profile** — edit display name and bio in Settings (`ProfileEditView`).
+- **New group** — the `+` in the top-right of Chats opens `NewGroupView`, a multi-select of
+  your friends; the server rejects the group with a clear banner unless everyone is mutually
+  friends (the clique gate), and a created group's messages fan out to all members.
+
+The whole client↔backend path (register → befriend → create group → send → receive, plus the
+non-friend-group rejection) is verified end-to-end by `scripts/swift_backend_smoke.sh`.
+
+## What still needs Xcode / a device
+
+The `@main` app target, on-device Secure Enclave enrollment (swap `SoftwareDeviceSigner` for
+`SecureEnclaveDeviceSigner` in `AppModel`), App Attest, push notifications, and the on-device
+MLS UniFFI binding (ADR-0007) so message *content* can be decrypted and rendered in the chat
+view. The screens compile via `swift build`; running them is the Xcode step.

@@ -135,3 +135,30 @@ HTTP — unacked envelopes re-deliver on reconnect. Unauthenticated upgrades are
 ciphertext and verify, by direct database query, that no plaintext is stored; they also cover
 fan-out, idempotent retry, long-poll and WebSocket wake-on-delivery, at-least-once peek/ack,
 and idle-waiters-exceed-pool. See [PERFORMANCE.md](../PERFORMANCE.md).
+
+## Profiles, friends, and groups
+
+All require a Bearer access token. Profiles and the friendship graph are social/routing
+metadata (never message content). Group creation is gated on a complete mutual-friend clique.
+
+### `GET /v1/profile` → `{ account_id, username, display_name, bio }`
+### `PUT /v1/profile` → `204`  `{ display_name (≤64), bio (≤256) }`
+### `GET /v1/profile/{account_id}` → a profile
+### `GET /v1/profiles/search?q=<prefix>` → `[ { account_id, username, display_name }, … ]`
+Username-**prefix** search (min 2 chars, capped, rate-limited) — deliberate discovery, not a
+bulk directory dump.
+
+### `GET /v1/friends` → `[ summary, … ]`
+### `GET /v1/friends/requests` → incoming pending requests `[ summary, … ]`
+### `POST /v1/friends/request` → `{ "status": "requested" | "friended" | "already_friends" }`
+`{ "account_id": "<16B hex>" }`. Auto-friends if the other side already requested you.
+### `POST /v1/friends/accept` → `204` | `404 no_request`  `{ account_id }`
+### `POST /v1/friends/decline` → `204`  `{ account_id }`
+### `POST /v1/friends/remove` → `204`  `{ account_id }`
+
+### `POST /v1/groups` → `200` | `403 not_all_friends`
+`{ "member_account_ids": [ "<16B hex>", … ] }`. Creates a group **only if** the creator and
+every listed member form a complete mutual-friend clique; otherwise `403 not_all_friends`.
+Returns `{ "conversation_id", "member_account_ids" }` and adds all members' active devices to
+routing, so the group's messages reach everyone. `services/api/tests/social.rs` covers the
+whole flow including the clique rejection.

@@ -7,7 +7,7 @@ import Foundation
 ///
 /// Networking uses `URLSession` async/await so it runs headlessly (the `SentinelSmoke`
 /// executable drives it against a live server) and unchanged inside the app.
-public struct SentinelClient {
+public struct SentinelClient: Sendable {
     public enum ClientError: Error {
         case http(status: Int, body: String)
         case decoding
@@ -131,6 +131,218 @@ public struct SentinelClient {
         guard let data = Hex.decode(string) else { throw ClientError.decoding }
         return data
     }
+
+    // MARK: Authenticated transport (used by the social/messaging API)
+
+    fileprivate func perform(_ request: URLRequest) async throws -> Data {
+        let (data, response): (Data, URLResponse)
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            throw ClientError.transport(error.localizedDescription)
+        }
+        guard let http = response as? HTTPURLResponse else { throw ClientError.decoding }
+        guard (200 ..< 300).contains(http.statusCode) else {
+            throw ClientError.http(status: http.statusCode, body: String(decoding: data, as: UTF8.self))
+        }
+        return data
+    }
+
+    fileprivate func decode<R: Decodable>(_ data: Data) throws -> R {
+        do {
+            return try JSONDecoder().decode(R.self, from: data)
+        } catch {
+            throw ClientError.decoding
+        }
+    }
+
+    fileprivate func authed(_ method: String, _ path: String, accessToken: String) -> URLRequest {
+        var request = URLRequest(url: baseURL.appendingPathComponent(path))
+        request.httpMethod = method
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        return request
+    }
+
+    fileprivate func queryURL(_ path: String, _ items: [URLQueryItem]) -> URL {
+        var components = URLComponents(
+            url: baseURL.appendingPathComponent(path),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = items
+        return components.url!
+    }
+}
+
+// MARK: - Profiles, friends, groups, and messaging (contracts/API.md)
+
+public struct Profile: Decodable, Sendable {
+    public let accountID: String
+    public let username: String
+    public let displayName: String
+    public let bio: String
+    enum CodingKeys: String, CodingKey {
+        case accountID = "account_id", username, displayName = "display_name", bio
+    }
+}
+
+public struct ProfileSummary: Decodable, Sendable, Identifiable, Hashable {
+    public let accountID: String
+    public let username: String
+    public let displayName: String
+    public var id: String { accountID }
+    enum CodingKeys: String, CodingKey {
+        case accountID = "account_id", username, displayName = "display_name"
+    }
+}
+
+public struct GroupCreated: Decodable, Sendable {
+    public let conversationID: String
+    public let memberAccountIDs: [String]
+    enum CodingKeys: String, CodingKey {
+        case conversationID = "conversation_id", memberAccountIDs = "member_account_ids"
+    }
+}
+
+public struct InboxEnvelope: Decodable, Sendable, Identifiable {
+    public let id: Int
+    public let conversationID: String
+    public let senderDevice: String
+    public let ciphertext: String
+    enum CodingKeys: String, CodingKey {
+        case id, conversationID = "conversation_id", senderDevice = "sender_device", ciphertext
+    }
+}
+
+public extension SentinelClient {
+    // ----- profiles -----
+
+    func myProfile(accessToken: String) async throws -> Profile {
+        try decode(await perform(authed("GET", "/v1/profile", accessToken: accessToken)))
+    }
+
+    func profile(accessToken: String, accountID: String) async throws -> Profile {
+        try decode(await perform(authed("GET", "/v1/profile/\(accountID)", accessToken: accessToken)))
+    }
+
+    func updateProfile(accessToken: String, displayName: String, bio: String) async throws {
+        struct Body: Encodable { let display_name: String; let bio: String }
+        var request = authed("PUT", "/v1/profile", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(Body(display_name: displayName, bio: bio))
+        _ = try await perform(request)
+    }
+
+    func searchProfiles(accessToken: String, query: String) async throws -> [ProfileSummary] {
+        var request = URLRequest(url: queryURL("/v1/profiles/search", [URLQueryItem(name: "q", value: query)]))
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        return try decode(await perform(request))
+    }
+
+    // ----- friends -----
+
+    func listFriends(accessToken: String) async throws -> [ProfileSummary] {
+        try decode(await perform(authed("GET", "/v1/friends", accessToken: accessToken)))
+    }
+
+    func friendRequests(accessToken: String) async throws -> [ProfileSummary] {
+        try decode(await perform(authed("GET", "/v1/friends/requests", accessToken: accessToken)))
+    }
+
+    /// Returns the resulting status: "requested", "friended", or "already_friends".
+    @discardableResult
+    func sendFriendRequest(accessToken: String, accountID: String) async throws -> String {
+        struct Res: Decodable { let status: String }
+        let res: Res = try await postAccountRef("/v1/friends/request", accessToken, accountID)
+        return res.status
+    }
+
+    func acceptFriend(accessToken: String, accountID: String) async throws {
+        try await postAccountRefVoid("/v1/friends/accept", accessToken, accountID)
+    }
+
+    func declineFriend(accessToken: String, accountID: String) async throws {
+        try await postAccountRefVoid("/v1/friends/decline", accessToken, accountID)
+    }
+
+    func removeFriend(accessToken: String, accountID: String) async throws {
+        try await postAccountRefVoid("/v1/friends/remove", accessToken, accountID)
+    }
+
+    // ----- groups & messaging -----
+
+    /// Create a group; the server rejects with 403 unless all members are mutual friends.
+    func createGroup(accessToken: String, memberAccountIDs: [String]) async throws -> GroupCreated {
+        struct Body: Encodable { let member_account_ids: [String] }
+        var request = authed("POST", "/v1/groups", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(Body(member_account_ids: memberAccountIDs))
+        return try decode(await perform(request))
+    }
+
+    /// Send one MLS application ciphertext; the server fans it out to every other member.
+    /// Returns the number of recipient devices it was delivered to.
+    @discardableResult
+    func sendMessage(
+        accessToken: String,
+        conversationID: String,
+        ciphertext: Data,
+        idempotencyKey: Data
+    ) async throws -> Int {
+        struct Body: Encodable { let ciphertext: String; let idempotency_key: String }
+        struct Receipt: Decodable { let delivered: Int }
+        var request = authed("POST", "/v1/conversations/\(conversationID)/messages", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            Body(ciphertext: Hex.encode(ciphertext), idempotency_key: Hex.encode(idempotencyKey))
+        )
+        let receipt: Receipt = try decode(await perform(request))
+        return receipt.delivered
+    }
+
+    /// Peek the inbox (optionally long-polling for up to `waitSeconds`). Non-destructive;
+    /// call `ackInbox` after persisting.
+    func fetchInbox(accessToken: String, waitSeconds: Int = 0) async throws -> [InboxEnvelope] {
+        let items = waitSeconds > 0 ? [URLQueryItem(name: "wait", value: String(waitSeconds))] : []
+        var request = URLRequest(url: queryURL("/v1/inbox", items))
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        return try decode(await perform(request))
+    }
+
+    func ackInbox(accessToken: String, ids: [Int]) async throws {
+        struct Body: Encodable { let ids: [Int] }
+        var request = authed("POST", "/v1/inbox/ack", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(Body(ids: ids))
+        _ = try await perform(request)
+    }
+
+    // ----- internals -----
+
+    private func postAccountRef<R: Decodable>(
+        _ path: String,
+        _ accessToken: String,
+        _ accountID: String
+    ) async throws -> R {
+        var request = authed("POST", path, accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(AccountRefBody(account_id: accountID))
+        return try decode(await perform(request))
+    }
+
+    private func postAccountRefVoid(
+        _ path: String,
+        _ accessToken: String,
+        _ accountID: String
+    ) async throws {
+        var request = authed("POST", path, accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(AccountRefBody(account_id: accountID))
+        _ = try await perform(request)
+    }
+}
+
+private struct AccountRefBody: Encodable {
+    let account_id: String
 }
 
 // MARK: - Wire DTOs (match contracts/API.md)
