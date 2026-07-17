@@ -257,6 +257,23 @@ async fn group_of_all_friends_is_allowed_and_reaches_everyone() {
             "member received the group message"
         );
     }
+
+    // The group appears in every member's conversation list (Chats tab), with all members.
+    for (token, _) in &clique {
+        let (status, convos) = get_auth(&app, "/v1/conversations", token).await;
+        assert_eq!(status, StatusCode::OK);
+        let group = convos
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["conversation_id"] == conversation_id.as_str())
+            .expect("group present in the member's conversation list");
+        assert_eq!(
+            group["member_account_ids"].as_array().unwrap().len(),
+            clique.len(),
+            "conversation lists all members"
+        );
+    }
 }
 
 /// A group is REJECTED if not every pair is mutually friends.

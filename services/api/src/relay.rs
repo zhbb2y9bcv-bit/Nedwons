@@ -29,6 +29,12 @@ pub struct ClaimedKeyPackage {
     pub key_package: Vec<u8>,
 }
 
+/// A conversation the caller belongs to, with its member accounts (for the Chats list).
+pub struct ConversationSummary {
+    pub conversation_id: [u8; 16],
+    pub member_account_ids: Vec<[u8; 16]>,
+}
+
 /// Result of a fanout send.
 pub enum FanoutOutcome {
     /// The sender is not a member of the conversation.
@@ -162,6 +168,42 @@ impl PgRelay {
         )
         .map_err(db_err)?;
         Ok(())
+    }
+
+    /// List the conversations a device belongs to, most recent first, each with its member
+    /// account ids. Rows for one conversation are contiguous (ordered by created_at then
+    /// conversation_id), so they group in a single pass.
+    pub fn list_conversations(&self, device: &DeviceId) -> StoreResult<Vec<ConversationSummary>> {
+        let mut conn = self.conn()?;
+        let rows = conn
+            .query(
+                "SELECT c.conversation_id, m2.account_id
+                 FROM conversation_members m1
+                 JOIN conversations c ON c.conversation_id = m1.conversation_id
+                 JOIN conversation_members m2 ON m2.conversation_id = c.conversation_id
+                 WHERE m1.device_id = $1
+                 ORDER BY c.created_at DESC, c.conversation_id, m2.account_id",
+                &[&device.as_bytes()],
+            )
+            .map_err(db_err)?;
+
+        let mut out: Vec<ConversationSummary> = Vec::new();
+        for row in rows {
+            let cid = id16(row.get::<_, &[u8]>(0))?;
+            let account = id16(row.get::<_, &[u8]>(1))?;
+            match out.last_mut() {
+                Some(last) if last.conversation_id == cid => {
+                    if !last.member_account_ids.contains(&account) {
+                        last.member_account_ids.push(account);
+                    }
+                }
+                _ => out.push(ConversationSummary {
+                    conversation_id: cid,
+                    member_account_ids: vec![account],
+                }),
+            }
+        }
+        Ok(out)
     }
 
     pub fn is_member(&self, conversation_id: &[u8; 16], device: &DeviceId) -> StoreResult<bool> {

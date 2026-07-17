@@ -97,6 +97,10 @@ Atomically pops one key package for the target account's device (to add them to 
 Body `{}`. Creates a conversation with the caller as first member →
 `{ "conversation_id": "<16B hex>" }`.
 
+### `GET /v1/conversations` → `200`
+The caller's conversations, most recent first, each with its members (for the Chats list):
+`[ { "conversation_id": "<16B hex>", "member_account_ids": [ "<16B hex>", … ] }, … ]`.
+
 ### `POST /v1/conversations/{id}/members` → `204` | `403`
 `{ "account_id": "<16B hex>" }` — add a target account's active device to routing membership.
 Caller must be a member; the target device is resolved server-side (never client-asserted).

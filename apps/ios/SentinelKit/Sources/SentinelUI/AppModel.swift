@@ -14,6 +14,7 @@ public final class AppModel: ObservableObject {
     @Published public var friends: [ProfileSummary] = []
     @Published public var incomingRequests: [ProfileSummary] = []
     @Published public var searchResults: [ProfileSummary] = []
+    @Published public var conversations: [Conversation] = []
     @Published public var inbox: [InboxEnvelope] = []
     @Published public var isBusy = false
     @Published public var banner: String?
@@ -84,6 +85,14 @@ public final class AppModel: ObservableObject {
         myProfile = try? await client.myProfile(accessToken: token)
         friends = (try? await client.listFriends(accessToken: token)) ?? []
         incomingRequests = (try? await client.friendRequests(accessToken: token)) ?? []
+        conversations = (try? await client.listConversations(accessToken: token)) ?? []
+    }
+
+    public func refreshConversations() async {
+        await run { [self] in
+            guard let token else { return }
+            conversations = try await client.listConversations(accessToken: token)
+        }
     }
 
     // MARK: Profile
@@ -154,6 +163,7 @@ public final class AppModel: ObservableObject {
             guard let token else { return }
             let group = try await client.createGroup(accessToken: token, memberAccountIDs: memberAccountIDs)
             conversationID = group.conversationID
+            conversations = try await client.listConversations(accessToken: token)
             banner = "Group created."
         }
         return conversationID
