@@ -35,6 +35,11 @@ impl PgStores {
         Self { pool }
     }
 
+    /// Share the underlying pool (e.g. to build the relay store over the same connections).
+    pub fn pool_clone(&self) -> PgPool {
+        self.pool.clone()
+    }
+
     fn conn(&self) -> StoreResult<r2d2::PooledConnection<PostgresConnectionManager<NoTls>>> {
         self.pool
             .get()

@@ -1,0 +1,21 @@
+# Standalone crate (its own workspace) — the shared MLS protocol integration layer
+# (ADR-0001). It exposes a narrow, memory-safe API that the iOS client reaches over a UniFFI
+# boundary. The backend does NOT depend on this crate: the server only ever handles opaque
+# ciphertext, so it must not link the protocol library (defense in depth / smaller TCB).
+[package]
+name = "mls-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+rust-version = "1.85"
+
+[workspace]
+
+[dependencies]
+# Mature, maintained, independently reviewed MLS (RFC 9420) — no custom crypto (ADR-0001).
+openmls = "0.8"
+openmls_rust_crypto = "0.5"
+openmls_basic_credential = "0.5"
+openmls_traits = "0.5"
+thiserror = "1"

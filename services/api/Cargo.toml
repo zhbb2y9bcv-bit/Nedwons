@@ -38,3 +38,6 @@ http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 p256 = { version = "0.13", features = ["ecdsa"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+# Test-only: drive REAL MLS ciphertext through the relay to prove the server stores no
+# plaintext. The server library itself never depends on mls-core.
+mls-core = { path = "../../core/mls-core" }

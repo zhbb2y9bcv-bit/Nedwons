@@ -11,7 +11,7 @@ See [ADR-0001](docs/adr/0001-messaging-protocol.md) for the protocol selection r
 
 | Purpose | Choice | Source / provenance | Notes |
 |---------|--------|---------------------|-------|
-| Group + 1:1 messaging protocol | **MLS (RFC 9420)** via **OpenMLS 0.8.1** | crates.io, MIT license (verified 2026-07-17) | One protocol for 1:1 and groups; epoch-based membership; forward secrecy + post-compromise security. |
+| Group + 1:1 messaging protocol | **MLS (RFC 9420)** via **OpenMLS 0.8.1** | crates.io, MIT license (verified 2026-07-17) | Integrated in `core/mls-core` behind a narrow API. One protocol for 1:1 and groups; epoch-based membership; forward secrecy + post-compromise security. Tests prove no plaintext in ciphertext and removed-member epoch exclusion. |
 | Message AEAD / KDF | Provided by MLS ciphersuite | RustCrypto within OpenMLS | We do **not** mix suites ad hoc; the ciphersuite is chosen explicitly and versioned. Default: `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (classical). |
 | Device proof-of-possession signature | **ECDSA P-256** | `p256` crate (RustCrypto) | Server-side verification; client signer is the Secure Enclave. Deterministic (RFC 6979) on the software test side. |
 | Password hashing | **Argon2id (RFC 9106)** | `argon2` crate (RustCrypto) | Unique per-account salt; params benchmarked per environment; optional KMS pepper. |

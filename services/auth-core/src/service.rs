@@ -381,6 +381,16 @@ impl AuthService {
         Ok(())
     }
 
+    /// Look up the active device id for an account (server-side authority for routing;
+    /// never a client-asserted value, INV-6). Returns `Ok(None)` if the account has no
+    /// active device.
+    pub fn active_device(&self, account_id: &AccountId) -> Result<Option<DeviceId>> {
+        Ok(self
+            .devices
+            .active_device_for_account(account_id)?
+            .map(|d| d.device_id))
+    }
+
     /// Revoke a device: mark it revoked and burn all its refresh families and access
     /// tokens (INV-10). Future logins, refreshes, and API calls from it fail closed.
     pub fn revoke_device(&self, device_id: &DeviceId) -> Result<()> {
