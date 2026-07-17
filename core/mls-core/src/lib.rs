@@ -12,6 +12,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod client;
+
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
