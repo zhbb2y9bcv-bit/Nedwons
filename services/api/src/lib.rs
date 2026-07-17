@@ -6,6 +6,7 @@
 
 pub mod http;
 pub mod pgstore;
+pub mod relay;
 
 use refinery::embed_migrations;
 

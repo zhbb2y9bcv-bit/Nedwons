@@ -17,6 +17,7 @@ use auth_core::{AuthService, Config, RegisterRequest, Session};
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use rand_core::{OsRng, RngCore};
 use sentinel_api::pgstore::PgStores;
+use sentinel_api::relay::PgRelay;
 
 pub const PASSWORD: &str = "battery staple orbit lantern";
 
@@ -57,7 +58,12 @@ pub fn shared_stores() -> Arc<PgStores> {
 /// Migrated PgStores handle + AuthService over it.
 pub fn setup() -> (Arc<PgStores>, AuthService) {
     let stores = shared_stores();
-    let service = AuthService::new(
+    let service = make_service(&stores);
+    (stores, service)
+}
+
+pub fn make_service(stores: &Arc<PgStores>) -> AuthService {
+    AuthService::new(
         stores.clone(),
         stores.clone(),
         stores.clone(),
@@ -65,8 +71,12 @@ pub fn setup() -> (Arc<PgStores>, AuthService) {
         stores.clone(),
         Arc::new(SystemClock),
         Config::default(),
-    );
-    (stores, service)
+    )
+}
+
+/// Relay store over the shared pool.
+pub fn shared_relay() -> Arc<PgRelay> {
+    Arc::new(PgRelay::new(shared_stores().pool_clone()))
 }
 
 /// Random username, unique per call, satisfying the normalization policy.
@@ -126,5 +136,153 @@ pub fn register(service: &AuthService, username: &str) -> (TestDevice, Session) 
             signature,
         })
         .expect("registration should succeed");
+    (device, session)
+}
+
+// ----- shared in-process HTTP client (for http_api.rs and relay_e2ee.rs) --------------
+
+use auth_core::ids::{AccountId, DeviceId, TxnId};
+use axum::body::Body;
+use axum::http::{header, Request, StatusCode};
+use axum::Router;
+use http_body_util::BodyExt;
+use serde_json::{json, Value};
+use tower::ServiceExt;
+
+/// Build the full app (auth + relay) over the shared pool, on a blocking thread.
+pub async fn make_app(per_ip_per_minute: u32) -> Router {
+    tokio::task::spawn_blocking(move || {
+        let stores = shared_stores();
+        let service = Arc::new(make_service(&stores));
+        sentinel_api::http::build_router(service, shared_relay(), per_ip_per_minute)
+    })
+    .await
+    .expect("app setup")
+}
+
+pub async fn post_json(app: &Router, path: &str, body: Value) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let value = if bytes.is_empty() {
+        json!(null)
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(json!(null))
+    };
+    (status, value)
+}
+
+/// Authenticated POST/GET with a Bearer access token.
+pub async fn post_json_auth(
+    app: &Router,
+    path: &str,
+    token: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let value = if bytes.is_empty() {
+        json!(null)
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(json!(null))
+    };
+    (status, value)
+}
+
+pub async fn get_auth(app: &Router, path: &str, token: &str) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::get(path)
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(json!(null)),
+    )
+}
+
+pub fn id16_from_hex(s: &str) -> [u8; 16] {
+    hex::decode(s).expect("hex").try_into().expect("16 bytes")
+}
+
+/// Sign a begin-endpoint challenge JSON with the given device for `action`.
+pub fn sign_challenge(device: &TestDevice, challenge: &Value, action: Action) -> String {
+    let account_id = AccountId(id16_from_hex(challenge["account_id"].as_str().unwrap()));
+    let device_id = DeviceId(id16_from_hex(challenge["device_id"].as_str().unwrap()));
+    let txn_id = TxnId(id16_from_hex(challenge["txn_id"].as_str().unwrap()));
+    let nonce = hex::decode(challenge["nonce"].as_str().unwrap()).expect("hex");
+    let transcript = Transcript {
+        action,
+        account_id: &account_id,
+        device_id: &device_id,
+        public_key: &device.public_key,
+        challenge: &nonce,
+        expires_at: challenge["expires_at"].as_u64().unwrap(),
+        txn_id: &txn_id,
+    };
+    hex::encode(device.sign(&transcript.encode()))
+}
+
+/// Register a fresh account over HTTP; returns (device, session JSON).
+pub async fn http_register(app: &Router, username: &str) -> (TestDevice, Value) {
+    let device = TestDevice::new();
+    let (status, challenge) = post_json(app, "/v1/register/begin", json!({})).await;
+    assert_eq!(status, StatusCode::OK);
+    let signature = sign_challenge(&device, &challenge, Action::Register);
+    let (status, session) = post_json(
+        app,
+        "/v1/register/finish",
+        json!({
+            "username": username,
+            "password": PASSWORD,
+            "device_public_key": hex::encode(&device.public_key),
+            "txn_id": challenge["txn_id"],
+            "signature": signature,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "register finish: {session}");
     (device, session)
 }

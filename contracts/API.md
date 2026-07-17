@@ -79,3 +79,37 @@ Tokens are opaque bearer values. Possession of the access token authorizes API c
 expiry; possession of the refresh token **plus** a device-key signature is required to
 rotate. This is the same flow the iOS client drives; `services/api/tests/http_api.rs`
 exercises it end to end against real PostgreSQL.
+
+## Relay endpoints (E2EE messaging)
+
+All require `Authorization: Bearer <access-token hex>`. The server stores and forwards
+**opaque ciphertext** only — it never decrypts, and the server library does not link the MLS
+implementation. Bodies may be up to 256 KiB (envelopes).
+
+### `POST /v1/keypackages` → `204`
+`{ "key_package": "<hex>" }` — publish an MLS key package ("prekey") for the caller's device.
+
+### `POST /v1/keypackages/claim` → `200` | `404`
+`{ "account_id": "<16B hex>" }` → `{ "device_id": "<16B hex>", "key_package": "<hex>" }`.
+Atomically pops one key package for the target account's device (to add them to a group).
+
+### `POST /v1/conversations` → `200`
+Body `{}`. Creates a conversation with the caller as first member →
+`{ "conversation_id": "<16B hex>" }`.
+
+### `POST /v1/conversations/{id}/members` → `204` | `403`
+`{ "account_id": "<16B hex>" }` — add a target account's active device to routing membership.
+Caller must be a member; the target device is resolved server-side (never client-asserted).
+
+### `POST /v1/conversations/{id}/messages` → `200` | `403`
+`{ "recipient_device": "<16B hex>", "ciphertext": "<hex>" }`. Sender and recipient must both
+be members (object-level authz). Returns `{ "envelope_id": <int> }` — a server receipt
+(queued at the server, **not** a decryption claim).
+
+### `GET /v1/inbox` → `200`
+Returns the caller's undelivered envelopes **in delivery order** and marks them delivered:
+`[ { "id", "conversation_id", "sender_device", "ciphertext" }, … ]`. Ordered delivery is
+required — MLS commits/welcomes must be processed in order.
+
+`services/api/tests/relay_e2ee.rs` drives this whole flow with real MLS ciphertext and
+verifies, by direct database query, that no plaintext is stored.

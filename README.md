@@ -46,13 +46,14 @@ later without redesign.
 | Component | Toolchain present | Compiles here | Tested here |
 |-----------|-------------------|---------------|-------------|
 | `services/auth-core` (Rust) | Rust 1.97.1 stable | ✅ | ✅ `cargo test` — 17 unit + golden vector |
-| `services/api` (Rust: Postgres stores + axum HTTP) | Rust 1.97.1 + PostgreSQL 17 | ✅ | ✅ 12 integration tests vs **real Postgres** (concurrency races + full HTTP flow) |
+| `services/api` (Rust: Postgres stores + axum HTTP + E2EE relay) | Rust 1.97.1 + PostgreSQL 17 | ✅ | ✅ 15 integration tests vs **real Postgres** (concurrency races, full HTTP flow, MLS relay with DB no-plaintext check) |
+| `core/mls-core` (Rust: OpenMLS E2EE) | Rust 1.97.1 | ✅ | ✅ 3 tests — encrypted exchange, no plaintext in ciphertext, removed-member epoch |
 | `apps/ios/SentinelKit` (Swift crypto/protocol) | Xcode 26.6 / Swift 6.3.3 | ✅ `swift build` | ✅ `swift test` — 6 tests |
 | `apps/ios/SentinelUI` (SwiftUI design system + screens) | Swift 6.3.3 | ✅ `swift build` | — (visual; no unit tests) |
 | Cross-language interop (Swift signs → Rust verifies) | both | ✅ | ✅ `INTEROP_OK` + byte-identical transcript vectors |
 | `infra` (docker-compose) | Docker/Colima (installed) | ✅ `config` validates | ✅ Postgres service verified up; API image build not run |
 | `apps/ios/Sentinel` (`@main` app target) | Xcode 26.6 | requires Xcode app target (see apps/ios/README.md) | ⚠️ not run on a simulator/device (R-101) |
-| `core` (Rust↔Swift MLS FFI) | Rust 1.97.1 | planned (Milestone 2) | — |
+| `core/mls-core` Rust↔Swift FFI (UniFFI) | Rust 1.97.1 | planned (on-device, Section 3 / R-101) | — |
 
 See each milestone report in the git history for exactly what was run and what was not.
 

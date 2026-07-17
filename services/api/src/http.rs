@@ -16,10 +16,11 @@ use std::net::{IpAddr, SocketAddr};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use auth_core::ids::TxnId;
+use auth_core::ids::{AccountId, DeviceId, TxnId};
+use auth_core::store::AccountDevice;
 use auth_core::{AuthError, AuthService, RegisterRequest};
-use axum::extract::{ConnectInfo, Request, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{ConnectInfo, Path, Request, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -30,25 +31,45 @@ use governor::{Quota, RateLimiter};
 use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
 
+use crate::relay::PgRelay;
+
 type IpLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 
-/// Maximum request body accepted on any auth endpoint.
+/// Maximum request body on auth endpoints. Message envelopes may be larger (attachments
+/// are chunked separately), so the relay routes get their own higher cap.
 const MAX_BODY_BYTES: usize = 8 * 1024;
+const MAX_RELAY_BODY_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
     pub service: Arc<AuthService>,
+    pub relay: Arc<PgRelay>,
     limiter: Arc<IpLimiter>,
 }
 
 /// Requests allowed per minute per client IP on `/v1` routes.
-pub fn build_router(service: Arc<AuthService>, per_ip_per_minute: u32) -> Router {
+pub fn build_router(
+    service: Arc<AuthService>,
+    relay: Arc<PgRelay>,
+    per_ip_per_minute: u32,
+) -> Router {
     let quota =
         Quota::per_minute(NonZeroU32::new(per_ip_per_minute.max(1)).expect("max(1) is non-zero"));
     let state = AppState {
         service,
+        relay,
         limiter: Arc::new(RateLimiter::keyed(quota)),
     };
+
+    // Relay routes accept larger bodies (opaque envelopes) than auth routes.
+    let relay_routes = Router::new()
+        .route("/v1/keypackages", post(publish_key_package))
+        .route("/v1/keypackages/claim", post(claim_key_package))
+        .route("/v1/conversations", post(create_conversation))
+        .route("/v1/conversations/{id}/members", post(add_member))
+        .route("/v1/conversations/{id}/messages", post(send_message))
+        .route("/v1/inbox", get(fetch_inbox))
+        .layer(RequestBodyLimitLayer::new(MAX_RELAY_BODY_BYTES));
 
     Router::new()
         .route("/v1/register/begin", post(register_begin))
@@ -58,8 +79,9 @@ pub fn build_router(service: Arc<AuthService>, per_ip_per_minute: u32) -> Router
         .route("/v1/session/refresh", post(refresh))
         .route("/v1/session/logout", post(logout))
         .route("/v1/session/whoami", get(whoami))
-        .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
+        .merge(relay_routes)
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(state)
 }
@@ -97,6 +119,18 @@ fn internal() -> ApiError {
     ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal")
 }
 
+fn forbidden() -> ApiError {
+    // The relay uses a generic 403 for "not a member" so it does not confirm a
+    // conversation's existence or membership to non-members.
+    ApiError(StatusCode::FORBIDDEN, "forbidden")
+}
+
+impl From<auth_core::store::StoreError> for ApiError {
+    fn from(_: auth_core::store::StoreError) -> Self {
+        internal()
+    }
+}
+
 // ----- rate limiting ------------------------------------------------------------------
 
 async fn rate_limit(State(state): State<AppState>, request: Request, next: Next) -> Response {
@@ -124,9 +158,26 @@ fn hex_exact(input: &str, expected_bytes: usize) -> Result<Vec<u8>, ApiError> {
 }
 
 fn txn_from_hex(input: &str) -> Result<TxnId, ApiError> {
+    Ok(TxnId(id16_from_hex(input)?))
+}
+
+fn id16_from_hex(input: &str) -> Result<[u8; 16], ApiError> {
     let bytes = hex_exact(input, 16)?;
-    let arr: [u8; 16] = bytes.try_into().map_err(|_| bad_request())?;
-    Ok(TxnId(arr))
+    bytes.try_into().map_err(|_| bad_request())
+}
+
+/// Authenticate the caller from the `Authorization: Bearer <access-token hex>` header,
+/// returning the bound account/device. Any failure is a generic 401.
+async fn authed_device(state: &AppState, headers: &HeaderMap) -> Result<AccountDevice, ApiError> {
+    let bearer = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or(ApiError(StatusCode::UNAUTHORIZED, "denied"))?;
+    let access_token =
+        hex_exact(bearer, 32).map_err(|_| ApiError(StatusCode::UNAUTHORIZED, "denied"))?;
+    let service = state.service.clone();
+    blocking(move || service.validate_access(&access_token)).await
 }
 
 // ----- DTOs ----------------------------------------------------------------------------
@@ -314,20 +365,220 @@ async fn logout(
 
 async fn whoami(
     State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
 ) -> Result<Json<WhoamiDto>, ApiError> {
-    let bearer = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .ok_or(ApiError(StatusCode::UNAUTHORIZED, "denied"))?;
-    let access_token =
-        hex_exact(bearer, 32).map_err(|_| ApiError(StatusCode::UNAUTHORIZED, "denied"))?;
-
-    let service = state.service.clone();
-    let who = blocking(move || service.validate_access(&access_token)).await?;
+    let who = authed_device(&state, &headers).await?;
     Ok(Json(WhoamiDto {
         account_id: hex::encode(who.account_id.as_bytes()),
         device_id: hex::encode(who.device_id.as_bytes()),
     }))
+}
+
+// ----- relay (E2EE message routing; server never decrypts) ----------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublishKeyPackageBody {
+    /// TLS-serialized MLS key package (opaque to the server).
+    key_package: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaimKeyPackageBody {
+    account_id: String,
+}
+
+#[derive(Serialize)]
+struct ClaimedKeyPackageDto {
+    device_id: String,
+    key_package: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddMemberBody {
+    account_id: String,
+}
+
+#[derive(Serialize)]
+struct ConversationDto {
+    conversation_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendMessageBody {
+    recipient_device: String,
+    /// Opaque MLS ciphertext envelope (hex).
+    ciphertext: String,
+}
+
+#[derive(Serialize)]
+struct ReceiptDto {
+    /// Server-assigned envelope id — proof the server queued the ciphertext, NOT that the
+    /// recipient decrypted it.
+    envelope_id: i64,
+}
+
+#[derive(Serialize)]
+struct InboxEnvelopeDto {
+    id: i64,
+    conversation_id: String,
+    sender_device: String,
+    ciphertext: String,
+}
+
+/// Publish a key package for the authenticated device.
+async fn publish_key_package(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PublishKeyPackageBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    if body.key_package.is_empty() || body.key_package.len() > MAX_RELAY_BODY_BYTES {
+        return Err(bad_request());
+    }
+    let key_package = hex::decode(&body.key_package).map_err(|_| bad_request())?;
+    let relay = state.relay.clone();
+    blocking_store(move || relay.publish_key_package(me.account_id, me.device_id, &key_package))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Claim one key package for a target account's device (to add them to a group).
+async fn claim_key_package(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ClaimKeyPackageBody>,
+) -> Result<Json<ClaimedKeyPackageDto>, ApiError> {
+    let _me = authed_device(&state, &headers).await?;
+    let account = AccountId(id16_from_hex(&body.account_id)?);
+    let relay = state.relay.clone();
+    let claimed = blocking_store(move || relay.claim_key_package(&account))
+        .await?
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "no_key_package"))?;
+    Ok(Json(ClaimedKeyPackageDto {
+        device_id: hex::encode(claimed.device_id),
+        key_package: hex::encode(claimed.key_package),
+    }))
+}
+
+/// Create a conversation with the authenticated device as the first member.
+async fn create_conversation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ConversationDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = auth_core::crypto::random_bytes::<16>();
+    let relay = state.relay.clone();
+    blocking_store(move || relay.create_conversation(conversation_id, me.account_id, me.device_id))
+        .await?;
+    Ok(Json(ConversationDto {
+        conversation_id: hex::encode(conversation_id),
+    }))
+}
+
+/// Add a target account's active device to a conversation's routing membership. The caller
+/// must already be a member.
+async fn add_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+    Json(body): Json<AddMemberBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let target_account = AccountId(id16_from_hex(&body.account_id)?);
+
+    let relay = state.relay.clone();
+    let service = state.service.clone();
+    blocking_store(move || {
+        if !relay.is_member(&conversation_id, &me.device_id)? {
+            // Non-members cannot learn anything; a store-level error maps to 500, so we
+            // signal "not a member" out of band below.
+            return Ok(None);
+        }
+        // Resolve the target's active device (server-side authority, never client-asserted).
+        let device = service
+            .active_device(&target_account)
+            .map_err(|_| auth_core::store::StoreError("device lookup".into()))?;
+        match device {
+            Some(device_id) => {
+                relay.add_member(&conversation_id, target_account, device_id)?;
+                Ok(Some(()))
+            }
+            None => Ok(Some(())), // no active device: nothing to route to (still success)
+        }
+    })
+    .await?
+    .ok_or_else(forbidden)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Send an opaque ciphertext envelope to a member of a conversation. The server stores and
+/// forwards bytes; it does not (and cannot) decrypt them.
+async fn send_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+    Json(body): Json<SendMessageBody>,
+) -> Result<Json<ReceiptDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let recipient = DeviceId(id16_from_hex(&body.recipient_device)?);
+    if body.ciphertext.is_empty() || body.ciphertext.len() > MAX_RELAY_BODY_BYTES {
+        return Err(bad_request());
+    }
+    let ciphertext = hex::decode(&body.ciphertext).map_err(|_| bad_request())?;
+
+    let relay = state.relay.clone();
+    let envelope_id = blocking_store(move || {
+        // Both sender and recipient must be members (object-level authz, no IDOR).
+        if !relay.is_member(&conversation_id, &me.device_id)?
+            || !relay.is_member(&conversation_id, &recipient)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(relay.send_envelope(
+            &conversation_id,
+            &me.device_id,
+            &recipient,
+            &ciphertext,
+        )?))
+    })
+    .await?
+    .ok_or_else(forbidden)?;
+    Ok(Json(ReceiptDto { envelope_id }))
+}
+
+/// Fetch (and mark delivered) the authenticated device's queued envelopes.
+async fn fetch_inbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<InboxEnvelopeDto>>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let relay = state.relay.clone();
+    let envelopes = blocking_store(move || relay.fetch_inbox(&me.device_id, 100)).await?;
+    Ok(Json(
+        envelopes
+            .into_iter()
+            .map(|e| InboxEnvelopeDto {
+                id: e.id,
+                conversation_id: hex::encode(e.conversation_id),
+                sender_device: hex::encode(e.sender_device),
+                ciphertext: hex::encode(e.ciphertext),
+            })
+            .collect(),
+    ))
+}
+
+/// Like `blocking`, but for relay store calls that return `StoreResult`.
+async fn blocking_store<T: Send + 'static>(
+    f: impl FnOnce() -> auth_core::store::StoreResult<T> + Send + 'static,
+) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|_| internal())?
+        .map_err(ApiError::from)
 }

@@ -45,13 +45,19 @@ results, remaining risks, and the next smallest step.
   now in `auth-core`; the client signing path is proven to interoperate with the server
   verifier; end-to-end on device pending R-101*.
 
-## Milestone 2 — E2EE direct messages — **NOT STARTED**
+## Milestone 2 — E2EE direct messages — **IN PROGRESS (Rust side done)**
 
-- [ ] OpenMLS integration in `core/`; UniFFI Swift bindings.
-- [ ] Key-package (prekey) service; identity/prekey directory.
-- [ ] Two devices exchange encrypted text; offline queue, retries, dedup, receipts, local
-      encrypted persistence, identity verification, push wake-up.
-- [ ] Evidence: server/DB/queue/push contain **no plaintext** (INV-1, R-104).
+- [x] **OpenMLS integration in `core/mls-core`**: identity/credential, key packages, group
+      create, add/remove member with epoch rotation, application encrypt/decrypt. 3 tests.
+- [x] **Key-package (prekey) service + relay** in `services/api`: publish/claim key packages,
+      conversations + routing membership, opaque envelope send/inbox, server receipts, no
+      decryption. Object-level authz (non-members forbidden). Ordered delivery.
+- [x] **Evidence server/DB contain no plaintext (INV-1, R-104)**: `relay_e2ee.rs` sends real
+      MLS ciphertext through the HTTP relay and a direct `SELECT` on `envelopes` confirms no
+      plaintext at rest. Server library never links `mls-core`.
+- [ ] UniFFI Swift bindings so two devices exchange text on-device. *(Section 3 / R-101)*
+- [ ] Offline retry/dedup polish, local encrypted persistence, identity verification UI,
+      push wake-up. *(Milestone 3)*
 
 ## Milestone 3 — Complete core messaging — **NOT STARTED**
 

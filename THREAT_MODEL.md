@@ -68,7 +68,7 @@ Each invariant is enforced by a test where possible. **T** = tested in this repo
 
 | ID | Invariant | Status |
 |----|-----------|--------|
-| INV-1 | The service never receives message/attachment/call/backup/local-search **plaintext** in the normal E2EE path. | **P** — Milestone 2 (R-104). Design enforces it; test evidence pending. |
+| INV-1 | The service never receives message/attachment/call/backup/local-search **plaintext** in the normal E2EE path. | **T (Rust)** — `mls-core/tests/e2ee.rs` (ciphertext has no plaintext; outsider/removed-member cannot decrypt) + `sentinel-api/tests/relay_e2ee.rs` (real MLS ciphertext through the HTTP relay; direct DB query confirms no plaintext at rest). On-device Swift path pending (R-101). |
 | INV-2 | Username + password **without** an active registered device key cannot create or refresh a session. | **T** — `auth-core` tests `login_denied_without_device_key`, `refresh_requires_device_signature`. |
 | INV-3 | A private device/identity key is never exportable from secure hardware when the platform supports it. | **P** — verified by on-device test (R-101); enforced by Secure Enclave key attributes. |
 | INV-4 | Every challenge is action-bound, account-bound, device-bound, expiring, and single-use. | **T** — `auth-core` tests for replay, expiry, wrong-action, wrong-account, wrong-device, double-consume. |
