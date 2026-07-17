@@ -64,6 +64,26 @@ struct SentinelSmoke {
                 fail("unexpected error on attacker login: \(error)")
             }
 
+            // --- Key transparency (R-201): the client self-monitors its own enrolled key ---
+            // In production the log public key is pinned in the app; here we take it from a first
+            // STH fetch to demonstrate the verification mechanism end to end.
+            let firstSTH = try await client.transparencySignedTreeHead(
+                accessToken: registered.accessToken
+            )
+            guard let pinnedLogKey = Hex.decode(firstSTH.logPublicKey) else {
+                fail("transparency: bad log public key")
+            }
+            let monitor = try await client.selfMonitorKeyTransparency(
+                accessToken: registered.accessToken,
+                accountID: registered.accountID,
+                deviceID: registered.deviceID,
+                expectedPublicKeyX963: signer.publicKeyX963,
+                pinnedLogPublicKeyX963: pinnedLogKey
+            )
+            guard monitor == .ok else {
+                fail("key-transparency self-monitor did not pass: \(monitor)")
+            }
+
             // --- Social + group + messaging over the live server ---
 
             // A second real user, Bob.

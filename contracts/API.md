@@ -68,6 +68,25 @@ token revokes the whole family.
 Header: `Authorization: Bearer <32B access-token hex>`. Returns
 `{ "account_id":"…","device_id":"…" }`.
 
+## Key transparency (R-201)
+
+An append-only RFC 6962 Merkle log of account→device-key bindings (auth'd reads). Clients verify
+STH signatures under a **pinned** log key and self-monitor their own account. See
+[KEY_TRANSPARENCY.md](../docs/KEY_TRANSPARENCY.md) for the honest scope.
+
+### `GET /v1/transparency/sth` → signed tree head
+`{ "tree_size", "root_hash":"<32B hex>", "timestamp", "signature":"<64B hex>", "log_public_key":"<65B SEC1 hex>" }`.
+`signature` is ECDSA-P256 over the canonical `encode_sth(tree_size, root, timestamp)`.
+
+### `GET /v1/transparency/consistency?first=N&second=M` → `{ "proof": ["<hex>", …] }` | `400`
+RFC 6962 consistency proof that tree size `M` append-only-extends size `N` (`0 < N ≤ M ≤ size`).
+
+### `GET /v1/transparency/account/{account_id}[?tree_size=N]` → account view
+`{ "tree_size", "bindings":[ { "leaf_index", "device_id", "public_key", "entry":"<hex>", "proof":["<hex>",…] }, … ] }`.
+Each binding's inclusion proof is computed at `tree_size` (defaults to current). A client verifies
+each proof against an STH root at the same size and checks the logged key is the one it enrolled.
+`services/api/tests/transparency.rs` drives the full self-monitor flow.
+
 ## Session object
 ```json
 { "account_id":"<16B hex>", "device_id":"<16B hex>",
