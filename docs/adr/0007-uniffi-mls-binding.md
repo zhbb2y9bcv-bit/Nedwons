@@ -56,3 +56,22 @@ FFI boundary (ADR-0004 consequence); no Swift crypto to review.
 Planned. The host-side MLS (`mls-core`) and the auth client transport (SentinelKit's
 `SentinelClient`, verified against the live backend) are done; this binding is the remaining
 bridge to run E2EE on the device, landed together with the Xcode app target (Section 3 / R-101).
+
+### Update 2026-07-17 — the narrow Rust-owned API layer now exists (`mls_core::client`)
+
+The FFI-shaped surface the binding will wrap is implemented and tested headlessly, so the
+UniFFI step becomes packaging rather than design:
+
+- **`ClientApi`** exposes **`&self`** methods over a `Mutex` (satisfies item 1 — no `&mut` at the
+  boundary), keyed by **opaque `u64` handles**; no MLS objects or secrets cross to the caller.
+- **Byte-oriented + bounded:** every input is length-checked (`MAX_*` constants) before parsing.
+- **Typed, stable, redacted errors** (`ClientError`), and **every entry point is wrapped in
+  `catch_unwind`** so a panic can never unwind across the FFI boundary (UB) — it becomes `Internal`.
+- Tests (`tests/client_api.rs`): deterministic two-party round trip through handles, oversized-input
+  rejection, unknown-handle handling, and a malformed/near-miss **corpus that must never panic**.
+
+**Still required before shipping on device (blocked on the iOS toolchain — R-101):** the `uniffi`
+scaffolding/UDL and generated Swift bindings; cross-compiled `aarch64-apple-ios(-sim)` staticlib +
+`xcframework`; the **persistent `StorageProvider`** (ratchet secrets under the at-rest key
+hierarchy — the security-sensitive piece); and a **`cargo fuzz`** target on `process`/`join`/
+`add_member` to harden the corpus test into continuous fuzzing.
