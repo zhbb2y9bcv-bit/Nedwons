@@ -1,10 +1,13 @@
 //! The device-bound authentication service (ADR-0002). Orchestrates registration, the
-//! two-stage login, device-signed refresh, logout, and revocation over the storage seam.
+//! two-stage login, device-signed refresh, access-token validation, logout, and revocation
+//! over the storage seam.
 //!
 //! Security posture, enforced below and by tests:
 //!  * Username + password alone never create a session (INV-2).
 //!  * Every challenge is single-use, expiring, and account/device/action-bound (INV-4).
 //!  * All security failures return the generic [`AuthError::Denied`] (fail closed).
+//!  * Storage failures never become implicit successes: `StoreError` maps to
+//!    [`AuthError::Internal`] (or `Denied` where the safe direction is denial).
 
 use std::sync::Arc;
 
@@ -16,9 +19,16 @@ use crate::ids::{AccountId, DeviceId, TxnId};
 use crate::password;
 use crate::store::{
     AccountDevice, AccountRecord, ChallengeRecord, ChallengeStore, Clock, CredentialStore,
-    DeviceRecord, DeviceStore, RefreshOutcome, RefreshStore,
+    DeviceRecord, DeviceStore, RefreshOutcome, RefreshStore, SessionStore, StoreError,
 };
 use crate::transcript::{Action, Transcript};
+
+impl From<StoreError> for AuthError {
+    fn from(_: StoreError) -> Self {
+        // The message is for source-side logging only; callers get a generic error.
+        AuthError::Internal
+    }
+}
 
 /// Tunable lifetimes. Defaults are conservative starting values.
 #[derive(Clone, Copy, Debug)]
@@ -89,6 +99,7 @@ pub struct AuthService {
     devices: Arc<dyn DeviceStore + Send + Sync>,
     challenges: Arc<dyn ChallengeStore + Send + Sync>,
     refresh: Arc<dyn RefreshStore + Send + Sync>,
+    sessions: Arc<dyn SessionStore + Send + Sync>,
     clock: Arc<dyn Clock + Send + Sync>,
     config: Config,
     argon2: Argon2<'static>,
@@ -103,6 +114,7 @@ impl AuthService {
         devices: Arc<dyn DeviceStore + Send + Sync>,
         challenges: Arc<dyn ChallengeStore + Send + Sync>,
         refresh: Arc<dyn RefreshStore + Send + Sync>,
+        sessions: Arc<dyn SessionStore + Send + Sync>,
         clock: Arc<dyn Clock + Send + Sync>,
         config: Config,
     ) -> Self {
@@ -113,6 +125,7 @@ impl AuthService {
             devices,
             challenges,
             refresh,
+            sessions,
             clock,
             config,
             argon2,
@@ -123,7 +136,7 @@ impl AuthService {
     // ----- Registration -------------------------------------------------------------
 
     /// Stage 1 of enrollment: reserve ids and issue a single-use `Register` challenge.
-    pub fn register_begin(&self) -> RegistrationChallenge {
+    pub fn register_begin(&self) -> Result<RegistrationChallenge> {
         let account_id = AccountId::random();
         let device_id = DeviceId::random();
         let txn_id = TxnId::random();
@@ -136,22 +149,22 @@ impl AuthService {
             action: Action::Register,
             nonce,
             expires_at,
-        });
-        RegistrationChallenge {
+        })?;
+        Ok(RegistrationChallenge {
             account_id,
             device_id,
             txn_id,
             nonce,
             expires_at,
-        }
+        })
     }
 
     /// Stage 2 of enrollment: verify the device holds the private key for its asserted
-    /// public key (proof of possession), then create the account and device.
+    /// public key (proof of possession), then create the account and device atomically.
     pub fn register_finish(&self, req: RegisterRequest) -> Result<Session> {
         let challenge = self
             .challenges
-            .consume(&req.txn_id)
+            .consume(&req.txn_id)?
             .ok_or(AuthError::Denied)?;
         self.check_challenge(&challenge, Action::Register)?;
 
@@ -170,29 +183,33 @@ impl AuthService {
             return Err(AuthError::Denied);
         }
 
-        // Username validation is a client-correctable request error, distinct from Denied.
+        // Username/password validation are client-correctable request errors, distinct
+        // from Denied.
         let username = normalize_username(&req.username)?;
+        password::validate_password_policy(&req.password)?;
         let password_phc = password::hash_password(&self.argon2, &req.password)?;
 
-        let created = self.creds.create_account(AccountRecord {
-            account_id: challenge.account_id,
-            username_normalized: username,
-            password_phc,
-        });
+        let created = self.creds.create_account_with_device(
+            AccountRecord {
+                account_id: challenge.account_id,
+                username_normalized: username,
+                password_phc,
+            },
+            DeviceRecord {
+                device_id: challenge.device_id,
+                account_id: challenge.account_id,
+                public_key: req.device_public_key,
+                revoked: false,
+            },
+        )?;
         if !created {
             return Err(AuthError::UsernameUnavailable);
         }
-        self.devices.create_device(DeviceRecord {
-            device_id: challenge.device_id,
-            account_id: challenge.account_id,
-            public_key: req.device_public_key,
-            revoked: false,
-        });
 
-        Ok(self.mint_session_new_family(AccountDevice {
+        self.mint_session_new_family(AccountDevice {
             account_id: challenge.account_id,
             device_id: challenge.device_id,
-        }))
+        })
     }
 
     // ----- Login (two-stage) --------------------------------------------------------
@@ -200,11 +217,12 @@ impl AuthService {
     /// Stage 1 of login. Verifies credentials with enumeration-resistant timing and always
     /// returns a challenge. A real (stored) challenge is issued only when the credentials
     /// are valid AND the account has an active device; otherwise an unstored decoy of
-    /// identical shape is returned so the response reveals nothing.
+    /// identical shape is returned so the response reveals nothing. Storage errors surface
+    /// as a decoy too — the caller cannot distinguish an outage from a bad credential.
     pub fn login_begin(&self, username: &str, password: &str) -> LoginChallenge {
         let account = normalize_username(username)
             .ok()
-            .and_then(|u| self.creds.find_by_username(&u));
+            .and_then(|u| self.creds.find_by_username(&u).ok().flatten());
 
         // Always run one Argon2 verification (real hash if found, dummy if not) so timing
         // does not distinguish existence.
@@ -219,11 +237,11 @@ impl AuthService {
 
         if credentials_ok {
             if let Some(acct) = account {
-                if let Some(device) = self.devices.active_device_for_account(&acct.account_id) {
+                if let Ok(Some(device)) = self.devices.active_device_for_account(&acct.account_id) {
                     let txn_id = TxnId::random();
                     let nonce = random_bytes::<32>();
                     let expires_at = self.clock.now_unix() + self.config.challenge_ttl_secs;
-                    self.challenges.put(ChallengeRecord {
+                    let stored = self.challenges.put(ChallengeRecord {
                         txn_id,
                         account_id: acct.account_id,
                         device_id: device.device_id,
@@ -231,13 +249,15 @@ impl AuthService {
                         nonce,
                         expires_at,
                     });
-                    return LoginChallenge {
-                        account_id: acct.account_id,
-                        device_id: device.device_id,
-                        txn_id,
-                        nonce,
-                        expires_at,
-                    };
+                    if stored.is_ok() {
+                        return LoginChallenge {
+                            account_id: acct.account_id,
+                            device_id: device.device_id,
+                            txn_id,
+                            nonce,
+                            expires_at,
+                        };
+                    }
                 }
             }
         }
@@ -248,12 +268,12 @@ impl AuthService {
     /// enrolled device's public key over the bound challenge. A decoy `txn_id` (or any
     /// replay/expiry/mismatch) consumes to nothing and fails closed.
     pub fn login_finish(&self, txn_id: &TxnId, signature: &[u8]) -> Result<Session> {
-        let challenge = self.challenges.consume(txn_id).ok_or(AuthError::Denied)?;
+        let challenge = self.challenges.consume(txn_id)?.ok_or(AuthError::Denied)?;
         self.check_challenge(&challenge, Action::Login)?;
 
         let device = self
             .devices
-            .device(&challenge.device_id)
+            .device(&challenge.device_id)?
             .filter(|d| !d.revoked)
             .ok_or(AuthError::Denied)?;
 
@@ -270,13 +290,13 @@ impl AuthService {
             return Err(AuthError::Denied);
         }
 
-        Ok(self.mint_session_new_family(AccountDevice {
+        self.mint_session_new_family(AccountDevice {
             account_id: challenge.account_id,
             device_id: challenge.device_id,
-        }))
+        })
     }
 
-    // ----- Refresh / logout / revocation --------------------------------------------
+    // ----- Sessions: refresh / validate / logout / revocation ------------------------
 
     /// Rotate a refresh token. Requires BOTH the (unpredictable, rotating) refresh token
     /// and a device-key signature over a `Refresh` transcript, so a copied bearer token is
@@ -286,10 +306,10 @@ impl AuthService {
         let now = self.clock.now_unix();
         let old_hash = sha256(refresh_token);
 
-        let owner = self.refresh.owner_of(&old_hash).ok_or(AuthError::Denied)?;
+        let owner = self.refresh.owner_of(&old_hash)?.ok_or(AuthError::Denied)?;
         let device = self
             .devices
-            .device(&owner.device_id)
+            .device(&owner.device_id)?
             .filter(|d| !d.revoked)
             .ok_or(AuthError::Denied)?;
 
@@ -310,30 +330,64 @@ impl AuthService {
         let new_token = random_bytes::<32>();
         let new_hash = sha256(&new_token);
         let new_expires = now + self.config.refresh_ttl_secs;
-        match self.refresh.rotate(&old_hash, new_hash, new_expires) {
-            RefreshOutcome::Rotated { account } => Ok(Session {
-                account_id: account.account_id,
-                device_id: account.device_id,
-                access_token: random_bytes::<32>().to_vec(),
-                access_expires_at: now + self.config.access_ttl_secs,
-                refresh_token: new_token.to_vec(),
-                refresh_expires_at: new_expires,
-            }),
+        match self.refresh.rotate(&old_hash, new_hash, new_expires)? {
+            RefreshOutcome::Rotated { account } => {
+                let access_token = random_bytes::<32>();
+                let access_expires_at = now + self.config.access_ttl_secs;
+                self.sessions
+                    .put_access(sha256(&access_token), account, access_expires_at)?;
+                Ok(Session {
+                    account_id: account.account_id,
+                    device_id: account.device_id,
+                    access_token: access_token.to_vec(),
+                    access_expires_at,
+                    refresh_token: new_token.to_vec(),
+                    refresh_expires_at: new_expires,
+                })
+            }
             // Reuse or unknown: the family is now revoked. Fail closed.
             RefreshOutcome::ReuseDetected | RefreshOutcome::Unknown => Err(AuthError::Denied),
         }
     }
 
-    /// Revoke the family owning this refresh token (logout on one device).
-    pub fn logout(&self, refresh_token: &[u8]) {
-        self.refresh.revoke_by_token_hash(&sha256(refresh_token));
+    /// Validate an access token: known hash, not expired, and its device still active.
+    pub fn validate_access(&self, access_token: &[u8]) -> Result<AccountDevice> {
+        let (account, expires_at) = self
+            .sessions
+            .get_access(&sha256(access_token))?
+            .ok_or(AuthError::Denied)?;
+        if self.clock.now_unix() > expires_at {
+            return Err(AuthError::Denied);
+        }
+        // A revoked device's tokens are removed by revoke_device, but check anyway so a
+        // missed cleanup still fails closed (defense in depth).
+        let device = self
+            .devices
+            .device(&account.device_id)?
+            .filter(|d| !d.revoked)
+            .ok_or(AuthError::Denied)?;
+        debug_assert_eq!(device.account_id, account.account_id);
+        Ok(account)
     }
 
-    /// Revoke a device: mark it revoked and burn all its refresh families (INV-10). Future
-    /// logins and refreshes from it fail closed.
-    pub fn revoke_device(&self, device_id: &DeviceId) {
-        self.devices.revoke_device(device_id);
-        self.refresh.revoke_all_for_device(device_id);
+    /// Revoke the family owning this refresh token and the device's access tokens
+    /// (logout on one device). Idempotent; unknown tokens are a no-op.
+    pub fn logout(&self, refresh_token: &[u8]) -> Result<()> {
+        let hash = sha256(refresh_token);
+        if let Some(owner) = self.refresh.owner_of(&hash)? {
+            self.refresh.revoke_by_token_hash(&hash)?;
+            self.sessions.revoke_access_for_device(&owner.device_id)?;
+        }
+        Ok(())
+    }
+
+    /// Revoke a device: mark it revoked and burn all its refresh families and access
+    /// tokens (INV-10). Future logins, refreshes, and API calls from it fail closed.
+    pub fn revoke_device(&self, device_id: &DeviceId) -> Result<()> {
+        self.devices.revoke_device(device_id)?;
+        self.refresh.revoke_all_for_device(device_id)?;
+        self.sessions.revoke_access_for_device(device_id)?;
+        Ok(())
     }
 
     // ----- internals ----------------------------------------------------------------
@@ -350,20 +404,26 @@ impl AuthService {
         Ok(())
     }
 
-    fn mint_session_new_family(&self, account: AccountDevice) -> Session {
+    fn mint_session_new_family(&self, account: AccountDevice) -> Result<Session> {
         let now = self.clock.now_unix();
         let refresh_token = random_bytes::<32>();
         let refresh_expires_at = now + self.config.refresh_ttl_secs;
         self.refresh
-            .issue(account, sha256(&refresh_token), refresh_expires_at);
-        Session {
+            .issue(account, sha256(&refresh_token), refresh_expires_at)?;
+
+        let access_token = random_bytes::<32>();
+        let access_expires_at = now + self.config.access_ttl_secs;
+        self.sessions
+            .put_access(sha256(&access_token), account, access_expires_at)?;
+
+        Ok(Session {
             account_id: account.account_id,
             device_id: account.device_id,
-            access_token: random_bytes::<32>().to_vec(),
-            access_expires_at: now + self.config.access_ttl_secs,
+            access_token: access_token.to_vec(),
+            access_expires_at,
             refresh_token: refresh_token.to_vec(),
             refresh_expires_at,
-        }
+        })
     }
 
     fn decoy_login_challenge(&self) -> LoginChallenge {

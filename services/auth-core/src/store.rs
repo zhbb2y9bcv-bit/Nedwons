@@ -3,11 +3,27 @@
 //! atomicity these method contracts require. In-memory implementations for tests live in
 //! [`crate::memstore`].
 //!
-//! Each method's doc comment states the atomicity contract the SQL implementation MUST
-//! honor. A mismatch there is a critical security bug, not a refactor.
+//! Every method returns `Result<_, StoreError>` because real storage can fail, and the
+//! service maps any storage failure to a **fail-closed** denial or internal error — never
+//! to an implicit success. Each method's doc comment states the atomicity contract the SQL
+//! implementation MUST honor. A mismatch there is a critical security bug, not a refactor.
 
 use crate::ids::{AccountId, DeviceId, FamilyId, TxnId};
 use crate::transcript::Action;
+
+/// An opaque storage failure. Carries a message for internal logging only; it is never
+/// surfaced to API callers (they see a generic error, INV-8).
+#[derive(Debug)]
+pub struct StoreError(pub String);
+
+impl core::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "store error: {}", self.0)
+    }
+}
+impl std::error::Error for StoreError {}
+
+pub type StoreResult<T> = core::result::Result<T, StoreError>;
 
 /// Wall-clock source, injected for testable expiry.
 pub trait Clock {
@@ -45,7 +61,7 @@ pub struct ChallengeRecord {
     pub expires_at: u64,
 }
 
-/// Account + device pair identifying a refresh-token lineage owner.
+/// Account + device pair identifying a session owner / refresh-token lineage owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AccountDevice {
     pub account_id: AccountId,
@@ -65,49 +81,80 @@ pub enum RefreshOutcome {
 }
 
 pub trait CredentialStore {
-    /// Create an account. MUST enforce a unique constraint on `username_normalized` and
-    /// return `false` if it is already taken (atomic insert-or-reject).
-    fn create_account(&self, account: AccountRecord) -> bool;
-    fn find_by_username(&self, username_normalized: &str) -> Option<AccountRecord>;
+    /// Create the account AND its first device **in one atomic transaction** — either both
+    /// exist afterwards or neither does (no orphaned username squatting on partial
+    /// failure). MUST enforce a unique constraint on `username_normalized` and return
+    /// `Ok(false)` if it is already taken.
+    fn create_account_with_device(
+        &self,
+        account: AccountRecord,
+        device: DeviceRecord,
+    ) -> StoreResult<bool>;
+    fn find_by_username(&self, username_normalized: &str) -> StoreResult<Option<AccountRecord>>;
 }
 
 pub trait DeviceStore {
-    fn create_device(&self, device: DeviceRecord);
     /// The single active (non-revoked) device for an account. v1 is single-active-device
-    /// (ADR-0002).
-    fn active_device_for_account(&self, account_id: &AccountId) -> Option<DeviceRecord>;
-    fn device(&self, device_id: &DeviceId) -> Option<DeviceRecord>;
+    /// (ADR-0002); the SQL schema enforces it with a partial unique index.
+    fn active_device_for_account(
+        &self,
+        account_id: &AccountId,
+    ) -> StoreResult<Option<DeviceRecord>>;
+    fn device(&self, device_id: &DeviceId) -> StoreResult<Option<DeviceRecord>>;
     /// Mark a device revoked. Future signatures from it MUST fail closed (INV-10).
-    fn revoke_device(&self, device_id: &DeviceId);
+    fn revoke_device(&self, device_id: &DeviceId) -> StoreResult<()>;
 }
 
 pub trait ChallengeStore {
     /// Persist a challenge.
-    fn put(&self, challenge: ChallengeRecord);
+    fn put(&self, challenge: ChallengeRecord) -> StoreResult<()>;
     /// **Atomically** consume (remove and return) the challenge for `txn_id`. A second call
-    /// for the same `txn_id` MUST return `None`. In SQL: `DELETE ... WHERE txn_id = $1
-    /// RETURNING ...`. This single-use property is INV-4 and the whole point of the store.
-    fn consume(&self, txn_id: &TxnId) -> Option<ChallengeRecord>;
+    /// for the same `txn_id` MUST return `Ok(None)`, including under concurrent access. In
+    /// SQL: `DELETE ... WHERE txn_id = $1 RETURNING ...`. This single-use property is INV-4
+    /// and the whole point of the store.
+    fn consume(&self, txn_id: &TxnId) -> StoreResult<Option<ChallengeRecord>>;
 }
 
 pub trait RefreshStore {
     /// Start a new refresh-token family with `token_hash` as generation 0.
-    fn issue(&self, account: AccountDevice, token_hash: [u8; 32], expires_at: u64) -> FamilyId;
+    fn issue(
+        &self,
+        account: AccountDevice,
+        token_hash: [u8; 32],
+        expires_at: u64,
+    ) -> StoreResult<FamilyId>;
     /// Look up the owner of a token hash (current OR retired), used to fetch the device
-    /// public key before verifying the refresh signature. Returns `None` if unknown.
-    fn owner_of(&self, token_hash: &[u8; 32]) -> Option<AccountDevice>;
+    /// public key before verifying the refresh signature. `Ok(None)` if unknown.
+    fn owner_of(&self, token_hash: &[u8; 32]) -> StoreResult<Option<AccountDevice>>;
     /// **Atomically** rotate: if `old_hash` is the family's current token, install
     /// `new_hash` as the next generation and return `Rotated`. If `old_hash` is retired or
-    /// the family is revoked, revoke the family and return `ReuseDetected`. In SQL this is a
-    /// compare-and-swap on a generation column inside a transaction.
+    /// the family is revoked, revoke the family and return `ReuseDetected`. Under a
+    /// concurrent race on the same `old_hash`, **at most one** caller may observe
+    /// `Rotated`. In SQL this is a compare-and-swap on a generation column inside a
+    /// transaction.
     fn rotate(
         &self,
         old_hash: &[u8; 32],
         new_hash: [u8; 32],
         new_expires_at: u64,
-    ) -> RefreshOutcome;
+    ) -> StoreResult<RefreshOutcome>;
     /// Revoke the family that owns `token_hash` (logout).
-    fn revoke_by_token_hash(&self, token_hash: &[u8; 32]);
+    fn revoke_by_token_hash(&self, token_hash: &[u8; 32]) -> StoreResult<()>;
     /// Revoke every family belonging to a device (device revocation / INV-10).
-    fn revoke_all_for_device(&self, device_id: &DeviceId);
+    fn revoke_all_for_device(&self, device_id: &DeviceId) -> StoreResult<()>;
+}
+
+pub trait SessionStore {
+    /// Record a short-lived access token (by hash) for later validation.
+    fn put_access(
+        &self,
+        token_hash: [u8; 32],
+        account: AccountDevice,
+        expires_at: u64,
+    ) -> StoreResult<()>;
+    /// Owner and expiry for an access-token hash, or `Ok(None)` if unknown/revoked.
+    /// Expiry enforcement is the service's job (it owns the clock).
+    fn get_access(&self, token_hash: &[u8; 32]) -> StoreResult<Option<(AccountDevice, u64)>>;
+    /// Remove all access tokens for a device (logout / device revocation, INV-10).
+    fn revoke_access_for_device(&self, device_id: &DeviceId) -> StoreResult<()>;
 }

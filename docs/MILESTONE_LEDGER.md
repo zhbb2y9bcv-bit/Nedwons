@@ -29,9 +29,15 @@ results, remaining risks, and the next smallest step.
       ECDSA-P256 signature verifies in the Rust backend (`INTEROP_OK`).
 - [x] iOS `SentinelUI`: futuristic design tokens + components + app screens (tab shell,
       onboarding with gated enrollment, empty states) — builds with `swift build`.
-- [ ] Postgres implementations of the store traits with concurrency integration tests. *(R-102)*
-- [ ] HTTP API layer (`axum`) exposing register/login/refresh/logout with schema validation,
-      size bounds, rate limits, generic errors.
+- [x] **Postgres implementations of the store traits with concurrency integration tests**
+      (`services/api`). DELETE-RETURNING challenge consume, FOR-UPDATE + generation-CAS
+      refresh rotation, partial-unique single-active-device, atomic account+device create.
+      Race tests prove exactly-one/at-most-one winners against real PostgreSQL. **Closes R-102.**
+- [x] **HTTP API layer (`axum`)**: register/login/refresh/logout/whoami with `deny_unknown_fields`
+      schemas, exact-length hex validation, 8 KiB body cap, per-IP GCRA rate limiting, generic
+      fail-closed errors, CPU work on `spawn_blocking`. End-to-end tests vs real Postgres.
+      NIST-aligned password policy (length + blocklist) added. Server boots + serves verified.
+- [x] `infra/docker-compose.yml` (Postgres + API) validated; Postgres service verified healthy.
 - [ ] iOS app target (`@main`) built in Xcode; real Secure Enclave enrollment + App Attest
       verified on device. *(R-101)*
 - [ ] Recovery-kit flow. *(R-304)*

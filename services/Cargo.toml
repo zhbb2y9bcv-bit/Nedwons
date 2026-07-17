@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["auth-core"]
+members = ["auth-core", "api"]
 
 # Backend modular monolith (ADR-0004). `auth-core` is the pure, storage-agnostic
 # security logic (ADR-0006). Additional members (relay, key-directory, api) are added

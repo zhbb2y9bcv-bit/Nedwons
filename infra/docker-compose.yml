@@ -1,0 +1,50 @@
+# Local development / demo stack for the CPU-only core services (ARCHITECTURE.md §7).
+# The future isolated GPU worker pool (Milestone 6) is a SEPARATE deployment in a separate
+# trust zone and is deliberately not wired into the core stack.
+#
+#   docker compose -f infra/docker-compose.yml up --build
+#
+# This is a DEV configuration. Production uses a managed Postgres, secrets from a KMS/secret
+# manager (never env files in the repo), TLS 1.3 terminated at the ingress, and per-
+# environment credentials (SECURITY.md).
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: devonly_not_a_secret
+      POSTGRES_DB: sentinel_dev
+    ports:
+      - "127.0.0.1:5432:5432" # loopback only
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sentinel -d sentinel_dev"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: ../services
+      dockerfile: api/Dockerfile
+    environment:
+      DATABASE_URL: postgres://sentinel:devonly_not_a_secret@postgres:5432/sentinel_dev
+      SENTINEL_BIND: 0.0.0.0:8080
+      SENTINEL_RATE_PER_MIN: "60"
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080" # loopback only
+    # Container hardening (defense in depth).
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  pgdata:

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use auth_core::crypto::sha256;
 use auth_core::memstore::{
-    MemChallengeStore, MemCredentialStore, MemDeviceStore, MemRefreshStore, MockClock,
+    MemAccountStore, MemChallengeStore, MemRefreshStore, MemSessionStore, MockClock,
 };
 use auth_core::transcript::Transcript;
 use auth_core::{
@@ -48,11 +48,15 @@ impl TestDevice {
 
 fn make_service() -> (AuthService, Arc<MockClock>) {
     let clock = Arc::new(MockClock::new(1_000_000));
+    // One MemAccountStore serves as both CredentialStore and DeviceStore, mirroring the
+    // single-transaction account+device creation the SQL schema provides.
+    let accounts = Arc::new(MemAccountStore::default());
     let service = AuthService::new(
-        Arc::new(MemCredentialStore::default()),
-        Arc::new(MemDeviceStore::default()),
+        accounts.clone(),
+        accounts,
         Arc::new(MemChallengeStore::default()),
         Arc::new(MemRefreshStore::default()),
+        Arc::new(MemSessionStore::default()),
         clock.clone(),
         Config::default(),
     );
@@ -62,7 +66,9 @@ fn make_service() -> (AuthService, Arc<MockClock>) {
 /// Register an account and return the (real) device that enrolled it.
 fn register(service: &AuthService, username: &str) -> (TestDevice, Session) {
     let device = TestDevice::new();
-    let challenge = service.register_begin();
+    let challenge = service
+        .register_begin()
+        .expect("register_begin should succeed");
     let transcript = Transcript {
         action: Action::Register,
         account_id: &challenge.account_id,
@@ -226,7 +232,7 @@ fn challenge_is_action_bound() {
     let device = TestDevice::new();
 
     // A fresh, unconsumed Register challenge.
-    let reg = service.register_begin();
+    let reg = service.register_begin().expect("begin should succeed");
     let transcript = Transcript {
         action: Action::Register,
         account_id: &reg.account_id,
@@ -338,7 +344,9 @@ fn device_revocation_fails_closed() {
     // Sanity: login works before revocation.
     assert!(login(&service, &device, "alice", PASSWORD).is_ok());
 
-    service.revoke_device(&session.device_id);
+    service
+        .revoke_device(&session.device_id)
+        .expect("revocation should succeed");
 
     // After revocation there is no active device, so login is denied.
     assert_denied(login(&service, &device, "alice", PASSWORD));
@@ -423,6 +431,98 @@ fn transcript_encoding_is_unambiguous() {
     }
     .encode();
     assert_ne!(t1, t3);
+}
+
+/// Access tokens validate while fresh, expire on TTL, and die with logout and device
+/// revocation (INV-10).
+#[test]
+fn access_token_lifecycle() {
+    let (service, clock) = make_service();
+    let (_device, session) = register(&service, "alice");
+
+    // Fresh token validates and maps to the right account/device.
+    let who = service
+        .validate_access(&session.access_token)
+        .expect("fresh access token should validate");
+    assert_eq!(who.account_id, session.account_id);
+    assert_eq!(who.device_id, session.device_id);
+
+    // Expired token is denied.
+    clock.advance(Config::default().access_ttl_secs + 1);
+    assert!(matches!(
+        service.validate_access(&session.access_token),
+        Err(AuthError::Denied)
+    ));
+}
+
+#[test]
+fn logout_revokes_access_and_refresh() {
+    let (service, _clock) = make_service();
+    let (device, session) = register(&service, "alice");
+
+    service.logout(&session.refresh_token).expect("logout ok");
+
+    // Access token no longer validates.
+    assert!(matches!(
+        service.validate_access(&session.access_token),
+        Err(AuthError::Denied)
+    ));
+    // Refresh family is revoked.
+    let sig = sign_refresh(
+        &device,
+        &session.account_id,
+        &session.device_id,
+        &session.refresh_token,
+    );
+    assert_denied(service.refresh(&session.refresh_token, &sig));
+}
+
+#[test]
+fn device_revocation_kills_access_tokens() {
+    let (service, _clock) = make_service();
+    let (_device, session) = register(&service, "alice");
+
+    service
+        .revoke_device(&session.device_id)
+        .expect("revocation should succeed");
+    assert!(matches!(
+        service.validate_access(&session.access_token),
+        Err(AuthError::Denied)
+    ));
+}
+
+/// NIST-aligned password policy: length floor, generous ceiling, common-password blocklist.
+#[test]
+fn weak_passwords_are_rejected_at_registration() {
+    let (service, _clock) = make_service();
+    let device = TestDevice::new();
+    let challenge = service.register_begin().expect("begin ok");
+    let transcript = Transcript {
+        action: Action::Register,
+        account_id: &challenge.account_id,
+        device_id: &challenge.device_id,
+        public_key: &device.public_key,
+        challenge: &challenge.nonce,
+        expires_at: challenge.expires_at,
+        txn_id: &challenge.txn_id,
+    };
+    let signature = device.sign(&transcript.encode());
+    let result = service.register_finish(RegisterRequest {
+        username: "alice".into(),
+        password: "password1234".into(), // on the blocklist
+        device_public_key: device.public_key.clone(),
+        txn_id: challenge.txn_id,
+        signature,
+    });
+    assert!(matches!(result, Err(AuthError::WeakPassword)));
+
+    // Short passwords fail the policy check directly.
+    assert!(matches!(
+        auth_core::password::validate_password_policy("short11"),
+        Err(AuthError::WeakPassword)
+    ));
+    // A long passphrase is fine.
+    assert!(auth_core::password::validate_password_policy("battery staple orbit lantern").is_ok());
 }
 
 #[test]
