@@ -19,6 +19,8 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 
+pub mod durable;
+
 /// The single, explicit ciphersuite for v1 (CRYPTOGRAPHY.md §1). No silent negotiation.
 pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
@@ -115,6 +117,64 @@ impl Member {
             StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None).map_err(lib)?;
         let group = staged.into_group(&self.provider).map_err(lib)?;
         Ok(Conversation { group })
+    }
+
+    // ----- Durable snapshot/restore (crash-safe client state machine; see `durable`) --------
+
+    /// This member's signature public key — needed to reload the signer from a restored store.
+    /// Not a secret.
+    pub fn public_key(&self) -> Vec<u8> {
+        self.signer.public().to_vec()
+    }
+
+    /// Serialize this member's key store, which holds the signature key pair **and the group's
+    /// ratchet secrets**. This blob is SENSITIVE: on device it is encrypted under the local
+    /// at-rest key hierarchy (CRYPTOGRAPHY.md §5) before it ever touches disk.
+    pub fn export_store(&self) -> Result<Vec<u8>> {
+        // The provider's KV map (`values`) is public; serialize it as key/value pairs (JSON can't
+        // key an object by a byte array). This avoids the storage crate's `test-utils`-gated codec.
+        let values = self
+            .provider
+            .storage()
+            .values
+            .read()
+            .map_err(|_| MlsError::Codec)?;
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> =
+            values.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        serde_json::to_vec(&pairs).map_err(|_| MlsError::Codec)
+    }
+
+    /// Reconstruct a member from a previously [`export_store`](Member::export_store)d blob plus its
+    /// (non-secret) identity and public key. Rebuilds the provider, reloads the signer, and
+    /// re-derives the credential; the caller then reloads the group with [`Conversation::reload`].
+    pub fn restore(identity: &[u8], store_bytes: &[u8], public_key: &[u8]) -> Result<Self> {
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> =
+            serde_json::from_slice(store_bytes).map_err(|_| MlsError::Codec)?;
+        let provider = OpenMlsRustCrypto::default();
+        {
+            let mut values = provider
+                .storage()
+                .values
+                .write()
+                .map_err(|_| MlsError::Codec)?;
+            *values = pairs.into_iter().collect();
+        }
+        let signer = SignatureKeyPair::read(
+            provider.storage(),
+            public_key,
+            CIPHERSUITE.signature_algorithm(),
+        )
+        .ok_or(MlsError::MemberNotFound)?;
+        let credential = CredentialWithKey {
+            credential: BasicCredential::new(identity.to_vec()).into(),
+            signature_key: public_key.to_vec().into(),
+        };
+        Ok(Self {
+            provider,
+            signer,
+            credential,
+            identity: identity.to_vec(),
+        })
     }
 }
 
@@ -220,6 +280,20 @@ impl Conversation {
             }
             _ => Ok(Incoming::StateAdvanced),
         }
+    }
+
+    /// The MLS group id — the key under which this group's state lives in the store. Not a secret.
+    pub fn group_id(&self) -> Vec<u8> {
+        self.group.group_id().as_slice().to_vec()
+    }
+
+    /// Reload a conversation's group state from a restored [`Member`]'s store (crash recovery).
+    pub fn reload(member: &Member, group_id: &[u8]) -> Result<Self> {
+        let gid = GroupId::from_slice(group_id);
+        let group = MlsGroup::load(member.provider.storage(), &gid)
+            .map_err(lib)?
+            .ok_or(MlsError::MemberNotFound)?;
+        Ok(Self { group })
     }
 
     fn leaf_for_identity(&self, identity: &[u8]) -> Option<LeafNodeIndex> {
