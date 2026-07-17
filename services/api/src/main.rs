@@ -74,20 +74,23 @@ fn main() {
     ));
 
     let relay = Arc::new(sentinel_api::relay::PgRelay::new(stores.pool_clone()));
+    let social = Arc::new(sentinel_api::social::PgSocial::new(stores.pool_clone()));
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
-    runtime.block_on(serve(bind, rate_per_min, stores, service, relay));
+    runtime.block_on(serve(bind, rate_per_min, stores, service, relay, social));
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve(
     bind: SocketAddr,
     rate_per_min: u32,
     stores: Arc<PgStores>,
     service: Arc<AuthService>,
     relay: Arc<sentinel_api::relay::PgRelay>,
+    social: Arc<sentinel_api::social::PgSocial>,
 ) {
     // Retention hygiene: purge expired challenges/access tokens every minute
     // (DATA_RETENTION.md). Failure is logged and retried next tick — never fatal.
@@ -116,7 +119,7 @@ async fn serve(
         });
     }
 
-    let app = http::build_router(service, relay, rate_per_min);
+    let app = http::build_router(service, relay, social, rate_per_min);
     let listener = match tokio::net::TcpListener::bind(bind).await {
         Ok(l) => l,
         Err(e) => {
