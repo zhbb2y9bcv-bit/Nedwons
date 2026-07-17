@@ -1,0 +1,24 @@
+[package]
+name = "auth-core"
+version = "0.1.0"
+description = "Pure, storage-agnostic device-bound authentication logic for Sentinel."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# All crypto comes from mature, maintained, reviewed implementations (no custom crypto).
+argon2 = "0.5"                                             # Argon2id password hashing (RFC 9106)
+p256 = { version = "0.13", features = ["ecdsa"] }          # ECDSA P-256 device-signature verification
+sha2 = "0.10"                                              # SHA-256 (RustCrypto)
+rand_core = { version = "0.6", features = ["getrandom"] }  # platform CSPRNG (OsRng)
+subtle = "2.5"                                             # constant-time comparison
+zeroize = "1"                                              # best-effort secret wiping
+thiserror = "1"
+
+[dev-dependencies]
+# The tests simulate a client device that holds the private key (the Secure Enclave in
+# production). They legitimately need signing primitives.
+p256 = { version = "0.13", features = ["ecdsa"] }
+rand_core = { version = "0.6", features = ["getrandom"] }

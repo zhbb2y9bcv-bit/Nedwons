@@ -1,0 +1,35 @@
+# Rust
+/target
+**/target
+Cargo.lock.bak
+*.rs.bk
+
+# macOS
+.DS_Store
+
+# Xcode / Swift
+apps/ios/**/build/
+apps/ios/**/*.xcuserstate
+apps/ios/**/xcuserdata/
+apps/ios/**/DerivedData/
+apps/ios/**/.swiftpm/
+*.xcarchive
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Secrets — must never be committed. Real values live in a KMS/secret manager.
+*.p8
+*.p12
+*.mobileprovision
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+!contracts/**/*.pem  # (none expected; guard against accidental private keys)
+
+# Editor
+.idea/
+.vscode/
+*.swp

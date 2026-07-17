@@ -1,0 +1,451 @@
+//! Security regression tests. Each maps to an invariant in THREAT_MODEL.md. These prove
+//! the *logic*; the PostgreSQL implementations of the store traits must preserve the same
+//! atomicity (ADR-0006) and get their own concurrency tests later.
+
+use std::sync::Arc;
+
+use auth_core::crypto::sha256;
+use auth_core::memstore::{
+    MemChallengeStore, MemCredentialStore, MemDeviceStore, MemRefreshStore, MockClock,
+};
+use auth_core::transcript::Transcript;
+use auth_core::{
+    refresh_txn_id, AccountId, Action, AuthError, AuthService, Config, DeviceId, RegisterRequest,
+    Session,
+};
+
+use p256::ecdsa::{signature::Signer, Signature, SigningKey};
+use rand_core::OsRng;
+
+const PASSWORD: &str = "correct horse battery staple stitch";
+
+/// A test stand-in for a real device: it holds the private key that, in production, lives
+/// non-exportably in the Secure Enclave. The service only ever sees `public_key`.
+struct TestDevice {
+    signing_key: SigningKey,
+    public_key: Vec<u8>,
+}
+
+impl TestDevice {
+    fn new() -> Self {
+        let signing_key = SigningKey::random(&mut OsRng);
+        let public_key = signing_key
+            .verifying_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        Self {
+            signing_key,
+            public_key,
+        }
+    }
+
+    fn sign(&self, message: &[u8]) -> Vec<u8> {
+        let sig: Signature = self.signing_key.sign(message);
+        sig.to_bytes().to_vec()
+    }
+}
+
+fn make_service() -> (AuthService, Arc<MockClock>) {
+    let clock = Arc::new(MockClock::new(1_000_000));
+    let service = AuthService::new(
+        Arc::new(MemCredentialStore::default()),
+        Arc::new(MemDeviceStore::default()),
+        Arc::new(MemChallengeStore::default()),
+        Arc::new(MemRefreshStore::default()),
+        clock.clone(),
+        Config::default(),
+    );
+    (service, clock)
+}
+
+/// Register an account and return the (real) device that enrolled it.
+fn register(service: &AuthService, username: &str) -> (TestDevice, Session) {
+    let device = TestDevice::new();
+    let challenge = service.register_begin();
+    let transcript = Transcript {
+        action: Action::Register,
+        account_id: &challenge.account_id,
+        device_id: &challenge.device_id,
+        public_key: &device.public_key,
+        challenge: &challenge.nonce,
+        expires_at: challenge.expires_at,
+        txn_id: &challenge.txn_id,
+    };
+    let signature = device.sign(&transcript.encode());
+    let session = service
+        .register_finish(RegisterRequest {
+            username: username.to_string(),
+            password: PASSWORD.to_string(),
+            device_public_key: device.public_key.clone(),
+            txn_id: challenge.txn_id,
+            signature,
+        })
+        .expect("registration should succeed");
+    (device, session)
+}
+
+/// Perform a full login with the given device, returning the finish result.
+fn login(
+    service: &AuthService,
+    device: &TestDevice,
+    username: &str,
+    password: &str,
+) -> Result<Session, AuthError> {
+    let challenge = service.login_begin(username, password);
+    let transcript = Transcript {
+        action: Action::Login,
+        account_id: &challenge.account_id,
+        device_id: &challenge.device_id,
+        public_key: &device.public_key,
+        challenge: &challenge.nonce,
+        expires_at: challenge.expires_at,
+        txn_id: &challenge.txn_id,
+    };
+    let signature = device.sign(&transcript.encode());
+    service.login_finish(&challenge.txn_id, &signature)
+}
+
+fn sign_refresh(
+    device: &TestDevice,
+    account_id: &AccountId,
+    device_id: &DeviceId,
+    refresh_token: &[u8],
+) -> Vec<u8> {
+    let old_hash = sha256(refresh_token);
+    let txn_id = refresh_txn_id(&old_hash);
+    let transcript = Transcript {
+        action: Action::Refresh,
+        account_id,
+        device_id,
+        public_key: &device.public_key,
+        challenge: &old_hash,
+        expires_at: 0,
+        txn_id: &txn_id,
+    };
+    device.sign(&transcript.encode())
+}
+
+/// `Session` has no `PartialEq`/`Debug` on purpose (tokens must never be formatted into
+/// logs), so we assert the denied case by pattern rather than `assert_eq!`.
+fn assert_denied(result: Result<Session, AuthError>) {
+    assert!(
+        matches!(result, Err(AuthError::Denied)),
+        "expected AuthError::Denied"
+    );
+}
+
+// --------------------------------------------------------------------------------------
+
+#[test]
+fn full_login_succeeds_with_the_enrolled_device() {
+    let (service, _clock) = make_service();
+    let (device, reg_session) = register(&service, "alice");
+
+    let session = login(&service, &device, "alice", PASSWORD).expect("login should succeed");
+    assert_eq!(session.account_id, reg_session.account_id);
+    assert!(!session.access_token.is_empty());
+    assert!(!session.refresh_token.is_empty());
+}
+
+/// INV-2: username + password from a device WITHOUT the enrolled private key cannot log in.
+#[test]
+fn login_denied_without_the_device_key() {
+    let (service, _clock) = make_service();
+    let _ = register(&service, "alice");
+
+    // The attacker knows the correct username and password, and login_begin returns a real
+    // challenge (credentials are valid). But the attacker signs with a *different* key.
+    let attacker = TestDevice::new();
+    let result = login(&service, &attacker, "alice", PASSWORD);
+    assert_denied(result);
+}
+
+/// INV-2 (companion): a wrong password is also denied — and reveals nothing more than the
+/// device-key failure does.
+#[test]
+fn login_denied_with_wrong_password() {
+    let (service, _clock) = make_service();
+    let (device, _) = register(&service, "alice");
+    let result = login(&service, &device, "alice", "not the password");
+    assert_denied(result);
+}
+
+/// INV-4: a challenge is single-use. Replaying a completed login is denied.
+#[test]
+fn challenge_is_single_use() {
+    let (service, _clock) = make_service();
+    let (device, _) = register(&service, "alice");
+
+    let challenge = service.login_begin("alice", PASSWORD);
+    let transcript = Transcript {
+        action: Action::Login,
+        account_id: &challenge.account_id,
+        device_id: &challenge.device_id,
+        public_key: &device.public_key,
+        challenge: &challenge.nonce,
+        expires_at: challenge.expires_at,
+        txn_id: &challenge.txn_id,
+    };
+    let signature = device.sign(&transcript.encode());
+
+    // First use succeeds.
+    assert!(service.login_finish(&challenge.txn_id, &signature).is_ok());
+    // Replay of the same challenge + signature is denied (challenge consumed).
+    assert_denied(service.login_finish(&challenge.txn_id, &signature));
+}
+
+/// INV-4: an expired challenge is denied.
+#[test]
+fn expired_challenge_is_denied() {
+    let (service, clock) = make_service();
+    let (device, _) = register(&service, "alice");
+
+    let challenge = service.login_begin("alice", PASSWORD);
+    // Move time past the challenge TTL (default 120s).
+    clock.advance(Config::default().challenge_ttl_secs + 1);
+
+    let transcript = Transcript {
+        action: Action::Login,
+        account_id: &challenge.account_id,
+        device_id: &challenge.device_id,
+        public_key: &device.public_key,
+        challenge: &challenge.nonce,
+        expires_at: challenge.expires_at,
+        txn_id: &challenge.txn_id,
+    };
+    let signature = device.sign(&transcript.encode());
+    assert_denied(service.login_finish(&challenge.txn_id, &signature));
+}
+
+/// INV-4: challenges are action-bound. A `Register` challenge cannot be redeemed at the
+/// login endpoint even with a valid signature over it.
+#[test]
+fn challenge_is_action_bound() {
+    let (service, _clock) = make_service();
+    let device = TestDevice::new();
+
+    // A fresh, unconsumed Register challenge.
+    let reg = service.register_begin();
+    let transcript = Transcript {
+        action: Action::Register,
+        account_id: &reg.account_id,
+        device_id: &reg.device_id,
+        public_key: &device.public_key,
+        challenge: &reg.nonce,
+        expires_at: reg.expires_at,
+        txn_id: &reg.txn_id,
+    };
+    let signature = device.sign(&transcript.encode());
+
+    // Redeeming it at login_finish must fail: the stored challenge's action is Register.
+    assert_denied(service.login_finish(&reg.txn_id, &signature));
+}
+
+/// INV-4: challenges are device-bound. A second enrolled device (bob's) cannot satisfy a
+/// challenge issued for alice's device.
+#[test]
+fn challenge_is_device_bound() {
+    let (service, _clock) = make_service();
+    let (_alice_device, _) = register(&service, "alice");
+    let (bob_device, _) = register(&service, "bob");
+
+    // alice's login challenge, signed by bob's device key.
+    let challenge = service.login_begin("alice", PASSWORD);
+    let transcript = Transcript {
+        action: Action::Login,
+        account_id: &challenge.account_id,
+        device_id: &challenge.device_id,
+        public_key: &bob_device.public_key,
+        challenge: &challenge.nonce,
+        expires_at: challenge.expires_at,
+        txn_id: &challenge.txn_id,
+    };
+    let signature = bob_device.sign(&transcript.encode());
+    assert_denied(service.login_finish(&challenge.txn_id, &signature));
+}
+
+/// Refresh rotates the token, and reuse of a retired token revokes the whole family.
+#[test]
+fn refresh_rotates_and_reuse_revokes_family() {
+    let (service, _clock) = make_service();
+    let (device, session0) = register(&service, "alice");
+
+    // Rotate once: R0 -> R1.
+    let sig0 = sign_refresh(
+        &device,
+        &session0.account_id,
+        &session0.device_id,
+        &session0.refresh_token,
+    );
+    let session1 = service
+        .refresh(&session0.refresh_token, &sig0)
+        .expect("first refresh should succeed");
+    assert_ne!(session0.refresh_token, session1.refresh_token);
+
+    // Reuse the retired R0 again -> reuse detected -> family revoked.
+    let sig0_again = sign_refresh(
+        &device,
+        &session0.account_id,
+        &session0.device_id,
+        &session0.refresh_token,
+    );
+    assert_denied(service.refresh(&session0.refresh_token, &sig0_again));
+
+    // Because the family is now revoked, even the current R1 no longer works.
+    let sig1 = sign_refresh(
+        &device,
+        &session1.account_id,
+        &session1.device_id,
+        &session1.refresh_token,
+    );
+    assert_denied(service.refresh(&session1.refresh_token, &sig1));
+}
+
+/// INV-2 for refresh: a stolen bearer token WITHOUT the device key cannot refresh, and a
+/// failed bearer attempt must NOT revoke the victim's family (no denial-of-service).
+#[test]
+fn refresh_requires_device_signature_and_failed_attempt_is_not_dos() {
+    let (service, _clock) = make_service();
+    let (device, session) = register(&service, "alice");
+
+    // Attacker has the refresh token but signs with the wrong key.
+    let attacker = TestDevice::new();
+    let bad_sig = sign_refresh(
+        &attacker,
+        &session.account_id,
+        &session.device_id,
+        &session.refresh_token,
+    );
+    assert_denied(service.refresh(&session.refresh_token, &bad_sig));
+
+    // The legitimate device can still refresh — its family was not burned by the attacker.
+    let good_sig = sign_refresh(
+        &device,
+        &session.account_id,
+        &session.device_id,
+        &session.refresh_token,
+    );
+    assert!(service.refresh(&session.refresh_token, &good_sig).is_ok());
+}
+
+/// INV-10: revoking a device denies future logins and refreshes from it.
+#[test]
+fn device_revocation_fails_closed() {
+    let (service, _clock) = make_service();
+    let (device, session) = register(&service, "alice");
+
+    // Sanity: login works before revocation.
+    assert!(login(&service, &device, "alice", PASSWORD).is_ok());
+
+    service.revoke_device(&session.device_id);
+
+    // After revocation there is no active device, so login is denied.
+    assert_denied(login(&service, &device, "alice", PASSWORD));
+
+    // And the existing refresh token no longer works.
+    let sig = sign_refresh(
+        &device,
+        &session.account_id,
+        &session.device_id,
+        &session.refresh_token,
+    );
+    assert_denied(service.refresh(&session.refresh_token, &sig));
+}
+
+/// The begin step does not reveal account existence: a nonexistent user still gets a
+/// well-formed challenge (an unstored decoy), not an error.
+#[test]
+fn login_begin_does_not_leak_account_existence() {
+    let (service, _clock) = make_service();
+    let _ = register(&service, "alice");
+
+    // Nonexistent account -> still a challenge (decoy), and finishing it is denied.
+    let decoy = service.login_begin("nobody", PASSWORD);
+    let attacker = TestDevice::new();
+    let transcript = Transcript {
+        action: Action::Login,
+        account_id: &decoy.account_id,
+        device_id: &decoy.device_id,
+        public_key: &attacker.public_key,
+        challenge: &decoy.nonce,
+        expires_at: decoy.expires_at,
+        txn_id: &decoy.txn_id,
+    };
+    let signature = attacker.sign(&transcript.encode());
+    assert_denied(service.login_finish(&decoy.txn_id, &signature));
+}
+
+/// The canonical transcript is unambiguous: length prefixes prevent field-splitting
+/// collisions between distinct field vectors.
+#[test]
+fn transcript_encoding_is_unambiguous() {
+    let a = AccountId([1u8; 16]);
+    let b = DeviceId([2u8; 16]);
+    let txn = auth_core::TxnId([3u8; 16]);
+    let nonce = [9u8; 32];
+
+    let t1 = Transcript {
+        action: Action::Login,
+        account_id: &a,
+        device_id: &b,
+        public_key: b"ABC",
+        challenge: &nonce,
+        expires_at: 42,
+        txn_id: &txn,
+    }
+    .encode();
+
+    // Move one byte from the public key into the challenge boundary region; without length
+    // prefixes these could collide. With them, they must differ.
+    let t2 = Transcript {
+        action: Action::Login,
+        account_id: &a,
+        device_id: &b,
+        public_key: b"AB",
+        challenge: &nonce,
+        expires_at: 42,
+        txn_id: &txn,
+    }
+    .encode();
+
+    assert_ne!(t1, t2);
+
+    // Changing only the action changes the bytes (purpose binding).
+    let t3 = Transcript {
+        action: Action::Register,
+        account_id: &a,
+        device_id: &b,
+        public_key: b"ABC",
+        challenge: &nonce,
+        expires_at: 42,
+        txn_id: &txn,
+    }
+    .encode();
+    assert_ne!(t1, t3);
+}
+
+#[test]
+fn username_normalization_rejects_confusables_and_bad_shapes() {
+    use auth_core::normalize_username;
+
+    // Valid.
+    assert_eq!(normalize_username("Alice").unwrap(), "alice");
+    assert_eq!(normalize_username("bob_2.0").unwrap(), "bob_2.0");
+
+    // Casing collision maps to the same normalized identity.
+    assert_eq!(
+        normalize_username("ALICE").unwrap(),
+        normalize_username("alice").unwrap()
+    );
+
+    // Rejected: too short, leading non-letter, zero-width/invisible, non-ASCII homoglyph,
+    // double dot, trailing dot, whitespace injection.
+    assert!(normalize_username("ab").is_err());
+    assert!(normalize_username("1abc").is_err());
+    assert!(normalize_username("ali\u{200b}ce").is_err()); // zero-width space
+    assert!(normalize_username("аlice").is_err()); // Cyrillic 'а'
+    assert!(normalize_username("a..b").is_err());
+    assert!(normalize_username("alice.").is_err());
+    assert!(normalize_username("alice bob").is_err());
+}

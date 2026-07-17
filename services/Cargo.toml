@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["auth-core"]
+
+# Backend modular monolith (ADR-0004). `auth-core` is the pure, storage-agnostic
+# security logic (ADR-0006). Additional members (relay, key-directory, api) are added
+# in later milestones.
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+publish = false
+rust-version = "1.85"
+
+[profile.release]
+# Security-relevant hardening for release builds.
+overflow-checks = true
+panic = "abort"
