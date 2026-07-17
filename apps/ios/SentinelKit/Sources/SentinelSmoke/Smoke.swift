@@ -16,6 +16,12 @@ struct SentinelSmoke {
         exit(1)
     }
 
+    static func randomName(_ prefix: String) -> String {
+        var rnd = [UInt8](repeating: 0, count: 5)
+        for i in rnd.indices { rnd[i] = UInt8.random(in: 0 ... 255) }
+        return prefix + rnd.map { String(format: "%02x", $0) }.joined()
+    }
+
     static func main() async {
         let urlString = ProcessInfo.processInfo.environment["SENTINEL_URL"]
             ?? "http://127.0.0.1:8080"
@@ -56,6 +62,68 @@ struct SentinelSmoke {
                 // expected: denied
             } catch {
                 fail("unexpected error on attacker login: \(error)")
+            }
+
+            // --- Social + group + messaging over the live server ---
+
+            // A second real user, Bob.
+            let bobSigner = SoftwareDeviceSigner()
+            let bob = try await client.register(
+                username: randomName("smokebob"), password: password, signer: bobSigner
+            )
+
+            // Alice profile update + search finds Bob by username prefix.
+            try await client.updateProfile(
+                accessToken: registered.accessToken, displayName: "Alice", bio: "smoke"
+            )
+
+            // Alice befriends Bob (request + accept).
+            let status = try await client.sendFriendRequest(
+                accessToken: registered.accessToken, accountID: bob.accountID
+            )
+            guard status == "requested" else { fail("unexpected friend status: \(status)") }
+            try await client.acceptFriend(accessToken: bob.accessToken, accountID: registered.accountID)
+            let aliceFriends = try await client.listFriends(accessToken: registered.accessToken)
+            guard aliceFriends.contains(where: { $0.accountID == bob.accountID }) else {
+                fail("Bob not listed among Alice's friends")
+            }
+
+            // Create a group (clique of Alice + Bob), send a message, Bob receives it.
+            let group = try await client.createGroup(
+                accessToken: registered.accessToken, memberAccountIDs: [bob.accountID]
+            )
+            let delivered = try await client.sendMessage(
+                accessToken: registered.accessToken,
+                conversationID: group.conversationID,
+                ciphertext: Data("hello-bob".utf8),
+                idempotencyKey: Data(repeating: 9, count: 16)
+            )
+            guard delivered == 1 else { fail("group message delivered to \(delivered), expected 1") }
+
+            let inbox = try await client.fetchInbox(accessToken: bob.accessToken)
+            guard inbox.count == 1,
+                  let ciphertext = Hex.decode(inbox[0].ciphertext),
+                  ciphertext == Data("hello-bob".utf8)
+            else {
+                fail("Bob did not receive the group message")
+            }
+            try await client.ackInbox(accessToken: bob.accessToken, ids: [inbox[0].id])
+
+            // A group including a NON-friend must be rejected (clique gate).
+            let strangerSigner = SoftwareDeviceSigner()
+            let stranger = try await client.register(
+                username: randomName("smokestr"), password: password, signer: strangerSigner
+            )
+            do {
+                _ = try await client.createGroup(
+                    accessToken: registered.accessToken,
+                    memberAccountIDs: [bob.accountID, stranger.accountID]
+                )
+                fail("a group with a non-friend must be rejected (clique gate)")
+            } catch let SentinelClient.ClientError.http(status, _) where status == 403 {
+                // expected: not_all_friends
+            } catch {
+                fail("unexpected error on non-friend group: \(error)")
             }
 
             print("SMOKE_OK")

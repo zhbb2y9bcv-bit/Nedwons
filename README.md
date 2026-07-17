@@ -49,8 +49,9 @@ later without redesign.
 | `services/auth-core` (Rust) | Rust 1.97.1 stable | ✅ | ✅ `cargo test` — 17 unit + golden vector |
 | `services/api` (Rust: Postgres stores + axum HTTP + E2EE relay + WebSocket) | Rust 1.97.1 + PostgreSQL 17 | ✅ | ✅ 24 integration tests vs **real Postgres**: concurrency races, full HTTP flow, MLS relay + DB no-plaintext, fan-out, idempotency, long-poll, WebSocket push, at-least-once peek/ack, load (idle-waiters > pool) |
 | `core/mls-core` (Rust: OpenMLS E2EE) | Rust 1.97.1 | ✅ | ✅ 3 tests — encrypted exchange, no plaintext in ciphertext, removed-member epoch |
-| `apps/ios/SentinelKit` (Swift crypto/protocol + HTTP client) | Xcode 26.6 / Swift 6.3.3 | ✅ `swift build` | ✅ `swift test` — 7 tests |
-| **Swift client ↔ live backend** (register/login/whoami) | Swift + Rust + Postgres | ✅ | ✅ `scripts/swift_backend_smoke.sh` — SMOKE_OK (incl. INV-2 negative) |
+| `apps/ios/SentinelKit` (Swift crypto/protocol + full HTTP client) | Xcode 26.6 / Swift 6.3.3 | ✅ `swift build` | ✅ `swift test` — 7 tests |
+| `apps/ios/SentinelUI` (design system + **wired app screens + AppModel**) | Swift 6.3.3 | ✅ `swift build` | — (buttons wired to the client; runs in Xcode) |
+| **Swift client ↔ live backend** (auth + profiles + friends + groups + messaging) | Swift + Rust + Postgres | ✅ | ✅ `scripts/swift_backend_smoke.sh` — SMOKE_OK (INV-2 negative, befriend→group→deliver, non-friend-group 403) |
 | `apps/ios/SentinelUI` (SwiftUI design system + screens) | Swift 6.3.3 | ✅ `swift build` | — (visual; no unit tests) |
 | Cross-language interop (Swift signs → Rust verifies) | both | ✅ | ✅ `INTEROP_OK` + byte-identical transcript vectors |
 | `infra` (docker-compose) | Docker/Colima (installed) | ✅ `config` validates | ✅ Postgres service verified up; API image build not run |

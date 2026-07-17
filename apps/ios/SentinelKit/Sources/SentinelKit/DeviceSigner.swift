@@ -6,7 +6,7 @@ import Foundation
 /// interop tool use the software implementation, which is also the documented fallback for
 /// devices without a usable Secure Enclave (never a silent downgrade — the app records which
 /// path was used and treats software-backed keys as a distinct, lower assurance level).
-public protocol DeviceSigner {
+public protocol DeviceSigner: Sendable {
     /// SEC1 uncompressed (x9.63) public key, accepted by the Rust backend's
     /// `verify_p256` / `VerifyingKey::from_sec1_bytes`.
     var publicKeyX963: Data { get }

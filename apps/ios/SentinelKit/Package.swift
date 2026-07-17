@@ -15,10 +15,10 @@ let package = Package(
     ],
     targets: [
         .target(name: "SentinelKit"),
-        // The SwiftUI design system + app screens. Kept free of iOS-only APIs so it
-        // type-checks with `swift build` on macOS; the app wires these tokens to
+        // The SwiftUI design system + app screens + view model. Kept free of iOS-only APIs
+        // so it type-checks with `swift build` on macOS; the app wires these tokens to
         // asset-catalog colors in Xcode. The `@main` entry point lives in the Xcode project.
-        .target(name: "SentinelUI"),
+        .target(name: "SentinelUI", dependencies: ["SentinelKit"]),
         .executableTarget(name: "InteropEmit", dependencies: ["SentinelKit"]),
         // Live end-to-end smoke test against a running sentinel-api server.
         .executableTarget(name: "SentinelSmoke", dependencies: ["SentinelKit"]),
