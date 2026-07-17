@@ -20,6 +20,8 @@ let package = Package(
         // asset-catalog colors in Xcode. The `@main` entry point lives in the Xcode project.
         .target(name: "SentinelUI"),
         .executableTarget(name: "InteropEmit", dependencies: ["SentinelKit"]),
+        // Live end-to-end smoke test against a running sentinel-api server.
+        .executableTarget(name: "SentinelSmoke", dependencies: ["SentinelKit"]),
         .testTarget(name: "SentinelKitTests", dependencies: ["SentinelKit"]),
     ]
 )

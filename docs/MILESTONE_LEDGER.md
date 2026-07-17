@@ -38,8 +38,11 @@ results, remaining risks, and the next smallest step.
       fail-closed errors, CPU work on `spawn_blocking`. End-to-end tests vs real Postgres.
       NIST-aligned password policy (length + blocklist) added. Server boots + serves verified.
 - [x] `infra/docker-compose.yml` (Postgres + API) validated; Postgres service verified healthy.
+- [x] **`SentinelClient` (Swift) verified against the live backend** over real HTTP
+      (`scripts/swift_backend_smoke.sh` → SMOKE_OK): register → whoami → login → whoami, plus
+      the INV-2 negative check (a different device with the same password is denied).
 - [ ] iOS app target (`@main`) built in Xcode; real Secure Enclave enrollment + App Attest
-      verified on device. *(R-101)*
+      verified on device; UniFFI MLS binding (ADR-0007). *(R-101 — needs Xcode/hardware)*
 - [ ] Recovery-kit flow. *(R-304)*
 - **Acceptance:** valid credentials from an unregistered device cannot log in — *logic proven
   now in `auth-core`; the client signing path is proven to interoperate with the server
