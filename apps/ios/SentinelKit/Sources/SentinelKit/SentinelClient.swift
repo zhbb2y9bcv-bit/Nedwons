@@ -334,6 +334,15 @@ public extension SentinelClient {
         return try decode(await perform(request))
     }
 
+    /// Leave a conversation (consent withdrawal, ADR-0009). Removes all of this account's devices
+    /// from routing and purges queued undelivered envelopes for it. Idempotent on the server.
+    func leaveConversation(accessToken: String, conversationID: String) async throws {
+        let request = authed(
+            "POST", "/v1/conversations/\(conversationID)/leave", accessToken: accessToken
+        )
+        _ = try await perform(request)
+    }
+
     /// Send one MLS application ciphertext; the server fans it out to every other member.
     /// Returns the number of recipient devices it was delivered to.
     @discardableResult

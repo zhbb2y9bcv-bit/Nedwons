@@ -131,6 +131,24 @@ struct SentinelSmoke {
                 fail("a group with a non-friend should now be allowed")
             }
 
+            // The stranger leaves (consent): the group disappears from their Chats list but
+            // remains for the others.
+            try await client.leaveConversation(
+                accessToken: stranger.accessToken, conversationID: mixedGroup.conversationID
+            )
+            let strangerConvos = try await client.listConversations(accessToken: stranger.accessToken)
+            guard !strangerConvos.contains(where: { $0.conversationID == mixedGroup.conversationID })
+            else {
+                fail("left conversation still listed for the leaver")
+            }
+            let aliceConvosAfterLeave = try await client.listConversations(
+                accessToken: registered.accessToken
+            )
+            guard aliceConvosAfterLeave.contains(where: { $0.conversationID == mixedGroup.conversationID })
+            else {
+                fail("conversation should remain for the other members")
+            }
+
             // --- Abuse controls: block + report ---
 
             // Alice blocks Bob → Bob leaves her friends and appears in her block list.

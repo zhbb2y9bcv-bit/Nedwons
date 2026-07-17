@@ -467,3 +467,152 @@ async fn report_is_recorded_and_rejects_self() {
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
+
+/// Leave-group (ADR-0009 consent): leaving removes the member from routing, purges their queued
+/// undelivered envelopes, excludes them from future fan-out, revokes their send rights, is
+/// idempotent, and deletes the conversation once the last member leaves.
+#[tokio::test]
+async fn leave_group_withdraws_membership_and_purges_queue() {
+    let app = make_app(100_000).await;
+    let (_a, alice) = http_register(&app, &unique_username("lva")).await;
+    let (_b, bob) = http_register(&app, &unique_username("lvb")).await;
+    let (_c, carol) = http_register(&app, &unique_username("lvc")).await;
+    let alice_token = alice["access_token"].as_str().unwrap();
+    let bob_token = bob["access_token"].as_str().unwrap();
+    let carol_token = carol["access_token"].as_str().unwrap();
+    let bob_acct = bob["account_id"].as_str().unwrap();
+    let carol_acct = carol["account_id"].as_str().unwrap();
+
+    // Group of three (non-friends — allowed since ADR-0009).
+    let (status, group) = post_json_auth(
+        &app,
+        "/v1/groups",
+        alice_token,
+        json!({ "member_account_ids": [bob_acct, carol_acct] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let conversation_id = group["conversation_id"].as_str().unwrap().to_string();
+
+    // Alice sends; it reaches Bob and Carol (2 devices). Nobody acks yet.
+    let (status, receipt) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conversation_id}/messages"),
+        alice_token,
+        json!({ "ciphertext": hex::encode(b"pre-leave"), "idempotency_key": hex::encode([7u8; 16]) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(receipt["delivered"], 2);
+
+    // Bob leaves. Idempotent 204.
+    let (status, _) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conversation_id}/leave"),
+        bob_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Bob's queued (undelivered) envelope for this conversation was purged with his consent.
+    let (_, bob_inbox) = get_auth(&app, "/v1/inbox", bob_token).await;
+    assert_eq!(
+        bob_inbox.as_array().unwrap().len(),
+        0,
+        "leaver's queued envelopes must be purged"
+    );
+
+    // The group is gone from Bob's conversation list…
+    let (_, bob_convos) = get_auth(&app, "/v1/conversations", bob_token).await;
+    assert!(
+        !bob_convos
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["conversation_id"] == conversation_id.as_str()),
+        "left conversation must not be listed"
+    );
+
+    // …and remaining members no longer list Bob in it.
+    let (_, alice_convos) = get_auth(&app, "/v1/conversations", alice_token).await;
+    let listed = alice_convos
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["conversation_id"] == conversation_id.as_str())
+        .expect("Alice still has the conversation");
+    assert!(
+        !listed.as_object().unwrap()["member_account_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m == bob_acct),
+        "leaver must disappear from the member list"
+    );
+
+    // Future fan-out excludes Bob: next send reaches only Carol.
+    let (status, receipt) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conversation_id}/messages"),
+        alice_token,
+        json!({ "ciphertext": hex::encode(b"post-leave"), "idempotency_key": hex::encode([8u8; 16]) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(receipt["delivered"], 1, "fan-out must exclude the leaver");
+
+    // Bob can no longer send to the conversation.
+    let (status, _) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conversation_id}/messages"),
+        bob_token,
+        json!({ "ciphertext": hex::encode(b"ghost"), "idempotency_key": hex::encode([9u8; 16]) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "leaver cannot send");
+
+    // Leaving again is a no-op 204 (idempotent).
+    let (status, _) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conversation_id}/leave"),
+        bob_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Carol and Alice leave too → the conversation row itself is deleted (hygiene).
+    for token in [carol_token, alice_token] {
+        let (status, _) = post_json_auth(
+            &app,
+            &format!("/v1/conversations/{conversation_id}/leave"),
+            token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    let conversation_hex = conversation_id.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut client =
+            postgres::Client::connect(&common::db_url(), postgres::NoTls).expect("db connect");
+        let cid = hex::decode(&conversation_hex).expect("hex");
+        let rows = client
+            .query(
+                "SELECT 1 FROM conversations WHERE conversation_id = $1",
+                &[&cid],
+            )
+            .expect("query");
+        assert!(rows.is_empty(), "empty conversation must be deleted");
+        let envs = client
+            .query(
+                "SELECT 1 FROM envelopes WHERE conversation_id = $1",
+                &[&cid],
+            )
+            .expect("query");
+        assert!(envs.is_empty(), "orphan envelopes must be deleted");
+    })
+    .await
+    .expect("db inspection");
+}

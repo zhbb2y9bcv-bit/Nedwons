@@ -101,6 +101,13 @@ Body `{}`. Creates a conversation with the caller as first member →
 The caller's conversations, most recent first, each with its members (for the Chats list):
 `[ { "conversation_id": "<16B hex>", "member_account_ids": [ "<16B hex>", … ] }, … ]`.
 
+### `POST /v1/conversations/{id}/leave` → `204`
+Leave a conversation (consent withdrawal, ADR-0009). Removes **all** of the caller's devices from
+routing membership and purges their queued undelivered envelopes for it; future fan-out excludes
+them and they can no longer send (`403`). Idempotent — leaving a conversation you're not in (or
+that doesn't exist) is a `204` no-op; ids are opaque random values so nothing is disclosed. When
+the last member leaves, the conversation row and any leftover envelopes are deleted.
+
 ### `POST /v1/conversations/{id}/members` → `204` | `403`
 `{ "account_id": "<16B hex>" }` — add a target account's active device to routing membership.
 Caller must be a member; the target device is resolved server-side (never client-asserted).

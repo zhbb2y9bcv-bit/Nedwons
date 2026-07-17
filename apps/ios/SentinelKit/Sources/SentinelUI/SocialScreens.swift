@@ -126,6 +126,13 @@ struct ChatsView: View {
                                 SecurityBadge(.encrypted, palette: palette)
                             }
                         }
+                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                            Button(role: .destructive) {
+                                Task { await model.leaveGroup(conversation.conversationID) }
+                            } label: {
+                                Label("Leave", systemImage: "rectangle.portrait.and.arrow.right")
+                            }
+                        }
                     }
                 }
             }
@@ -157,7 +164,7 @@ struct ChatsView: View {
                 .foregroundStyle(palette.accentPrimary)
             Text("Start an encrypted group")
                 .font(Sentinel.TypeScale.headline)
-            Text("You can add anyone you're both friends with.")
+            Text("Group anyone you like — blocked people are kept apart.")
                 .font(Sentinel.TypeScale.callout)
                 .foregroundStyle(palette.textSecondary)
             PrimaryButton("New group", palette: palette) { showNewGroup = true }
