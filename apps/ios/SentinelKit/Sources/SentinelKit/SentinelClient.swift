@@ -195,6 +195,40 @@ public struct ProfileSummary: Decodable, Sendable, Identifiable, Hashable {
     }
 }
 
+/// A signed tree head from the transparency log (R-201).
+public struct SignedTreeHead: Decodable, Sendable {
+    public let treeSize: UInt64
+    public let rootHash: String
+    public let timestamp: UInt64
+    public let signature: String
+    public let logPublicKey: String
+    enum CodingKeys: String, CodingKey {
+        case treeSize = "tree_size", rootHash = "root_hash", timestamp
+        case signature, logPublicKey = "log_public_key"
+    }
+}
+
+/// One logged account→device-key binding with its inclusion proof.
+public struct TransparencyBinding: Decodable, Sendable {
+    public let leafIndex: UInt64
+    public let deviceID: String
+    public let publicKey: String
+    public let entry: String
+    public let proof: [String]
+    enum CodingKeys: String, CodingKey {
+        case leafIndex = "leaf_index", deviceID = "device_id"
+        case publicKey = "public_key", entry, proof
+    }
+}
+
+public struct TransparencyAccountView: Decodable, Sendable {
+    public let treeSize: UInt64
+    public let bindings: [TransparencyBinding]
+    enum CodingKeys: String, CodingKey {
+        case treeSize = "tree_size", bindings
+    }
+}
+
 /// Result of presenting an invite token: joined outright, or a pending join request
 /// (approval-gated groups).
 public struct AcceptedInvite: Decodable, Sendable {
@@ -351,6 +385,73 @@ public extension SentinelClient {
             "POST", "/v1/conversations/\(conversationID)/leave", accessToken: accessToken
         )
         _ = try await perform(request)
+    }
+
+    // ----- key transparency (R-201) -----
+
+    /// The log's current signed tree head.
+    func transparencySignedTreeHead(accessToken: String) async throws -> SignedTreeHead {
+        try decode(await perform(authed("GET", "/v1/transparency/sth", accessToken: accessToken)))
+    }
+
+    /// This account's logged bindings + inclusion proofs, pinned to `treeSize` so they verify
+    /// against the signed root at that size.
+    func transparencyAccount(
+        accessToken: String,
+        accountID: String,
+        treeSize: UInt64
+    ) async throws -> TransparencyAccountView {
+        var request = URLRequest(
+            url: queryURL(
+                "/v1/transparency/account/\(accountID)",
+                [URLQueryItem(name: "tree_size", value: String(treeSize))]
+            )
+        )
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        return try decode(await perform(request))
+    }
+
+    /// Self-monitor key transparency: verify the STH signature under the **pinned** log public key,
+    /// that this device's enrolled key is the one logged (no substitution), and that it is included
+    /// under the signed root. The client trusts nothing the server says here — it checks.
+    func selfMonitorKeyTransparency(
+        accessToken: String,
+        accountID: String,
+        deviceID: String,
+        expectedPublicKeyX963: Data,
+        pinnedLogPublicKeyX963: Data
+    ) async throws -> SelfMonitorResult {
+        let sth = try await transparencySignedTreeHead(accessToken: accessToken)
+        guard let root = Hex.decode(sth.rootHash),
+            let sig = Hex.decode(sth.signature),
+            let advertised = Hex.decode(sth.logPublicKey)
+        else { return .badSignature }
+
+        // The log must not silently change its key from the pinned one.
+        if advertised != pinnedLogPublicKeyX963 { return .logKeyChanged }
+        guard Transparency.verifySTHSignature(
+            treeSize: sth.treeSize, root: root, timestamp: sth.timestamp,
+            signature: sig, logPublicKeyX963: pinnedLogPublicKeyX963
+        ) else { return .badSignature }
+
+        let view = try await transparencyAccount(
+            accessToken: accessToken, accountID: accountID, treeSize: sth.treeSize
+        )
+        guard let mine = view.bindings.first(where: { $0.deviceID == deviceID }) else {
+            return .notIncluded
+        }
+        guard Hex.decode(mine.publicKey) == expectedPublicKeyX963 else { return .keyMismatch }
+        guard let entry = Hex.decode(mine.entry) else { return .badProof }
+        let proof = mine.proof.compactMap { Hex.decode($0) }
+        guard proof.count == mine.proof.count else { return .badProof }
+        let included = Transparency.verifyInclusion(
+            leaf: Transparency.hashLeaf(entry),
+            index: Int(mine.leafIndex),
+            treeSize: Int(sth.treeSize),
+            proof: proof,
+            root: root
+        )
+        return included ? .ok : .badProof
     }
 
     /// Mint an invite-link token for a conversation (admin only). Strangers join with the token —
