@@ -226,6 +226,17 @@ public final class AppModel: ObservableObject {
 
     // MARK: Groups
 
+    /// Leave a group: consent withdrawal. The server removes this account from routing and purges
+    /// its queued mail for the conversation; the Chats list refreshes without it.
+    public func leaveGroup(_ conversationID: String) async {
+        await run { [self] in
+            guard let token else { return }
+            try await client.leaveConversation(accessToken: token, conversationID: conversationID)
+            conversations = try await client.listConversations(accessToken: token)
+            banner = "You left the group."
+        }
+    }
+
     /// Create a group from selected people; the server refuses only if a blocked pair is included.
     /// Returns the new conversation id, or nil on failure (banner explains why).
     public func createGroup(memberAccountIDs: [String]) async -> String? {

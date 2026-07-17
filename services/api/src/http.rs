@@ -108,6 +108,7 @@ pub fn build_router_cfg(
             post(create_conversation).get(list_conversations),
         )
         .route("/v1/conversations/{id}/members", post(add_member))
+        .route("/v1/conversations/{id}/leave", post(leave_conversation))
         .route("/v1/conversations/{id}/messages", post(send_message))
         .route("/v1/conversations/{id}/welcome", post(send_welcome))
         .route("/v1/inbox", get(fetch_inbox))
@@ -671,6 +672,22 @@ async fn add_member(
     })
     .await?
     .ok_or_else(forbidden)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Leave a conversation (consent withdrawal, ADR-0009). Removes all of the caller's devices from
+/// routing and purges their queued undelivered envelopes for it. Idempotent `204`: leaving a
+/// conversation you're not in (or that doesn't exist) is a no-op — ids are opaque random values,
+/// so this discloses nothing.
+async fn leave_conversation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let relay = state.relay.clone();
+    blocking_store(move || relay.leave_conversation(&conversation_id, &me.account_id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
