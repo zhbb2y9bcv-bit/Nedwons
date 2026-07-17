@@ -195,6 +195,16 @@ public struct ProfileSummary: Decodable, Sendable, Identifiable, Hashable {
     }
 }
 
+/// Result of presenting an invite token: joined outright, or a pending join request
+/// (approval-gated groups).
+public struct AcceptedInvite: Decodable, Sendable {
+    public let conversationID: String
+    public let status: String
+    enum CodingKeys: String, CodingKey {
+        case conversationID = "conversation_id", status
+    }
+}
+
 public struct GroupCreated: Decodable, Sendable {
     public let conversationID: String
     public let memberAccountIDs: [String]
@@ -341,6 +351,39 @@ public extension SentinelClient {
             "POST", "/v1/conversations/\(conversationID)/leave", accessToken: accessToken
         )
         _ = try await perform(request)
+    }
+
+    /// Mint an invite-link token for a conversation (admin only). Strangers join with the token —
+    /// their own consent — instead of being force-added. Returns the token (hex).
+    func createInvite(
+        accessToken: String,
+        conversationID: String,
+        maxUses: Int? = nil,
+        expiresInSecs: Int? = nil
+    ) async throws -> String {
+        struct Body: Encodable {
+            let max_uses: Int?
+            let expires_in_secs: Int?
+        }
+        struct Res: Decodable { let invite_token: String }
+        var request = authed(
+            "POST", "/v1/conversations/\(conversationID)/invites", accessToken: accessToken
+        )
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            Body(max_uses: maxUses, expires_in_secs: expiresInSecs)
+        )
+        let res: Res = try decode(await perform(request))
+        return res.invite_token
+    }
+
+    /// Join (or request to join, for approval-gated groups) a conversation with an invite token.
+    func acceptInvite(accessToken: String, inviteToken: String) async throws -> AcceptedInvite {
+        struct Body: Encodable { let invite_token: String }
+        var request = authed("POST", "/v1/invites/accept", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(Body(invite_token: inviteToken))
+        return try decode(await perform(request))
     }
 
     /// Send one MLS application ciphertext; the server fans it out to every other member.

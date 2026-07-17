@@ -103,13 +103,24 @@ group is refused (`403 blocked_member`) if any pair within it has blocked each o
 the live smoke (non-friend group succeeds; a group containing a blocked member is refused). Swift
 client + UI copy updated. Blocking already severs friendships and refuses friend requests (V5).
 
-**Not yet done (designed above):** admin/member roles + role enforcement, invitations (direct /
-expiring links / QR) and join-request approval, **leave-group** and admin remove, group system
-messages, and — the big one — binding routing membership to **authenticated MLS Add/Remove
-commits**. That binding is inherently client-driven because the relay is deliberately MLS-blind
-(it must never link the MLS library); it depends on the on-device MLS core (ADR-0007) and key
-transparency (R-201). Until it lands, server routing membership and MLS membership remain distinct
-(R-506), and this must not be described as fully realized.
+**Done — second slice (2026-07-17, governance):** migration V7 + `groups::PgGroups` +
+`tests/groups.rs`. The creator is the group's first **admin**. Admins mint/list/revoke
+**invite links** (32-byte bearer tokens; expiring, use-bounded, revocable), manage **join
+requests** (approve re-checks blocks; deny), **remove members** (same exit path as leave),
+**promote/demote** (last-admin demotion refused), and set **join approval**. `POST
+/v1/invites/accept` is the joiner's own consent; blocks bar entry at every path. **Leave-group**
+cleans up roles and auto-promotes the earliest member when the last admin departs. **Direct adds
+tightened:** `create_group`/`add_member` now require the adder to be an admin (for adds) and
+friends with each target — closing the forced-membership spam hole that pure open groups left;
+strangers join only via invite tokens. Verified end to end in the live smoke (direct non-friend
+add refused; stranger joins via invite; leaves).
+
+**Not yet done (designed above):** QR rendering of invites (client UI), group system messages,
+per-invite member-list preview, and — the big one — binding routing membership to
+**authenticated MLS Add/Remove commits**. That binding is inherently client-driven because the
+relay is deliberately MLS-blind (it must never link the MLS library); it depends on the on-device
+MLS core (ADR-0007) and key transparency (R-201). Until it lands, server routing membership and
+MLS membership remain distinct (R-506), and this must not be described as fully realized.
 
 ## Consequences
 

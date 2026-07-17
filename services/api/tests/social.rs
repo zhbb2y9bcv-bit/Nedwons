@@ -4,7 +4,7 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{get_auth, http_register, make_app, post_json_auth, unique_username};
+use common::{befriend, get_auth, http_register, make_app, post_json_auth, unique_username};
 use serde_json::json;
 
 async fn put_auth(
@@ -284,11 +284,17 @@ async fn group_allows_non_friends_but_rejects_blocked_pair() {
     let (_b, bob) = http_register(&app, &unique_username("gnb")).await;
     let (_c, carol) = http_register(&app, &unique_username("gnc")).await;
     let alice_token = alice["access_token"].as_str().unwrap();
+    let alice_acct = alice["account_id"].as_str().unwrap();
     let bob_token = bob["access_token"].as_str().unwrap();
     let bob_acct = bob["account_id"].as_str().unwrap();
+    let carol_token = carol["access_token"].as_str().unwrap();
     let carol_acct = carol["account_id"].as_str().unwrap();
 
-    // Non-friends can now be grouped (no blocks among them).
+    // The creator must be friends with each listed member (direct add = consent by proxy)…
+    befriend(&app, alice_token, alice_acct, bob_token, bob_acct).await;
+    befriend(&app, alice_token, alice_acct, carol_token, carol_acct).await;
+
+    // …but Bob and Carol are strangers to each other, and can still be grouped (no clique).
     let (status, group) = post_json_auth(
         &app,
         "/v1/groups",
@@ -478,12 +484,15 @@ async fn leave_group_withdraws_membership_and_purges_queue() {
     let (_b, bob) = http_register(&app, &unique_username("lvb")).await;
     let (_c, carol) = http_register(&app, &unique_username("lvc")).await;
     let alice_token = alice["access_token"].as_str().unwrap();
+    let alice_acct = alice["account_id"].as_str().unwrap();
     let bob_token = bob["access_token"].as_str().unwrap();
     let carol_token = carol["access_token"].as_str().unwrap();
     let bob_acct = bob["account_id"].as_str().unwrap();
     let carol_acct = carol["account_id"].as_str().unwrap();
+    befriend(&app, alice_token, alice_acct, bob_token, bob_acct).await;
+    befriend(&app, alice_token, alice_acct, carol_token, carol_acct).await;
 
-    // Group of three (non-friends — allowed since ADR-0009).
+    // Group of three (Bob and Carol are strangers to each other — allowed since ADR-0009).
     let (status, group) = post_json_auth(
         &app,
         "/v1/groups",

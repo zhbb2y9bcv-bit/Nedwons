@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod groups;
 pub mod http;
 pub mod notify;
 pub mod pgstore;

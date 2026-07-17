@@ -6,7 +6,9 @@
 mod common;
 
 use axum::http::StatusCode;
-use common::{db_url, get_auth, http_register, make_app, post_json_auth, unique_username};
+use common::{
+    befriend, db_url, get_auth, http_register, make_app, post_json_auth, unique_username,
+};
 use mls_core::{Incoming, Member};
 use serde_json::json;
 
@@ -46,6 +48,16 @@ async fn mls_message_routed_through_relay_leaves_no_plaintext() {
     let bob_token = bob["access_token"].as_str().unwrap();
     let bob_device_hex = bob["device_id"].as_str().unwrap().to_string();
     let bob_account_hex = bob["account_id"].as_str().unwrap();
+    let alice_account_hex = alice["account_id"].as_str().unwrap();
+    // Direct adds require friendship with the adder (ADR-0009).
+    befriend(
+        &app,
+        alice_token,
+        alice_account_hex,
+        bob_token,
+        bob_account_hex,
+    )
+    .await;
 
     // MLS identities.
     let alice_mls = Member::new(b"alice-mls").expect("alice mls");
@@ -191,6 +203,8 @@ async fn peek_is_non_destructive_until_ack() {
     let alice_token = alice["access_token"].as_str().unwrap();
     let bob_token = bob["access_token"].as_str().unwrap();
     let bob_account = bob["account_id"].as_str().unwrap();
+    let alice_account = alice["account_id"].as_str().unwrap();
+    befriend(&app, alice_token, alice_account, bob_token, bob_account).await;
 
     let (_, conv) = post_json_auth(&app, "/v1/conversations", alice_token, json!({})).await;
     let conversation_id = conv["conversation_id"].as_str().unwrap();
@@ -277,6 +291,8 @@ async fn inbox_long_poll_wakes_on_delivery() {
     let alice_token = alice["access_token"].as_str().unwrap().to_string();
     let bob_token = bob["access_token"].as_str().unwrap().to_string();
     let bob_account = bob["account_id"].as_str().unwrap().to_string();
+    let alice_account = alice["account_id"].as_str().unwrap().to_string();
+    befriend(&app, &alice_token, &alice_account, &bob_token, &bob_account).await;
 
     // Bob publishes a key package; Alice sets up a conversation with Bob.
     let bob_mls = Member::new(b"bob-lp").expect("bob mls");
@@ -354,7 +370,9 @@ async fn ack_deletes_rows_and_ttl_purges_stale_mail() {
     let alice_token = alice["access_token"].as_str().unwrap();
     let bob_token = bob["access_token"].as_str().unwrap();
     let bob_account = bob["account_id"].as_str().unwrap();
+    let alice_account = alice["account_id"].as_str().unwrap();
     let bob_device_hex = bob["device_id"].as_str().unwrap().to_string();
+    befriend(&app, alice_token, alice_account, bob_token, bob_account).await;
 
     let (_, conv) = post_json_auth(&app, "/v1/conversations", alice_token, json!({})).await;
     let conversation_id = conv["conversation_id"].as_str().unwrap();

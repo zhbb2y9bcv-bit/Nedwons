@@ -31,6 +31,7 @@ use governor::{Quota, RateLimiter};
 use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
 
+use crate::groups::{InviteOutcome, PgGroups};
 use crate::notify::DeliveryNotifier;
 use crate::relay::{FanoutOutcome, PgRelay};
 use crate::social::{FriendRequestOutcome, PgSocial};
@@ -50,6 +51,7 @@ pub struct AppState {
     pub service: Arc<AuthService>,
     pub relay: Arc<PgRelay>,
     pub social: Arc<PgSocial>,
+    pub groups: Arc<PgGroups>,
     notifier: DeliveryNotifier,
     limiter: Arc<IpLimiter>,
     /// When `Some(h)`, the client IP for rate limiting is taken from header `h` — which MUST be
@@ -64,9 +66,10 @@ pub fn build_router(
     service: Arc<AuthService>,
     relay: Arc<PgRelay>,
     social: Arc<PgSocial>,
+    groups: Arc<PgGroups>,
     per_ip_per_minute: u32,
 ) -> Router {
-    build_router_cfg(service, relay, social, per_ip_per_minute, None)
+    build_router_cfg(service, relay, social, groups, per_ip_per_minute, None)
 }
 
 /// As [`build_router`], but `trusted_ip_header` selects where the client IP comes from for rate
@@ -85,6 +88,7 @@ pub fn build_router_cfg(
     service: Arc<AuthService>,
     relay: Arc<PgRelay>,
     social: Arc<PgSocial>,
+    groups: Arc<PgGroups>,
     per_ip_per_minute: u32,
     trusted_ip_header: Option<HeaderName>,
 ) -> Router {
@@ -94,6 +98,7 @@ pub fn build_router_cfg(
         service,
         relay,
         social,
+        groups,
         notifier: DeliveryNotifier::default(),
         limiter: Arc::new(RateLimiter::keyed(quota)),
         trusted_ip_header,
@@ -108,7 +113,27 @@ pub fn build_router_cfg(
             post(create_conversation).get(list_conversations),
         )
         .route("/v1/conversations/{id}/members", post(add_member))
+        .route("/v1/conversations/{id}/members/remove", post(remove_member))
         .route("/v1/conversations/{id}/leave", post(leave_conversation))
+        // group governance (ADR-0009)
+        .route(
+            "/v1/conversations/{id}/invites",
+            get(list_invites).post(create_invite),
+        )
+        .route("/v1/conversations/{id}/invites/revoke", post(revoke_invite))
+        .route("/v1/invites/accept", post(accept_invite))
+        .route("/v1/conversations/{id}/requests", get(list_join_requests))
+        .route(
+            "/v1/conversations/{id}/requests/approve",
+            post(approve_join_request),
+        )
+        .route(
+            "/v1/conversations/{id}/requests/deny",
+            post(deny_join_request),
+        )
+        .route("/v1/conversations/{id}/admins", post(promote_admin))
+        .route("/v1/conversations/{id}/admins/demote", post(demote_admin))
+        .route("/v1/conversations/{id}/settings", post(update_settings))
         .route("/v1/conversations/{id}/messages", post(send_message))
         .route("/v1/conversations/{id}/welcome", post(send_welcome))
         .route("/v1/inbox", get(fetch_inbox))
@@ -631,8 +656,12 @@ async fn create_conversation(
     let me = authed_device(&state, &headers).await?;
     let conversation_id = auth_core::crypto::random_bytes::<16>();
     let relay = state.relay.clone();
-    blocking_store(move || relay.create_conversation(conversation_id, me.account_id, me.device_id))
-        .await?;
+    let groups = state.groups.clone();
+    blocking_store(move || {
+        relay.create_conversation(conversation_id, me.account_id, me.device_id)?;
+        groups.bootstrap_admin(&conversation_id, &me.account_id)
+    })
+    .await?;
     Ok(Json(ConversationDto {
         conversation_id: hex::encode(conversation_id),
     }))
@@ -652,10 +681,18 @@ async fn add_member(
 
     let relay = state.relay.clone();
     let service = state.service.clone();
+    let groups = state.groups.clone();
+    let social = state.social.clone();
     blocking_store(move || {
-        if !relay.is_member(&conversation_id, &me.device_id)? {
-            // Non-members cannot learn anything; a store-level error maps to 500, so we
-            // signal "not a member" out of band below.
+        // Direct add is consent-by-proxy, so it is tightly gated (ADR-0009): the caller must be
+        // an ADMIN of the group AND friends with the target (friends = implied consent to be
+        // added by you; strangers join via invite links = their own consent), and no block may
+        // exist between the target and any current member. Non-members/non-admins learn nothing.
+        if !relay.is_member(&conversation_id, &me.device_id)?
+            || !groups.is_admin(&conversation_id, &me.account_id)?
+            || !social.are_friends(&me.account_id, &target_account)?
+            || groups.blocked_against_members(&conversation_id, &target_account)?
+        {
             return Ok(None);
         }
         // Resolve the target's active device (server-side authority, never client-asserted).
@@ -686,8 +723,372 @@ async fn leave_conversation(
 ) -> Result<StatusCode, ApiError> {
     let me = authed_device(&state, &headers).await?;
     let conversation_id = id16_from_hex(&conversation_hex)?;
+    let groups = state.groups.clone();
+    blocking_store(move || groups.leave_conversation(&conversation_id, &me.account_id)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ----- group governance (ADR-0009): admins, invites, join requests --------------------
+
+/// Invite-link bounds: default 7 days / 100 uses, capped at 30 days / 1000 uses.
+const INVITE_DEFAULT_EXPIRES_SECS: i64 = 7 * 24 * 3600;
+const INVITE_MAX_EXPIRES_SECS: i64 = 30 * 24 * 3600;
+const INVITE_DEFAULT_MAX_USES: i32 = 100;
+const INVITE_MAX_MAX_USES: i32 = 1000;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateInviteBody {
+    #[serde(default)]
+    expires_in_secs: Option<i64>,
+    #[serde(default)]
+    max_uses: Option<i32>,
+}
+
+#[derive(Serialize)]
+struct InviteDto {
+    invite_token: String,
+    expires_at: i64,
+    max_uses: i32,
+    uses: i32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InviteTokenBody {
+    invite_token: String,
+}
+
+#[derive(Serialize)]
+struct AcceptInviteDto {
+    conversation_id: String,
+    status: &'static str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SettingsBody {
+    join_approval: bool,
+}
+
+fn token32_from_hex(input: &str) -> Result<[u8; 32], ApiError> {
+    let bytes = hex_exact(input, 32)?;
+    bytes.try_into().map_err(|_| bad_request())
+}
+
+/// Guard: true iff the caller is a routed member AND an admin of the conversation. Handlers treat
+/// `false` as a generic forbidden — non-members/non-admins learn nothing. Store errors stay 500.
+fn is_conversation_admin(
+    state: &AppState,
+    conversation_id: &[u8; 16],
+    me: &AccountDevice,
+) -> auth_core::store::StoreResult<bool> {
+    Ok(state.relay.is_member(conversation_id, &me.device_id)?
+        && state.groups.is_admin(conversation_id, &me.account_id)?)
+}
+
+async fn create_invite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+    Json(body): Json<CreateInviteBody>,
+) -> Result<Json<InviteDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let expires = body
+        .expires_in_secs
+        .unwrap_or(INVITE_DEFAULT_EXPIRES_SECS)
+        .clamp(60, INVITE_MAX_EXPIRES_SECS);
+    let max_uses = body
+        .max_uses
+        .unwrap_or(INVITE_DEFAULT_MAX_USES)
+        .clamp(1, INVITE_MAX_MAX_USES);
+    let token = auth_core::crypto::random_bytes::<32>();
+    let st = state.clone();
+    blocking_store(move || {
+        if !is_conversation_admin(&st, &conversation_id, &me)? {
+            return Ok(None);
+        }
+        st.groups
+            .create_invite(&conversation_id, &me.account_id, token, expires, max_uses)?;
+        Ok(Some(()))
+    })
+    .await?
+    .ok_or_else(forbidden)?;
+    Ok(Json(InviteDto {
+        invite_token: hex::encode(token),
+        expires_at: now_unix_i64() + expires,
+        max_uses,
+        uses: 0,
+    }))
+}
+
+fn now_unix_i64() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+async fn list_invites(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+) -> Result<Json<Vec<InviteDto>>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let st = state.clone();
+    let invites = blocking_store(move || {
+        if !is_conversation_admin(&st, &conversation_id, &me)? {
+            return Ok(None);
+        }
+        st.groups.list_invites(&conversation_id).map(Some)
+    })
+    .await?
+    .ok_or_else(forbidden)?;
+    Ok(Json(
+        invites
+            .into_iter()
+            .map(|i| InviteDto {
+                invite_token: hex::encode(i.token),
+                expires_at: i.expires_at_unix,
+                max_uses: i.max_uses,
+                uses: i.uses,
+            })
+            .collect(),
+    ))
+}
+
+async fn revoke_invite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+    Json(body): Json<InviteTokenBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let token = token32_from_hex(&body.invite_token)?;
+    let st = state.clone();
+    blocking_store(move || {
+        if !is_conversation_admin(&st, &conversation_id, &me)? {
+            return Ok(None);
+        }
+        st.groups.revoke_invite(&conversation_id, &token)?;
+        Ok(Some(()))
+    })
+    .await?
+    .ok_or_else(forbidden)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Present an invite token: the joiner's own consent. Joins immediately, or files a join request
+/// when the group requires approval. One generic 403 on any refusal — a token must not become an
+/// oracle for group/block state.
+async fn accept_invite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<InviteTokenBody>,
+) -> Result<Json<AcceptInviteDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let token = token32_from_hex(&body.invite_token)?;
+    let groups = state.groups.clone();
     let relay = state.relay.clone();
-    blocking_store(move || relay.leave_conversation(&conversation_id, &me.account_id)).await?;
+    let outcome = blocking_store(move || {
+        let outcome = groups.accept_invite(&token, &me.account_id)?;
+        if let InviteOutcome::Joined { conversation_id } = &outcome {
+            // Routing add after the validated consume; the caller's own device only.
+            relay.add_member(conversation_id, me.account_id, me.device_id)?;
+        }
+        Ok(outcome)
+    })
+    .await?;
+    match outcome {
+        InviteOutcome::Joined { conversation_id } => Ok(Json(AcceptInviteDto {
+            conversation_id: hex::encode(conversation_id),
+            status: "joined",
+        })),
+        InviteOutcome::Requested { conversation_id } => Ok(Json(AcceptInviteDto {
+            conversation_id: hex::encode(conversation_id),
+            status: "requested",
+        })),
+        InviteOutcome::Refused => Err(forbidden()),
+    }
+}
+
+async fn list_join_requests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+) -> Result<Json<Vec<String>>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let st = state.clone();
+    let requests = blocking_store(move || {
+        if !is_conversation_admin(&st, &conversation_id, &me)? {
+            return Ok(None);
+        }
+        st.groups.list_join_requests(&conversation_id).map(Some)
+    })
+    .await?
+    .ok_or_else(forbidden)?;
+    Ok(Json(requests.into_iter().map(hex::encode).collect()))
+}
+
+async fn approve_join_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+    Json(body): Json<AccountRefBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let target = AccountId(id16_from_hex(&body.account_id)?);
+    let st = state.clone();
+    let approved = blocking_store(move || {
+        if !is_conversation_admin(&st, &conversation_id, &me)? {
+            return Ok(None);
+        }
+        // Blocks are re-checked at approval time inside approve_join_request.
+        if !st.groups.approve_join_request(&conversation_id, &target)? {
+            return Ok(Some(false));
+        }
+        let device = st
+            .service
+            .active_device(&target)
+            .map_err(|_| auth_core::store::StoreError("device lookup".into()))?;
+        if let Some(device_id) = device {
+            st.relay.add_member(&conversation_id, target, device_id)?;
+        }
+        Ok(Some(true))
+    })
+    .await?
+    .ok_or_else(forbidden)?;
+    if approved {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError(StatusCode::NOT_FOUND, "no_request"))
+    }
+}
+
+async fn deny_join_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+    Json(body): Json<AccountRefBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let target = AccountId(id16_from_hex(&body.account_id)?);
+    let st = state.clone();
+    blocking_store(move || {
+        if !is_conversation_admin(&st, &conversation_id, &me)? {
+            return Ok(None);
+        }
+        st.groups.deny_join_request(&conversation_id, &target)?;
+        Ok(Some(()))
+    })
+    .await?
+    .ok_or_else(forbidden)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Admin removes a member. Uses the same exit path as leave (routing removal + queued-mail purge +
+/// role cleanup). Removing yourself is a `leave`, not a remove.
+async fn remove_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+    Json(body): Json<AccountRefBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let target = AccountId(id16_from_hex(&body.account_id)?);
+    if target.0 == me.account_id.0 {
+        return Err(bad_request());
+    }
+    let st = state.clone();
+    blocking_store(move || {
+        if !is_conversation_admin(&st, &conversation_id, &me)? {
+            return Ok(None);
+        }
+        st.groups.leave_conversation(&conversation_id, &target)?;
+        Ok(Some(()))
+    })
+    .await?
+    .ok_or_else(forbidden)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn promote_admin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+    Json(body): Json<AccountRefBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let target = AccountId(id16_from_hex(&body.account_id)?);
+    let st = state.clone();
+    let promoted = blocking_store(move || {
+        if !is_conversation_admin(&st, &conversation_id, &me)? {
+            return Ok(None);
+        }
+        st.groups.promote(&conversation_id, &target).map(Some)
+    })
+    .await?
+    .ok_or_else(forbidden)?;
+    if promoted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError(StatusCode::NOT_FOUND, "not_member"))
+    }
+}
+
+async fn demote_admin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+    Json(body): Json<AccountRefBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let target = AccountId(id16_from_hex(&body.account_id)?);
+    let st = state.clone();
+    let demoted = blocking_store(move || {
+        if !is_conversation_admin(&st, &conversation_id, &me)? {
+            return Ok(None);
+        }
+        st.groups.demote(&conversation_id, &target).map(Some)
+    })
+    .await?
+    .ok_or_else(forbidden)?;
+    if demoted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        // Refusing to demote the LAST admin keeps the group manageable.
+        Err(ApiError(StatusCode::CONFLICT, "last_admin"))
+    }
+}
+
+async fn update_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+    Json(body): Json<SettingsBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let st = state.clone();
+    blocking_store(move || {
+        if !is_conversation_admin(&st, &conversation_id, &me)? {
+            return Ok(None);
+        }
+        st.groups
+            .set_join_approval(&conversation_id, body.join_approval)?;
+        Ok(Some(()))
+    })
+    .await?
+    .ok_or_else(forbidden)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1256,14 +1657,24 @@ async fn create_group(
     let relay = state.relay.clone();
     let service = state.service.clone();
     let others_for_task = others.clone();
+    let groups = state.groups.clone();
     let outcome = blocking_store(move || {
-        // Gate (ADR-0009): members need not be friends, but a group must not force together a pair
-        // that has blocked each other.
+        // Gates (ADR-0009): listing someone is a DIRECT add, so the creator must be friends with
+        // each listed member (friends = implied consent to be added by you — strangers join via
+        // invite links, which is their own consent; this stops forced-membership spam). Members
+        // need NOT be friends with each other. And a group must never force together a pair that
+        // has blocked each other.
+        for member in &others_for_task {
+            if !social.are_friends(&me.account_id, member)? {
+                return Ok(Err("not_friends"));
+            }
+        }
         if social.any_block_within(&all)? {
-            return Ok(None);
+            return Ok(Err("blocked_member"));
         }
         let conversation_id = auth_core::crypto::random_bytes::<16>();
         relay.create_conversation(conversation_id, me.account_id, me.device_id)?;
+        groups.bootstrap_admin(&conversation_id, &me.account_id)?;
         for member in &others_for_task {
             // Resolve each member's active device server-side (never client-asserted).
             if let Some(device) = service
@@ -1273,13 +1684,13 @@ async fn create_group(
                 relay.add_member(&conversation_id, *member, device)?;
             }
         }
-        Ok(Some(conversation_id))
+        Ok(Ok(conversation_id))
     })
     .await?;
 
     match outcome {
-        None => Err(ApiError(StatusCode::FORBIDDEN, "blocked_member")),
-        Some(conversation_id) => Ok(Json(GroupDto {
+        Err(reason) => Err(ApiError(StatusCode::FORBIDDEN, reason)),
+        Ok(conversation_id) => Ok(Json(GroupDto {
             conversation_id: hex::encode(conversation_id),
             member_account_ids: others.iter().map(|a| hex::encode(a.0)).collect(),
         })),
