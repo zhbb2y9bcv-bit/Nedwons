@@ -156,10 +156,92 @@ async fn mls_message_routed_through_relay_leaves_no_plaintext() {
         Incoming::StateAdvanced => panic!("expected the application message"),
     }
 
-    // Inbox is now drained (envelopes were marked delivered).
-    let (status, inbox2) = get_auth(&app, "/v1/inbox", bob_token).await;
+    // At-least-once: a peek does NOT drain. Re-peeking returns the same envelopes until Bob
+    // acks — so a crash between peek and persist loses nothing.
+    let (status, inbox_again) = get_auth(&app, "/v1/inbox", bob_token).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(inbox2.as_array().unwrap().len(), 0);
+    assert_eq!(
+        inbox_again.as_array().unwrap().len(),
+        2,
+        "peek is non-destructive until ack"
+    );
+
+    // Bob persisted the messages; now he acks them.
+    let ids: Vec<i64> = envelopes
+        .iter()
+        .map(|e| e["id"].as_i64().unwrap())
+        .collect();
+    let (status, _) = post_json_auth(&app, "/v1/inbox/ack", bob_token, json!({ "ids": ids })).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Now the inbox is drained.
+    let (status, inbox_final) = get_auth(&app, "/v1/inbox", bob_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inbox_final.as_array().unwrap().len(), 0);
+}
+
+/// At-least-once delivery: peeking is non-destructive, and only an explicit ack removes mail
+/// from the queue. This is the anti-message-loss guarantee — a client that crashes after
+/// peeking but before persisting re-fetches the same envelopes.
+#[tokio::test]
+async fn peek_is_non_destructive_until_ack() {
+    let app = make_app(100_000).await;
+    let (_a, alice) = http_register(&app, &unique_username("relsend")).await;
+    let (_b, bob) = http_register(&app, &unique_username("relrecv")).await;
+    let alice_token = alice["access_token"].as_str().unwrap();
+    let bob_token = bob["access_token"].as_str().unwrap();
+    let bob_account = bob["account_id"].as_str().unwrap();
+
+    let (_, conv) = post_json_auth(&app, "/v1/conversations", alice_token, json!({})).await;
+    let conversation_id = conv["conversation_id"].as_str().unwrap();
+    let (status, _) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conversation_id}/members"),
+        alice_token,
+        json!({ "account_id": bob_account }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conversation_id}/messages"),
+        alice_token,
+        json!({ "ciphertext": hex::encode(b"opaque"), "idempotency_key": hex::encode([5u8; 16]) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Two peeks in a row return the same envelope (simulating a crash before persist).
+    let (_, first) = get_auth(&app, "/v1/inbox", bob_token).await;
+    let (_, second) = get_auth(&app, "/v1/inbox", bob_token).await;
+    assert_eq!(first.as_array().unwrap().len(), 1);
+    assert_eq!(second.as_array().unwrap().len(), 1);
+    assert_eq!(first[0]["id"], second[0]["id"], "same envelope re-served");
+
+    // A device cannot ack another device's mail: alice acking bob's id is a no-op.
+    let bob_id = first[0]["id"].as_i64().unwrap();
+    let (status, _) = post_json_auth(
+        &app,
+        "/v1/inbox/ack",
+        alice_token,
+        json!({ "ids": [bob_id] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, still_there) = get_auth(&app, "/v1/inbox", bob_token).await;
+    assert_eq!(
+        still_there.as_array().unwrap().len(),
+        1,
+        "cross-device ack is a no-op"
+    );
+
+    // Bob's own ack drains it.
+    let (status, _) =
+        post_json_auth(&app, "/v1/inbox/ack", bob_token, json!({ "ids": [bob_id] })).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, drained) = get_auth(&app, "/v1/inbox", bob_token).await;
+    assert_eq!(drained.as_array().unwrap().len(), 0);
 }
 
 /// A non-member cannot post into a conversation (object-level authz, no IDOR).

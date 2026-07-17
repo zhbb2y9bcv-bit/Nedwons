@@ -76,6 +76,8 @@ pub fn build_router(
         .route("/v1/conversations/{id}/messages", post(send_message))
         .route("/v1/conversations/{id}/welcome", post(send_welcome))
         .route("/v1/inbox", get(fetch_inbox))
+        .route("/v1/inbox/ack", post(ack_inbox))
+        .route("/v1/stream", get(stream_handler))
         .layer(RequestBodyLimitLayer::new(MAX_RELAY_BODY_BYTES));
 
     Router::new()
@@ -458,6 +460,13 @@ struct InboxQuery {
     wait: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AckBody {
+    /// Envelope ids the client has durably persisted and no longer needs served.
+    ids: Vec<i64>,
+}
+
 /// Publish a key package for the authenticated device.
 async fn publish_key_package(
     State(state): State<AppState>,
@@ -613,7 +622,8 @@ async fn send_welcome(
     Ok(Json(ReceiptDto { envelope_id }))
 }
 
-/// Fetch the authenticated device's queued envelopes (marks them delivered). With `?wait=N`
+/// Peek the authenticated device's queued envelopes (does NOT mark delivered — the client
+/// acks via `/v1/inbox/ack` after persisting, giving at-least-once delivery). With `?wait=N`
 /// this long-polls: it returns immediately if mail is present, otherwise parks until mail
 /// arrives (woken by a send) or `N` seconds elapse — near-zero idle delivery latency without
 /// burning a database connection while waiting.
@@ -651,12 +661,129 @@ async fn fetch_inbox(
     ))
 }
 
+/// Acknowledge durably-persisted envelopes so the server can purge them. At-least-once: a
+/// client peeks, persists locally, then acks; a crash before ack just re-peeks (dedup by id).
+async fn ack_inbox(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AckBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    if body.ids.len() > 1000 {
+        return Err(bad_request());
+    }
+    let relay = state.relay.clone();
+    blocking_store(move || relay.ack_envelopes(&me.device_id, &body.ids)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn read_inbox(
     state: &AppState,
     device_id: DeviceId,
 ) -> Result<Vec<crate::relay::EnvelopeOut>, ApiError> {
     let relay = state.relay.clone();
-    blocking_store(move || relay.fetch_inbox(&device_id, 100)).await
+    // Peek (do NOT mark delivered); the client acks after persisting (at-least-once).
+    blocking_store(move || relay.peek_inbox(&device_id, 100)).await
+}
+
+// ----- WebSocket streaming delivery ---------------------------------------------------
+
+#[derive(Serialize)]
+struct StreamPush {
+    envelopes: Vec<InboxEnvelopeDto>,
+}
+
+#[derive(Deserialize)]
+struct StreamAck {
+    #[serde(default)]
+    ack: Vec<i64>,
+}
+
+/// Authenticated WebSocket push channel: `GET /v1/stream` with `Authorization: Bearer
+/// <access-token hex>` on the upgrade request. The server pushes new envelopes the instant
+/// they arrive (woken by the same `DeliveryNotifier` as long-poll — sub-100 ms, no polling)
+/// and the client acks over the same socket. Same at-least-once semantics as HTTP: unacked
+/// envelopes are re-delivered on reconnect.
+async fn stream_handler(
+    ws: axum::extract::ws::WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    // Authenticate BEFORE upgrading, so an unauthenticated client gets a clean 401.
+    let me = match authed_device(&state, &headers).await {
+        Ok(me) => me,
+        Err(e) => return e.into_response(),
+    };
+    ws.on_upgrade(move |socket| stream_socket(socket, state, me))
+}
+
+async fn stream_socket(
+    mut socket: axum::extract::ws::WebSocket,
+    state: AppState,
+    me: AccountDevice,
+) {
+    use axum::extract::ws::Message;
+
+    let device = me.device_id;
+    let notify = state.notifier.handle(&device.0);
+    // Only push envelopes newer than what we've already sent this session; unacked ones are
+    // re-served from the DB on reconnect (last_sent resets to 0).
+    let mut last_sent: i64 = 0;
+    let heartbeat = std::time::Duration::from_secs(30);
+
+    loop {
+        // Deliver anything pending and not yet pushed this session.
+        match read_inbox(&state, device).await {
+            Ok(pending) => {
+                let fresh: Vec<InboxEnvelopeDto> = pending
+                    .into_iter()
+                    .filter(|e| e.id > last_sent)
+                    .map(|e| InboxEnvelopeDto {
+                        id: e.id,
+                        conversation_id: hex::encode(e.conversation_id),
+                        sender_device: hex::encode(e.sender_device),
+                        ciphertext: hex::encode(e.ciphertext),
+                    })
+                    .collect();
+                if let Some(max_id) = fresh.iter().map(|e| e.id).max() {
+                    last_sent = max_id;
+                    let payload = serde_json::to_string(&StreamPush { envelopes: fresh })
+                        .unwrap_or_else(|_| "{\"envelopes\":[]}".to_string());
+                    if socket.send(Message::Text(payload.into())).await.is_err() {
+                        return; // client gone
+                    }
+                }
+            }
+            Err(_) => return, // storage fault: drop the connection, client reconnects
+        }
+
+        tokio::select! {
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(StreamAck { ack }) = serde_json::from_str::<StreamAck>(&text) {
+                            if !ack.is_empty() && ack.len() <= 1000 {
+                                let relay = state.relay.clone();
+                                let _ = blocking_store(move || relay.ack_envelopes(&device, &ack)).await;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = socket.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => return,
+                    _ => {}
+                }
+            }
+            _ = notify.notified() => { /* new mail: loop to deliver */ }
+            _ = tokio::time::sleep(heartbeat) => {
+                // Liveness probe; a dead peer surfaces as a send error next cycle.
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 fn decode_ciphertext(hex_str: &str) -> Result<Vec<u8>, ApiError> {

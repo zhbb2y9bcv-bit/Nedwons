@@ -271,24 +271,23 @@ impl PgRelay {
         Ok(FanoutOutcome::Delivered { newly_queued })
     }
 
-    /// Fetch and mark-delivered the undelivered envelopes for a device (in order).
-    pub fn fetch_inbox(&self, device: &DeviceId, limit: i64) -> StoreResult<Vec<EnvelopeOut>> {
+    /// **Peek** a device's undelivered envelopes, in order, WITHOUT marking them delivered.
+    /// This is at-least-once delivery: the client persists them locally and then calls
+    /// [`Self::ack_envelopes`]. If the client crashes between peek and ack, it simply
+    /// re-peeks and re-processes (deduping by envelope id) — no message is lost, unlike the
+    /// old mark-on-fetch model where a lost response silently dropped mail.
+    pub fn peek_inbox(&self, device: &DeviceId, limit: i64) -> StoreResult<Vec<EnvelopeOut>> {
         let mut conn = self.conn()?;
-        // Atomically claim a batch: mark delivered and return them.
         let rows = conn
             .query(
-                "UPDATE envelopes SET delivered = TRUE
-                 WHERE id IN (
-                     SELECT id FROM envelopes
-                     WHERE recipient_device = $1 AND NOT delivered
-                     ORDER BY id LIMIT $2 FOR UPDATE SKIP LOCKED
-                 )
-                 RETURNING id, conversation_id, sender_device, ciphertext",
+                "SELECT id, conversation_id, sender_device, ciphertext
+                 FROM envelopes
+                 WHERE recipient_device = $1 AND NOT delivered
+                 ORDER BY id LIMIT $2",
                 &[&device.as_bytes(), &limit],
             )
             .map_err(db_err)?;
-        let mut out: Vec<EnvelopeOut> = rows
-            .into_iter()
+        rows.into_iter()
             .map(|r| {
                 Ok(EnvelopeOut {
                     id: r.get(0),
@@ -297,11 +296,25 @@ impl PgRelay {
                     ciphertext: r.get::<_, Vec<u8>>(3),
                 })
             })
-            .collect::<StoreResult<Vec<_>>>()?;
-        // `UPDATE ... RETURNING` does not preserve the subquery's ORDER BY, so sort by id
-        // here. Ordered delivery is REQUIRED: MLS commits/welcomes must be processed in the
-        // order they were produced or the receiver's group state diverges.
-        out.sort_by_key(|e| e.id);
-        Ok(out)
+            .collect()
+    }
+
+    /// Acknowledge durably-persisted envelopes: mark them delivered so they stop being
+    /// peeked and become eligible for retention purge (DATA_RETENTION.md). Scoped to the
+    /// caller's own device, so a client cannot ack another device's mail. Idempotent.
+    /// Returns the number of rows newly acked.
+    pub fn ack_envelopes(&self, device: &DeviceId, ids: &[i64]) -> StoreResult<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn()?;
+        let acked = conn
+            .execute(
+                "UPDATE envelopes SET delivered = TRUE
+                 WHERE recipient_device = $1 AND id = ANY($2) AND NOT delivered",
+                &[&device.as_bytes(), &ids],
+            )
+            .map_err(db_err)?;
+        Ok(acked)
     }
 }
