@@ -93,6 +93,19 @@ pub fn shared_groups() -> Arc<sentinel_api::groups::PgGroups> {
     ))
 }
 
+/// Transparency store over the shared pool, with a process-stable log signing key (so STH
+/// signatures verify against a consistent public key across a test's requests).
+pub fn shared_transparency() -> Arc<sentinel_api::transparency::PgTransparency> {
+    static KEY: std::sync::OnceLock<p256::ecdsa::SigningKey> = std::sync::OnceLock::new();
+    let key = KEY
+        .get_or_init(|| p256::ecdsa::SigningKey::random(&mut OsRng))
+        .clone();
+    Arc::new(sentinel_api::transparency::PgTransparency::new(
+        shared_stores().pool_clone(),
+        key,
+    ))
+}
+
 /// Random username, unique per call, satisfying the normalization policy.
 pub fn unique_username(prefix: &str) -> String {
     let mut bytes = [0u8; 6];
@@ -173,6 +186,7 @@ pub async fn make_app(per_ip_per_minute: u32) -> Router {
             shared_relay(),
             shared_social(),
             shared_groups(),
+            shared_transparency(),
             per_ip_per_minute,
         )
     })
@@ -191,6 +205,7 @@ pub async fn make_app_with_trusted_ip_header(per_ip_per_minute: u32) -> Router {
             shared_relay(),
             shared_social(),
             shared_groups(),
+            shared_transparency(),
             per_ip_per_minute,
             Some(axum::http::HeaderName::from_static("x-real-client-ip")),
         )

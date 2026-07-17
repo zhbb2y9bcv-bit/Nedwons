@@ -10,6 +10,7 @@ pub mod notify;
 pub mod pgstore;
 pub mod relay;
 pub mod social;
+pub mod transparency;
 
 use refinery::embed_migrations;
 
