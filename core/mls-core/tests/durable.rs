@@ -157,3 +157,50 @@ fn ratchet_survives_relaunch() {
         InboundOutcome::Application(p) if p == b"two"
     ));
 }
+
+/// Out-of-order delivery: the network/queue may deliver later messages first. Both must still
+/// decrypt (MLS tolerates in-epoch reordering; the durable layer must not break that).
+#[test]
+fn out_of_order_application_messages_decrypt() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+    let id1 = alice.enqueue(b"first").expect("enqueue 1");
+    let ct1 = alice.encrypt(id1).expect("encrypt 1");
+    let id2 = alice.enqueue(b"second").expect("enqueue 2");
+    let ct2 = alice.encrypt(id2).expect("encrypt 2");
+
+    // Bob receives them reversed.
+    assert!(matches!(
+        bob.process_inbound(2, &ct2).expect("process 2 first"),
+        InboundOutcome::Application(p) if p == b"second"
+    ));
+    assert!(matches!(
+        bob.process_inbound(1, &ct1).expect("process 1 second"),
+        InboundOutcome::Application(p) if p == b"first"
+    ));
+    assert_eq!(bob.messages().len(), 2);
+}
+
+/// Out-of-order delivery that also straddles a crash: process the later message, relaunch, then
+/// the earlier one still decrypts — the secret-tree state that permits reordering is durable.
+#[test]
+fn out_of_order_across_relaunch() {
+    let (mut alice, _ja, mut bob, jb) = pair();
+    let id1 = alice.enqueue(b"first").expect("enqueue 1");
+    let ct1 = alice.encrypt(id1).expect("encrypt 1");
+    let id2 = alice.enqueue(b"second").expect("enqueue 2");
+    let ct2 = alice.encrypt(id2).expect("encrypt 2");
+
+    assert!(matches!(
+        bob.process_inbound(2, &ct2).expect("process 2"),
+        InboundOutcome::Application(p) if p == b"second"
+    ));
+
+    drop(bob);
+    let mut bob = DurableSession::open(jb).expect("reopen bob");
+
+    assert!(matches!(
+        bob.process_inbound(1, &ct1).expect("process 1 after relaunch"),
+        InboundOutcome::Application(p) if p == b"first"
+    ));
+    assert_eq!(bob.messages().len(), 2);
+}

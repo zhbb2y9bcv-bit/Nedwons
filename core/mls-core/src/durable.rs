@@ -17,8 +17,13 @@
 //! body (the store blob is where on-device encryption + the OpenMLS fork/discard strategy attach).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use aes_gcm::aead::{Aead, KeyInit};
+use aes_gcm::{Aes256Gcm, Key, Nonce};
+use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 use crate::{Conversation, Incoming, Member};
@@ -433,5 +438,88 @@ impl Journal for InMemoryJournal {
     fn load(&self) -> Result<Option<Vec<u8>>, DurableError> {
         let g = self.inner.lock().map_err(|_| DurableError::Journal)?;
         Ok(g.blob.clone())
+    }
+}
+
+// --------------------------------------------------------------------------------------------
+// Production journal: an encrypted, atomically-written file.
+//
+// - **At rest encryption:** the blob (which contains ratchet secrets + decrypted messages) is
+//   sealed with AES-256-GCM (vetted RustCrypto — no custom crypto). The key is supplied by the
+//   caller; on device it comes from the Keychain-wrapped local key hierarchy (CRYPTOGRAPHY.md §5),
+//   never hard-coded and never in the file.
+// - **Atomicity:** each commit writes a temp file (fsync'd) then `rename`s it over the target, so a
+//   crash mid-write can never leave a torn/partial blob — you either see the old blob or the new.
+// - **Tamper-evidence:** GCM authentication fails closed on any modification of the ciphertext.
+//
+// File layout: `nonce (12 bytes) || AES-256-GCM ciphertext`. A fresh random nonce per write keeps
+// the (key, nonce) pair unique, which AES-GCM requires.
+
+pub struct FileJournal {
+    path: PathBuf,
+    cipher: Aes256Gcm,
+}
+
+impl FileJournal {
+    /// `key` is a 32-byte AES-256 key (on device: from the local at-rest key hierarchy). The same
+    /// path + key reopen the persisted session after a relaunch.
+    pub fn new(path: impl Into<PathBuf>, key: &[u8; 32]) -> Self {
+        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+        Self {
+            path: path.into(),
+            cipher,
+        }
+    }
+
+    fn tmp_path(&self) -> PathBuf {
+        let mut p = self.path.clone();
+        let mut name = p.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+        name.push(".tmp");
+        p.set_file_name(name);
+        p
+    }
+}
+
+impl Journal for FileJournal {
+    fn commit(&mut self, blob: &[u8]) -> Result<(), DurableError> {
+        let mut nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let nonce = Nonce::from_slice(&nonce_bytes);
+        let ciphertext = self
+            .cipher
+            .encrypt(nonce, blob)
+            .map_err(|_| DurableError::Journal)?;
+
+        let mut out = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
+
+        // Write to a temp file, fsync, then atomically rename over the target.
+        let tmp = self.tmp_path();
+        {
+            let mut f = std::fs::File::create(&tmp).map_err(|_| DurableError::Journal)?;
+            f.write_all(&out).map_err(|_| DurableError::Journal)?;
+            f.sync_all().map_err(|_| DurableError::Journal)?;
+        }
+        std::fs::rename(&tmp, &self.path).map_err(|_| DurableError::Journal)?;
+        Ok(())
+    }
+
+    fn load(&self) -> Result<Option<Vec<u8>>, DurableError> {
+        let data = match std::fs::read(&self.path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(DurableError::Journal),
+        };
+        if data.len() < 12 {
+            return Err(DurableError::Journal);
+        }
+        let (nonce_bytes, ciphertext) = data.split_at(12);
+        let nonce = Nonce::from_slice(nonce_bytes);
+        let plaintext = self
+            .cipher
+            .decrypt(nonce, ciphertext)
+            .map_err(|_| DurableError::Journal)?; // fails closed on tamper / wrong key
+        Ok(Some(plaintext))
     }
 }
