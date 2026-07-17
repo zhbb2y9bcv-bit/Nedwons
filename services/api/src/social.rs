@@ -37,6 +37,8 @@ pub enum FriendRequestOutcome {
     Friended,
     /// Already friends; nothing to do.
     AlreadyFriends,
+    /// A block exists between the two accounts (either direction); the request is refused.
+    Blocked,
 }
 
 fn db_err(e: postgres::Error) -> StoreError {
@@ -173,6 +175,19 @@ impl PgSocial {
         let (lo, hi) = canon(from.0, to.0);
         let mut conn = self.conn()?;
         let mut txn = conn.transaction().map_err(db_err)?;
+
+        // Refuse if either party has blocked the other (dropping the txn rolls back).
+        if txn
+            .query_opt(
+                "SELECT 1 FROM blocks
+                 WHERE (blocker = $1 AND blocked = $2) OR (blocker = $2 AND blocked = $1)",
+                &[&from.as_bytes(), &to.as_bytes()],
+            )
+            .map_err(db_err)?
+            .is_some()
+        {
+            return Ok(FriendRequestOutcome::Blocked);
+        }
 
         // Already friends?
         if txn
@@ -312,6 +327,87 @@ impl PgSocial {
                  LEFT JOIN profiles p ON p.account_id = a.account_id
                  WHERE r.to_account = $1
                  ORDER BY r.created_at",
+                &[&me.as_bytes()],
+            )
+            .map_err(db_err)?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(ProfileSummary {
+                    account_id: id16(r.get::<_, &[u8]>(0))?,
+                    username: r.get(1),
+                    display_name: r.get(2),
+                })
+            })
+            .collect()
+    }
+
+    // ----- blocks --------------------------------------------------------------------
+
+    /// Block `blocked`: record the block and, atomically, drop any existing friendship and pending
+    /// requests in either direction. Idempotent.
+    pub fn block(&self, blocker: &AccountId, blocked: &AccountId) -> StoreResult<()> {
+        if blocker.0 == blocked.0 {
+            return Err(StoreError("cannot block self".into()));
+        }
+        let (lo, hi) = canon(blocker.0, blocked.0);
+        let mut conn = self.conn()?;
+        let mut txn = conn.transaction().map_err(db_err)?;
+        txn.execute(
+            "INSERT INTO blocks (blocker, blocked) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            &[&blocker.as_bytes(), &blocked.as_bytes()],
+        )
+        .map_err(db_err)?;
+        txn.execute(
+            "DELETE FROM friendships WHERE account_lo = $1 AND account_hi = $2",
+            &[&lo.as_slice(), &hi.as_slice()],
+        )
+        .map_err(db_err)?;
+        txn.execute(
+            "DELETE FROM friend_requests
+             WHERE (from_account = $1 AND to_account = $2)
+                OR (from_account = $2 AND to_account = $1)",
+            &[&blocker.as_bytes(), &blocked.as_bytes()],
+        )
+        .map_err(db_err)?;
+        txn.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Remove a block `blocker` placed on `blocked`. Idempotent. Does not restore prior friendship.
+    pub fn unblock(&self, blocker: &AccountId, blocked: &AccountId) -> StoreResult<()> {
+        let mut conn = self.conn()?;
+        conn.execute(
+            "DELETE FROM blocks WHERE blocker = $1 AND blocked = $2",
+            &[&blocker.as_bytes(), &blocked.as_bytes()],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// True iff a block exists in either direction between the two accounts.
+    pub fn is_blocked_between(&self, a: &AccountId, b: &AccountId) -> StoreResult<bool> {
+        let mut conn = self.conn()?;
+        Ok(conn
+            .query_opt(
+                "SELECT 1 FROM blocks
+                 WHERE (blocker = $1 AND blocked = $2) OR (blocker = $2 AND blocked = $1)",
+                &[&a.as_bytes(), &b.as_bytes()],
+            )
+            .map_err(db_err)?
+            .is_some())
+    }
+
+    /// Accounts `me` has blocked, most recent first.
+    pub fn list_blocked(&self, me: &AccountId) -> StoreResult<Vec<ProfileSummary>> {
+        let mut conn = self.conn()?;
+        let rows = conn
+            .query(
+                "SELECT a.account_id, a.username_normalized, COALESCE(p.display_name, '')
+                 FROM blocks b
+                 JOIN accounts a ON a.account_id = b.blocked
+                 LEFT JOIN profiles p ON p.account_id = a.account_id
+                 WHERE b.blocker = $1
+                 ORDER BY b.created_at DESC",
                 &[&me.as_bytes()],
             )
             .map_err(db_err)?;
