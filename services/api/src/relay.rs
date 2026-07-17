@@ -390,10 +390,11 @@ impl PgRelay {
             .collect()
     }
 
-    /// Acknowledge durably-persisted envelopes: mark them delivered so they stop being
-    /// peeked and become eligible for retention purge (DATA_RETENTION.md). Scoped to the
-    /// caller's own device, so a client cannot ack another device's mail. Idempotent.
-    /// Returns the number of rows newly acked.
+    /// Acknowledge durably-persisted envelopes: **delete** them. DATA_RETENTION.md commits to
+    /// "purged from server on delivery ack" — the recipient's device is the store, so retaining
+    /// acked ciphertext would be a silent retention violation. Scoped to the caller's own device,
+    /// so a client cannot ack (delete) another device's mail. Idempotent: re-acking deleted ids is
+    /// a no-op. Returns the number of rows purged.
     pub fn ack_envelopes(&self, device: &DeviceId, ids: &[i64]) -> StoreResult<u64> {
         if ids.is_empty() {
             return Ok(0);
@@ -401,11 +402,23 @@ impl PgRelay {
         let mut conn = self.conn()?;
         let acked = conn
             .execute(
-                "UPDATE envelopes SET delivered = TRUE
-                 WHERE recipient_device = $1 AND id = ANY($2) AND NOT delivered",
+                "DELETE FROM envelopes WHERE recipient_device = $1 AND id = ANY($2)",
                 &[&device.as_bytes(), &ids],
             )
             .map_err(db_err)?;
         Ok(acked)
+    }
+
+    /// Retention TTL (DATA_RETENTION.md): purge undelivered envelopes older than `ttl_days` (the
+    /// 30-day queue TTL — the sender's client shows "failed" after this). Returns rows purged.
+    pub fn purge_stale_envelopes(&self, ttl_days: i32) -> StoreResult<u64> {
+        let mut conn = self.conn()?;
+        let purged = conn
+            .execute(
+                "DELETE FROM envelopes WHERE created_at < now() - ($1 * interval '1 day')",
+                &[&f64::from(ttl_days)],
+            )
+            .map_err(db_err)?;
+        Ok(purged)
     }
 }
