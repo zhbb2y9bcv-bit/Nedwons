@@ -172,6 +172,57 @@ pub async fn make_app(per_ip_per_minute: u32) -> Router {
     .expect("app setup")
 }
 
+/// Build the app trusting a client-IP header (`x-real-client-ip`) for rate limiting, so tests can
+/// exercise per-client-IP buckets behind a proxy.
+pub async fn make_app_with_trusted_ip_header(per_ip_per_minute: u32) -> Router {
+    tokio::task::spawn_blocking(move || {
+        let stores = shared_stores();
+        let service = Arc::new(make_service(&stores));
+        sentinel_api::http::build_router_cfg(
+            service,
+            shared_relay(),
+            shared_social(),
+            per_ip_per_minute,
+            Some(axum::http::HeaderName::from_static("x-real-client-ip")),
+        )
+    })
+    .await
+    .expect("app setup")
+}
+
+/// POST JSON carrying an `x-real-client-ip` header (a simulated proxy-forwarded client IP).
+pub async fn post_json_with_client_ip(
+    app: &Router,
+    path: &str,
+    body: Value,
+    client_ip: &str,
+) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-real-client-ip", client_ip)
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let value = if bytes.is_empty() {
+        json!(null)
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(json!(null))
+    };
+    (status, value)
+}
+
 pub async fn post_json(app: &Router, path: &str, body: Value) -> (StatusCode, Value) {
     let response = app
         .clone()

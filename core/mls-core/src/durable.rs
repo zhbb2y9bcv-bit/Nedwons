@@ -22,7 +22,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use aes_gcm::aead::{Aead, KeyInit};
-use aes_gcm::{Aes256Gcm, Key, Nonce};
+use aes_gcm::Aes256Gcm;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
@@ -464,7 +464,8 @@ impl FileJournal {
     /// `key` is a 32-byte AES-256 key (on device: from the local at-rest key hierarchy). The same
     /// path + key reopen the persisted session after a relaunch.
     pub fn new(path: impl Into<PathBuf>, key: &[u8; 32]) -> Self {
-        let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
+        // 32 bytes is always a valid AES-256 key length, so this cannot fail.
+        let cipher = Aes256Gcm::new_from_slice(key).expect("AES-256 key is 32 bytes");
         Self {
             path: path.into(),
             cipher,
@@ -484,10 +485,9 @@ impl Journal for FileJournal {
     fn commit(&mut self, blob: &[u8]) -> Result<(), DurableError> {
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
-        let nonce = Nonce::from_slice(&nonce_bytes);
         let ciphertext = self
             .cipher
-            .encrypt(nonce, blob)
+            .encrypt(&nonce_bytes.into(), blob)
             .map_err(|_| DurableError::Journal)?;
 
         let mut out = Vec::with_capacity(nonce_bytes.len() + ciphertext.len());
@@ -515,10 +515,10 @@ impl Journal for FileJournal {
             return Err(DurableError::Journal);
         }
         let (nonce_bytes, ciphertext) = data.split_at(12);
-        let nonce = Nonce::from_slice(nonce_bytes);
+        let nonce: [u8; 12] = nonce_bytes.try_into().map_err(|_| DurableError::Journal)?;
         let plaintext = self
             .cipher
-            .decrypt(nonce, ciphertext)
+            .decrypt(&nonce.into(), ciphertext)
             .map_err(|_| DurableError::Journal)?; // fails closed on tamper / wrong key
         Ok(Some(plaintext))
     }

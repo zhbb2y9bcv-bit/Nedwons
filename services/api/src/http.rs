@@ -20,7 +20,7 @@ use auth_core::ids::{AccountId, DeviceId, TxnId};
 use auth_core::store::AccountDevice;
 use auth_core::{AuthError, AuthService, RegisterRequest};
 use axum::extract::{ConnectInfo, Path, Request, State};
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -52,14 +52,41 @@ pub struct AppState {
     pub social: Arc<PgSocial>,
     notifier: DeliveryNotifier,
     limiter: Arc<IpLimiter>,
+    /// When `Some(h)`, the client IP for rate limiting is taken from header `h` — which MUST be
+    /// set by a trusted reverse proxy. When `None`, the peer socket IP is used and any such header
+    /// is ignored, so a client cannot spoof its IP. See [`build_router_cfg`].
+    trusted_ip_header: Option<HeaderName>,
 }
 
-/// Requests allowed per minute per client IP on `/v1` routes.
+/// Build the router with per-IP rate limiting keyed on the **peer** socket IP (correct when the
+/// service is directly exposed or in tests). Behind a proxy, use [`build_router_cfg`].
 pub fn build_router(
     service: Arc<AuthService>,
     relay: Arc<PgRelay>,
     social: Arc<PgSocial>,
     per_ip_per_minute: u32,
+) -> Router {
+    build_router_cfg(service, relay, social, per_ip_per_minute, None)
+}
+
+/// As [`build_router`], but `trusted_ip_header` selects where the client IP comes from for rate
+/// limiting.
+///
+/// - `None` (default): use the peer socket IP; **ignore** any forwarded header (a client cannot
+///   spoof its address).
+/// - `Some(header)`: read the client IP from `header`, which MUST be overwritten on every request
+///   by a trusted reverse proxy that sets it to the single real client IP (e.g. nginx
+///   `proxy_set_header X-Real-Client-IP $remote_addr;`, or Cloudflare `CF-Connecting-IP`). The
+///   value must be one IP address; a multi-value / malformed header falls back to the peer IP
+///   (fail safe — still limited, just by the proxy). **Only enable this behind such a proxy**
+///   (ABUSE_MODEL.md, RISK_REGISTER R-306) — otherwise clients could forge the header to evade
+///   per-IP limits.
+pub fn build_router_cfg(
+    service: Arc<AuthService>,
+    relay: Arc<PgRelay>,
+    social: Arc<PgSocial>,
+    per_ip_per_minute: u32,
+    trusted_ip_header: Option<HeaderName>,
 ) -> Router {
     let quota =
         Quota::per_minute(NonZeroU32::new(per_ip_per_minute.max(1)).expect("max(1) is non-zero"));
@@ -69,6 +96,7 @@ pub fn build_router(
         social,
         notifier: DeliveryNotifier::default(),
         limiter: Arc::new(RateLimiter::keyed(quota)),
+        trusted_ip_header,
     };
 
     // Relay routes accept larger bodies (opaque envelopes) than auth routes.
@@ -161,17 +189,35 @@ impl From<auth_core::store::StoreError> for ApiError {
 // ----- rate limiting ------------------------------------------------------------------
 
 async fn rate_limit(State(state): State<AppState>, request: Request, next: Next) -> Response {
-    // ConnectInfo is present when served via into_make_service_with_connect_info (the
-    // production path in main.rs). In-process tests without a socket share one bucket.
-    let ip = request
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ci| ci.0.ip())
-        .unwrap_or(IpAddr::from([127, 0, 0, 1]));
+    let ip = client_ip(&request, &state);
     if state.limiter.check_key(&ip).is_err() {
         return ApiError(StatusCode::TOO_MANY_REQUESTS, "rate_limited").into_response();
     }
     next.run(request).await
+}
+
+/// The IP used for rate limiting. Prefers a *trusted* proxy header when configured, else the peer
+/// socket IP. A client-supplied header is only honored when `trusted_ip_header` is set (operator
+/// opt-in), so it can never be used to spoof an address in the default configuration.
+fn client_ip(request: &Request, state: &AppState) -> IpAddr {
+    if let Some(header) = &state.trusted_ip_header {
+        if let Some(ip) = request
+            .headers()
+            .get(header)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<IpAddr>().ok())
+        {
+            return ip;
+        }
+        // Header trusted but absent/malformed: fall back to the peer IP (still limited).
+    }
+    // ConnectInfo is present when served via into_make_service_with_connect_info (the production
+    // path in main.rs). In-process tests without a socket share one bucket.
+    request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip())
+        .unwrap_or(IpAddr::from([127, 0, 0, 1]))
 }
 
 // ----- hex helpers ---------------------------------------------------------------------
