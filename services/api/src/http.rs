@@ -31,7 +31,8 @@ use governor::{Quota, RateLimiter};
 use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
 
-use crate::relay::PgRelay;
+use crate::notify::DeliveryNotifier;
+use crate::relay::{FanoutOutcome, PgRelay};
 
 type IpLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 
@@ -40,10 +41,14 @@ type IpLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultCloc
 const MAX_BODY_BYTES: usize = 8 * 1024;
 const MAX_RELAY_BODY_BYTES: usize = 256 * 1024;
 
+/// Upper bound on inbox long-poll wait, so a client cannot hold a request open forever.
+const MAX_INBOX_WAIT_SECS: u64 = 30;
+
 #[derive(Clone)]
 pub struct AppState {
     pub service: Arc<AuthService>,
     pub relay: Arc<PgRelay>,
+    notifier: DeliveryNotifier,
     limiter: Arc<IpLimiter>,
 }
 
@@ -58,6 +63,7 @@ pub fn build_router(
     let state = AppState {
         service,
         relay,
+        notifier: DeliveryNotifier::default(),
         limiter: Arc::new(RateLimiter::keyed(quota)),
     };
 
@@ -68,6 +74,7 @@ pub fn build_router(
         .route("/v1/conversations", post(create_conversation))
         .route("/v1/conversations/{id}/members", post(add_member))
         .route("/v1/conversations/{id}/messages", post(send_message))
+        .route("/v1/conversations/{id}/welcome", post(send_welcome))
         .route("/v1/inbox", get(fetch_inbox))
         .layer(RequestBodyLimitLayer::new(MAX_RELAY_BODY_BYTES));
 
@@ -409,15 +416,30 @@ struct ConversationDto {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SendMessageBody {
-    recipient_device: String,
-    /// Opaque MLS ciphertext envelope (hex).
+    /// Opaque MLS application ciphertext (hex) — ONE ciphertext the whole group decrypts.
     ciphertext: String,
+    /// 16-byte client-chosen idempotency key (hex); a retry with the same key is a no-op.
+    idempotency_key: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SendWelcomeBody {
+    /// The joining member's device (routing target for the MLS Welcome).
+    recipient_device: String,
+    ciphertext: String,
+    idempotency_key: String,
+}
+
+#[derive(Serialize)]
+struct FanoutReceiptDto {
+    /// Number of recipient devices the ciphertext was newly queued for (0 on an idempotent
+    /// retry). Delivery to the server, NOT a decryption claim.
+    delivered: usize,
 }
 
 #[derive(Serialize)]
 struct ReceiptDto {
-    /// Server-assigned envelope id — proof the server queued the ciphertext, NOT that the
-    /// recipient decrypted it.
     envelope_id: i64,
 }
 
@@ -427,6 +449,13 @@ struct InboxEnvelopeDto {
     conversation_id: String,
     sender_device: String,
     ciphertext: String,
+}
+
+#[derive(Deserialize)]
+struct InboxQuery {
+    /// Long-poll: seconds to wait for new mail before returning empty (0 = return now).
+    #[serde(default)]
+    wait: u64,
 }
 
 /// Publish a key package for the authenticated device.
@@ -516,50 +545,99 @@ async fn add_member(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Send an opaque ciphertext envelope to a member of a conversation. The server stores and
-/// forwards bytes; it does not (and cannot) decrypt them.
+/// Send an MLS application message: ONE ciphertext, fanned out server-side to every other
+/// member device in a single round trip (the client uploads once, not once per recipient).
+/// Idempotent per `idempotency_key`.
 async fn send_message(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(conversation_hex): Path<String>,
     Json(body): Json<SendMessageBody>,
+) -> Result<Json<FanoutReceiptDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let idempotency_key = id16_from_hex(&body.idempotency_key)?;
+    let ciphertext = decode_ciphertext(&body.ciphertext)?;
+
+    let relay = state.relay.clone();
+    let outcome = blocking_store(move || {
+        relay.fanout_message(
+            &conversation_id,
+            &me.device_id,
+            &ciphertext,
+            &idempotency_key,
+        )
+    })
+    .await?;
+    match outcome {
+        FanoutOutcome::Forbidden => Err(forbidden()),
+        FanoutOutcome::Delivered { newly_queued } => {
+            // Wake any long-poll waiters for the recipients that just got mail.
+            for device in &newly_queued {
+                state.notifier.wake(device);
+            }
+            Ok(Json(FanoutReceiptDto {
+                delivered: newly_queued.len(),
+            }))
+        }
+    }
+}
+
+/// Send a targeted MLS Welcome to a specific joining device. Idempotent.
+async fn send_welcome(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+    Json(body): Json<SendWelcomeBody>,
 ) -> Result<Json<ReceiptDto>, ApiError> {
     let me = authed_device(&state, &headers).await?;
     let conversation_id = id16_from_hex(&conversation_hex)?;
     let recipient = DeviceId(id16_from_hex(&body.recipient_device)?);
-    if body.ciphertext.is_empty() || body.ciphertext.len() > MAX_RELAY_BODY_BYTES {
-        return Err(bad_request());
-    }
-    let ciphertext = hex::decode(&body.ciphertext).map_err(|_| bad_request())?;
+    let idempotency_key = id16_from_hex(&body.idempotency_key)?;
+    let ciphertext = decode_ciphertext(&body.ciphertext)?;
 
     let relay = state.relay.clone();
+    let recipient_bytes = recipient.0;
     let envelope_id = blocking_store(move || {
-        // Both sender and recipient must be members (object-level authz, no IDOR).
-        if !relay.is_member(&conversation_id, &me.device_id)?
-            || !relay.is_member(&conversation_id, &recipient)?
-        {
-            return Ok(None);
-        }
-        Ok(Some(relay.send_envelope(
+        relay.send_targeted(
             &conversation_id,
             &me.device_id,
             &recipient,
             &ciphertext,
-        )?))
+            &idempotency_key,
+        )
     })
     .await?
     .ok_or_else(forbidden)?;
+    state.notifier.wake(&recipient_bytes);
     Ok(Json(ReceiptDto { envelope_id }))
 }
 
-/// Fetch (and mark delivered) the authenticated device's queued envelopes.
+/// Fetch the authenticated device's queued envelopes (marks them delivered). With `?wait=N`
+/// this long-polls: it returns immediately if mail is present, otherwise parks until mail
+/// arrives (woken by a send) or `N` seconds elapse — near-zero idle delivery latency without
+/// burning a database connection while waiting.
 async fn fetch_inbox(
     State(state): State<AppState>,
     headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<InboxQuery>,
 ) -> Result<Json<Vec<InboxEnvelopeDto>>, ApiError> {
     let me = authed_device(&state, &headers).await?;
-    let relay = state.relay.clone();
-    let envelopes = blocking_store(move || relay.fetch_inbox(&me.device_id, 100)).await?;
+    let device = me.device_id.0;
+
+    // Register interest BEFORE the first read to avoid a lost-wakeup window.
+    let notified = state.notifier.handle(&device);
+    let mut envelopes = read_inbox(&state, me.device_id).await?;
+
+    if envelopes.is_empty() && query.wait > 0 {
+        let wait = std::time::Duration::from_secs(query.wait.min(MAX_INBOX_WAIT_SECS));
+        tokio::select! {
+            _ = notified.notified() => {}
+            _ = tokio::time::sleep(wait) => {}
+        }
+        envelopes = read_inbox(&state, me.device_id).await?;
+    }
+
     Ok(Json(
         envelopes
             .into_iter()
@@ -571,6 +649,21 @@ async fn fetch_inbox(
             })
             .collect(),
     ))
+}
+
+async fn read_inbox(
+    state: &AppState,
+    device_id: DeviceId,
+) -> Result<Vec<crate::relay::EnvelopeOut>, ApiError> {
+    let relay = state.relay.clone();
+    blocking_store(move || relay.fetch_inbox(&device_id, 100)).await
+}
+
+fn decode_ciphertext(hex_str: &str) -> Result<Vec<u8>, ApiError> {
+    if hex_str.is_empty() || hex_str.len() > MAX_RELAY_BODY_BYTES {
+        return Err(bad_request());
+    }
+    hex::decode(hex_str).map_err(|_| bad_request())
 }
 
 /// Like `blocking`, but for relay store calls that return `StoreResult`.

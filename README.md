@@ -40,13 +40,14 @@ later without redesign.
 4. [SECURITY.md](SECURITY.md) — hardening posture and vulnerability-disclosure process.
 5. [PRIVACY.md](PRIVACY.md) / [DATA_RETENTION.md](DATA_RETENTION.md) / [ABUSE_MODEL.md](ABUSE_MODEL.md).
 6. [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) and [RISK_REGISTER.md](RISK_REGISTER.md).
+7. [PERFORMANCE.md](PERFORMANCE.md) — messaging efficiency: fan-out, long-poll, idempotency, and the counterintuitive pitfalls.
 
 ## Build & test status (this working copy)
 
 | Component | Toolchain present | Compiles here | Tested here |
 |-----------|-------------------|---------------|-------------|
 | `services/auth-core` (Rust) | Rust 1.97.1 stable | ✅ | ✅ `cargo test` — 17 unit + golden vector |
-| `services/api` (Rust: Postgres stores + axum HTTP + E2EE relay) | Rust 1.97.1 + PostgreSQL 17 | ✅ | ✅ 15 integration tests vs **real Postgres** (concurrency races, full HTTP flow, MLS relay with DB no-plaintext check) |
+| `services/api` (Rust: Postgres stores + axum HTTP + E2EE relay) | Rust 1.97.1 + PostgreSQL 17 | ✅ | ✅ 16 integration tests vs **real Postgres** (concurrency races, full HTTP flow, MLS relay + DB no-plaintext, fan-out, idempotency, long-poll) |
 | `core/mls-core` (Rust: OpenMLS E2EE) | Rust 1.97.1 | ✅ | ✅ 3 tests — encrypted exchange, no plaintext in ciphertext, removed-member epoch |
 | `apps/ios/SentinelKit` (Swift crypto/protocol + HTTP client) | Xcode 26.6 / Swift 6.3.3 | ✅ `swift build` | ✅ `swift test` — 7 tests |
 | **Swift client ↔ live backend** (register/login/whoami) | Swift + Rust + Postgres | ✅ | ✅ `scripts/swift_backend_smoke.sh` — SMOKE_OK (incl. INV-2 negative) |

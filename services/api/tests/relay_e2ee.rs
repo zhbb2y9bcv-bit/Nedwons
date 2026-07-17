@@ -91,23 +91,46 @@ async fn mls_message_routed_through_relay_leaves_no_plaintext() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    // Alice sends the Welcome, then an encrypted application message — both opaque envelopes.
+    // Alice sends the Welcome (targeted to Bob), then an encrypted application message
+    // (fanned out server-side to all other members — here just Bob).
     let plaintext = b"the exchange point is under the north bridge".to_vec();
     let ciphertext = alice_group
         .encrypt(&alice_mls, &plaintext)
         .expect("encrypt");
 
-    for envelope in [add.welcome.clone(), ciphertext.clone()] {
-        let (status, receipt) = post_json_auth(
-            &app,
-            &format!("/v1/conversations/{conversation_id}/messages"),
-            alice_token,
-            json!({ "recipient_device": bob_device_hex, "ciphertext": hex::encode(&envelope) }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "send: {receipt}");
-        assert!(receipt["envelope_id"].is_i64() || receipt["envelope_id"].is_u64());
-    }
+    let (status, receipt) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conversation_id}/welcome"),
+        alice_token,
+        json!({
+            "recipient_device": bob_device_hex,
+            "ciphertext": hex::encode(&add.welcome),
+            "idempotency_key": hex::encode([1u8; 16]),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "welcome: {receipt}");
+
+    let (status, receipt) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conversation_id}/messages"),
+        alice_token,
+        json!({ "ciphertext": hex::encode(&ciphertext), "idempotency_key": hex::encode([2u8; 16]) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "message: {receipt}");
+    assert_eq!(receipt["delivered"], 1, "fanned out to Bob");
+
+    // Idempotent retry of the same message is a no-op (0 newly delivered).
+    let (status, retry) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conversation_id}/messages"),
+        alice_token,
+        json!({ "ciphertext": hex::encode(&ciphertext), "idempotency_key": hex::encode([2u8; 16]) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(retry["delivered"], 0, "idempotent retry queues nothing new");
 
     // INV-1 EVIDENCE: the plaintext is nowhere in the stored envelopes.
     assert_no_plaintext_in_db(bob_device_hex.clone(), plaintext.clone()).await;
@@ -156,10 +179,74 @@ async fn non_member_cannot_send_to_conversation() {
         &app,
         &format!("/v1/conversations/{conversation_id}/messages"),
         bob_token,
-        json!({ "recipient_device": alice["device_id"], "ciphertext": hex::encode(b"x") }),
+        json!({ "ciphertext": hex::encode(b"x"), "idempotency_key": hex::encode([9u8; 16]) }),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN, "body: {body}");
+}
+
+/// Long-poll: a waiting inbox returns promptly when a message is sent, without the client
+/// polling — near-zero idle delivery latency. Also proves the notify path wakes the waiter.
+#[tokio::test]
+async fn inbox_long_poll_wakes_on_delivery() {
+    let app = make_app(100_000).await;
+    let (_a, alice) = http_register(&app, &unique_username("lpsender")).await;
+    let (_b, bob) = http_register(&app, &unique_username("lprecv")).await;
+    let alice_token = alice["access_token"].as_str().unwrap().to_string();
+    let bob_token = bob["access_token"].as_str().unwrap().to_string();
+    let bob_account = bob["account_id"].as_str().unwrap().to_string();
+
+    // Bob publishes a key package; Alice sets up a conversation with Bob.
+    let bob_mls = Member::new(b"bob-lp").expect("bob mls");
+    let (status, _) = post_json_auth(
+        &app,
+        "/v1/keypackages",
+        &bob_token,
+        json!({ "key_package": hex::encode(bob_mls.key_package_bytes().unwrap()) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, conv) = post_json_auth(&app, "/v1/conversations", &alice_token, json!({})).await;
+    let conversation_id = conv["conversation_id"].as_str().unwrap().to_string();
+    let (status, _) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conversation_id}/members"),
+        &alice_token,
+        json!({ "account_id": bob_account }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Bob starts a long-poll (up to 10s). Alice sends shortly after; Bob should return well
+    // under the timeout.
+    let app_bob = app.clone();
+    let poll = tokio::spawn(async move {
+        let start = std::time::Instant::now();
+        let (status, inbox) = get_auth(&app_bob, "/v1/inbox?wait=10", &bob_token).await;
+        (status, inbox, start.elapsed())
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (status, _) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conversation_id}/messages"),
+        &alice_token,
+        json!({ "ciphertext": hex::encode(b"ping"), "idempotency_key": hex::encode([7u8; 16]) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, inbox, elapsed) = poll.await.expect("poll task");
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        inbox.as_array().unwrap().len(),
+        1,
+        "long-poll returned the message"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "long-poll should wake on delivery, not wait out the timeout (took {elapsed:?})"
+    );
 }
 
 /// Relay endpoints require authentication.

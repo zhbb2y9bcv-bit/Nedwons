@@ -102,14 +102,23 @@ Body `{}`. Creates a conversation with the caller as first member →
 Caller must be a member; the target device is resolved server-side (never client-asserted).
 
 ### `POST /v1/conversations/{id}/messages` → `200` | `403`
-`{ "recipient_device": "<16B hex>", "ciphertext": "<hex>" }`. Sender and recipient must both
-be members (object-level authz). Returns `{ "envelope_id": <int> }` — a server receipt
-(queued at the server, **not** a decryption claim).
+`{ "ciphertext": "<hex>", "idempotency_key": "<16B hex>" }`. One MLS application ciphertext,
+**fanned out server-side** to every other member device (the client uploads once, not once
+per recipient). Idempotent per key. Returns `{ "delivered": <int> }` — the number of devices
+newly queued (0 on an idempotent retry). Caller must be a member (object-level authz).
 
-### `GET /v1/inbox` → `200`
+### `POST /v1/conversations/{id}/welcome` → `200` | `403`
+`{ "recipient_device": "<16B hex>", "ciphertext": "<hex>", "idempotency_key": "<16B hex>" }`.
+Targeted delivery of an MLS Welcome to a specific joining device. Idempotent; returns
+`{ "envelope_id": <int> }`.
+
+### `GET /v1/inbox[?wait=N]` → `200`
 Returns the caller's undelivered envelopes **in delivery order** and marks them delivered:
 `[ { "id", "conversation_id", "sender_device", "ciphertext" }, … ]`. Ordered delivery is
-required — MLS commits/welcomes must be processed in order.
+required — MLS commits/welcomes must be processed in order. With `?wait=N` (seconds, capped at
+30) this **long-polls**: returns immediately if mail is present, otherwise parks until a send
+wakes it or `N` elapses — near-zero idle delivery latency without holding a DB connection.
 
 `services/api/tests/relay_e2ee.rs` drives this whole flow with real MLS ciphertext and
-verifies, by direct database query, that no plaintext is stored.
+verifies, by direct database query, that no plaintext is stored; it also covers fan-out,
+idempotent retry, and long-poll wake-on-delivery. See [PERFORMANCE.md](../PERFORMANCE.md).

@@ -29,8 +29,33 @@ pub struct ClaimedKeyPackage {
     pub key_package: Vec<u8>,
 }
 
+/// Result of a fanout send.
+pub enum FanoutOutcome {
+    /// The sender is not a member of the conversation.
+    Forbidden,
+    /// Delivered (or already delivered, on an idempotent retry). Carries the recipient
+    /// devices that received a *new* envelope, so only those get woken.
+    Delivered { newly_queued: Vec<[u8; 16]> },
+}
+
 fn db_err(e: postgres::Error) -> StoreError {
     StoreError(format!("relay db: {e}"))
+}
+
+/// Membership check inside an open transaction (so the check and the dependent write are
+/// atomic — a member removed concurrently can't slip a message in).
+fn member_in_txn(
+    txn: &mut postgres::Transaction<'_>,
+    conversation_id: &[u8; 16],
+    device: &[u8],
+) -> StoreResult<bool> {
+    let row = txn
+        .query_opt(
+            "SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND device_id = $2",
+            &[&conversation_id.as_slice(), &device],
+        )
+        .map_err(db_err)?;
+    Ok(row.is_some())
 }
 
 fn id16(bytes: &[u8]) -> StoreResult<[u8; 16]> {
@@ -150,29 +175,100 @@ impl PgRelay {
         Ok(row.is_some())
     }
 
-    /// Store an opaque envelope for a recipient device. Returns the server-assigned id
-    /// (a server receipt — delivery to the server, NOT a decryption claim).
-    pub fn send_envelope(
+    /// Store an opaque envelope for a single recipient device (used for targeted messages
+    /// like MLS Welcomes). Idempotent: a retry with the same `idempotency_key` returns the
+    /// existing envelope id rather than inserting a duplicate. Returns `None` if the sender
+    /// is not a member of the conversation.
+    pub fn send_targeted(
         &self,
         conversation_id: &[u8; 16],
         sender_device: &DeviceId,
         recipient_device: &DeviceId,
         ciphertext: &[u8],
-    ) -> StoreResult<i64> {
+        idempotency_key: &[u8; 16],
+    ) -> StoreResult<Option<i64>> {
         let mut conn = self.conn()?;
-        let row = conn
-            .query_one(
-                "INSERT INTO envelopes (conversation_id, sender_device, recipient_device, ciphertext)
-                 VALUES ($1, $2, $3, $4) RETURNING id",
+        let mut txn = conn.transaction().map_err(db_err)?;
+        if !member_in_txn(&mut txn, conversation_id, sender_device.as_bytes())? {
+            return Ok(None);
+        }
+        // Insert, or on idempotent conflict fetch the existing row's id.
+        let inserted = txn
+            .query_opt(
+                "INSERT INTO envelopes
+                     (conversation_id, sender_device, recipient_device, ciphertext, idempotency_key)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (sender_device, recipient_device, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+                 RETURNING id",
                 &[
                     &conversation_id.as_slice(),
                     &sender_device.as_bytes(),
                     &recipient_device.as_bytes(),
                     &ciphertext,
+                    &idempotency_key.as_slice(),
                 ],
             )
             .map_err(db_err)?;
-        Ok(row.get(0))
+        let id = match inserted {
+            Some(row) => row.get::<_, i64>(0),
+            None => txn
+                .query_one(
+                    "SELECT id FROM envelopes
+                     WHERE sender_device = $1 AND recipient_device = $2 AND idempotency_key = $3",
+                    &[
+                        &sender_device.as_bytes(),
+                        &recipient_device.as_bytes(),
+                        &idempotency_key.as_slice(),
+                    ],
+                )
+                .map_err(db_err)?
+                .get::<_, i64>(0),
+        };
+        txn.commit().map_err(db_err)?;
+        Ok(Some(id))
+    }
+
+    /// Fan out one ciphertext to every OTHER member device of a conversation in a single
+    /// round trip and a single statement (`INSERT ... SELECT ... ON CONFLICT DO NOTHING`).
+    /// This matches MLS semantics — an application message is one ciphertext the whole group
+    /// decrypts — so the client uploads once instead of once per recipient. Idempotent per
+    /// `idempotency_key`.
+    pub fn fanout_message(
+        &self,
+        conversation_id: &[u8; 16],
+        sender_device: &DeviceId,
+        ciphertext: &[u8],
+        idempotency_key: &[u8; 16],
+    ) -> StoreResult<FanoutOutcome> {
+        let mut conn = self.conn()?;
+        let mut txn = conn.transaction().map_err(db_err)?;
+        if !member_in_txn(&mut txn, conversation_id, sender_device.as_bytes())? {
+            return Ok(FanoutOutcome::Forbidden);
+        }
+        let rows = txn
+            .query(
+                "INSERT INTO envelopes
+                     (conversation_id, sender_device, recipient_device, ciphertext, idempotency_key)
+                 SELECT $1, $2, cm.device_id, $3, $4
+                 FROM conversation_members cm
+                 WHERE cm.conversation_id = $1 AND cm.device_id <> $2
+                 ON CONFLICT (sender_device, recipient_device, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
+                 RETURNING recipient_device",
+                &[
+                    &conversation_id.as_slice(),
+                    &sender_device.as_bytes(),
+                    &ciphertext,
+                    &idempotency_key.as_slice(),
+                ],
+            )
+            .map_err(db_err)?;
+        txn.commit().map_err(db_err)?;
+
+        let newly_queued = rows
+            .into_iter()
+            .map(|r| id16(r.get::<_, &[u8]>(0)))
+            .collect::<StoreResult<Vec<_>>>()?;
+        Ok(FanoutOutcome::Delivered { newly_queued })
     }
 
     /// Fetch and mark-delivered the undelivered envelopes for a device (in order).
