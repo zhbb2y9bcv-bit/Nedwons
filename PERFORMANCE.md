@@ -34,7 +34,24 @@ Every send carries a 16-byte `idempotency_key`. A retry after a dropped response
 (unique index `(sender_device, recipient_device, idempotency_key)`), so clients can retry
 **immediately and aggressively** instead of using conservative long backoffs to avoid
 duplicates. Faster recovery from transient loss, and no duplicate messages. Tested: the
-idempotent-retry assertion (`delivered == 0` on replay).
+idempotent-retry assertion (`delivered == 0` on replay) and a 10-way concurrent duplicate
+storm that still queues exactly one envelope (`load.rs`).
+
+### 4. WebSocket streaming push (`GET /v1/stream`)
+For a foregrounded app, long-poll's one-round-trip-per-batch is still a round trip. The
+authenticated WebSocket at `/v1/stream` pushes new envelopes the **instant** they arrive
+(woken by the same `DeliveryNotifier`), and the client acks over the same socket. Same
+at-least-once semantics; unacked envelopes re-deliver on reconnect. Tested against a real
+bound socket (`ws_stream.rs`): a message sent while connected arrives in well under a second.
+
+### 5. At-least-once delivery (peek + explicit ack)
+The inbox is now **non-destructive**: `GET /v1/inbox` peeks without marking delivered, and
+the client calls `POST /v1/inbox/ack` after it has *durably persisted* the messages. A client
+that crashes between peek and persist simply re-peeks — nothing is lost. The old mark-on-fetch
+model silently dropped mail if the response was lost. Acks are scoped to the caller's own
+device (a client can't ack another device's mail) and marking-delivered makes envelopes
+eligible for retention purge (DATA_RETENTION.md). Tested: `peek_is_non_destructive_until_ack`
+(re-peek returns the same mail; cross-device ack is a no-op; own ack drains).
 
 ## Counterintuitive choices (where the obvious optimization is wrong)
 
@@ -67,13 +84,20 @@ idempotent-retry assertion (`delivered == 0` on replay).
 - **HTTP keep-alive / TLS reuse**: `URLSession` (client) and hyper (server) reuse connections
   by default, amortizing TLS handshakes across messages.
 
+## Load/soak evidence (bounded tests in `load.rs`)
+
+- **Group fan-out** to 12 members: one upload delivers to all 12 (`delivered == 12`).
+- **Idempotency under concurrency**: 10 simultaneous duplicate sends queue exactly one row.
+- **Idle waiters hold no DB connection**: 30 parked long-poll waiters (> the 24-connection
+  pool) still deliver promptly. If parking held a connection, the pool would be exhausted and
+  the send would deadlock — so this is a direct proof of the zero-idle-cost claim.
+
 ## Worthwhile next steps (not yet done)
 
-- **WebSocket (or WebTransport) delivery** to replace long-poll for sub-100 ms push and to
-  carry typing/presence cheaply. Long-poll is the stepping stone.
-- **Explicit delivery ack** so the server purges delivered ciphertext on client confirmation
-  (DATA_RETENTION.md) rather than on fetch — turns at-most-once fetch into at-least-once with
-  client dedup, preventing loss if a client crashes mid-fetch.
+- **WebTransport / QUIC** and multiplexed streams beyond the current WebSocket, plus carrying
+  typing/presence over the same channel.
+- **Cross-instance delivery signal** (PostgreSQL `LISTEN/NOTIFY` or a bus) so the notifier
+  works across multiple API instances, not just in-process.
 - **Prepared-statement reuse** for the hottest queries (the sync `postgres` client re-parses
   string queries; caching `Statement` handles per pooled connection removes a parse per call).
 - **Batch key-package claim / prekey prefetch** so adding several members is one round trip.

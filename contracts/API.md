@@ -113,12 +113,25 @@ Targeted delivery of an MLS Welcome to a specific joining device. Idempotent; re
 `{ "envelope_id": <int> }`.
 
 ### `GET /v1/inbox[?wait=N]` → `200`
-Returns the caller's undelivered envelopes **in delivery order** and marks them delivered:
-`[ { "id", "conversation_id", "sender_device", "ciphertext" }, … ]`. Ordered delivery is
-required — MLS commits/welcomes must be processed in order. With `?wait=N` (seconds, capped at
-30) this **long-polls**: returns immediately if mail is present, otherwise parks until a send
-wakes it or `N` elapses — near-zero idle delivery latency without holding a DB connection.
+**Peeks** the caller's undelivered envelopes **in delivery order** WITHOUT marking them
+delivered: `[ { "id", "conversation_id", "sender_device", "ciphertext" }, … ]`. Ordered
+delivery is required — MLS commits/welcomes must be processed in order. The client persists
+them locally and then calls `/v1/inbox/ack`; a crash between peek and persist loses nothing
+(at-least-once). With `?wait=N` (seconds, capped at 30) this **long-polls**: returns
+immediately if mail is present, otherwise parks until a send wakes it or `N` elapses —
+near-zero idle latency without holding a DB connection.
 
-`services/api/tests/relay_e2ee.rs` drives this whole flow with real MLS ciphertext and
-verifies, by direct database query, that no plaintext is stored; it also covers fan-out,
-idempotent retry, and long-poll wake-on-delivery. See [PERFORMANCE.md](../PERFORMANCE.md).
+### `POST /v1/inbox/ack` → `204`
+`{ "ids": [<envelope id>, …] }`. Acknowledge durably-persisted envelopes so they stop being
+served and become eligible for retention purge. Scoped to the caller's own device; idempotent.
+
+### `GET /v1/stream` (WebSocket)
+Upgrade with `Authorization: Bearer <access-token hex>` on the handshake. The server **pushes**
+new envelopes the instant they arrive (sub-second, no polling): server→client
+`{ "envelopes": [ … ] }`, client→server `{ "ack": [<id>, …] }`. Same at-least-once queue as
+HTTP — unacked envelopes re-deliver on reconnect. Unauthenticated upgrades are rejected.
+
+`services/api/tests/{relay_e2ee,ws_stream,load}.rs` drive these flows with real MLS
+ciphertext and verify, by direct database query, that no plaintext is stored; they also cover
+fan-out, idempotent retry, long-poll and WebSocket wake-on-delivery, at-least-once peek/ack,
+and idle-waiters-exceed-pool. See [PERFORMANCE.md](../PERFORMANCE.md).
