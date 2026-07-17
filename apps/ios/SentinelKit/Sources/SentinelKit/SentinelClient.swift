@@ -203,6 +203,15 @@ public struct GroupCreated: Decodable, Sendable {
     }
 }
 
+public struct Conversation: Decodable, Sendable, Identifiable {
+    public let conversationID: String
+    public let memberAccountIDs: [String]
+    public var id: String { conversationID }
+    enum CodingKeys: String, CodingKey {
+        case conversationID = "conversation_id", memberAccountIDs = "member_account_ids"
+    }
+}
+
 public struct InboxEnvelope: Decodable, Sendable, Identifiable {
     public let id: Int
     public let conversationID: String
@@ -269,6 +278,11 @@ public extension SentinelClient {
     }
 
     // ----- groups & messaging -----
+
+    /// The conversations this device belongs to (for the Chats list).
+    func listConversations(accessToken: String) async throws -> [Conversation] {
+        try decode(await perform(authed("GET", "/v1/conversations", accessToken: accessToken)))
+    }
 
     /// Create a group; the server rejects with 403 unless all members are mutual friends.
     func createGroup(accessToken: String, memberAccountIDs: [String]) async throws -> GroupCreated {

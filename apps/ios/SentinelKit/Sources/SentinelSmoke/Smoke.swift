@@ -109,6 +109,15 @@ struct SentinelSmoke {
             }
             try await client.ackInbox(accessToken: bob.accessToken, ids: [inbox[0].id])
 
+            // The group shows up in both members' conversation lists (Chats tab).
+            let aliceConvos = try await client.listConversations(accessToken: registered.accessToken)
+            let bobConvos = try await client.listConversations(accessToken: bob.accessToken)
+            guard aliceConvos.contains(where: { $0.conversationID == group.conversationID }),
+                  bobConvos.contains(where: { $0.conversationID == group.conversationID })
+            else {
+                fail("group missing from a member's conversation list")
+            }
+
             // A group including a NON-friend must be rejected (clique gate).
             let strangerSigner = SoftwareDeviceSigner()
             let stranger = try await client.register(

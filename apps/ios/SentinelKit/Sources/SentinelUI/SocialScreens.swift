@@ -108,21 +108,27 @@ struct ChatsView: View {
 
     var body: some View {
         NavigationStack {
-            VStack(spacing: Sentinel.Spacing.lg) {
-                Spacer()
-                Image(systemName: "lock.rectangle.stack.fill")
-                    .font(.system(size: 44))
-                    .foregroundStyle(palette.accentPrimary)
-                Text("Start an encrypted group")
-                    .font(Sentinel.TypeScale.headline)
-                Text("You can add anyone you're both friends with.")
-                    .font(Sentinel.TypeScale.callout)
-                    .foregroundStyle(palette.textSecondary)
-                PrimaryButton("New group", palette: palette) { showNewGroup = true }
-                    .frame(maxWidth: 240)
-                Spacer()
+            Group {
+                if model.conversations.isEmpty {
+                    emptyState
+                } else {
+                    List(model.conversations) { conversation in
+                        HStack(spacing: Sentinel.Spacing.md) {
+                            Image(systemName: conversation.memberAccountIDs.count > 2
+                                ? "person.3.fill" : "person.fill")
+                                .foregroundStyle(palette.accentPrimary)
+                            VStack(alignment: .leading, spacing: Sentinel.Spacing.xxs) {
+                                Text(conversation.memberAccountIDs.count > 1
+                                    ? "Group · \(conversation.memberAccountIDs.count + 1) people"
+                                    : "Conversation")
+                                    .font(Sentinel.TypeScale.body)
+                                    .foregroundStyle(palette.textPrimary)
+                                SecurityBadge(.encrypted, palette: palette)
+                            }
+                        }
+                    }
+                }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(palette.background)
             .navigationTitle("Chats")
             .toolbar {
@@ -138,7 +144,27 @@ struct ChatsView: View {
             .sheet(isPresented: $showNewGroup) {
                 NewGroupView(model: model)
             }
+            .task { await model.refreshConversations() }
+            .refreshable { await model.refreshConversations() }
         }
+    }
+
+    private var emptyState: some View {
+        VStack(spacing: Sentinel.Spacing.lg) {
+            Spacer()
+            Image(systemName: "lock.rectangle.stack.fill")
+                .font(.system(size: 44))
+                .foregroundStyle(palette.accentPrimary)
+            Text("Start an encrypted group")
+                .font(Sentinel.TypeScale.headline)
+            Text("You can add anyone you're both friends with.")
+                .font(Sentinel.TypeScale.callout)
+                .foregroundStyle(palette.textSecondary)
+            PrimaryButton("New group", palette: palette) { showNewGroup = true }
+                .frame(maxWidth: 240)
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 

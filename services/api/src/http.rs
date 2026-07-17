@@ -75,7 +75,10 @@ pub fn build_router(
     let relay_routes = Router::new()
         .route("/v1/keypackages", post(publish_key_package))
         .route("/v1/keypackages/claim", post(claim_key_package))
-        .route("/v1/conversations", post(create_conversation))
+        .route(
+            "/v1/conversations",
+            post(create_conversation).get(list_conversations),
+        )
         .route("/v1/conversations/{id}/members", post(add_member))
         .route("/v1/conversations/{id}/messages", post(send_message))
         .route("/v1/conversations/{id}/welcome", post(send_welcome))
@@ -515,6 +518,31 @@ async fn claim_key_package(
         device_id: hex::encode(claimed.device_id),
         key_package: hex::encode(claimed.key_package),
     }))
+}
+
+#[derive(Serialize)]
+struct ConversationSummaryDto {
+    conversation_id: String,
+    member_account_ids: Vec<String>,
+}
+
+/// List the conversations the authenticated device belongs to (for the Chats list).
+async fn list_conversations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ConversationSummaryDto>>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let relay = state.relay.clone();
+    let convos = blocking_store(move || relay.list_conversations(&me.device_id)).await?;
+    Ok(Json(
+        convos
+            .into_iter()
+            .map(|c| ConversationSummaryDto {
+                conversation_id: hex::encode(c.conversation_id),
+                member_account_ids: c.member_account_ids.iter().map(hex::encode).collect(),
+            })
+            .collect(),
+    ))
 }
 
 /// Create a conversation with the authenticated device as the first member.
