@@ -277,6 +277,47 @@ public extension SentinelClient {
         try await postAccountRefVoid("/v1/friends/remove", accessToken, accountID)
     }
 
+    // ----- blocking & reporting -----
+
+    /// Block an account: severs any friendship and refuses future requests (server enforces).
+    func blockUser(accessToken: String, accountID: String) async throws {
+        try await postAccountRefVoid("/v1/blocks", accessToken, accountID)
+    }
+
+    /// Remove a block (does not restore prior friendship).
+    func unblock(accessToken: String, accountID: String) async throws {
+        try await postAccountRefVoid("/v1/blocks/remove", accessToken, accountID)
+    }
+
+    /// Accounts this user has blocked.
+    func listBlocked(accessToken: String) async throws -> [ProfileSummary] {
+        try decode(await perform(authed("GET", "/v1/blocks", accessToken: accessToken)))
+    }
+
+    /// File an abuse report. `evidence` is only what the user chooses to include — the server
+    /// cannot read E2EE content. Returns the server-assigned report id.
+    @discardableResult
+    func reportUser(
+        accessToken: String,
+        accountID: String,
+        reason: String,
+        evidence: String? = nil
+    ) async throws -> Int {
+        struct Body: Encodable {
+            let account_id: String
+            let reason: String
+            let evidence: String?
+        }
+        struct Res: Decodable { let report_id: Int }
+        var request = authed("POST", "/v1/reports", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            Body(account_id: accountID, reason: reason, evidence: evidence)
+        )
+        let res: Res = try decode(await perform(request))
+        return res.report_id
+    }
+
     // ----- groups & messaging -----
 
     /// The conversations this device belongs to (for the Chats list).
