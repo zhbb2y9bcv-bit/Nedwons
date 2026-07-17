@@ -24,6 +24,7 @@ pub mod password;
 pub mod service;
 pub mod store;
 pub mod transcript;
+pub mod transparency;
 
 pub use error::{AuthError, Result};
 pub use ids::{AccountId, DeviceId, FamilyId, TxnId};
