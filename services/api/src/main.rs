@@ -96,21 +96,27 @@ async fn serve(
     relay: Arc<sentinel_api::relay::PgRelay>,
     social: Arc<sentinel_api::social::PgSocial>,
 ) {
-    // Retention hygiene: purge expired challenges/access tokens every minute
-    // (DATA_RETENTION.md). Failure is logged and retried next tick — never fatal.
+    // Retention hygiene (DATA_RETENTION.md): every minute purge expired challenges/access
+    // tokens AND stale envelopes past the 30-day queue TTL. Failure is logged and retried
+    // next tick — never fatal.
     {
         let stores = stores.clone();
+        let relay = relay.clone();
         tokio::spawn(async move {
+            const ENVELOPE_TTL_DAYS: i32 = 30;
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 tick.tick().await;
                 let stores = stores.clone();
+                let relay = relay.clone();
                 let purged = tokio::task::spawn_blocking(move || {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
-                    stores.purge_expired(now)
+                    let auth = stores.purge_expired(now)?;
+                    let mail = relay.purge_stale_envelopes(ENVELOPE_TTL_DAYS)?;
+                    Ok::<u64, auth_core::store::StoreError>(auth + mail)
                 })
                 .await;
                 match purged {

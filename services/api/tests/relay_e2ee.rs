@@ -342,3 +342,97 @@ async fn relay_requires_auth() {
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
+
+/// DATA_RETENTION.md: an ack must PURGE the envelope row (the device is the store — the server
+/// must not retain delivered ciphertext), and undelivered envelopes past the queue TTL are
+/// deleted by the retention job.
+#[tokio::test]
+async fn ack_deletes_rows_and_ttl_purges_stale_mail() {
+    let app = make_app(100_000).await;
+    let (_a, alice) = http_register(&app, &unique_username("reta")).await;
+    let (_b, bob) = http_register(&app, &unique_username("retb")).await;
+    let alice_token = alice["access_token"].as_str().unwrap();
+    let bob_token = bob["access_token"].as_str().unwrap();
+    let bob_account = bob["account_id"].as_str().unwrap();
+    let bob_device_hex = bob["device_id"].as_str().unwrap().to_string();
+
+    let (_, conv) = post_json_auth(&app, "/v1/conversations", alice_token, json!({})).await;
+    let conversation_id = conv["conversation_id"].as_str().unwrap();
+    let (status, _) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conversation_id}/members"),
+        alice_token,
+        json!({ "account_id": bob_account }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // First message: peek + ack, then the row must be GONE from the DB (not merely hidden).
+    let (status, _) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conversation_id}/messages"),
+        alice_token,
+        json!({ "ciphertext": hex::encode(b"acked-away"), "idempotency_key": hex::encode([11u8; 16]) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, inbox) = get_auth(&app, "/v1/inbox", bob_token).await;
+    let id = inbox[0]["id"].as_i64().unwrap();
+    let (status, _) =
+        post_json_auth(&app, "/v1/inbox/ack", bob_token, json!({ "ids": [id] })).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let device_hex = bob_device_hex.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut client = postgres::Client::connect(&db_url(), postgres::NoTls).expect("db");
+        let device = hex::decode(&device_hex).expect("hex");
+        let rows = client
+            .query(
+                "SELECT 1 FROM envelopes WHERE recipient_device = $1",
+                &[&device],
+            )
+            .expect("query");
+        assert!(
+            rows.is_empty(),
+            "acked envelope must be DELETED, not retained"
+        );
+    })
+    .await
+    .expect("db check");
+
+    // Second message: never acked. Backdate past the 30-day TTL and run the retention purge.
+    let (status, _) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conversation_id}/messages"),
+        alice_token,
+        json!({ "ciphertext": hex::encode(b"stale"), "idempotency_key": hex::encode([12u8; 16]) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let device_hex = bob_device_hex.clone();
+    let purged = tokio::task::spawn_blocking(move || {
+        let mut client = postgres::Client::connect(&db_url(), postgres::NoTls).expect("db");
+        let device = hex::decode(&device_hex).expect("hex");
+        client
+            .execute(
+                "UPDATE envelopes SET created_at = now() - interval '31 days'
+                 WHERE recipient_device = $1",
+                &[&device],
+            )
+            .expect("backdate");
+        common::shared_relay()
+            .purge_stale_envelopes(30)
+            .expect("purge")
+    })
+    .await
+    .expect("purge task");
+    assert!(purged >= 1, "TTL purge must remove the stale envelope");
+
+    let (_, drained) = get_auth(&app, "/v1/inbox", bob_token).await;
+    assert_eq!(
+        drained.as_array().unwrap().len(),
+        0,
+        "stale envelope must be gone after TTL purge"
+    );
+}
