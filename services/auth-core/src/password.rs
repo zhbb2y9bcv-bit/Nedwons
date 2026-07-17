@@ -17,6 +17,43 @@ const MEMORY_KIB: u32 = 19_456;
 const ITERATIONS: u32 = 2;
 const PARALLELISM: u32 = 1;
 
+/// Password policy per NIST SP 800-63B: prioritize length, no composition puzzles, no
+/// periodic rotation. NIST's floor is 8 characters with 15 recommended; the product policy
+/// here is a 12-character minimum. The generous maximum supports long passphrases and
+/// password managers (Argon2 cost is length-independent after hashing input).
+pub const MIN_PASSWORD_CHARS: usize = 12;
+pub const MAX_PASSWORD_BYTES: usize = 1024;
+
+/// A small embedded blocklist of the most common passwords/patterns that satisfy the
+/// length rule. This is a floor, not the ceiling: production must layer a real compromised-
+/// credential list (e.g. a k-anonymity range query) — tracked in RISK_REGISTER R-305.
+const COMMON_PASSWORDS: &[&str] = &[
+    "password1234",
+    "password12345",
+    "123456789012",
+    "qwertyuiop12",
+    "iloveyou1234",
+    "adminadmin12",
+    "letmeinplease",
+    "changemeplease",
+    "correcthorsebatterystaple", // famous example phrase — widely guessed
+    "welcome12345",
+    "sunshine1234",
+    "trustno1trustno1",
+];
+
+/// Validate a candidate password against the policy. Case-insensitive blocklist match.
+pub fn validate_password_policy(password: &str) -> Result<(), AuthError> {
+    if password.chars().count() < MIN_PASSWORD_CHARS || password.len() > MAX_PASSWORD_BYTES {
+        return Err(AuthError::WeakPassword);
+    }
+    let lowered = password.to_lowercase();
+    if COMMON_PASSWORDS.contains(&lowered.as_str()) {
+        return Err(AuthError::WeakPassword);
+    }
+    Ok(())
+}
+
 /// Build the Argon2id hasher with our fixed, recorded parameters.
 pub(crate) fn hasher() -> Argon2<'static> {
     // `Params::new` only fails on out-of-range constants; ours are valid, so a failure is a

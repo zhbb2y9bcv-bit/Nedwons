@@ -1,0 +1,40 @@
+[package]
+name = "sentinel-api"
+version = "0.1.0"
+description = "Sentinel backend: PostgreSQL-backed stores and the HTTP authentication API."
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+auth-core = { path = "../auth-core" }
+
+# HTTP
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["limit", "timeout"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+
+# Storage — synchronous postgres + r2d2 pool. Security logic (Argon2, signature checks)
+# is CPU-bound and runs in spawn_blocking anyway, so a sync DB client keeps auth-core's
+# storage seam synchronous and simple (ADR-0006).
+postgres = "0.19"
+r2d2 = "0.8"
+r2d2_postgres = "0.18"
+refinery = { version = "0.9", features = ["postgres"] }
+
+# Rate limiting (GCRA) — vetted implementation, not hand-rolled.
+governor = "0.10"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+p256 = { version = "0.13", features = ["ecdsa"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
