@@ -20,6 +20,11 @@ openmls_basic_credential = "0.5"
 openmls_traits = "0.5"
 thiserror = "1"
 # Durable client state (crash-safe state machine): serialize the coupled MLS-store snapshot +
-# message/queue metadata as one atomically-committed blob. No crypto here — persistence only.
+# message/queue metadata as one atomically-committed blob.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# At-rest encryption for the local store (FileJournal). Vetted RustCrypto AES-256-GCM — no custom
+# crypto; same crate family OpenMLS's provider already uses. The key comes from the caller (on
+# device: the Keychain-wrapped local key hierarchy, CRYPTOGRAPHY.md §5).
+aes-gcm = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
