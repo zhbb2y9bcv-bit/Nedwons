@@ -1,0 +1,8 @@
+# Published at https://<domain>/.well-known/security.txt (RFC 9116).
+# Placeholder values below MUST be replaced with real, monitored endpoints before launch.
+Contact: mailto:security@example.invalid
+Expires: 2027-01-01T00:00:00.000Z
+Preferred-Languages: en
+Canonical: https://<domain>/.well-known/security.txt
+Policy: https://<domain>/security-policy
+# We support coordinated disclosure. Do not test against accounts or data you do not own.
