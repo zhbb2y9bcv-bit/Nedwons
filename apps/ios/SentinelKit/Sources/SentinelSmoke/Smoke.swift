@@ -135,6 +135,40 @@ struct SentinelSmoke {
                 fail("unexpected error on non-friend group: \(error)")
             }
 
+            // --- Abuse controls: block + report ---
+
+            // Alice blocks Bob → Bob leaves her friends and appears in her block list.
+            try await client.blockUser(accessToken: registered.accessToken, accountID: bob.accountID)
+            let blockedList = try await client.listBlocked(accessToken: registered.accessToken)
+            guard blockedList.contains(where: { $0.accountID == bob.accountID }) else {
+                fail("Bob missing from Alice's block list")
+            }
+            let friendsAfterBlock = try await client.listFriends(accessToken: registered.accessToken)
+            guard !friendsAfterBlock.contains(where: { $0.accountID == bob.accountID }) else {
+                fail("block did not sever the friendship")
+            }
+
+            // A blocked user cannot send a friend request (server enforces, 403).
+            do {
+                _ = try await client.sendFriendRequest(
+                    accessToken: bob.accessToken, accountID: registered.accountID
+                )
+                fail("a blocked user was able to send a friend request")
+            } catch let SentinelClient.ClientError.http(status, _) where status == 403 {
+                // expected: blocked
+            } catch {
+                fail("unexpected error on blocked friend request: \(error)")
+            }
+
+            // Alice reports Bob; evidence is reporter-chosen (the server can't read E2EE content).
+            let reportID = try await client.reportUser(
+                accessToken: registered.accessToken,
+                accountID: bob.accountID,
+                reason: "spam",
+                evidence: "reporter-chosen excerpt"
+            )
+            guard reportID >= 1 else { fail("report id not assigned") }
+
             print("SMOKE_OK")
         } catch {
             fail("\(error)")

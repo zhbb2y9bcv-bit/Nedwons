@@ -15,6 +15,7 @@ public final class AppModel: ObservableObject {
     @Published public var friends: [ProfileSummary] = []
     @Published public var incomingRequests: [ProfileSummary] = []
     @Published public var searchResults: [ProfileSummary] = []
+    @Published public var blocked: [ProfileSummary] = []
     @Published public var conversations: [Conversation] = []
     @Published public var inbox: [InboxEnvelope] = []
     @Published public var isBusy = false
@@ -112,6 +113,7 @@ public final class AppModel: ObservableObject {
         friends = []
         incomingRequests = []
         searchResults = []
+        blocked = []
         inbox = []
         deviceAssurance = nil
     }
@@ -121,6 +123,7 @@ public final class AppModel: ObservableObject {
         myProfile = try? await client.myProfile(accessToken: token)
         friends = (try? await client.listFriends(accessToken: token)) ?? []
         incomingRequests = (try? await client.friendRequests(accessToken: token)) ?? []
+        blocked = (try? await client.listBlocked(accessToken: token)) ?? []
         conversations = (try? await client.listConversations(accessToken: token)) ?? []
     }
 
@@ -186,6 +189,38 @@ public final class AppModel: ObservableObject {
             guard let token else { return }
             friends = try await client.listFriends(accessToken: token)
             incomingRequests = try await client.friendRequests(accessToken: token)
+        }
+    }
+
+    // MARK: Blocking & reporting
+
+    /// Block an account: the server severs any friendship and refuses future requests.
+    public func block(_ accountID: String) async {
+        await run { [self] in
+            guard let token else { return }
+            try await client.blockUser(accessToken: token, accountID: accountID)
+            friends = try await client.listFriends(accessToken: token)
+            blocked = try await client.listBlocked(accessToken: token)
+            banner = "Blocked."
+        }
+    }
+
+    public func unblock(_ accountID: String) async {
+        await run { [self] in
+            guard let token else { return }
+            try await client.unblock(accessToken: token, accountID: accountID)
+            blocked = try await client.listBlocked(accessToken: token)
+        }
+    }
+
+    /// File an abuse report. `evidence` is only what the user chooses to submit (E2EE-safe).
+    public func report(_ accountID: String, reason: String, evidence: String? = nil) async {
+        await run { [self] in
+            guard let token else { return }
+            _ = try await client.reportUser(
+                accessToken: token, accountID: accountID, reason: reason, evidence: evidence
+            )
+            banner = "Report submitted."
         }
     }
 
