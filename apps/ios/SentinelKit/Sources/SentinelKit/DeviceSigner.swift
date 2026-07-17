@@ -32,6 +32,11 @@ public struct SoftwareDeviceSigner: DeviceSigner {
 
     public var publicKeyX963: Data { privateKey.publicKey.x963Representation }
 
+    /// Raw private-key bytes, for persisting the **software fallback** key so the same key is
+    /// reused across launches (login must sign with the *enrolled* key — INV-2). Hardware keys
+    /// are never exportable and expose no equivalent; this exists only on the software path.
+    public var rawRepresentation: Data { privateKey.rawRepresentation }
+
     public func sign(_ message: Data) throws -> Data {
         try privateKey.signature(for: message).rawRepresentation
     }

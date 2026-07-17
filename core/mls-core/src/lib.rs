@@ -48,8 +48,7 @@ impl Member {
     /// Create a fresh identity. `identity` is the credential's identity bytes (e.g. a device
     /// record id); it is not a secret.
     pub fn new(identity: &[u8]) -> Result<Self> {
-        let signer =
-            SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).map_err(lib)?;
+        let signer = SignatureKeyPair::new(CIPHERSUITE.signature_algorithm()).map_err(lib)?;
         let provider = OpenMlsRustCrypto::default();
         signer.store(provider.storage()).map_err(lib)?;
         let credential = CredentialWithKey {
@@ -72,7 +71,12 @@ impl Member {
     /// in Signal terms). Serialized bytes are published to the key-directory service.
     pub fn key_package(&self) -> Result<KeyPackage> {
         let bundle = KeyPackage::builder()
-            .build(CIPHERSUITE, &self.provider, &self.signer, self.credential.clone())
+            .build(
+                CIPHERSUITE,
+                &self.provider,
+                &self.signer,
+                self.credential.clone(),
+            )
             .map_err(lib)?;
         Ok(bundle.key_package().clone())
     }
@@ -96,7 +100,8 @@ impl Member {
 
     /// Join a group from a serialized Welcome (produced by [`Conversation::add_member`]).
     pub fn join_from_welcome(&self, mut welcome_bytes: &[u8]) -> Result<Conversation> {
-        let message = MlsMessageIn::tls_deserialize(&mut welcome_bytes).map_err(|_| MlsError::Codec)?;
+        let message =
+            MlsMessageIn::tls_deserialize(&mut welcome_bytes).map_err(|_| MlsError::Codec)?;
         let welcome = match message.extract() {
             MlsMessageBodyIn::Welcome(welcome) => welcome,
             _ => return Err(MlsError::Codec),
@@ -158,15 +163,21 @@ impl Conversation {
         self.group.merge_pending_commit(&me.provider).map_err(lib)?;
 
         Ok(AddResult {
-            commit: commit.tls_serialize_detached().map_err(|_| MlsError::Codec)?,
-            welcome: welcome.tls_serialize_detached().map_err(|_| MlsError::Codec)?,
+            commit: commit
+                .tls_serialize_detached()
+                .map_err(|_| MlsError::Codec)?,
+            welcome: welcome
+                .tls_serialize_detached()
+                .map_err(|_| MlsError::Codec)?,
         })
     }
 
     /// Remove the member whose credential identity matches `identity`. Returns the commit to
     /// fan out; the epoch advances so the removed member cannot decrypt future messages.
     pub fn remove_member(&mut self, me: &Member, identity: &[u8]) -> Result<Vec<u8>> {
-        let leaf = self.leaf_for_identity(identity).ok_or(MlsError::MemberNotFound)?;
+        let leaf = self
+            .leaf_for_identity(identity)
+            .ok_or(MlsError::MemberNotFound)?;
         let (commit, _welcome, _info) = self
             .group
             .remove_members(&me.provider, &me.signer, &[leaf])

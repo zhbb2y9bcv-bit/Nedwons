@@ -18,7 +18,11 @@ fn two_members_exchange_encrypted_message() {
 
     // Bob joins from the welcome.
     let mut bob_group = bob.join_from_welcome(&add.welcome).expect("bob joins");
-    assert_eq!(alice_group.epoch(), bob_group.epoch(), "same epoch after join");
+    assert_eq!(
+        alice_group.epoch(),
+        bob_group.epoch(),
+        "same epoch after join"
+    );
 
     // Alice encrypts a message.
     let plaintext = b"meet me at the safehouse at 0300";
@@ -82,7 +86,9 @@ fn removed_member_cannot_read_future_messages() {
     bob_group
         .process(&bob, &add_carol.commit)
         .expect("bob processes add-carol commit");
-    let mut carol_group = carol.join_from_welcome(&add_carol.welcome).expect("carol joins");
+    let mut carol_group = carol
+        .join_from_welcome(&add_carol.welcome)
+        .expect("carol joins");
 
     let epoch_before = alice_group.epoch();
 
@@ -91,7 +97,10 @@ fn removed_member_cannot_read_future_messages() {
     let remove_commit = alice_group
         .remove_member(&alice, b"bob")
         .expect("remove bob");
-    assert!(alice_group.epoch() > epoch_before, "epoch advances on removal");
+    assert!(
+        alice_group.epoch() > epoch_before,
+        "epoch advances on removal"
+    );
 
     // Carol applies the removal commit and stays in the group.
     carol_group

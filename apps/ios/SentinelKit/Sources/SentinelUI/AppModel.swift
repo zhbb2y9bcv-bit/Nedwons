@@ -4,9 +4,10 @@ import SwiftUI
 
 /// Observable app state that backs the UI. Every button calls one of these async methods,
 /// which call `SentinelClient` against the backend — so the controls are functionally wired,
-/// not decorative. On device, `signIn`/`register` use a `SecureEnclaveDeviceSigner` and the
-/// session is persisted in the Keychain; the scaffold uses the software signer so the flow
-/// type-checks and runs headlessly.
+/// not decorative. The device proof-of-possession key is provisioned and reloaded through
+/// `DeviceIdentity`: registration enrolls the Secure Enclave key when the hardware exists (else
+/// an explicit, acknowledged software fallback), and sign-in reloads that *same* enrolled key —
+/// so device binding (INV-2) actually holds instead of signing a fresh key each launch.
 @MainActor
 public final class AppModel: ObservableObject {
     @Published public var session: SentinelClient.Session?
@@ -18,11 +19,20 @@ public final class AppModel: ObservableObject {
     @Published public var inbox: [InboxEnvelope] = []
     @Published public var isBusy = false
     @Published public var banner: String?
+    /// Assurance level of the key backing the current session (hardware vs software fallback).
+    @Published public var deviceAssurance: DeviceAssurance?
 
     private let client: SentinelClient
+    private let deviceIdentity: DeviceIdentity
 
-    public init(baseURL: URL) {
+    /// Fail closed by default: a device without a Secure Enclave will **not** silently enroll a
+    /// software key. Flip to `.allowSoftwareFallback` only after the user acknowledges the lower
+    /// assurance (e.g. from a Settings toggle).
+    public var provisionPolicy: DeviceProvisionPolicy = .requireHardware
+
+    public init(baseURL: URL, deviceIdentity: DeviceIdentity = DeviceIdentity()) {
         client = SentinelClient(baseURL: baseURL)
+        self.deviceIdentity = deviceIdentity
     }
 
     public var isLoggedIn: Bool { session != nil }
@@ -39,6 +49,13 @@ public final class AppModel: ObservableObject {
             banner = errorText(for: status)
         } catch SentinelClient.ClientError.transport {
             banner = "Can't reach the server. Check your connection."
+        } catch DeviceIdentityError.secureHardwareUnavailable {
+            banner = "This device has no Secure Enclave, which Sentinel requires to protect your "
+                + "key. Use a supported device, or enable a lower-assurance software key in Settings."
+        } catch DeviceIdentityError.corruptKeyMaterial {
+            banner = "This device's saved key is unreadable. Re-register or recover your account."
+        } catch is DeviceIdentityError {
+            banner = "Couldn't access this device's secure key store."
         } catch {
             banner = "Something went wrong."
         }
@@ -57,27 +74,46 @@ public final class AppModel: ObservableObject {
 
     public func register(username: String, password: String) async {
         await run { [self] in
-            let s = try await client.register(username: username, password: password, signer: SoftwareDeviceSigner())
+            // Enroll (and persist) the device key: Secure Enclave when available, else per policy.
+            let enrolled = try deviceIdentity.provision(policy: provisionPolicy)
+            deviceAssurance = enrolled.assurance
+            let s = try await client.register(
+                username: username, password: password, signer: enrolled.signer
+            )
             session = s
+            if enrolled.assurance == .software {
+                banner = "This device has no Secure Enclave — using a lower-assurance software key."
+            }
             await loadInitial()
         }
     }
 
-    public func signIn(username: String, password: String, signer: DeviceSigner) async {
+    public func signIn(username: String, password: String) async {
         await run { [self] in
-            let s = try await client.login(username: username, password: password, signer: signer)
+            // Sign with the SAME key enrolled at registration (INV-2), reloaded from the Keychain.
+            guard let enrolled = try deviceIdentity.loadEnrolled() else {
+                banner = "No device key on this device yet. Register, or recover your account."
+                return
+            }
+            deviceAssurance = enrolled.assurance
+            let s = try await client.login(
+                username: username, password: password, signer: enrolled.signer
+            )
             session = s
             await loadInitial()
         }
     }
 
     public func signOut() {
+        // Clears session state only; the enrolled device key stays in the Keychain so the same
+        // device can sign back in (device binding persists across sign-out).
         session = nil
         myProfile = nil
         friends = []
         incomingRequests = []
         searchResults = []
         inbox = []
+        deviceAssurance = nil
     }
 
     private func loadInitial() async {

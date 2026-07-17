@@ -61,7 +61,7 @@ struct SignInView: View {
                 .textFieldStyle(.roundedBorder)
 
             PrimaryButton("Sign in", palette: palette, isEnabled: canSubmit) {
-                Task { await model.signIn(username: username, password: password, signer: SoftwareDeviceSigner()) }
+                Task { await model.signIn(username: username, password: password) }
             }
             Button("Create account") {
                 Task { await model.register(username: username, password: password) }
