@@ -10,8 +10,8 @@ use auth_core::refresh_txn_id;
 use auth_core::transcript::{Action, Transcript};
 use axum::http::StatusCode;
 use common::{
-    get_auth, http_register, id16_from_hex, make_app, post_json, sign_challenge, unique_username,
-    TestDevice, PASSWORD,
+    get_auth, http_register, id16_from_hex, make_app, make_app_with_trusted_ip_header, post_json,
+    post_json_with_client_ip, sign_challenge, unique_username, TestDevice, PASSWORD,
 };
 use serde_json::json;
 
@@ -218,4 +218,41 @@ async fn http_rate_limit_trips() {
         last = status;
     }
     assert_eq!(last, StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// With a trusted proxy header configured, each forwarded client IP gets its own rate-limit
+/// bucket — one abusive client cannot exhaust the limit for everyone behind the proxy (R-306).
+#[tokio::test]
+async fn rate_limit_keys_on_trusted_client_ip_header() {
+    let app = make_app_with_trusted_ip_header(2).await; // 2/min per client IP
+
+    // Client A burns its budget: two allowed, the third is limited.
+    for _ in 0..2 {
+        let (status, _) =
+            post_json_with_client_ip(&app, "/v1/register/begin", json!({}), "203.0.113.7").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    let (status, _) =
+        post_json_with_client_ip(&app, "/v1/register/begin", json!({}), "203.0.113.7").await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+    // A different client IP has an independent bucket and is still allowed.
+    let (status, _) =
+        post_json_with_client_ip(&app, "/v1/register/begin", json!({}), "198.51.100.9").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// Without trust configured, the forwarded header is IGNORED: a client cannot forge distinct IPs to
+/// mint fresh buckets — everything shares the peer bucket. (Anti-spoofing default.)
+#[tokio::test]
+async fn forwarded_header_is_ignored_without_trust_config() {
+    let app = make_app(2).await; // no trusted header; keyed on peer IP (127.0.0.1 in-process)
+
+    let (s1, _) = post_json_with_client_ip(&app, "/v1/register/begin", json!({}), "10.0.0.1").await;
+    let (s2, _) = post_json_with_client_ip(&app, "/v1/register/begin", json!({}), "10.0.0.2").await;
+    let (s3, _) = post_json_with_client_ip(&app, "/v1/register/begin", json!({}), "10.0.0.3").await;
+    assert_eq!(s1, StatusCode::OK);
+    assert_eq!(s2, StatusCode::OK);
+    // Third trips the shared peer bucket despite the spoofed distinct header IPs.
+    assert_eq!(s3, StatusCode::TOO_MANY_REQUESTS);
 }

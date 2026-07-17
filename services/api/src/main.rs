@@ -6,6 +6,10 @@
 //!   loopback only; production terminates TLS 1.3 at the ingress in front of this service
 //!   and must configure trusted-proxy client-IP forwarding for rate limiting.
 //! * `SENTINEL_RATE_PER_MIN` — per-IP requests/minute on `/v1`, default 60.
+//! * `SENTINEL_TRUSTED_IP_HEADER` — optional. When set (e.g. `x-real-client-ip`), the client IP
+//!   for rate limiting is read from that header. **Only** set this behind a trusted reverse proxy
+//!   that overwrites the header on every request; otherwise clients could forge it (R-306). Unset
+//!   ⇒ rate limit by peer socket IP and ignore the header.
 //!
 //! Logging: tracing with target-level filters. No request/response bodies, tokens, or
 //! credentials are ever logged (INV-8).
@@ -119,7 +123,13 @@ async fn serve(
         });
     }
 
-    let app = http::build_router(service, relay, social, rate_per_min);
+    // Optional trusted-proxy client-IP header for rate limiting (R-306). Only honored when set;
+    // must be overwritten by a trusted proxy on every request or clients could forge it.
+    let trusted_ip_header = std::env::var("SENTINEL_TRUSTED_IP_HEADER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|s| axum::http::HeaderName::from_bytes(s.trim().as_bytes()).ok());
+    let app = http::build_router_cfg(service, relay, social, rate_per_min, trusted_ip_header);
     let listener = match tokio::net::TcpListener::bind(bind).await {
         Ok(l) => l,
         Err(e) => {
