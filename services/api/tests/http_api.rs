@@ -11,7 +11,8 @@ use auth_core::transcript::{Action, Transcript};
 use axum::http::StatusCode;
 use common::{
     get_auth, http_register, id16_from_hex, make_app, make_app_with_trusted_ip_header, post_json,
-    post_json_with_client_ip, sign_challenge, unique_username, TestDevice, PASSWORD,
+    post_json_with_client_ip, response_headers, sign_challenge, unique_username, TestDevice,
+    PASSWORD,
 };
 use serde_json::json;
 
@@ -255,4 +256,31 @@ async fn forwarded_header_is_ignored_without_trust_config() {
     assert_eq!(s2, StatusCode::OK);
     // Third trips the shared peer bucket despite the spoofed distinct header IPs.
     assert_eq!(s3, StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// Every response carries the defense-in-depth security headers (OWASP ASVS).
+#[tokio::test]
+async fn responses_carry_security_headers() {
+    let app = make_app(100_000).await;
+    let h = response_headers(&app, "/healthz").await;
+    assert_eq!(
+        h.get("x-content-type-options")
+            .and_then(|v| v.to_str().ok()),
+        Some("nosniff")
+    );
+    assert_eq!(
+        h.get("cache-control").and_then(|v| v.to_str().ok()),
+        Some("no-store")
+    );
+    assert_eq!(
+        h.get("referrer-policy").and_then(|v| v.to_str().ok()),
+        Some("no-referrer")
+    );
+    assert_eq!(
+        h.get("x-frame-options").and_then(|v| v.to_str().ok()),
+        Some("DENY")
+    );
+    assert!(h.get("content-security-policy").is_some());
+    // HSTS is set at the TLS ingress, not by the app.
+    assert!(h.get("strict-transport-security").is_none());
 }

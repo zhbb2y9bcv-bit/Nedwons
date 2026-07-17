@@ -20,7 +20,7 @@ use auth_core::ids::{AccountId, DeviceId, TxnId};
 use auth_core::store::AccountDevice;
 use auth_core::{AuthError, AuthService, RegisterRequest};
 use axum::extract::{ConnectInfo, Path, Request, State};
-use axum::http::{header, HeaderMap, HeaderName, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -141,6 +141,7 @@ pub fn build_router_cfg(
         .merge(relay_routes)
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .route("/healthz", get(|| async { "ok" }))
+        .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }
 
@@ -221,6 +222,33 @@ fn client_ip(request: &Request, state: &AppState) -> IpAddr {
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip())
         .unwrap_or(IpAddr::from([127, 0, 0, 1]))
+}
+
+// ----- security headers ----------------------------------------------------------------
+
+/// Add conservative security headers to every response (defense-in-depth; OWASP ASVS). This is a
+/// JSON API, so a strict `default-src 'none'` CSP and `nosniff` prevent a browser from ever
+/// interpreting a response as executable/framed content, and `no-store` keeps tokens/profiles out
+/// of shared caches. HSTS is intentionally **not** set here — it belongs at the TLS-terminating
+/// ingress, since this hop runs behind the proxy.
+async fn security_headers(request: Request, next: Next) -> Response {
+    let mut response = next.run(request).await;
+    let h = response.headers_mut();
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+    );
+    response
 }
 
 // ----- hex helpers ---------------------------------------------------------------------

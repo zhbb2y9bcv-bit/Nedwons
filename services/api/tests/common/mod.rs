@@ -223,6 +223,16 @@ pub async fn post_json_with_client_ip(
     (status, value)
 }
 
+/// GET a path and return the response headers (for asserting security headers).
+pub async fn response_headers(app: &Router, path: &str) -> axum::http::HeaderMap {
+    let response = app
+        .clone()
+        .oneshot(Request::get(path).body(Body::empty()).expect("request"))
+        .await
+        .expect("response");
+    response.headers().clone()
+}
+
 pub async fn post_json(app: &Router, path: &str, body: Value) -> (StatusCode, Value) {
     let response = app
         .clone()
