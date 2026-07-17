@@ -118,21 +118,17 @@ struct SentinelSmoke {
                 fail("group missing from a member's conversation list")
             }
 
-            // A group including a NON-friend must be rejected (clique gate).
+            // A group including a NON-friend now succeeds (ADR-0009: no friend-clique requirement).
             let strangerSigner = SoftwareDeviceSigner()
             let stranger = try await client.register(
                 username: randomName("smokestr"), password: password, signer: strangerSigner
             )
-            do {
-                _ = try await client.createGroup(
-                    accessToken: registered.accessToken,
-                    memberAccountIDs: [bob.accountID, stranger.accountID]
-                )
-                fail("a group with a non-friend must be rejected (clique gate)")
-            } catch let SentinelClient.ClientError.http(status, _) where status == 403 {
-                // expected: not_all_friends
-            } catch {
-                fail("unexpected error on non-friend group: \(error)")
+            let mixedGroup = try await client.createGroup(
+                accessToken: registered.accessToken,
+                memberAccountIDs: [bob.accountID, stranger.accountID]
+            )
+            guard !mixedGroup.conversationID.isEmpty else {
+                fail("a group with a non-friend should now be allowed")
             }
 
             // --- Abuse controls: block + report ---
@@ -146,6 +142,18 @@ struct SentinelSmoke {
             let friendsAfterBlock = try await client.listFriends(accessToken: registered.accessToken)
             guard !friendsAfterBlock.contains(where: { $0.accountID == bob.accountID }) else {
                 fail("block did not sever the friendship")
+            }
+
+            // With Bob blocked, a new group containing Bob is refused (blocked pair, ADR-0009).
+            do {
+                _ = try await client.createGroup(
+                    accessToken: registered.accessToken, memberAccountIDs: [bob.accountID]
+                )
+                fail("a group containing a blocked member must be rejected")
+            } catch let SentinelClient.ClientError.http(status, _) where status == 403 {
+                // expected: blocked_member
+            } catch {
+                fail("unexpected error on blocked-member group: \(error)")
             }
 
             // A blocked user cannot send a friend request (server enforces, 403).

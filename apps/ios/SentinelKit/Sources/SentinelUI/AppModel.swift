@@ -65,7 +65,7 @@ public final class AppModel: ObservableObject {
     private func errorText(for status: Int) -> String {
         switch status {
         case 401: "Not authorized."
-        case 403: "Not allowed — everyone in a group must be friends first."
+        case 403: "Not allowed. A block between people here may be preventing this."
         case 409: "That username is taken."
         default: "Request failed (\(status))."
         }
@@ -226,7 +226,7 @@ public final class AppModel: ObservableObject {
 
     // MARK: Groups
 
-    /// Create a group from selected friends; the server enforces the mutual-friend clique.
+    /// Create a group from selected people; the server refuses only if a blocked pair is included.
     /// Returns the new conversation id, or nil on failure (banner explains why).
     public func createGroup(memberAccountIDs: [String]) async -> String? {
         var conversationID: String?

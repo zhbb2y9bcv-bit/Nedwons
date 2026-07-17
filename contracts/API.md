@@ -143,7 +143,8 @@ and idle-waiters-exceed-pool. See [PERFORMANCE.md](../PERFORMANCE.md).
 ## Profiles, friends, and groups
 
 All require a Bearer access token. Profiles and the friendship graph are social/routing
-metadata (never message content). Group creation is gated on a complete mutual-friend clique.
+metadata (never message content). Group creation no longer requires a friend clique (ADR-0009):
+any members may be grouped as long as no pair among them has blocked each other.
 
 ### `GET /v1/profile` → `{ account_id, username, display_name, bio }`
 ### `PUT /v1/profile` → `204`  `{ display_name (≤64), bio (≤256) }`
@@ -177,9 +178,9 @@ report yourself (`400`).
 Note: `POST /v1/friends/request` may now also return `403 {"error":"blocked"}`. `services/api/tests/social.rs`
 covers the full block flow (sever, refuse both directions, list, reversible).
 
-### `POST /v1/groups` → `200` | `403 not_all_friends`
-`{ "member_account_ids": [ "<16B hex>", … ] }`. Creates a group **only if** the creator and
-every listed member form a complete mutual-friend clique; otherwise `403 not_all_friends`.
-Returns `{ "conversation_id", "member_account_ids" }` and adds all members' active devices to
-routing, so the group's messages reach everyone. `services/api/tests/social.rs` covers the
-whole flow including the clique rejection.
+### `POST /v1/groups` → `200` | `403 blocked_member`
+`{ "member_account_ids": [ "<16B hex>", … ] }`. Creates a group. Members need **not** be friends
+(ADR-0009); the only membership gate is that no pair within the group has blocked each other —
+otherwise `403 blocked_member`. Returns `{ "conversation_id", "member_account_ids" }` and adds all
+members' active devices to routing, so the group's messages reach everyone.
+`services/api/tests/social.rs` covers non-friend groups being allowed and blocked-pair rejection.
