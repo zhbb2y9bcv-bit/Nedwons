@@ -9,6 +9,7 @@ Cargo.lock.bak
 
 # Xcode / Swift
 apps/ios/**/build/
+apps/ios/**/.build/
 apps/ios/**/*.xcuserstate
 apps/ios/**/xcuserdata/
 apps/ios/**/DerivedData/

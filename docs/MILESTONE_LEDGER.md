@@ -21,14 +21,23 @@ results, remaining risks, and the next smallest step.
 - [x] `auth-core`: single-use/expiring/account+device+action-bound challenges, atomic consume.
 - [x] `auth-core`: P-256 device-signature verification; device-bound login.
 - [x] `auth-core`: rotating refresh-token families with reuse detection + family revocation.
-- [x] Security invariant tests (INV-2, INV-4, refresh reuse) pass under `cargo test`.
+- [x] Security invariant tests (INV-2, INV-4, refresh reuse) pass under `cargo test` (13 tests).
+- [x] iOS `SentinelKit`: Swift transcript encoder, `ClientTranscripts` (register/login/refresh),
+      `SecureEnclaveDeviceSigner` + software fallback, `KeychainStore` — builds + 6 `swift test`.
+- [x] Cross-language interoperability proven: Swift and Rust produce **byte-identical**
+      canonical transcripts (golden vectors in `contracts/test-vectors/`), and a Swift-signed
+      ECDSA-P256 signature verifies in the Rust backend (`INTEROP_OK`).
+- [x] iOS `SentinelUI`: futuristic design tokens + components + app screens (tab shell,
+      onboarding with gated enrollment, empty states) — builds with `swift build`.
 - [ ] Postgres implementations of the store traits with concurrency integration tests. *(R-102)*
 - [ ] HTTP API layer (`axum`) exposing register/login/refresh/logout with schema validation,
       size bounds, rate limits, generic errors.
-- [ ] iOS: real Secure Enclave enrollment + App Attest + Keychain, verified on device. *(R-101)*
+- [ ] iOS app target (`@main`) built in Xcode; real Secure Enclave enrollment + App Attest
+      verified on device. *(R-101)*
 - [ ] Recovery-kit flow. *(R-304)*
 - **Acceptance:** valid credentials from an unregistered device cannot log in — *logic proven
-  now in `auth-core`; end-to-end on device pending*.
+  now in `auth-core`; the client signing path is proven to interoperate with the server
+  verifier; end-to-end on device pending R-101*.
 
 ## Milestone 2 — E2EE direct messages — **NOT STARTED**
 
@@ -66,6 +75,15 @@ xcodebuild -version        # Xcode 26.6
 swift --version            # Apple Swift 6.3.3
 rustc --version            # 1.97.1 stable (installed this session)
 
-# auth-core
-cd services/auth-core && cargo test    # see report for results
+# auth-core (Rust): fmt clean, clippy -D warnings clean, 14 tests pass
+cd services && cargo fmt --manifest-path auth-core/Cargo.toml -- --check
+cargo clippy --manifest-path auth-core/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path auth-core/Cargo.toml
+
+# SentinelKit + SentinelUI (Swift): builds; 6 tests pass
+cd apps/ios/SentinelKit && swift build && swift test
+
+# Cross-language interop: Swift signs a transcript, Rust verifies -> INTEROP_OK
+swift run --package-path apps/ios/SentinelKit InteropEmit \
+  | cargo run -q --manifest-path services/auth-core/Cargo.toml --example verify_interop
 ```

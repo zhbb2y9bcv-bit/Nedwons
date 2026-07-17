@@ -87,3 +87,55 @@ fn put_lp(out: &mut Vec<u8>, field: &[u8]) {
     out.extend_from_slice(&(field.len() as u32).to_be_bytes());
     out.extend_from_slice(field);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::{AccountId, DeviceId, TxnId};
+
+    /// Golden cross-platform vector. The iOS Swift client's transcript encoder MUST produce
+    /// exactly these bytes for this input (see apps/ios/SentinelKit tests and
+    /// contracts/test-vectors/auth-transcript-login.hex). Changing this value is a
+    /// wire-breaking change and requires a protocol-version bump.
+    #[test]
+    fn login_transcript_golden_vector() {
+        let account_id = AccountId([
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ]);
+        let device_id = DeviceId([
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10,
+        ]);
+        let txn_id = TxnId([
+            0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd,
+            0xfe, 0xff,
+        ]);
+        let mut public_key = vec![0x04u8];
+        public_key.extend(0u8..64);
+        let challenge: Vec<u8> = (0u8..32).collect();
+
+        let bytes = Transcript {
+            action: Action::Login,
+            account_id: &account_id,
+            device_id: &device_id,
+            public_key: &public_key,
+            challenge: &challenge,
+            expires_at: 1_000_000_000,
+            txn_id: &txn_id,
+        }
+        .encode();
+
+        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "000000146170702e73656e74696e656c2e617574682e7631000102000000100011223344\
+             5566778899aabbccddeeff000000100102030405060708090a0b0c0d0e0f100000004104\
+             000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223\
+             2425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f0000002000010203\
+             0405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f000000003b9aca00\
+             00000010f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+                .replace(['\n', ' '], "")
+        );
+    }
+}

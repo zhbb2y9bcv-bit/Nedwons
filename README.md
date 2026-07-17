@@ -45,9 +45,12 @@ later without redesign.
 
 | Component | Toolchain present | Compiles here | Tested here |
 |-----------|-------------------|---------------|-------------|
-| `services/auth-core` (Rust) | Rust 1.97.1 stable | ✅ | ✅ `cargo test` (security invariants) |
-| `apps/ios` (SwiftUI) | Xcode 26.6 / Swift 6.3.3 | Skeleton; requires an Xcode/simulator build to verify | ⚠️ not yet run on a simulator/device |
-| `core` (Rust FFI) | Rust 1.97.1 | planned (Milestone 2) | — |
+| `services/auth-core` (Rust) | Rust 1.97.1 stable | ✅ | ✅ `cargo test` — 14 tests (security invariants + golden vector) |
+| `apps/ios/SentinelKit` (Swift crypto/protocol) | Xcode 26.6 / Swift 6.3.3 | ✅ `swift build` | ✅ `swift test` — 6 tests |
+| `apps/ios/SentinelUI` (SwiftUI design system + screens) | Swift 6.3.3 | ✅ `swift build` | — (visual; no unit tests) |
+| Cross-language interop (Swift signs → Rust verifies) | both | ✅ | ✅ `INTEROP_OK` + byte-identical transcript vectors |
+| `apps/ios/Sentinel` (`@main` app target) | Xcode 26.6 | requires Xcode app target (see apps/ios/README.md) | ⚠️ not run on a simulator/device (R-101) |
+| `core` (Rust↔Swift MLS FFI) | Rust 1.97.1 | planned (Milestone 2) | — |
 | `infra` (Docker) | ❌ not installed on this machine | — | — |
 
 See each milestone report in the git history for exactly what was run and what was not.
