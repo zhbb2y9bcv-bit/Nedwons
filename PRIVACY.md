@@ -23,12 +23,16 @@ R-402).
 | Data | Purpose | Retention | Visibility |
 |------|---------|-----------|-----------|
 | Random account ID | Identity | Life of account | Server (opaque) |
-| Username (normalized) | Discovery/login | Life of account | Server; visible to contacts |
+| Username (normalized) | Discovery/login | Life of account | Server (**plaintext**); visible to contacts |
+| Display name & bio (profile) | Show who you are | Life of account (editable) | Server (**plaintext**) |
+| Friendship graph & pending requests | Social graph, group gating | Life of relationship | Server (**plaintext**) |
+| Group / conversation membership | Route group messages | Life of membership | Server (**plaintext**) |
+| Blocks & reports | Abuse defense | Retained per policy | Server (access-controlled) |
 | Password (Argon2id hash) | Auth | Life of account | Server (hash only) |
 | Public device key + metadata | Device binding | Life of device enrollment | Server (public key only) |
 | Ciphertext message envelopes | Delivery | Until delivered + short TTL, then purged | Server (ciphertext only) |
 | Ciphertext attachments | Delivery | TTL-bounded | Object store (ciphertext only) |
-| Routing metadata (sender/recipient device, timestamps) | Delivery | Minimized; short retention | Server |
+| Routing metadata (sender/recipient device, timestamps) | Delivery | Minimized; short retention | Server (**plaintext**) |
 | Push token | Wake device | Until rotated/invalid | Server + APNs (opaque) |
 | IP address / proxy logs | Abuse defense, ops | Short, documented window | Server (access-controlled) |
 | Abuse/rate-limit counters | Abuse defense | Short, rolling | Server |
@@ -36,6 +40,22 @@ R-402).
 
 Message and attachment **content is never processed server-side** — it is E2EE and the
 server holds only ciphertext.
+
+### Content vs. metadata — be precise (R-507)
+
+The strong guarantee is about **message and call content**: it is end-to-end encrypted and the
+server holds only ciphertext (proven at rest by a direct database query in
+`services/api/tests/relay_e2ee.rs`). It is **not** correct to generalize "the server only stores
+ciphertext" to everything. **Social and routing metadata is server-readable plaintext today** —
+usernames, display names, bios, the friendship graph, group/conversation membership, and message
+timing/size. Username-prefix search inherently requires readable usernames. This distinction must
+be stated wherever the privacy guarantee is described (App Store label, marketing, in-app copy);
+implying metadata is encrypted would be false.
+
+**Direction (designed, not yet implemented — do not advertise as done):** E2EE profile fields
+shared only after an accepted connection, and sealed-sender-style metadata minimization (R-204).
+Until those ship, the metadata above is minimized and short-retained where possible and described
+honestly here.
 
 ## Contact discovery
 
