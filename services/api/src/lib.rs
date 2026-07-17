@@ -8,6 +8,7 @@ pub mod http;
 pub mod notify;
 pub mod pgstore;
 pub mod relay;
+pub mod social;
 
 use refinery::embed_migrations;
 

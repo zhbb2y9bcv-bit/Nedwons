@@ -79,6 +79,13 @@ pub fn shared_relay() -> Arc<PgRelay> {
     Arc::new(PgRelay::new(shared_stores().pool_clone()))
 }
 
+/// Social store (profiles/friends/groups) over the shared pool.
+pub fn shared_social() -> Arc<sentinel_api::social::PgSocial> {
+    Arc::new(sentinel_api::social::PgSocial::new(
+        shared_stores().pool_clone(),
+    ))
+}
+
 /// Random username, unique per call, satisfying the normalization policy.
 pub fn unique_username(prefix: &str) -> String {
     let mut bytes = [0u8; 6];
@@ -154,7 +161,12 @@ pub async fn make_app(per_ip_per_minute: u32) -> Router {
     tokio::task::spawn_blocking(move || {
         let stores = shared_stores();
         let service = Arc::new(make_service(&stores));
-        sentinel_api::http::build_router(service, shared_relay(), per_ip_per_minute)
+        sentinel_api::http::build_router(
+            service,
+            shared_relay(),
+            shared_social(),
+            per_ip_per_minute,
+        )
     })
     .await
     .expect("app setup")

@@ -33,6 +33,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::notify::DeliveryNotifier;
 use crate::relay::{FanoutOutcome, PgRelay};
+use crate::social::{FriendRequestOutcome, PgSocial};
 
 type IpLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
 
@@ -48,6 +49,7 @@ const MAX_INBOX_WAIT_SECS: u64 = 30;
 pub struct AppState {
     pub service: Arc<AuthService>,
     pub relay: Arc<PgRelay>,
+    pub social: Arc<PgSocial>,
     notifier: DeliveryNotifier,
     limiter: Arc<IpLimiter>,
 }
@@ -56,6 +58,7 @@ pub struct AppState {
 pub fn build_router(
     service: Arc<AuthService>,
     relay: Arc<PgRelay>,
+    social: Arc<PgSocial>,
     per_ip_per_minute: u32,
 ) -> Router {
     let quota =
@@ -63,6 +66,7 @@ pub fn build_router(
     let state = AppState {
         service,
         relay,
+        social,
         notifier: DeliveryNotifier::default(),
         limiter: Arc::new(RateLimiter::keyed(quota)),
     };
@@ -78,6 +82,17 @@ pub fn build_router(
         .route("/v1/inbox", get(fetch_inbox))
         .route("/v1/inbox/ack", post(ack_inbox))
         .route("/v1/stream", get(stream_handler))
+        // profiles & social
+        .route("/v1/profile", get(get_my_profile).put(update_profile))
+        .route("/v1/profile/{account_id}", get(get_profile_by_id))
+        .route("/v1/profiles/search", get(search_profiles))
+        .route("/v1/friends", get(list_friends))
+        .route("/v1/friends/requests", get(list_friend_requests))
+        .route("/v1/friends/request", post(friend_request))
+        .route("/v1/friends/accept", post(friend_accept))
+        .route("/v1/friends/decline", post(friend_decline))
+        .route("/v1/friends/remove", post(friend_remove))
+        .route("/v1/groups", post(create_group))
         .layer(RequestBodyLimitLayer::new(MAX_RELAY_BODY_BYTES));
 
     Router::new()
@@ -791,6 +806,277 @@ fn decode_ciphertext(hex_str: &str) -> Result<Vec<u8>, ApiError> {
         return Err(bad_request());
     }
     hex::decode(hex_str).map_err(|_| bad_request())
+}
+
+// ----- profiles, friends, and clique-gated groups -------------------------------------
+
+const MAX_GROUP_MEMBERS: usize = 256;
+const MIN_SEARCH_CHARS: usize = 2;
+
+#[derive(Serialize)]
+struct ProfileDto {
+    account_id: String,
+    username: String,
+    display_name: String,
+    bio: String,
+}
+
+#[derive(Serialize)]
+struct ProfileSummaryDto {
+    account_id: String,
+    username: String,
+    display_name: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateProfileBody {
+    display_name: String,
+    bio: String,
+}
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountRefBody {
+    account_id: String,
+}
+
+#[derive(Serialize)]
+struct FriendActionDto {
+    status: &'static str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreateGroupBody {
+    member_account_ids: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct GroupDto {
+    conversation_id: String,
+    member_account_ids: Vec<String>,
+}
+
+fn profile_dto(p: crate::social::Profile) -> ProfileDto {
+    ProfileDto {
+        account_id: hex::encode(p.account_id),
+        username: p.username,
+        display_name: p.display_name,
+        bio: p.bio,
+    }
+}
+
+fn summary_dto(s: crate::social::ProfileSummary) -> ProfileSummaryDto {
+    ProfileSummaryDto {
+        account_id: hex::encode(s.account_id),
+        username: s.username,
+        display_name: s.display_name,
+    }
+}
+
+async fn get_my_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ProfileDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let social = state.social.clone();
+    let profile = blocking_store(move || social.get_profile(&me.account_id))
+        .await?
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))?;
+    Ok(Json(profile_dto(profile)))
+}
+
+async fn update_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateProfileBody>,
+) -> Result<StatusCode, ApiError> {
+    if body.display_name.chars().count() > 64 || body.bio.chars().count() > 256 {
+        return Err(bad_request());
+    }
+    let me = authed_device(&state, &headers).await?;
+    let social = state.social.clone();
+    blocking_store(move || social.upsert_profile(&me.account_id, &body.display_name, &body.bio))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn get_profile_by_id(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(account_hex): Path<String>,
+) -> Result<Json<ProfileDto>, ApiError> {
+    let _me = authed_device(&state, &headers).await?;
+    let account = AccountId(id16_from_hex(&account_hex)?);
+    let social = state.social.clone();
+    let profile = blocking_store(move || social.get_profile(&account))
+        .await?
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))?;
+    Ok(Json(profile_dto(profile)))
+}
+
+async fn search_profiles(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<SearchQuery>,
+) -> Result<Json<Vec<ProfileSummaryDto>>, ApiError> {
+    let _me = authed_device(&state, &headers).await?;
+    // Username search is over the normalized (lowercase) handle; require a minimum length so
+    // this is deliberate discovery, not a bulk directory scan (ABUSE_MODEL.md).
+    let q = query.q.trim().to_lowercase();
+    if q.chars().count() < MIN_SEARCH_CHARS || q.len() > 64 {
+        return Err(bad_request());
+    }
+    let social = state.social.clone();
+    let results = blocking_store(move || social.search_profiles(&q, 20)).await?;
+    Ok(Json(results.into_iter().map(summary_dto).collect()))
+}
+
+async fn list_friends(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ProfileSummaryDto>>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let social = state.social.clone();
+    let friends = blocking_store(move || social.list_friends(&me.account_id)).await?;
+    Ok(Json(friends.into_iter().map(summary_dto).collect()))
+}
+
+async fn list_friend_requests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ProfileSummaryDto>>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let social = state.social.clone();
+    let reqs = blocking_store(move || social.list_incoming_requests(&me.account_id)).await?;
+    Ok(Json(reqs.into_iter().map(summary_dto).collect()))
+}
+
+async fn friend_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AccountRefBody>,
+) -> Result<Json<FriendActionDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let target = AccountId(id16_from_hex(&body.account_id)?);
+    if target.0 == me.account_id.0 {
+        return Err(bad_request());
+    }
+    let social = state.social.clone();
+    let outcome =
+        blocking_store(move || social.send_friend_request(&me.account_id, &target)).await?;
+    let status = match outcome {
+        FriendRequestOutcome::Requested => "requested",
+        FriendRequestOutcome::Friended => "friended",
+        FriendRequestOutcome::AlreadyFriends => "already_friends",
+    };
+    Ok(Json(FriendActionDto { status }))
+}
+
+async fn friend_accept(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AccountRefBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let other = AccountId(id16_from_hex(&body.account_id)?);
+    let social = state.social.clone();
+    let accepted =
+        blocking_store(move || social.accept_friend_request(&me.account_id, &other)).await?;
+    if accepted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError(StatusCode::NOT_FOUND, "no_request"))
+    }
+}
+
+async fn friend_decline(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AccountRefBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let other = AccountId(id16_from_hex(&body.account_id)?);
+    let social = state.social.clone();
+    blocking_store(move || social.cancel_request(&me.account_id, &other)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn friend_remove(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AccountRefBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let other = AccountId(id16_from_hex(&body.account_id)?);
+    let social = state.social.clone();
+    blocking_store(move || social.remove_friend(&me.account_id, &other)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Create a group conversation — allowed ONLY if the creator and every listed member form a
+/// complete mutual-friend clique (everyone has added everyone). Adds all members' active
+/// devices to routing so the group's messages reach every person.
+async fn create_group(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateGroupBody>,
+) -> Result<Json<GroupDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+
+    // Parse + dedup members, excluding the creator (added automatically).
+    let mut others: Vec<AccountId> = Vec::new();
+    for id_hex in &body.member_account_ids {
+        let account = AccountId(id16_from_hex(id_hex)?);
+        if account.0 != me.account_id.0 && !others.iter().any(|a| a.0 == account.0) {
+            others.push(account);
+        }
+    }
+    if others.is_empty() || others.len() + 1 > MAX_GROUP_MEMBERS {
+        return Err(bad_request());
+    }
+
+    // The full clique = creator + others.
+    let mut all = vec![me.account_id];
+    all.extend(others.iter().copied());
+
+    let social = state.social.clone();
+    let relay = state.relay.clone();
+    let service = state.service.clone();
+    let others_for_task = others.clone();
+    let outcome = blocking_store(move || {
+        // Gate: everyone must be mutually friends.
+        if !social.all_mutually_friends(&all)? {
+            return Ok(None);
+        }
+        let conversation_id = auth_core::crypto::random_bytes::<16>();
+        relay.create_conversation(conversation_id, me.account_id, me.device_id)?;
+        for member in &others_for_task {
+            // Resolve each member's active device server-side (never client-asserted).
+            if let Some(device) = service
+                .active_device(member)
+                .map_err(|_| auth_core::store::StoreError("device lookup".into()))?
+            {
+                relay.add_member(&conversation_id, *member, device)?;
+            }
+        }
+        Ok(Some(conversation_id))
+    })
+    .await?;
+
+    match outcome {
+        None => Err(ApiError(StatusCode::FORBIDDEN, "not_all_friends")),
+        Some(conversation_id) => Ok(Json(GroupDto {
+            conversation_id: hex::encode(conversation_id),
+            member_account_ids: others.iter().map(|a| hex::encode(a.0)).collect(),
+        })),
+    }
 }
 
 /// Like `blocking`, but for relay store calls that return `StoreResult`.
