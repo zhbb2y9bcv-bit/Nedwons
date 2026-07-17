@@ -1,6 +1,7 @@
-//! Profiles, the friendship graph, and friend requests. All of this is social/routing
-//! metadata — never message content. The friendship graph gates group creation: a group can
-//! only be formed among people who are ALL mutually friends (a complete clique).
+//! Profiles, the friendship graph, friend requests, blocking, and reporting. All of this is
+//! social/routing metadata — never message content. Group creation no longer requires a full
+//! friend clique (ADR-0009): any members may be grouped, provided no pair within the group has
+//! blocked each other (`any_block_within`).
 
 use auth_core::ids::AccountId;
 use auth_core::store::{StoreError, StoreResult};
@@ -449,26 +450,23 @@ impl PgSocial {
         Ok(row.get(0))
     }
 
-    /// True iff EVERY pair among `members` is friends (a complete clique). One query:
-    /// count the friendships whose both endpoints are in the set and compare to C(n,2).
-    /// This is the gate for group creation — a group only forms among people who have all
-    /// added each other.
-    pub fn all_mutually_friends(&self, members: &[AccountId]) -> StoreResult<bool> {
-        let n = members.len();
-        if n < 2 {
-            return Ok(true); // 0 or 1 member: trivially a clique
+    /// True iff a block (either direction) exists between two accounts that are BOTH in `members`.
+    /// ADR-0009 replaces the old full-friend-clique rule: group membership no longer requires
+    /// friendship, only the absence of a block within the group — a group must never force together
+    /// a pair that has blocked each other. One query: count blocks whose both endpoints are in set.
+    pub fn any_block_within(&self, members: &[AccountId]) -> StoreResult<bool> {
+        if members.len() < 2 {
+            return Ok(false);
         }
         let ids: Vec<&[u8]> = members.iter().map(|m| m.as_bytes()).collect();
         let mut conn = self.conn()?;
         let row = conn
             .query_one(
-                "SELECT count(*) FROM friendships
-                 WHERE account_lo = ANY($1) AND account_hi = ANY($1)",
+                "SELECT count(*) FROM blocks WHERE blocker = ANY($1) AND blocked = ANY($1)",
                 &[&ids],
             )
             .map_err(db_err)?;
-        let edges: i64 = row.get(0);
-        let required = (n as i64) * (n as i64 - 1) / 2;
-        Ok(edges == required)
+        let n: i64 = row.get(0);
+        Ok(n > 0)
     }
 }

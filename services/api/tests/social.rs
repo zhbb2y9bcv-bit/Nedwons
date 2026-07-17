@@ -1,5 +1,5 @@
-//! Profiles, friendship graph, and clique-gated group creation, end to end over the real
-//! HTTP API + PostgreSQL.
+//! Profiles, friendship graph, blocking/reporting, and block-gated group creation (ADR-0009),
+//! end to end over the real HTTP API + PostgreSQL.
 
 mod common;
 
@@ -276,48 +276,55 @@ async fn group_of_all_friends_is_allowed_and_reaches_everyone() {
     }
 }
 
-/// A group is REJECTED if not every pair is mutually friends.
+/// ADR-0009: group members need NOT be friends, but a group containing a blocked pair is refused.
 #[tokio::test]
-async fn group_requires_all_pairs_to_be_friends() {
+async fn group_allows_non_friends_but_rejects_blocked_pair() {
     let app = make_app(100_000).await;
-    // Make a clique of 3, then add a 4th who is friends with only ONE of them.
-    let mut clique = make_clique(&app, 3, "part").await;
-    let (_d, outsider) = http_register(&app, &unique_username("outsider")).await;
-    let outsider_token = outsider["access_token"].as_str().unwrap().to_string();
-    let outsider_acct = outsider["account_id"].as_str().unwrap().to_string();
+    let (_a, alice) = http_register(&app, &unique_username("gna")).await;
+    let (_b, bob) = http_register(&app, &unique_username("gnb")).await;
+    let (_c, carol) = http_register(&app, &unique_username("gnc")).await;
+    let alice_token = alice["access_token"].as_str().unwrap();
+    let bob_token = bob["access_token"].as_str().unwrap();
+    let bob_acct = bob["account_id"].as_str().unwrap();
+    let carol_acct = carol["account_id"].as_str().unwrap();
 
-    // Outsider befriends only clique[0], not the others.
-    let (status, _) = post_json_auth(
+    // Non-friends can now be grouped (no blocks among them).
+    let (status, group) = post_json_auth(
         &app,
-        "/v1/friends/request",
-        &clique[0].0,
-        json!({ "account_id": outsider_acct }),
+        "/v1/groups",
+        alice_token,
+        json!({ "member_account_ids": [bob_acct, carol_acct] }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "non-friends should be allowed: {group}"
+    );
+
+    // Bob blocks Carol → a group containing that blocked pair is refused.
     let (status, _) = post_json_auth(
         &app,
-        "/v1/friends/accept",
-        &outsider_token,
-        json!({ "account_id": clique[0].1 }),
+        "/v1/blocks",
+        bob_token,
+        json!({ "account_id": carol_acct }),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    clique.push((outsider_token, outsider_acct));
-    let creator_token = &clique[0].0;
-    let member_ids: Vec<&str> = clique[1..].iter().map(|(_, id)| id.as_str()).collect();
-
-    // The group includes the outsider, who is not friends with everyone → 403.
     let (status, body) = post_json_auth(
         &app,
         "/v1/groups",
-        creator_token,
-        json!({ "member_account_ids": member_ids }),
+        alice_token,
+        json!({ "member_account_ids": [bob_acct, carol_acct] }),
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "not all friends: {body}");
-    assert_eq!(body["error"], "not_all_friends");
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "blocked pair should be refused: {body}"
+    );
+    assert_eq!(body["error"], "blocked_member");
 }
 
 /// Blocking: severs friendship, refuses new requests in either direction, lists the block, and is

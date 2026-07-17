@@ -1209,9 +1209,9 @@ async fn friend_remove(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Create a group conversation — allowed ONLY if the creator and every listed member form a
-/// complete mutual-friend clique (everyone has added everyone). Adds all members' active
-/// devices to routing so the group's messages reach every person.
+/// Create a group conversation. Members need not be friends (ADR-0009), but creation is refused
+/// if any pair within the group has blocked each other. Adds all members' active devices to
+/// routing so the group's messages reach every person.
 async fn create_group(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1240,8 +1240,9 @@ async fn create_group(
     let service = state.service.clone();
     let others_for_task = others.clone();
     let outcome = blocking_store(move || {
-        // Gate: everyone must be mutually friends.
-        if !social.all_mutually_friends(&all)? {
+        // Gate (ADR-0009): members need not be friends, but a group must not force together a pair
+        // that has blocked each other.
+        if social.any_block_within(&all)? {
             return Ok(None);
         }
         let conversation_id = auth_core::crypto::random_bytes::<16>();
@@ -1260,7 +1261,7 @@ async fn create_group(
     .await?;
 
     match outcome {
-        None => Err(ApiError(StatusCode::FORBIDDEN, "not_all_friends")),
+        None => Err(ApiError(StatusCode::FORBIDDEN, "blocked_member")),
         Some(conversation_id) => Ok(Json(GroupDto {
             conversation_id: hex::encode(conversation_id),
             member_account_ids: others.iter().map(|a| hex::encode(a.0)).collect(),

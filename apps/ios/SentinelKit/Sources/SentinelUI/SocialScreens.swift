@@ -267,8 +267,8 @@ struct SearchView: View {
     }
 }
 
-/// Create a group by selecting friends; the server rejects it unless everyone is mutually
-/// friended (the clique gate), and the banner explains why.
+/// Create a group by selecting people (friends are the suggested pool). Members need not be
+/// friends (ADR-0009); the server refuses only if the group would contain a blocked pair.
 struct NewGroupView: View {
     @ObservedObject var model: AppModel
     @Environment(\.dismiss) private var dismiss
@@ -281,7 +281,7 @@ struct NewGroupView: View {
             List {
                 Section("Add friends") {
                     if model.friends.isEmpty {
-                        Text("Add friends first — you can only group people you're all friends with.")
+                        Text("No friends yet. Add people by username to start a group.")
                             .font(Sentinel.TypeScale.callout)
                             .foregroundStyle(palette.textSecondary)
                     }

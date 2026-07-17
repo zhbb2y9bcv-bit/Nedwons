@@ -1,6 +1,6 @@
 # ADR-0009: Invitation/role group membership tied to MLS commits (replaces the friend-clique rule)
 
-- **Status:** Accepted (design only — no code in this change)
+- **Status:** Accepted. **First slice implemented 2026-07-17** (see below); remainder designed.
 - **Date:** 2026-07-17
 - **Deciders:** security architect, backend lead, crypto integrator, product
 - **Supersedes:** the complete-mutual-friend-clique gate in `services/api/src/social.rs`
@@ -93,6 +93,23 @@ current epoch. Concretely:
 - Blocked-user enforcement on invite/join.
 - Invite-link expiry, revocation, and max-uses; join-request approve/deny.
 - Concurrent commits: one epoch advances, the other is rejected/retried; fork is resolved.
+
+## Implementation status (2026-07-17)
+
+**Done — first slice (the clique→block swap):** the full-friend-clique gate on `POST /v1/groups` is
+removed. Members no longer need to be friends; the only membership gate is `any_block_within` — a
+group is refused (`403 blocked_member`) if any pair within it has blocked each other. Verified in
+`services/api/tests/social.rs` (non-friend group allowed; blocked pair rejected) and end to end in
+the live smoke (non-friend group succeeds; a group containing a blocked member is refused). Swift
+client + UI copy updated. Blocking already severs friendships and refuses friend requests (V5).
+
+**Not yet done (designed above):** admin/member roles + role enforcement, invitations (direct /
+expiring links / QR) and join-request approval, **leave-group** and admin remove, group system
+messages, and — the big one — binding routing membership to **authenticated MLS Add/Remove
+commits**. That binding is inherently client-driven because the relay is deliberately MLS-blind
+(it must never link the MLS library); it depends on the on-device MLS core (ADR-0007) and key
+transparency (R-201). Until it lands, server routing membership and MLS membership remain distinct
+(R-506), and this must not be described as fully realized.
 
 ## Consequences
 
