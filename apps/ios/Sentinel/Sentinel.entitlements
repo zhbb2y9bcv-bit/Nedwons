@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  App entitlements (DRAFT — least privilege). Add only what the shipped build needs.
+  - App Attest: `com.apple.developer.devicecheck.appattest-environment` (production/development)
+    is configured by capability, not usually a raw entitlement key; enable the App Attest
+    capability in Xcode. Keep it as defense-in-depth only (RISK_REGISTER R-301).
+  - Keychain sharing / access groups: add only if extensions need shared items.
+  - Push: aps-environment for APNs (payloads are opaque wake-ups only, PRIVACY.md).
+-->
+<plist version="1.0">
+<dict>
+    <key>aps-environment</key>
+    <string>development</string>
+    <!-- keychain-access-groups: add only if an extension shares Keychain items.
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)app.sentinel.ios</string>
+    </array>
+    -->
+</dict>
+</plist>
