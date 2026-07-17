@@ -9,7 +9,7 @@ import Security
 ///
 /// This type type-checks with `swift build`; its runtime behavior depends on a real
 /// Keychain and is validated on device (RISK_REGISTER R-101).
-public struct KeychainStore {
+public struct KeychainStore: Sendable {
     public let service: String
 
     public init(service: String) {

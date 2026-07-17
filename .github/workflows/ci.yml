@@ -1,6 +1,8 @@
-# CI security gates (SECURITY.md, NIST SSDF). This pipeline is defined but has not been
-# executed in the current development environment (RISK_REGISTER R-501): there is no CI
-# runner here. It is the intended enforcement and must be wired to the real repository.
+# CI security gates (SECURITY.md, NIST SSDF). Enforcement intent; wire to the real repo runner.
+# Covers the WHOLE Rust workspace (auth-core + api) and the standalone mls-core crate — not just
+# auth-core (Gate 0 finding R-G0-3) — plus a real Postgres so the API integration tests run, and
+# a Software Composition Analysis (SCA) gate that fails on any advisory not explicitly documented
+# in docs/SECURITY_AUDIT_EXCEPTIONS.md (Gate 0 finding R-G0-1).
 name: ci
 
 on:
@@ -11,13 +13,51 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   backend:
-    name: backend (auth-core)
+    name: backend (auth-core + api, Postgres)
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: services
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: sentinel_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost/sentinel_test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format check (whole workspace)
+        run: cargo fmt --all -- --check
+      - name: Clippy (whole workspace, deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test (auth-core invariants + api integration vs real Postgres)
+        run: cargo test --workspace
+
+  mls-core:
+    name: mls-core (E2EE crypto integration)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: core/mls-core
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -25,39 +65,86 @@ jobs:
         with:
           components: rustfmt, clippy
       - name: Format check
-        run: cargo fmt --manifest-path auth-core/Cargo.toml -- --check
+        run: cargo fmt -- --check
       - name: Clippy (deny warnings)
-        run: cargo clippy --manifest-path auth-core/Cargo.toml --all-targets -- -D warnings
-      - name: Test (security invariants)
-        run: cargo test --manifest-path auth-core/Cargo.toml
-      - name: Dependency advisories (SCA)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test (E2EE properties)
+        run: cargo test
+
+  sca:
+    name: dependency advisories (SCA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      # Ignored advisories are documented per-ID with target-reachability analysis and a removal
+      # trigger in docs/SECURITY_AUDIT_EXCEPTIONS.md (tracked as RISK_REGISTER R-505). Any NEW
+      # advisory not on this list fails the build. Both Rust workspaces are scanned (separate
+      # Cargo.lock files). Keep this list identical to the exceptions doc.
+      - name: cargo audit (services workspace)
+        working-directory: services
         run: |
-          cargo install cargo-audit --locked
-          cargo audit
+          cargo audit \
+            --ignore RUSTSEC-2026-0124 \
+            --ignore RUSTSEC-2026-0207 \
+            --ignore RUSTSEC-2026-0208 \
+            --ignore RUSTSEC-2026-0209 \
+            --ignore RUSTSEC-2026-0210 \
+            --ignore RUSTSEC-2026-0211 \
+            --ignore RUSTSEC-2026-0212 \
+            --ignore RUSTSEC-2026-0173
+      - name: cargo audit (mls-core)
+        working-directory: core/mls-core
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2026-0124 \
+            --ignore RUSTSEC-2026-0207 \
+            --ignore RUSTSEC-2026-0208 \
+            --ignore RUSTSEC-2026-0209 \
+            --ignore RUSTSEC-2026-0210 \
+            --ignore RUSTSEC-2026-0211 \
+            --ignore RUSTSEC-2026-0212 \
+            --ignore RUSTSEC-2026-0173
       - name: Secret scan
         uses: gitleaks/gitleaks-action@v2
 
-  ios:
-    name: ios (build + test)
+  swift-package:
+    name: SentinelKit (build + test)
+    runs-on: macos-15   # provides Xcode 26 / Swift 6 toolchain
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (SentinelKit + SentinelUI)
+        working-directory: apps/ios/SentinelKit
+        run: swift build
+      - name: Test (transcript/interop unit tests)
+        working-directory: apps/ios/SentinelKit
+        run: swift test
+
+  ios-app:
+    name: ios app target (Xcode)
     runs-on: macos-15   # must provide Xcode 26 (iOS 26 SDK) per Apple's 2026-04-28 mandate
     steps:
       - uses: actions/checkout@v4
       - name: Show Xcode
         run: xcodebuild -version
-      # The iOS project is a skeleton in this milestone (RISK_REGISTER R-101). Once the
-      # Xcode project is committed, enable a build + unit-test step here, e.g.:
+      # The @main Xcode app target + on-device integrations (Secure Enclave, App Attest, Keychain
+      # UI, APNs) are not yet committed as an Xcode project (RISK_REGISTER R-101). Once it lands,
+      # enable e.g.:
       # - run: xcodebuild -scheme Sentinel -destination 'platform=iOS Simulator,name=iPhone 16' build test
       - name: Placeholder
-        run: echo "iOS build/test enabled when the Xcode project lands (Milestone 1)."
+        run: echo "iOS app-target build/test enabled when the Xcode project lands (Gate 1)."
 
   release-gate:
     name: release gate
     runs-on: ubuntu-latest
-    needs: [backend]
+    needs: [backend, mls-core, sca, swift-package]
     steps:
       - uses: actions/checkout@v4
-      # A release build must additionally fail on: any Critical RISK_REGISTER item still
-      # OPEN without a signed, time-boxed acceptance; missing SBOM/provenance; insecure
-      # release config. Implemented when release automation lands (Milestone 5).
+      # A release build must additionally fail on: any Critical RISK_REGISTER item still OPEN
+      # without a signed, time-boxed acceptance; missing SBOM/provenance; insecure release config.
+      # Implemented when release automation lands (Milestone 5).
       - name: Placeholder
         run: echo "Release gates enforced at Milestone 5 (SBOM, provenance, risk-register check)."
