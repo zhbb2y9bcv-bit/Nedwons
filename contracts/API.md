@@ -160,6 +160,17 @@ bulk directory dump.
 ### `POST /v1/friends/decline` → `204`  `{ account_id }`
 ### `POST /v1/friends/remove` → `204`  `{ account_id }`
 
+### Blocking (abuse control)
+### `GET /v1/blocks` → `[ summary, … ]` — accounts you have blocked
+### `POST /v1/blocks` → `204`  `{ "account_id": "<16B hex>" }`
+Block an account. Atomically removes any existing friendship and pending requests in either
+direction. Idempotent. A subsequent `POST /v1/friends/request` between the two (either way) returns
+`403 blocked` while the block stands.
+### `POST /v1/blocks/remove` → `204`  `{ account_id }` — unblock (does not restore prior friendship)
+
+Note: `POST /v1/friends/request` may now also return `403 {"error":"blocked"}`. `services/api/tests/social.rs`
+covers the full block flow (sever, refuse both directions, list, reversible).
+
 ### `POST /v1/groups` → `200` | `403 not_all_friends`
 `{ "member_account_ids": [ "<16B hex>", … ] }`. Creates a group **only if** the creator and
 every listed member form a complete mutual-friend clique; otherwise `403 not_all_friends`.

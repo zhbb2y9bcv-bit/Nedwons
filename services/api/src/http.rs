@@ -123,6 +123,8 @@ pub fn build_router_cfg(
         .route("/v1/friends/accept", post(friend_accept))
         .route("/v1/friends/decline", post(friend_decline))
         .route("/v1/friends/remove", post(friend_remove))
+        .route("/v1/blocks", get(list_blocked).post(block_user))
+        .route("/v1/blocks/remove", post(unblock_user))
         .route("/v1/groups", post(create_group))
         .layer(RequestBodyLimitLayer::new(MAX_RELAY_BODY_BYTES));
 
@@ -1049,8 +1051,46 @@ async fn friend_request(
         FriendRequestOutcome::Requested => "requested",
         FriendRequestOutcome::Friended => "friended",
         FriendRequestOutcome::AlreadyFriends => "already_friends",
+        FriendRequestOutcome::Blocked => return Err(ApiError(StatusCode::FORBIDDEN, "blocked")),
     };
     Ok(Json(FriendActionDto { status }))
+}
+
+async fn block_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AccountRefBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let target = AccountId(id16_from_hex(&body.account_id)?);
+    if target.0 == me.account_id.0 {
+        return Err(bad_request());
+    }
+    let social = state.social.clone();
+    blocking_store(move || social.block(&me.account_id, &target)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn unblock_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AccountRefBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let target = AccountId(id16_from_hex(&body.account_id)?);
+    let social = state.social.clone();
+    blocking_store(move || social.unblock(&me.account_id, &target)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_blocked(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ProfileSummaryDto>>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let social = state.social.clone();
+    let blocked = blocking_store(move || social.list_blocked(&me.account_id)).await?;
+    Ok(Json(blocked.into_iter().map(summary_dto).collect()))
 }
 
 async fn friend_accept(

@@ -319,3 +319,102 @@ async fn group_requires_all_pairs_to_be_friends() {
     assert_eq!(status, StatusCode::FORBIDDEN, "not all friends: {body}");
     assert_eq!(body["error"], "not_all_friends");
 }
+
+/// Blocking: severs friendship, refuses new requests in either direction, lists the block, and is
+/// reversible (ABUSE_MODEL.md).
+#[tokio::test]
+async fn block_severs_and_refuses_friend_requests() {
+    let app = make_app(100_000).await;
+    let (_da, alice) = http_register(&app, &unique_username("blka")).await;
+    let (_db, bob) = http_register(&app, &unique_username("blkb")).await;
+    let alice_token = alice["access_token"].as_str().unwrap();
+    let bob_token = bob["access_token"].as_str().unwrap();
+    let alice_acct = alice["account_id"].as_str().unwrap();
+    let bob_acct = bob["account_id"].as_str().unwrap();
+
+    // Become friends first.
+    let (_, res) = post_json_auth(
+        &app,
+        "/v1/friends/request",
+        alice_token,
+        json!({ "account_id": bob_acct }),
+    )
+    .await;
+    assert_eq!(res["status"], "requested");
+    let (status, _) = post_json_auth(
+        &app,
+        "/v1/friends/accept",
+        bob_token,
+        json!({ "account_id": alice_acct }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Alice blocks Bob → friendship severed.
+    let (status, _) = post_json_auth(
+        &app,
+        "/v1/blocks",
+        alice_token,
+        json!({ "account_id": bob_acct }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (_, alice_friends) = get_auth(&app, "/v1/friends", alice_token).await;
+    assert!(
+        !alice_friends
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["account_id"] == bob_acct),
+        "block must remove the friendship"
+    );
+
+    // Bob appears in Alice's block list.
+    let (_, blocked) = get_auth(&app, "/v1/blocks", alice_token).await;
+    assert!(blocked
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b["account_id"] == bob_acct));
+
+    // Bob cannot re-friend Alice (blocked direction), nor can Alice request Bob.
+    let (status, body) = post_json_auth(
+        &app,
+        "/v1/friends/request",
+        bob_token,
+        json!({ "account_id": alice_acct }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body["error"], "blocked");
+
+    let (status, _) = post_json_auth(
+        &app,
+        "/v1/friends/request",
+        alice_token,
+        json!({ "account_id": bob_acct }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Alice unblocks → requests work again.
+    let (status, _) = post_json_auth(
+        &app,
+        "/v1/blocks/remove",
+        alice_token,
+        json!({ "account_id": bob_acct }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, res) = post_json_auth(
+        &app,
+        "/v1/friends/request",
+        bob_token,
+        json!({ "account_id": alice_acct }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(res["status"], "requested");
+}
