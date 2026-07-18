@@ -205,6 +205,10 @@ pub fn build_router_cfg(
         .route("/v1/devices/enroll/begin", post(enroll_begin))
         .route("/v1/devices/enroll/finish", post(enroll_finish))
         .route("/v1/devices/revoke", post(revoke_device_handler))
+        // account recovery (ADR-0003): set a recovery secret (authed), recover a lost account
+        .route("/v1/recovery/set", post(set_recovery))
+        .route("/v1/recover/begin", post(recover_begin_handler))
+        .route("/v1/recover/finish", post(recover_finish_handler))
         // key transparency (R-201): the log is auditable; reads require a bearer token.
         .route("/v1/transparency/sth", get(transparency_sth))
         .route(
@@ -892,6 +896,84 @@ async fn revoke_device_handler(
         return Err(forbidden());
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ----- account recovery (ADR-0003, R-304) ---------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetRecoveryBody {
+    recovery_secret: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoverBeginBody {
+    username: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecoverFinishBody {
+    username: String,
+    recovery_secret: String,
+    txn_id: String,
+    /// SEC1 uncompressed P-256 public key of the recovering (new) device.
+    device_public_key: String,
+    /// The new device's self-signature over the `DeviceEnroll` transcript.
+    signature: String,
+}
+
+/// Set (or replace) the caller's recovery secret (authed; you set it up while you have a device).
+async fn set_recovery(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SetRecoveryBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let service = state.service.clone();
+    blocking(move || service.set_recovery_secret(&me, &body.recovery_secret)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Stage 1 of recovery (unauthenticated): reserve the recovering device's id + a nonce to sign.
+/// Enumeration-resistant — always returns a challenge.
+async fn recover_begin_handler(
+    State(state): State<AppState>,
+    Json(body): Json<RecoverBeginBody>,
+) -> Result<Json<ChallengeDto>, ApiError> {
+    let service = state.service.clone();
+    let ch = blocking(move || Ok::<_, AuthError>(service.recover_begin(&body.username))).await?;
+    Ok(Json(ChallengeDto {
+        account_id: hex::encode(ch.account_id.as_bytes()),
+        device_id: hex::encode(ch.device_id.as_bytes()),
+        txn_id: hex::encode(ch.txn_id.as_bytes()),
+        nonce: hex::encode(ch.nonce),
+        expires_at: ch.expires_at,
+    }))
+}
+
+/// Stage 2 of recovery (unauthenticated): the recovery secret + the new device's proof of
+/// possession enroll the new device and return its session.
+async fn recover_finish_handler(
+    State(state): State<AppState>,
+    Json(body): Json<RecoverFinishBody>,
+) -> Result<Json<SessionDto>, ApiError> {
+    let txn_id = txn_from_hex(&body.txn_id)?;
+    let device_public_key = hex_exact(&body.device_public_key, 65)?;
+    let signature = hex_exact(&body.signature, 64)?;
+    let service = state.service.clone();
+    let session = blocking(move || {
+        service.recover_finish(auth_core::RecoveryRequest {
+            username: body.username,
+            recovery_secret: body.recovery_secret,
+            txn_id,
+            new_device_public_key: device_public_key,
+            new_device_signature: signature,
+        })
+    })
+    .await?;
+    Ok(Json(SessionDto::from(session)))
 }
 
 // ----- relay (E2EE message routing; server never decrypts) ----------------------------

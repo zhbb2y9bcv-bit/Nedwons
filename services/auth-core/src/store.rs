@@ -91,6 +91,12 @@ pub trait CredentialStore {
         device: DeviceRecord,
     ) -> StoreResult<bool>;
     fn find_by_username(&self, username_normalized: &str) -> StoreResult<Option<AccountRecord>>;
+    /// Store (or replace) the account's recovery-secret Argon2id hash (ADR-0003). Returns `false`
+    /// if the account does not exist. The hash is write-only from the client's view — never read
+    /// back except by [`recovery_phc`](Self::recovery_phc) for verification.
+    fn set_recovery_phc(&self, account_id: &AccountId, phc: &str) -> StoreResult<bool>;
+    /// The account's recovery-secret hash, if one is set. `None` if unset or unknown account.
+    fn recovery_phc(&self, account_id: &AccountId) -> StoreResult<Option<String>>;
 }
 
 pub trait DeviceStore {

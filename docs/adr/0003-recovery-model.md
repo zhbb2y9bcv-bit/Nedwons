@@ -1,6 +1,9 @@
 # ADR-0003: Account recovery model — Recoverable Secure Mode (default)
 
-- **Status:** Accepted
+- **Status:** Accepted — **recovery-secret path implemented 2026-07-18** (set-while-authenticated
+  + enumeration-resistant recover begin/finish that enrolls a new device via the ADR-0008 ceremony;
+  R-304 → MITIGATING). Follow-ups: per-account attempt lockout / delay-and-notify, transparency
+  logging of recovery events, external review.
 - **Date:** 2026-07-17
 - **Deciders:** product, security architect
 - **Decision input:** explicit product choice — "Recoverable secure mode (recommended)".

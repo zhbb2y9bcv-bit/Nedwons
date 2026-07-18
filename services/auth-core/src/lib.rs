@@ -32,6 +32,7 @@ pub use error::{AuthError, Result};
 pub use ids::{AccountId, DeviceId, FamilyId, TxnId};
 pub use service::{
     normalize_username, refresh_txn_id, AuthService, Config, EnrollChallenge, EnrollRequest,
-    LoginChallenge, RegisterRequest, RegistrationChallenge, Session,
+    LoginChallenge, RecoveryChallenge, RecoveryRequest, RegisterRequest, RegistrationChallenge,
+    Session,
 };
 pub use transcript::{Action, Transcript, DOMAIN, PROTOCOL_VERSION};
