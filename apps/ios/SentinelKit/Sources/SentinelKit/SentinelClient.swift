@@ -697,6 +697,44 @@ public extension SentinelClient {
         _ = try await perform(request)
     }
 
+    /// Claim one key package for a target account's device (`POST /v1/keypackages/claim`), to add
+    /// that account to a conversation. Returns the claimed device + its opaque key package.
+    public func claimKeyPackage(
+        accessToken: String, accountID: String
+    ) async throws -> ClaimedKeyPackage {
+        struct Body: Encodable { let account_id: String }
+        var request = authed("POST", "/v1/keypackages/claim", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(Body(account_id: accountID))
+        return try decode(await perform(request))
+    }
+
+    /// Deliver an MLS Welcome to a specific joining device of a conversation
+    /// (`POST /v1/conversations/{id}/welcome`, targeted + idempotent). The relay routes the opaque
+    /// bytes; it never reads the Welcome.
+    public func sendWelcome(
+        accessToken: String,
+        conversationID: String,
+        recipientDevice: String,
+        ciphertext: Data,
+        idempotencyKey: Data
+    ) async throws {
+        struct Body: Encodable {
+            let recipient_device: String
+            let ciphertext: String
+            let idempotency_key: String
+        }
+        var request = authed(
+            "POST", "/v1/conversations/\(conversationID)/welcome", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            Body(
+                recipient_device: recipientDevice,
+                ciphertext: Hex.encode(ciphertext),
+                idempotency_key: Hex.encode(idempotencyKey)))
+        _ = try await perform(request)
+    }
+
     /// Declare this device a member of its account's self-group (`POST /v1/self-group/register`,
     /// idempotent). The device that creates the self-group calls this; each linked device calls it
     /// after `joinSelfGroup`. Only then does the relay fan consumption messages out to it.
