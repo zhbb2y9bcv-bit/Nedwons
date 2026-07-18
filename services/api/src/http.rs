@@ -525,6 +525,11 @@ struct AccountBindingDto {
     /// The canonical leaf INPUT (hex); leaf hash = H(0x00 || entry).
     entry: String,
     proof: Vec<String>,
+    /// Present (unix secs) only when this leaf is a **revocation** of `device_id` (ADR-0013). A
+    /// client can flag a revocation of its own device it did not initiate. Omitted for bindings, so
+    /// older clients that ignore the field are unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revoked_at: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -560,6 +565,7 @@ async fn transparency_account(
                 public_key: hex::encode(b.public_key),
                 entry: hex::encode(b.entry),
                 proof: b.proof.iter().map(hex::encode).collect(),
+                revoked_at: b.revoked_at,
             })
             .collect(),
     }))
@@ -1003,6 +1009,12 @@ async fn revoke_device_handler(
     if !revoked {
         return Err(forbidden());
     }
+    // Log the removal in the transparency log so a *revocation* is auditable under the signed root,
+    // not just additions (ADR-0013). Best-effort, like binding appends: a log hiccup must not fail
+    // the revocation (the device is already revoked in the source-of-truth store).
+    let transparency = state.transparency.clone();
+    let now = now_unix();
+    let _ = blocking_store(move || transparency.append_revocation(&account, &target, now)).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

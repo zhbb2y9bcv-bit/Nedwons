@@ -161,13 +161,19 @@ pub struct SignedTreeHead {
     pub signature: Vec<u8>,
 }
 
-/// One of an account's logged bindings, with an inclusion proof at the current tree size.
+/// One of an account's logged leaves, with an inclusion proof at the current tree size. Named
+/// `AccountBinding` for historical reasons; since ADR-0013 a leaf may instead be a **revocation**
+/// (`revoked_at.is_some()`), so the full device *lifecycle* — additions and removals — is auditable
+/// under the signed root.
 pub struct AccountBinding {
     pub leaf_index: u64,
     pub device_id: [u8; 16],
     pub public_key: Vec<u8>,
     pub entry: Vec<u8>,
     pub proof: Vec<Hash>,
+    /// `Some(unix_secs)` if this leaf is a v2 **revocation** of `device_id`; `None` for a binding
+    /// (legacy v1, or v2 binding). Lets a client detect a revocation it did not initiate.
+    pub revoked_at: Option<u64>,
 }
 
 /// An account's bindings together with the tree size the proofs were computed at.
@@ -236,6 +242,45 @@ impl PgTransparency {
                 &account.as_bytes(),
                 &device.as_bytes(),
                 &public_key,
+                &entry,
+            ],
+        )
+        .map_err(db_err)?;
+        txn.commit().map_err(db_err)?;
+        Ok(next as u64)
+    }
+
+    /// Append a **revocation** leaf (ADR-0013 v2) recording that `device` was revoked at
+    /// `revoked_at`, so a device *removal* is auditable under the signed root — not just additions.
+    /// The stored `public_key` is empty (a revocation carries no key); the v2 kind byte keeps it
+    /// unambiguous from a binding leaf. Same gapless-append discipline as [`append_binding`].
+    pub fn append_revocation(
+        &self,
+        account: &AccountId,
+        device: &DeviceId,
+        revoked_at: u64,
+    ) -> StoreResult<u64> {
+        let entry = encode_revocation_v2(account, device, revoked_at);
+        let empty: &[u8] = &[];
+        let mut conn = self.conn()?;
+        let mut txn = conn.transaction().map_err(db_err)?;
+        txn.execute("SELECT pg_advisory_xact_lock($1)", &[&APPEND_LOCK_KEY])
+            .map_err(db_err)?;
+        let next: i64 = txn
+            .query_one(
+                "SELECT coalesce(max(leaf_index) + 1, 0) FROM transparency_log",
+                &[],
+            )
+            .map_err(db_err)?
+            .get(0);
+        txn.execute(
+            "INSERT INTO transparency_log (leaf_index, account_id, device_id, public_key, entry)
+             VALUES ($1, $2, $3, $4, $5)",
+            &[
+                &next,
+                &account.as_bytes(),
+                &device.as_bytes(),
+                &empty,
                 &entry,
             ],
         )
@@ -321,14 +366,22 @@ impl PgTransparency {
             let leaf_index: i64 = r.get(0);
             let device: &[u8] = r.get(1);
             let proof = inclusion_proof(leaves, leaf_index as usize);
+            let entry: Vec<u8> = r.get(3);
+            // A v2 revocation leaf is recognizable by its domain header; everything else (legacy v1
+            // binding, v2 binding) is a binding for lifecycle purposes.
+            let revoked_at = decode_leaf_v2(&entry).and_then(|leaf| match leaf.kind {
+                LeafKind::Revocation => Some(leaf.revoked_at),
+                LeafKind::Binding => None,
+            });
             bindings.push(AccountBinding {
                 leaf_index: leaf_index as u64,
                 device_id: device
                     .try_into()
                     .map_err(|_| StoreError("bad device id".into()))?,
                 public_key: r.get(2),
-                entry: r.get(3),
+                entry,
                 proof,
+                revoked_at,
             });
         }
         Ok(AccountView {
