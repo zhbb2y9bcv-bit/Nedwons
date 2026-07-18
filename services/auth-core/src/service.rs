@@ -190,6 +190,18 @@ impl AuthService {
         self
     }
 
+    /// Mix a server-side **pepper** into all password + recovery-secret hashing (R-303). The
+    /// pepper is a KMS/HSM deployment secret held only in process memory (`'static`), so a
+    /// database-only compromise cannot offline-crack credentials. Rebuilds the timing-dummy hash
+    /// under the same pepper so enumeration resistance is preserved. Builder-style; existing
+    /// construction (no pepper) is unchanged. NOTE: enabling/changing the pepper invalidates all
+    /// prior hashes — set it before any users exist.
+    pub fn with_pepper(mut self, pepper: &'static [u8]) -> Self {
+        self.argon2 = password::hasher_with_pepper(pepper);
+        self.dummy_hash = password::make_dummy_hash(&self.argon2);
+        self
+    }
+
     // ----- Registration -------------------------------------------------------------
 
     /// Stage 1 of enrollment: reserve ids and issue a single-use `Register` challenge.

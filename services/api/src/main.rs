@@ -88,23 +88,34 @@ fn main() {
     };
     let stores = Arc::new(PgStores::new(pool));
 
-    let service = Arc::new(
-        AuthService::new(
-            stores.clone(),
-            stores.clone(),
-            stores.clone(),
-            stores.clone(),
-            stores.clone(),
-            Arc::new(SystemClock),
-            Config::default(),
-        )
-        // Compromised-credential check (R-305): a bundled corpus of common breached passwords that
-        // pass the length policy. Production swaps this `RangeProvider` for a large corpus (an HTTP
-        // k-anonymity range query, e.g. HIBP, or a Bloom filter) — the interface is unchanged.
-        .with_breach_provider(Arc::new(auth_core::breach::StaticCorpus::from_passwords(
-            BUNDLED_BREACHED_PASSWORDS,
-        ))),
-    );
+    let service = AuthService::new(
+        stores.clone(),
+        stores.clone(),
+        stores.clone(),
+        stores.clone(),
+        stores.clone(),
+        Arc::new(SystemClock),
+        Config::default(),
+    )
+    // Compromised-credential check (R-305): a bundled corpus of common breached passwords that
+    // pass the length policy. Production swaps this `RangeProvider` for a large corpus (an HTTP
+    // k-anonymity range query, e.g. HIBP, or a Bloom filter) — the interface is unchanged.
+    .with_breach_provider(Arc::new(auth_core::breach::StaticCorpus::from_passwords(
+        BUNDLED_BREACHED_PASSWORDS,
+    )));
+
+    // Server-side pepper (R-303): if configured, mix a KMS/HSM secret into all credential hashing.
+    // Leaked to 'static because it lives for the whole process. Set it BEFORE any users exist —
+    // enabling/rotating it invalidates existing hashes.
+    let service = match std::env::var("SENTINEL_PASSWORD_PEPPER") {
+        Ok(p) if !p.is_empty() => {
+            tracing::info!("password pepper ENABLED (server-side Argon2 secret)");
+            let pepper: &'static [u8] = Vec::leak(p.into_bytes());
+            service.with_pepper(pepper)
+        }
+        _ => service,
+    };
+    let service = Arc::new(service);
 
     let relay = Arc::new(sentinel_api::relay::PgRelay::new(stores.pool_clone()));
     let social = Arc::new(sentinel_api::social::PgSocial::new(stores.pool_clone()));
