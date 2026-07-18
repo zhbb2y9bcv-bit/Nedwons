@@ -187,6 +187,45 @@ fn normal_messages_work_before_during_and_after_a_secret() {
 }
 
 #[test]
+fn consumption_control_message_over_the_ffi() {
+    // ADR-0015 through the generated surface: after a recipient reveals, it produces an opaque
+    // consumption envelope (idempotent) that a peer processes as SecretConsumedRemotely.
+    let (alice, bob) = two_party(&tmp("a"), &tmp("b"));
+    let (env, sid) = send_secret(&alice, b"multidevice");
+    bob.process_inbound(1, env).unwrap();
+
+    // No consumption message before the reveal begins.
+    assert!(bob
+        .secret_consumption_envelope(sid.clone())
+        .unwrap()
+        .is_none());
+
+    bob.begin_secret_reveal(sid.clone(), 0).unwrap();
+    let c1 = bob
+        .secret_consumption_envelope(sid.clone())
+        .unwrap()
+        .expect("envelope");
+    let c2 = bob
+        .secret_consumption_envelope(sid.clone())
+        .unwrap()
+        .expect("envelope");
+    assert_eq!(
+        c1, c2,
+        "idempotent — same envelope, no double ratchet advance"
+    );
+    assert!(
+        !c1.windows(11).any(|w| w == b"multidevice"),
+        "relay sees only ciphertext"
+    );
+
+    // A peer group member applies it: SecretConsumedRemotely (here the sender, a harmless no-op).
+    match alice.process_inbound(2, c1).unwrap() {
+        InboundResult::SecretConsumedRemotely { secret_id } => assert_eq!(secret_id, sid),
+        other => panic!("expected SecretConsumedRemotely, got {other:?}"),
+    }
+}
+
+#[test]
 fn hostile_secret_id_never_panics_and_yields_typed_errors() {
     let (alice, bob) = two_party(&tmp("a"), &tmp("b"));
     let (envelope, _sid) = send_secret(&alice, b"x");

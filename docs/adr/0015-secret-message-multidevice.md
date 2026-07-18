@@ -1,8 +1,15 @@
 # ADR-0015: Account-wide single-consumption for Secret Messages (multi-device)
 
-- **Status:** Proposed (design only — **not implemented**). The shipped Secret Message feature
-  enforces view-once **per device**; this ADR designs the account-wide guarantee across a user's
-  devices. Written before the protocol change, per the repo rule.
+- **Status:** **Accepted — implemented 2026-07-18** (option 2). Account-wide single-consumption now
+  works via an E2EE, relay-blind `SecretConsumed` control message. The core race/offline caveats
+  below remain **inherent** and are documented honestly in `docs/SECRET_MESSAGES.md`.
+- **Implementation:** `Content::SecretConsumed { secret_id }` (new versioned content kind, bounded,
+  fuzzed); `DurableSession::emit_secret_consumption` (idempotent, builds the control message once
+  after a recipient reveals) + `process_inbound` force-consumes on receipt (new outcome
+  `SecretConsumedRemotely`); FFI `secret_consumption_envelope` + `InboundResult::SecretConsumedRemotely`;
+  Swift `MlsClientSecretEngine` fans it out via an injected broadcast closure. **Proven:** mls-core
+  `revealing_on_one_device_consumes_it_on_the_other` (real 3-member group: phone reveals → tablet's
+  copy consumed, relay sees only ciphertext), FFI + SentinelApp fan-out tests.
 - **Date:** 2026-07-18
 - **Deciders:** crypto integrator, backend lead, security architect
 - **Context:** ADR-0008 (multi-device trust), ADR-0010 (MLS-authoritative membership), ADR-0012/0014
