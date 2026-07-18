@@ -28,15 +28,31 @@ conversation, or body is ever placed in the push payload (asserted by
 - **Injected transport** (mirrors the HIBP breach provider): `trait PushTransport` decouples the
   socket. Tests use a recording transport; the mechanism is fully exercised without a network.
 
-## What live deployment still needs (blocked on credentials + one dependency)
+## The real transport — wired and proven
 
-1. **A real HTTP/2 transport** to `api.push.apple.com` implementing `PushTransport` (needs an HTTP/2
-   client dependency — e.g. `reqwest` with rustls — deliberately not added yet). Until one is wired,
-   `PushService` uses `NullTransport`: the mechanism runs but sends nothing.
-2. **Apple credentials**, supplied via env (`from_env` reads them; absent ⇒ the service is disabled):
-   - `SENTINEL_APNS_KEY_HEX` — the APNs auth key's P-256 private scalar (hex; operator extracts it
-     from the `.p8`),
-   - `SENTINEL_APNS_KEY_ID`, `SENTINEL_APNS_TEAM_ID`, `SENTINEL_APNS_TOPIC` (bundle id).
-3. **A physical device + Apple Developer provisioning** to obtain real device tokens and observe
-   delivery (the simulator cannot receive remote pushes). This is the same hardware gate as the
-   Secure Enclave / App Attest work.
+`HttpPushTransport` (`services/api/src/push.rs`) is the production `PushTransport`: HTTP/2 via
+`reqwest` + rustls (no OpenSSL), wired as the default in the router. An `https://` base uses TLS
+with ALPN (Apple negotiates h2); an `http://` base uses HTTP/2 prior knowledge for local/dev
+servers. `SENTINEL_APNS_URL` overrides the host (`https://api.sandbox.push.apple.com` for sandbox);
+default is production APNs. No socket is ever opened unless credentials are configured.
+
+**Proven** by `services/api/tests/apns_transport.rs`: a local mock APNs asserts the connection
+**actually negotiated HTTP/2** (the APNs contract), the `/3/device/<token>` path, the
+`authorization`/`apns-topic`/`apns-push-type` headers, and the contentless body; a `410 Unregistered`
+status surfaces to the caller; and the provider key loads **verbatim from Apple's `.p8` file**
+(PKCS#8 PEM, escaped-newline env-file form included; garbage fails closed).
+
+## Configuration (the only remaining input is Apple credentials)
+
+Supplied via env (`PushService::from_env`; any missing ⇒ the service is disabled, wake path no-ops):
+
+- `SENTINEL_APNS_KEY_P8` — the contents of the `.p8` from the Apple Developer portal, verbatim
+  (preferred), or `SENTINEL_APNS_KEY_HEX` — the raw P-256 scalar in hex.
+- `SENTINEL_APNS_KEY_ID`, `SENTINEL_APNS_TEAM_ID`, `SENTINEL_APNS_TOPIC` (bundle id).
+- `SENTINEL_APNS_URL` — optional host override (sandbox/dev).
+
+## What still needs hardware (cannot be closed without it)
+
+**A physical device + Apple Developer provisioning** to obtain real device tokens and observe
+delivery — the simulator cannot receive remote pushes. Everything software-side is built and tested;
+with credentials in env and a device in hand, the path is turn-key.

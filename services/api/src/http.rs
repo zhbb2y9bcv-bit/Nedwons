@@ -148,10 +148,13 @@ pub fn build_router_cfg(
     let notifier = DeliveryNotifier::default();
 
     // Push wiring (#4): a device that is not connected is reached by a contentless APNs wake push.
-    // Configured from SENTINEL_APNS_* (disabled otherwise). The production HTTP/2 socket adapter is
-    // supplied at deployment; until then this is a NullTransport (the mechanism runs, sends nothing).
-    let push =
-        crate::push::PushService::from_env(relay.clone(), Arc::new(crate::push::NullTransport));
+    // Configured from SENTINEL_APNS_* (disabled otherwise). The transport is the REAL HTTP/2 client
+    // (`SENTINEL_APNS_URL` overrides the host for sandbox/local); it is only contacted when the
+    // service is enabled, so an unconfigured deployment opens no sockets.
+    let push = crate::push::PushService::from_env(
+        relay.clone(),
+        Arc::new(crate::push::HttpPushTransport::from_env()),
+    );
     if push.is_enabled() {
         let push = push.clone();
         // Every delivery `wake` also dispatches a push, off the request path (best-effort).
