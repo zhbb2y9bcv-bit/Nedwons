@@ -226,6 +226,73 @@ fn consumption_control_message_over_the_ffi() {
 }
 
 #[test]
+fn consumption_over_the_self_group_across_the_ffi() {
+    // ADR-0015 option 3 through the generated surface: the consumption message is routed over the
+    // account's device self-group (phone + tablet), which the sender (alice) is not a member of.
+    // Conversation membership is built via the staged-commit path (client.rs proves it in isolation).
+    let alice = MlsClient::create_group(b"alice".to_vec(), tmp("a"), key()).unwrap();
+    let phone = MlsClient::new_joiner(b"phone".to_vec(), tmp("p"), key()).unwrap();
+    let tablet = MlsClient::new_joiner(b"tablet".to_vec(), tmp("t"), key()).unwrap();
+
+    // Add phone to the conversation.
+    let s_phone = alice.stage_add(phone.key_package().unwrap()).unwrap();
+    alice.merge_staged().unwrap();
+    phone.join_group(s_phone.welcome).unwrap();
+
+    // Add tablet: alice stages + merges, phone (a recipient) verifies + merges the commit, tablet joins.
+    let e = alice.epoch().unwrap();
+    let s_tablet = alice.stage_add(tablet.key_package().unwrap()).unwrap();
+    alice.merge_staged().unwrap();
+    phone
+        .process_commit(s_tablet.commit, e + 1, vec![b"tablet".to_vec()], vec![])
+        .unwrap();
+    tablet.join_group(s_tablet.welcome).unwrap();
+
+    // Phone + tablet form their self-group; alice has none.
+    phone.create_self_group().unwrap();
+    let s_self = phone
+        .add_self_device(tablet.key_package().unwrap())
+        .unwrap();
+    tablet.join_self_group(s_self.welcome).unwrap();
+    assert!(phone.has_self_group().unwrap() && tablet.has_self_group().unwrap());
+    assert!(!alice.has_self_group().unwrap());
+
+    // Alice sends a secret; both of Bob's devices seal it.
+    let (env, sid) = send_secret(&alice, b"self-group-secret");
+    assert!(matches!(
+        phone.process_inbound(10, env.clone()).unwrap(),
+        InboundResult::SecretSealed { .. }
+    ));
+    assert!(matches!(
+        tablet.process_inbound(10, env).unwrap(),
+        InboundResult::SecretSealed { .. }
+    ));
+
+    // Phone reveals and produces the consumption envelope — now self-group routed.
+    phone.begin_secret_reveal(sid.clone(), 0).unwrap();
+    let cenv = phone
+        .secret_consumption_envelope(sid.clone())
+        .unwrap()
+        .expect("envelope");
+
+    // Tablet applies it over the self-group inbox and is consumed.
+    match tablet.process_self_inbound(11, cenv.clone()).unwrap() {
+        InboundResult::SecretConsumedRemotely { secret_id } => assert_eq!(secret_id, sid),
+        other => panic!("expected SecretConsumedRemotely, got {other:?}"),
+    }
+    assert_eq!(
+        tablet.secret_phase(sid.clone(), 0).unwrap(),
+        SecretPhase::Consumed
+    );
+
+    // The sender is not in the self-group and cannot decrypt the read signal at all.
+    assert!(
+        alice.process_inbound(11, cenv).is_err(),
+        "the sender never receives, and cannot decrypt, the consumption message"
+    );
+}
+
+#[test]
 fn hostile_secret_id_never_panics_and_yields_typed_errors() {
     let (alice, bob) = two_party(&tmp("a"), &tmp("b"));
     let (envelope, _sid) = send_secret(&alice, b"x");

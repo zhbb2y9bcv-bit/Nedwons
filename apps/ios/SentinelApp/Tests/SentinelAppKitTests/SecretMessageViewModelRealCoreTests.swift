@@ -129,6 +129,60 @@ final class SecretMessageViewModelRealCoreTests: XCTestCase {
         XCTAssertEqual(sid, handle.secretId)
     }
 
+    /// ADR-0015 **option 3** over the real core + engine: the reveal fans the consumption message out
+    /// over the account's device **self-group** (phone + tablet), which the sender is not in — so a
+    /// peer device consumes its copy while the sender never receives, and cannot decrypt, the signal.
+    func testRevealFansOutOverTheSelfGroupSenderNeverSeesIt() throws {
+        let sender = try MlsClient.createGroup(
+            identity: Data("sender".utf8), dbPath: tmp("s"), atRestKey: key)
+        let phone = try MlsClient.newJoiner(
+            identity: Data("phone".utf8), dbPath: tmp("p"), atRestKey: key)
+        let tablet = try MlsClient.newJoiner(
+            identity: Data("tablet".utf8), dbPath: tmp("t"), atRestKey: key)
+
+        // Conversation: sender + phone + tablet (staged-commit membership).
+        let addP = try sender.stageAdd(keyPackage: try phone.keyPackage())
+        try sender.mergeStaged()
+        try phone.joinGroup(welcome: addP.welcome)
+        let epoch = try sender.epoch()
+        let addT = try sender.stageAdd(keyPackage: try tablet.keyPackage())
+        try sender.mergeStaged()
+        try phone.processCommit(
+            envelope: addT.commit, nextEpoch: epoch + 1, added: [Data("tablet".utf8)], removed: [])
+        try tablet.joinGroup(welcome: addT.welcome)
+
+        // Phone + tablet form their self-group; the sender is not a member.
+        try phone.createSelfGroup()
+        let addSelf = try phone.addSelfDevice(keyPackage: try tablet.keyPackage())
+        try tablet.joinSelfGroup(welcome: addSelf.welcome)
+        XCTAssertTrue(try phone.hasSelfGroup())
+        XCTAssertFalse(try sender.hasSelfGroup())
+
+        // The secret reaches both of the account's devices, sealed.
+        let handle = try sender.enqueueSecret(body: Data("self-group".utf8))
+        let env = try sender.encrypt(localId: handle.localId)
+        _ = try phone.processInbound(envelopeId: 10, ciphertext: env)
+        _ = try tablet.processInbound(envelopeId: 10, ciphertext: env)
+
+        // Reveal on the phone through the engine; capture the broadcast (now self-group routed).
+        var broadcast: Data?
+        let engine = MlsClientSecretEngine(client: phone) { broadcast = $0 }
+        let vm = SecretMessageViewModel(
+            secretID: handle.secretId, engine: engine, clock: FakeClock(0))
+        vm.beginReveal()
+        let consumption = try XCTUnwrap(broadcast, "reveal should fan out a consumption message")
+
+        // The tablet applies it over the self-group inbox and is consumed.
+        guard case let .secretConsumedRemotely(sid) = try tablet.processSelfInbound(
+            envelopeId: 11, ciphertext: consumption)
+        else { return XCTFail("tablet should consume over the self-group") }
+        XCTAssertEqual(sid, handle.secretId)
+        XCTAssertEqual(try tablet.secretPhase(secretId: handle.secretId, nowMs: 0), .consumed)
+
+        // The sender is not in the self-group and cannot decrypt the read signal at all.
+        XCTAssertThrowsError(try sender.processInbound(envelopeId: 11, ciphertext: consumption))
+    }
+
     func testTombstoneTextComesFromTheRealCore() throws {
         let (bob, _) = try deliverSecret("x")
         let engine = MlsClientSecretEngine(client: bob)
