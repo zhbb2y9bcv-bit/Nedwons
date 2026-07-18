@@ -70,6 +70,22 @@ struct SelfGroupLiveRun {
                 fail("tablet enrollment produced a wrong identity")
             }
 
+            // #8: audit R's device set against the transparency log. The user knows they enrolled
+            // exactly {phone, tablet}; the audit must agree (.ok) — and flag a device the user did
+            // NOT enroll as the alarm.
+            let sth = try await client.transparencySignedTreeHead(accessToken: r.accessToken)
+            guard let pinnedLogKey = Hex.decode(sth.logPublicKey) else { fail("bad log key") }
+            let audit = try await client.auditAccountDevices(
+                accessToken: r.accessToken, accountID: r.accountID,
+                expectedDeviceIDs: [r.deviceID, tablet.deviceID], pinnedLogPublicKeyX963: pinnedLogKey)
+            guard audit == .ok else { fail("device audit should be ok, got \(audit)") }
+            let alarm = try await client.auditAccountDevices(
+                accessToken: r.accessToken, accountID: r.accountID,
+                expectedDeviceIDs: [r.deviceID], pinnedLogPublicKeyX963: pinnedLogKey)
+            guard alarm == .unexpectedDevices([tablet.deviceID]) else {
+                fail("audit should flag the unexpected device, got \(alarm)")
+            }
+
             // S and R must be friends for S to add R to a conversation (ADR-0009).
             _ = try await client.sendFriendRequest(accessToken: s.accessToken, accountID: r.accountID)
             try await client.acceptFriend(accessToken: r.accessToken, accountID: s.accountID)
