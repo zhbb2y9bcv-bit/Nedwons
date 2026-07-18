@@ -930,3 +930,102 @@ fn recovery_locks_out_after_repeated_failures() {
     let d2 = TestDevice::new();
     assert!(recover(&service, "recover_lockout", RECOVERY_SECRET, &d2).is_ok());
 }
+
+// ----- Password change (device-bound + current password) --------------------------------
+
+fn change_password(
+    service: &AuthService,
+    device: &TestDevice,
+    ad: &AccountDevice,
+    current: &str,
+    new: &str,
+) -> Result<(), AuthError> {
+    let ch = service.password_change_begin(ad)?;
+    let transcript = Transcript {
+        action: Action::PasswordChange,
+        account_id: &ch.account_id,
+        device_id: &ch.device_id,
+        public_key: &device.public_key,
+        challenge: &ch.nonce,
+        expires_at: ch.expires_at,
+        txn_id: &ch.txn_id,
+    };
+    let signature = device.sign(&transcript.encode());
+    service.password_change_finish(ad, &ch.txn_id, &signature, current, new)
+}
+
+#[test]
+fn password_change_updates_the_login_password() {
+    let (service, _clock) = make_service();
+    let (device, reg) = register(&service, "pwchange");
+    let ad = AccountDevice {
+        account_id: reg.account_id,
+        device_id: reg.device_id,
+    };
+    let new_pw = "a-fresh-strong-new-passphrase-77";
+    change_password(&service, &device, &ad, PASSWORD, new_pw).expect("change ok");
+    // Login with the NEW password works; the OLD one no longer does.
+    assert!(login(&service, &device, "pwchange", new_pw).is_ok());
+    assert!(matches!(
+        login(&service, &device, "pwchange", PASSWORD),
+        Err(AuthError::Denied)
+    ));
+}
+
+#[test]
+fn password_change_requires_the_current_password() {
+    let (service, _clock) = make_service();
+    let (device, reg) = register(&service, "pwchange_wrong");
+    let ad = AccountDevice {
+        account_id: reg.account_id,
+        device_id: reg.device_id,
+    };
+    assert!(matches!(
+        change_password(
+            &service,
+            &device,
+            &ad,
+            "the-wrong-current-pass",
+            "a-fresh-strong-new-pass-77"
+        ),
+        Err(AuthError::Denied)
+    ));
+    // The password is unchanged: the original still logs in.
+    assert!(login(&service, &device, "pwchange_wrong", PASSWORD).is_ok());
+}
+
+#[test]
+fn password_change_rejects_a_weak_new_password() {
+    let (service, _clock) = make_service();
+    let (device, reg) = register(&service, "pwchange_weak");
+    let ad = AccountDevice {
+        account_id: reg.account_id,
+        device_id: reg.device_id,
+    };
+    assert!(matches!(
+        change_password(&service, &device, &ad, PASSWORD, "short"),
+        Err(AuthError::WeakPassword)
+    ));
+}
+
+#[test]
+fn password_change_needs_the_device_signature() {
+    let (service, _clock) = make_service();
+    let (_device, reg) = register(&service, "pwchange_nosig");
+    let ad = AccountDevice {
+        account_id: reg.account_id,
+        device_id: reg.device_id,
+    };
+    // An attacker with a session but NOT the device key cannot sign the transcript.
+    let attacker = TestDevice::new();
+    assert!(matches!(
+        change_password(
+            &service,
+            &attacker,
+            &ad,
+            PASSWORD,
+            "a-fresh-strong-new-pass-77"
+        ),
+        Err(AuthError::Denied)
+    ));
+}

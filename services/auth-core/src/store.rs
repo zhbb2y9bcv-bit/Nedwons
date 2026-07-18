@@ -91,6 +91,12 @@ pub trait CredentialStore {
         device: DeviceRecord,
     ) -> StoreResult<bool>;
     fn find_by_username(&self, username_normalized: &str) -> StoreResult<Option<AccountRecord>>;
+    /// Look up an account by its id (e.g. to re-verify the current password from an authenticated
+    /// session, where only the account id is known).
+    fn find_by_account_id(&self, account_id: &AccountId) -> StoreResult<Option<AccountRecord>>;
+    /// Replace the account's password hash (password change). Returns `false` if the account does
+    /// not exist.
+    fn update_password_phc(&self, account_id: &AccountId, phc: &str) -> StoreResult<bool>;
     /// Store (or replace) the account's recovery-secret Argon2id hash (ADR-0003). Returns `false`
     /// if the account does not exist. The hash is write-only from the client's view — never read
     /// back except by [`recovery_phc`](Self::recovery_phc) for verification.

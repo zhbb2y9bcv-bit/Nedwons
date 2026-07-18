@@ -154,6 +154,36 @@ impl CredentialStore for PgStores {
         .transpose()
     }
 
+    fn find_by_account_id(&self, account_id: &AccountId) -> StoreResult<Option<AccountRecord>> {
+        let mut conn = self.conn()?;
+        let row = conn
+            .query_opt(
+                "SELECT account_id, username_normalized, password_phc
+                 FROM accounts WHERE account_id = $1",
+                &[&account_id.as_bytes()],
+            )
+            .map_err(db_err)?;
+        row.map(|r| {
+            Ok(AccountRecord {
+                account_id: AccountId(id16(r.get::<_, &[u8]>(0), "account_id")?),
+                username_normalized: r.get(1),
+                password_phc: r.get(2),
+            })
+        })
+        .transpose()
+    }
+
+    fn update_password_phc(&self, account_id: &AccountId, phc: &str) -> StoreResult<bool> {
+        let mut conn = self.conn()?;
+        let updated = conn
+            .execute(
+                "UPDATE accounts SET password_phc = $2 WHERE account_id = $1",
+                &[&account_id.as_bytes(), &phc],
+            )
+            .map_err(db_err)?;
+        Ok(updated == 1)
+    }
+
     fn set_recovery_phc(&self, account_id: &AccountId, phc: &str) -> StoreResult<bool> {
         let mut conn = self.conn()?;
         let updated = conn

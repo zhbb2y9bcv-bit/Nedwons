@@ -201,6 +201,9 @@ pub fn build_router_cfg(
         .route("/v1/session/refresh", post(refresh))
         .route("/v1/session/logout", post(logout))
         .route("/v1/session/whoami", get(whoami))
+        // password change (device-signed + current-password): two stages
+        .route("/v1/session/password/begin", post(password_change_begin))
+        .route("/v1/session/password/finish", post(password_change_finish))
         // controlled multi-device (ADR-0008): enroll a new device via a trusted device, list, revoke
         .route("/v1/devices", get(list_devices_handler))
         .route("/v1/devices/enroll/begin", post(enroll_begin))
@@ -796,6 +799,62 @@ async fn whoami(
         account_id: hex::encode(who.account_id.as_bytes()),
         device_id: hex::encode(who.device_id.as_bytes()),
     }))
+}
+
+// ----- password change (device-signed + current password) -----------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PasswordChangeFinishBody {
+    txn_id: String,
+    /// Device signature over the `PasswordChange` transcript (128 hex chars).
+    signature: String,
+    current_password: String,
+    new_password: String,
+}
+
+/// Stage 1: issue a `PasswordChange` challenge for the authenticated device to sign.
+async fn password_change_begin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ChallengeDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let service = state.service.clone();
+    let ch = blocking(move || service.password_change_begin(&me)).await?;
+    Ok(Json(ChallengeDto {
+        account_id: hex::encode(ch.account_id.as_bytes()),
+        device_id: hex::encode(ch.device_id.as_bytes()),
+        txn_id: hex::encode(ch.txn_id.as_bytes()),
+        nonce: hex::encode(ch.nonce),
+        expires_at: ch.expires_at,
+    }))
+}
+
+/// Stage 2: verify the device signature AND the current password, then set the new password
+/// (policy + breach checked, rehashed). Requires both factors.
+async fn password_change_finish(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<PasswordChangeFinishBody>,
+) -> Result<StatusCode, ApiError> {
+    if body.new_password.len() > 1024 || body.current_password.len() > 1024 {
+        return Err(bad_request());
+    }
+    let me = authed_device(&state, &headers).await?;
+    let txn_id = txn_from_hex(&body.txn_id)?;
+    let signature = hex_exact(&body.signature, 64)?;
+    let service = state.service.clone();
+    blocking(move || {
+        service.password_change_finish(
+            &me,
+            &txn_id,
+            &signature,
+            &body.current_password,
+            &body.new_password,
+        )
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ----- controlled multi-device (ADR-0008, R-903) --------------------------------------

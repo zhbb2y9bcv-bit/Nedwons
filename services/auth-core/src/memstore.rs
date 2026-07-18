@@ -92,6 +92,31 @@ impl CredentialStore for MemAccountStore {
             .cloned())
     }
 
+    fn find_by_account_id(&self, account_id: &AccountId) -> StoreResult<Option<AccountRecord>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .accounts_by_username
+            .values()
+            .find(|a| &a.account_id == account_id)
+            .cloned())
+    }
+
+    fn update_password_phc(&self, account_id: &AccountId, phc: &str) -> StoreResult<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        if let Some(acct) = inner
+            .accounts_by_username
+            .values_mut()
+            .find(|a| &a.account_id == account_id)
+        {
+            acct.password_phc = phc.to_string();
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
     fn set_recovery_phc(&self, account_id: &AccountId, phc: &str) -> StoreResult<bool> {
         let mut inner = self.inner.lock().unwrap();
         let exists = inner
