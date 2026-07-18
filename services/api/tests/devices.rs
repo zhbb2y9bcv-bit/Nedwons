@@ -196,3 +196,39 @@ async fn password_alone_cannot_add_a_device() {
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"], "username_unavailable");
 }
+
+/// Device enrollment publishes the new device's binding to the transparency log, so a
+/// self-monitoring client sees EVERY device bound to it — a server cannot add a device undetected
+/// (ADR-0008 + R-201).
+#[tokio::test]
+async fn enrolled_device_binding_is_logged_in_transparency() {
+    let app = make_app(100_000).await;
+    let (device_a, session_a) = http_register(&app, &unique_username("ktdev")).await;
+    let token_a = session_a["access_token"].as_str().unwrap();
+    let account = session_a["account_id"].as_str().unwrap();
+    let device_a_id = session_a["device_id"].as_str().unwrap();
+
+    let device_b = TestDevice::new();
+    let (status, session_b) = enroll_device(&app, token_a, account, &device_a, &device_b).await;
+    assert_eq!(status, StatusCode::OK);
+    let device_b_id = session_b["device_id"].as_str().unwrap();
+
+    // Pin the account view to the current tree size and check BOTH devices are logged bindings.
+    let (_, sth) = get_auth(&app, "/v1/transparency/sth", token_a).await;
+    let tree_size = sth["tree_size"].as_u64().unwrap();
+    let (status, view) = get_auth(
+        &app,
+        &format!("/v1/transparency/account/{account}?tree_size={tree_size}"),
+        token_a,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let logged: Vec<&str> = view["bindings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["device_id"].as_str().unwrap())
+        .collect();
+    assert!(logged.contains(&device_a_id), "original device logged");
+    assert!(logged.contains(&device_b_id), "enrolled device logged too");
+}
