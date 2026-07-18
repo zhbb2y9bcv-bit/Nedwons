@@ -256,6 +256,74 @@ impl MlsClient {
         })
     }
 
+    /// Stage an add for MLS-commit-authoritative membership (ADR-0010): build commit + welcome
+    /// WITHOUT advancing the group. The caller signs a manifest, POSTs `/commit`, then calls
+    /// [`merge_staged`](Self::merge_staged) on success or [`clear_staged`](Self::clear_staged) on
+    /// rejection. Never merge before the server's epoch CAS confirms — that is how a race loser
+    /// desyncs.
+    pub fn stage_add(&self, key_package: Vec<u8>) -> Result<AddOutcome, MlsClientError> {
+        catch(move || {
+            bound(key_package.len(), MAX_KEY_PACKAGE_LEN)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            let (commit, welcome) = session
+                .stage_add_member(&key_package)
+                .map_err(map_durable_input)?;
+            Ok(AddOutcome { commit, welcome })
+        })
+    }
+
+    /// Stage a remove (see [`stage_add`](Self::stage_add)). `identity` is the target member's
+    /// credential identity bytes. Returns the commit; the group is not advanced until merged.
+    pub fn stage_remove(&self, identity: Vec<u8>) -> Result<Vec<u8>, MlsClientError> {
+        catch(move || {
+            bound(identity.len(), MAX_IDENTITY_LEN)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session.stage_remove_member(&identity).map_err(map_durable)
+        })
+    }
+
+    /// Merge the pending staged commit — the server accepted it. Advances the epoch and persists.
+    pub fn merge_staged(&self) -> Result<(), MlsClientError> {
+        catch(move || {
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session.merge_staged().map_err(map_durable)
+        })
+    }
+
+    /// Discard the pending staged commit — the server rejected it (stale epoch / governance) or the
+    /// client is rebasing. State is unchanged.
+    pub fn clear_staged(&self) -> Result<(), MlsClientError> {
+        catch(move || {
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session.clear_staged().map_err(map_durable)
+        })
+    }
+
+    /// Recipient path (ADR-0010): process an inbound membership commit, merging ONLY if its actual
+    /// cryptographic effect equals the sender's signed manifest — `next_epoch` and the `added` /
+    /// `removed` credential identities come from that manifest. On mismatch the commit is discarded
+    /// unmerged and `InvalidMessage` is returned; group state is unchanged.
+    pub fn process_commit(
+        &self,
+        envelope: Vec<u8>,
+        next_epoch: u64,
+        added: Vec<Vec<u8>>,
+        removed: Vec<Vec<u8>>,
+    ) -> Result<(), MlsClientError> {
+        catch(move || {
+            bound(envelope.len(), MAX_ENVELOPE_LEN)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session
+                .process_commit_checked(&envelope, next_epoch, &added, &removed)
+                .map_err(map_durable_input)
+        })
+    }
+
     /// Queue an outbound message (durable draft). Does NOT advance the ratchet. Returns a local id.
     pub fn enqueue(&self, plaintext: Vec<u8>) -> Result<u64, MlsClientError> {
         catch(move || {
