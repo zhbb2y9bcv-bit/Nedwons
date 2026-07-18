@@ -375,6 +375,38 @@ pub async fn post_json_auth(
     (status, value)
 }
 
+pub async fn put_json_auth(
+    app: &Router,
+    path: &str,
+    token: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::put(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let value = if bytes.is_empty() {
+        json!(null)
+    } else {
+        serde_json::from_slice(&bytes).unwrap_or(json!(null))
+    };
+    (status, value)
+}
+
 pub async fn get_auth(app: &Router, path: &str, token: &str) -> (StatusCode, Value) {
     let response = app
         .clone()

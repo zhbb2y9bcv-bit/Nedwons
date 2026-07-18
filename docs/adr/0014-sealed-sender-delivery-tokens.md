@@ -115,9 +115,13 @@ identified + sealed envelopes; sealed ones carry no sender field.
 
 ## Rollout slices (each independently committed + tested; do not land as one change)
 
-- **2a — DAK primitive + registration.** `auth_core` helper (derive `K_r`, compute/verify `V_r`,
-  constant-time compare) + `PUT /v1/delivery-access-key` + storage (migration). Pure logic fully
-  tested; **no delivery path yet** (safe, no trust change).
+- **2a — DAK primitive + registration (landed 2026-07-18).** `auth_core::delivery_key`
+  (`verifier` = SHA-256, constant-time `verify`, `is_valid_verifier`; 5 tests incl. a pinned
+  SHA-256("") vector for cross-language agreement) + `PUT /v1/delivery-access-key` (authed; stores
+  only `V_r`) + `PgRelay::set_delivery_verifier`/`delivery_verifier` + migration V16
+  `delivery_access_keys`. Integration-tested: register, rotate (old key revoked), malformed
+  verifier → 400, unauth → 401. **No delivery path yet** — registering a verifier changes no
+  delivery behavior, so this slice carries no trust-model change.
 - **2b — sealed delivery.** `sealed_envelopes` migration + unauthenticated `POST /v1/sealed/deliver`
   with the DAK gate + per-recipient rate limit + uniform-response no-oracle behavior + inbox
   surfacing. This is the **trust-model change** — gated on this ADR being Accepted + external review.
