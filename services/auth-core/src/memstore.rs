@@ -95,13 +95,16 @@ impl DeviceStore for MemAccountStore {
         &self,
         account_id: &AccountId,
     ) -> StoreResult<Option<DeviceRecord>> {
+        // Deterministic primary: the non-revoked device with the smallest id (the in-memory store
+        // has no creation timestamp; the SQL store orders by created_at then id).
         Ok(self
             .inner
             .lock()
             .unwrap()
             .devices_by_id
             .values()
-            .find(|d| &d.account_id == account_id && !d.revoked)
+            .filter(|d| &d.account_id == account_id && !d.revoked)
+            .min_by_key(|d| d.device_id.0)
             .cloned())
     }
 
@@ -120,6 +123,34 @@ impl DeviceStore for MemAccountStore {
             d.revoked = true;
         }
         Ok(())
+    }
+
+    fn add_active_device(&self, device: DeviceRecord, max_active: usize) -> StoreResult<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        let active = inner
+            .devices_by_id
+            .values()
+            .filter(|d| d.account_id == device.account_id && !d.revoked)
+            .count();
+        if active >= max_active || inner.devices_by_id.contains_key(&device.device_id) {
+            return Ok(false);
+        }
+        inner.devices_by_id.insert(device.device_id, device);
+        Ok(true)
+    }
+
+    fn list_devices(&self, account_id: &AccountId) -> StoreResult<Vec<DeviceRecord>> {
+        let mut out: Vec<DeviceRecord> = self
+            .inner
+            .lock()
+            .unwrap()
+            .devices_by_id
+            .values()
+            .filter(|d| &d.account_id == account_id)
+            .cloned()
+            .collect();
+        out.sort_by_key(|d| d.device_id.0);
+        Ok(out)
     }
 }
 

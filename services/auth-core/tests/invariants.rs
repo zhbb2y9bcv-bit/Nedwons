@@ -549,3 +549,140 @@ fn username_normalization_rejects_confusables_and_bad_shapes() {
     assert!(normalize_username("alice.").is_err());
     assert!(normalize_username("alice bob").is_err());
 }
+
+// ----- Trusted-device enrollment (ADR-0008 / R-903) ---------------------------------------
+
+use auth_core::store::AccountDevice;
+use auth_core::{EnrollChallenge, EnrollRequest};
+
+/// Enroll `new_device` onto the trusted device's account. Returns the provisioned session.
+fn enroll(
+    service: &AuthService,
+    trusted: &AccountDevice,
+    trusted_signer: &TestDevice,
+    new_device: &TestDevice,
+) -> Result<Session, AuthError> {
+    let ch: EnrollChallenge = service.enroll_device_begin(trusted)?;
+    // The TRUSTED device signs a DeviceEnroll transcript authorizing the NEW device's key.
+    let transcript = Transcript {
+        action: Action::DeviceEnroll,
+        account_id: &trusted.account_id,
+        device_id: &ch.device_id,
+        public_key: &new_device.public_key,
+        challenge: &ch.nonce,
+        expires_at: ch.expires_at,
+        txn_id: &ch.txn_id,
+    };
+    let signature = trusted_signer.sign(&transcript.encode());
+    service.enroll_device_finish(
+        trusted,
+        EnrollRequest {
+            txn_id: ch.txn_id,
+            device_public_key: new_device.public_key.clone(),
+            signature,
+        },
+    )
+}
+
+#[test]
+fn trusted_device_enrolls_a_second_device_and_it_gets_a_working_session() {
+    let (service, _clock) = make_service();
+    let (device_a, reg) = register(&service, "multi_device_user");
+    let trusted = AccountDevice {
+        account_id: reg.account_id,
+        device_id: reg.device_id,
+    };
+
+    let device_b = TestDevice::new();
+    let session_b = enroll(&service, &trusted, &device_a, &device_b).expect("enroll succeeds");
+
+    // The new device is on the SAME account but a DISTINCT device, with a working session.
+    assert_eq!(session_b.account_id, reg.account_id);
+    assert_ne!(session_b.device_id, reg.device_id);
+    let bound = service
+        .validate_access(&session_b.access_token)
+        .expect("new device's session is valid");
+    assert_eq!(bound.device_id, session_b.device_id);
+
+    // Both devices are now active and listed.
+    let devices = service.list_devices(&reg.account_id).expect("list");
+    let active: Vec<_> = devices.iter().filter(|d| !d.revoked).collect();
+    assert_eq!(active.len(), 2, "two active devices after enrollment");
+}
+
+#[test]
+fn enrollment_requires_the_trusted_device_signature() {
+    let (service, _clock) = make_service();
+    let (_device_a, reg) = register(&service, "enroll_badsig");
+    let trusted = AccountDevice {
+        account_id: reg.account_id,
+        device_id: reg.device_id,
+    };
+    // An attacker signs with a key that is NOT the trusted device's enrolled key.
+    let attacker = TestDevice::new();
+    let new_device = TestDevice::new();
+    assert!(matches!(
+        enroll(&service, &trusted, &attacker, &new_device),
+        Err(AuthError::Denied)
+    ));
+    // No device was added.
+    assert_eq!(service.list_devices(&reg.account_id).unwrap().len(), 1);
+}
+
+#[test]
+fn revoked_device_cannot_authorize_enrollment() {
+    let (service, _clock) = make_service();
+    let (device_a, reg) = register(&service, "enroll_revoked");
+    let trusted = AccountDevice {
+        account_id: reg.account_id,
+        device_id: reg.device_id,
+    };
+    service.revoke_device(&reg.device_id).expect("revoke");
+    let new_device = TestDevice::new();
+    // begin already fails closed for a revoked authorizer.
+    assert!(matches!(
+        enroll(&service, &trusted, &device_a, &new_device),
+        Err(AuthError::Denied)
+    ));
+}
+
+#[test]
+fn enrollment_is_capped_and_revoke_cascades() {
+    let (service, _clock) = make_service();
+    let (device_a, reg) = register(&service, "enroll_cap");
+    let trusted = AccountDevice {
+        account_id: reg.account_id,
+        device_id: reg.device_id,
+    };
+
+    // Fill up to the cap (device A already counts as one).
+    let mut sessions = Vec::new();
+    for _ in 1..AuthService::MAX_ACTIVE_DEVICES {
+        let d = TestDevice::new();
+        sessions.push(enroll(&service, &trusted, &device_a, &d).expect("under cap"));
+    }
+    let at_cap = service.list_devices(&reg.account_id).unwrap();
+    assert_eq!(
+        at_cap.iter().filter(|d| !d.revoked).count(),
+        AuthService::MAX_ACTIVE_DEVICES
+    );
+    // One more is refused.
+    let extra = TestDevice::new();
+    assert!(matches!(
+        enroll(&service, &trusted, &device_a, &extra),
+        Err(AuthError::Denied)
+    ));
+
+    // Revoking an enrolled device invalidates its session AND frees a slot.
+    let victim = &sessions[0];
+    service.revoke_device(&victim.device_id).expect("revoke");
+    assert!(service.validate_access(&victim.access_token).is_err());
+    let after = service.list_devices(&reg.account_id).unwrap();
+    assert_eq!(
+        after.iter().filter(|d| !d.revoked).count(),
+        AuthService::MAX_ACTIVE_DEVICES - 1
+    );
+    // A slot is free again.
+    let replacement = TestDevice::new();
+    assert!(enroll(&service, &trusted, &device_a, &replacement).is_ok());
+}

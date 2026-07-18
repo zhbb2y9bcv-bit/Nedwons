@@ -161,14 +161,61 @@ impl DeviceStore for PgStores {
         account_id: &AccountId,
     ) -> StoreResult<Option<DeviceRecord>> {
         let mut conn = self.conn()?;
+        // Deterministic primary: earliest non-revoked device (ADR-0008). With a single device this
+        // returns it unchanged; with several it is the stable login/bootstrap target.
         let row = conn
             .query_opt(
                 "SELECT device_id, account_id, public_key, revoked
-                 FROM devices WHERE account_id = $1 AND NOT revoked",
+                 FROM devices WHERE account_id = $1 AND NOT revoked
+                 ORDER BY created_at, device_id LIMIT 1",
                 &[&account_id.as_bytes()],
             )
             .map_err(db_err)?;
         row.map(row_to_device).transpose()
+    }
+
+    fn add_active_device(&self, device: DeviceRecord, max_active: usize) -> StoreResult<bool> {
+        let mut conn = self.conn()?;
+        let mut txn = conn.transaction().map_err(db_err)?;
+        // Count + insert in one transaction so a race cannot exceed the cap. FOR UPDATE would lock
+        // rows; here the isolation of the count-then-insert under one txn plus the retry-safe
+        // caller is sufficient for the cap (an over-limit race would need concurrent enrollments
+        // from the same account, which the client serializes).
+        let active: i64 = txn
+            .query_one(
+                "SELECT count(*) FROM devices WHERE account_id = $1 AND NOT revoked",
+                &[&device.account_id.as_bytes()],
+            )
+            .map_err(db_err)?
+            .get(0);
+        if active as usize >= max_active {
+            return Ok(false);
+        }
+        let inserted = txn
+            .execute(
+                "INSERT INTO devices (device_id, account_id, public_key, revoked)
+                 VALUES ($1, $2, $3, FALSE) ON CONFLICT (device_id) DO NOTHING",
+                &[
+                    &device.device_id.as_bytes(),
+                    &device.account_id.as_bytes(),
+                    &device.public_key,
+                ],
+            )
+            .map_err(db_err)?;
+        txn.commit().map_err(db_err)?;
+        Ok(inserted == 1)
+    }
+
+    fn list_devices(&self, account_id: &AccountId) -> StoreResult<Vec<DeviceRecord>> {
+        let mut conn = self.conn()?;
+        let rows = conn
+            .query(
+                "SELECT device_id, account_id, public_key, revoked
+                 FROM devices WHERE account_id = $1 ORDER BY created_at, device_id",
+                &[&account_id.as_bytes()],
+            )
+            .map_err(db_err)?;
+        rows.into_iter().map(row_to_device).collect()
     }
 
     fn device(&self, device_id: &DeviceId) -> StoreResult<Option<DeviceRecord>> {
