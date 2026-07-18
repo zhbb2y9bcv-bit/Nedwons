@@ -193,6 +193,9 @@ pub fn build_router_cfg(
         .route("/v1/self-group/deliver", post(self_group_deliver))
         // Push notifications (#4): register this device's APNs wake token.
         .route("/v1/push/register", post(register_push_token_handler))
+        // App Attest (#10): challenge issuance + attestation submission.
+        .route("/v1/attest/challenge", get(attest_challenge_handler))
+        .route("/v1/attest/key", post(attest_submit_handler))
         // sealed-sender certificate issuance (ADR-0012, R-204)
         .route("/v1/sender-certificate", get(issue_sender_certificate))
         // sealed-sender delivery access key registration (ADR-0014 Slice 2a, R-204)
@@ -1634,6 +1637,78 @@ async fn register_push_token_handler(
     let relay = state.relay.clone();
     let device = me.device_id;
     blocking_store(move || relay.register_push_token(&device, &body.platform, &body.token)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ----- App Attest (#10) ----------------------------------------------------------------
+
+/// How long an issued attestation challenge stays valid.
+const ATTEST_CHALLENGE_TTL_SECS: u64 = 5 * 60;
+
+#[derive(Serialize)]
+struct AttestChallengeDto {
+    /// A 32-byte random challenge (hex) to fold into the App Attest attestation object.
+    challenge: String,
+}
+
+/// Issue a short-lived App Attest challenge for the authenticated device (#10). The client hashes it
+/// into its attestation object so a replayed attestation is rejected.
+async fn attest_challenge_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AttestChallengeDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let mut challenge = [0u8; 32];
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut challenge);
+    let challenge_hex = hex::encode(challenge);
+    let relay = state.relay.clone();
+    let device = me.device_id;
+    blocking_store(move || {
+        relay.issue_attest_challenge(&device, &challenge, ATTEST_CHALLENGE_TTL_SECS)
+    })
+    .await?;
+    Ok(Json(AttestChallengeDto {
+        challenge: challenge_hex,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AttestSubmitBody {
+    /// The App Attest key id (opaque base64/string from `DCAppAttestService.generateKey`).
+    key_id: String,
+    /// The challenge (hex) the client attested over — must match the outstanding one (anti-replay).
+    challenge: String,
+    /// The CBOR attestation object (hex).
+    attestation: String,
+}
+
+/// Submit an App Attest attestation for the authenticated device (#10). The outstanding challenge is
+/// consumed (anti-replay) and the attestation stored. **Honest limit:** the cryptographic
+/// verification of the attestation object against Apple's App Attest root is the remaining
+/// hardware-gated step (docs/APP_ATTEST.md); the stored row's `verified` flag stays false until then.
+async fn attest_submit_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AttestSubmitBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    if body.key_id.is_empty() || body.key_id.len() > 512 {
+        return Err(bad_request());
+    }
+    let challenge = hex::decode(&body.challenge).map_err(|_| bad_request())?;
+    let attestation = decode_ciphertext(&body.attestation)?; // bounded, non-empty opaque bytes
+    let relay = state.relay.clone();
+    let device = me.device_id;
+    let matched =
+        blocking_store(move || relay.consume_attest_challenge(&device, &challenge)).await?;
+    if !matched {
+        // Unknown / expired / mismatched challenge — refuse (no replay).
+        return Err(bad_request());
+    }
+    let relay = state.relay.clone();
+    let device = me.device_id;
+    blocking_store(move || relay.store_attestation(&device, &body.key_id, &attestation)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
