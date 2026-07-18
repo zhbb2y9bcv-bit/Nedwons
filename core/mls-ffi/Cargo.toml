@@ -1,0 +1,38 @@
+# mls-ffi — the UniFFI boundary that exposes `mls-core` to Swift (ADR-0007).
+#
+# WHY A SEPARATE CRATE: `mls-core` is `#![forbid(unsafe_code)]` and must stay that way — it is the
+# audited crypto core. UniFFI necessarily generates `unsafe extern "C"` scaffolding (true of ANY
+# FFI). Confining that generated unsafe to this thin shim keeps the crypto core pure and keeps the
+# trust boundary small and fuzzable. No cryptography is implemented here; this crate only marshals
+# bytes across the boundary.
+#
+# The backend (`services/api`) does NOT depend on this crate or on `mls-core` — the relay stays
+# MLS-blind (ADR-0001 / INV-1).
+[package]
+name = "mls-ffi"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+rust-version = "1.85"
+
+# Standalone workspace (like mls-core) so the server workspace never pulls it in transitively.
+# `fuzz/` is its own crate (nightly + libfuzzer) and is excluded from the normal build/test.
+[workspace]
+exclude = ["fuzz"]
+
+[lib]
+name = "mls_ffi"
+# `staticlib` for the iOS device/simulator slices packaged into the xcframework; `cdylib` for
+# host-side library-mode bindgen + the macOS SwiftPM integration test; `lib` for Rust unit tests.
+crate-type = ["lib", "staticlib", "cdylib"]
+
+# In-crate library-mode bindgen (ADR-0007): `cargo run --bin uniffi-bindgen generate --library ...`.
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+mls-core = { path = "../mls-core" }
+uniffi = { version = "0.29", features = ["cli"] }
+thiserror = "1"
