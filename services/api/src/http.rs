@@ -137,6 +137,7 @@ pub fn build_router_cfg(
     let relay_routes = Router::new()
         .route("/v1/keypackages", post(publish_key_package))
         .route("/v1/keypackages/claim", post(claim_key_package))
+        .route("/v1/keypackages/count", get(key_package_count))
         .route(
             "/v1/conversations",
             post(create_conversation).get(list_conversations),
@@ -1120,12 +1121,41 @@ async fn claim_key_package(
     let _me = authed_device(&state, &headers).await?;
     let account = AccountId(id16_from_hex(&body.account_id)?);
     let relay = state.relay.clone();
-    let claimed = blocking_store(move || relay.claim_key_package(&account))
-        .await?
-        .ok_or(ApiError(StatusCode::NOT_FOUND, "no_key_package"))?;
+    let claimed = blocking_store(move || {
+        relay.claim_key_package(&account, crate::relay::KEY_PACKAGE_TTL_SECS)
+    })
+    .await?
+    .ok_or(ApiError(StatusCode::NOT_FOUND, "no_key_package"))?;
     Ok(Json(ClaimedKeyPackageDto {
         device_id: hex::encode(claimed.device_id),
         key_package: hex::encode(claimed.key_package),
+    }))
+}
+
+#[derive(Serialize)]
+struct KeyPackageCountDto {
+    /// Non-expired key packages this device still has published.
+    available: u64,
+    /// Publish more when `available` is at/below this (offline-add readiness).
+    low_watermark: u64,
+}
+
+/// The caller's device's available (non-expired) key-package count, so the client knows when to
+/// replenish its prekeys (MLS hygiene).
+async fn key_package_count(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<KeyPackageCountDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let relay = state.relay.clone();
+    let device = me.device_id;
+    let available = blocking_store(move || {
+        relay.count_available_key_packages(&device, crate::relay::KEY_PACKAGE_TTL_SECS)
+    })
+    .await?;
+    Ok(Json(KeyPackageCountDto {
+        available,
+        low_watermark: crate::relay::KEY_PACKAGE_LOW_WATERMARK,
     }))
 }
 
