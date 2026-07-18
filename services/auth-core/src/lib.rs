@@ -16,6 +16,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod breach;
 pub mod crypto;
 pub mod error;
 pub mod ids;

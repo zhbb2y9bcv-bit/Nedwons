@@ -149,6 +149,9 @@ pub struct AuthService {
     /// Valid Argon2 hash of a throwaway secret, verified against on the account-not-found
     /// path to equalize timing (enumeration resistance).
     dummy_hash: String,
+    /// Optional compromised-credential corpus (R-305). When set, a breached password is rejected
+    /// at registration. `None` (default) keeps only the length + embedded-blocklist policy.
+    breach: Option<Arc<dyn crate::breach::RangeProvider + Send + Sync>>,
 }
 
 impl AuthService {
@@ -173,7 +176,18 @@ impl AuthService {
             config,
             argon2,
             dummy_hash,
+            breach: None,
         }
+    }
+
+    /// Attach a compromised-credential corpus (R-305). Registration will reject a password whose
+    /// SHA-1 is in the corpus. Builder-style so existing construction is unchanged.
+    pub fn with_breach_provider(
+        mut self,
+        provider: Arc<dyn crate::breach::RangeProvider + Send + Sync>,
+    ) -> Self {
+        self.breach = Some(provider);
+        self
     }
 
     // ----- Registration -------------------------------------------------------------
@@ -230,6 +244,13 @@ impl AuthService {
         // from Denied.
         let username = normalize_username(&req.username)?;
         password::validate_password_policy(&req.password)?;
+        // Compromised-credential check (R-305). Fail OPEN on a provider error (an outage must not
+        // block registration); reject only on a confirmed corpus hit.
+        if let Some(provider) = &self.breach {
+            if crate::breach::is_compromised(provider.as_ref(), &req.password).unwrap_or(false) {
+                return Err(AuthError::WeakPassword);
+            }
+        }
         let password_phc = password::hash_password(&self.argon2, &req.password)?;
 
         let created = self.creds.create_account_with_device(

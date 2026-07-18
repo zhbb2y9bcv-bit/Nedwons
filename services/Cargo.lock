@@ -88,6 +88,7 @@ dependencies = [
  "argon2",
  "p256",
  "rand_core 0.6.4",
+ "sha1 0.10.7",
  "sha2 0.10.9",
  "subtle",
  "thiserror 1.0.69",
