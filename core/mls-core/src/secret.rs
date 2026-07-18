@@ -122,8 +122,11 @@ impl SecretRecord {
         }
         let now = self.clamp(now_ms);
         self.state = SecretState::Countdown;
-        self.countdown_deadline_ms = now + COUNTDOWN_MS;
-        self.view_deadline_ms = now + COUNTDOWN_MS + VIEW_MS;
+        // Saturating so a pathological/hostile `now_ms` near u64::MAX can never overflow-panic; a
+        // saturated deadline is already past, so the reveal simply expires — fail closed, never a
+        // crash (found by the `secret_state` transition fuzzer).
+        self.countdown_deadline_ms = now.saturating_add(COUNTDOWN_MS);
+        self.view_deadline_ms = now.saturating_add(COUNTDOWN_MS).saturating_add(VIEW_MS);
         Ok(())
     }
 
@@ -294,6 +297,16 @@ mod tests {
         assert!(r.is_tombstone());
         assert_eq!(r.begin_reveal(0), Err(InvalidTransition));
         assert!(r.visible_body(0).is_none());
+    }
+
+    #[test]
+    fn extreme_now_does_not_overflow_and_fails_closed() {
+        // A pathological clock near u64::MAX must not panic; the saturated deadline is already past,
+        // so the reveal expires immediately rather than crashing (regression for a fuzz finding).
+        let mut r = rec();
+        r.begin_reveal(u64::MAX).unwrap();
+        assert_eq!(r.poll(u64::MAX), SecretState::Consumed);
+        assert!(r.visible_body(u64::MAX).is_none());
     }
 
     #[test]
