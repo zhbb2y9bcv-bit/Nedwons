@@ -12,10 +12,19 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use crate::crypto::random_bytes;
 use crate::error::AuthError;
 
-/// OWASP-aligned starting parameters: 19 MiB memory, 2 iterations, 1 lane.
-const MEMORY_KIB: u32 = 19_456;
-const ITERATIONS: u32 = 2;
-const PARALLELISM: u32 = 1;
+/// OWASP-aligned starting parameters: 19 MiB memory, 2 iterations, 1 lane. These are a conservative
+/// *floor*; the operator MUST benchmark on production hardware and raise them so one hash costs the
+/// target time (~0.25–0.5 s), then record the chosen values + a version (R-302, CRYPTOGRAPHY.md).
+/// Run `cargo run --release -p auth-core --example argon2_bench` on the target host to measure.
+pub const MEMORY_KIB: u32 = 19_456;
+pub const ITERATIONS: u32 = 2;
+pub const PARALLELISM: u32 = 1;
+
+/// The configured Argon2id parameters, exposed so a benchmark/operator can measure the exact cost
+/// the service uses.
+pub fn argon2_params() -> Params {
+    Params::new(MEMORY_KIB, ITERATIONS, PARALLELISM, None).expect("static Argon2 parameters are valid")
+}
 
 /// Password policy per **NIST SP 800-63B-4** (the current revision; earlier revisions are
 /// superseded): prioritize length, no composition puzzles, no periodic rotation. 800-63B-4
