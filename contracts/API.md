@@ -199,6 +199,20 @@ hex) }` — the recovery secret authorizes and the new device self-signs the `De
 (proof of possession). Returns a **session for the recovered device**. Generic `401` on a wrong/unset
 secret or a bad signature. Recovery restores **account access, not E2EE message history**.
 
+## Password change (device-signed + current password)
+
+### `POST /v1/session/password/begin` → `200`
+Authed. Returns a `PasswordChange` challenge `{ account_id, device_id, txn_id, nonce, expires_at }`
+for the device to sign.
+
+### `POST /v1/session/password/finish` → `204` | `400` | `401`
+Authed. `{ txn_id, signature (64B hex), current_password, new_password }`. Requires BOTH factors —
+the device signature over the `PasswordChange` transcript (proof of possession) AND the current
+password — then validates the new password (length + blocklist + breach corpus, R-305) and rehashes
+it (Argon2id + pepper if configured, R-303). `401 denied` on a bad signature or wrong current
+password; `400 weak_password` if the new password fails policy/breach. Existing device-bound sessions
+continue (they are not password-derived); the new password governs future logins.
+
 ## Controlled multi-device (ADR-0008)
 
 ### `POST /v1/devices/enroll/begin` → `200`
