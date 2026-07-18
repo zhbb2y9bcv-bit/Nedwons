@@ -140,6 +140,10 @@ pub fn build_router_cfg(
         // manifest + opaque commit; the epoch CAS linearizes membership history.
         .route("/v1/conversations/{id}/commit", post(membership_commit))
         .route("/v1/conversations/{id}/epoch", get(conversation_epoch))
+        .route(
+            "/v1/conversations/{id}/membership/{epoch}",
+            get(membership_event),
+        )
         // group governance (ADR-0009)
         .route(
             "/v1/conversations/{id}/invites",
@@ -1328,7 +1332,7 @@ async fn send_welcome(
 }
 
 /// One added member in a membership commit: their account and joining device.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CommitAddDto {
     account_id: String,
@@ -1522,6 +1526,77 @@ async fn membership_commit(
         ApplyOutcome::IdempotencyMismatch => Err(idempotency_conflict()),
         ApplyOutcome::Invalid => Err(bad_request()),
     }
+}
+
+/// A stored membership event's manifest (decoded) + evidence, for a recipient's correspondence
+/// check (ADR-0010). Members only.
+#[derive(Serialize)]
+struct MembershipEventDto {
+    control_type: u8,
+    prev_epoch: u64,
+    next_epoch: u64,
+    commit_hash: String,
+    actor_device: String,
+    added: Vec<CommitAddDto>,
+    removed: Vec<String>,
+    idempotency_key: String,
+    expires_at: u64,
+    /// Canonical manifest bytes (hex) + the actor's device signature (hex), so the recipient can
+    /// verify the signature once the key directory exposes the actor's device key.
+    manifest: String,
+    signature: String,
+}
+
+/// Fetch the membership event for an epoch transition (`{epoch}` = its `next_epoch`). A recipient
+/// at local epoch N fetches `N+1` to learn the manifest's `added`/`removed` before running the
+/// client-side correspondence check. Members only (generic `403` otherwise).
+async fn membership_event(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((conversation_hex, epoch)): Path<(String, u64)>,
+) -> Result<Json<MembershipEventDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let membership = state.membership.clone();
+    let device = me.device_id;
+    let (is_member, row) = blocking_store(move || {
+        let is_member = membership
+            .epoch_for_member(&conversation_id, &device)?
+            .is_some();
+        let row = if is_member {
+            membership.event_for_epoch(&conversation_id, epoch)?
+        } else {
+            None
+        };
+        Ok((is_member, row))
+    })
+    .await?;
+    if !is_member {
+        return Err(forbidden());
+    }
+    // Not-found and not-a-member both surface as a generic 403 (no oracle on which epochs exist).
+    let row = row.ok_or_else(forbidden)?;
+    let m = auth_core::membership::decode(&row.manifest).ok_or_else(internal)?;
+    Ok(Json(MembershipEventDto {
+        control_type: m.control as u8,
+        prev_epoch: m.prev_epoch,
+        next_epoch: m.next_epoch,
+        commit_hash: hex::encode(m.commit_hash),
+        actor_device: hex::encode(m.actor_device),
+        added: m
+            .added
+            .iter()
+            .map(|(a, d)| CommitAddDto {
+                account_id: hex::encode(a),
+                device_id: hex::encode(d),
+            })
+            .collect(),
+        removed: m.removed.iter().map(hex::encode).collect(),
+        idempotency_key: hex::encode(m.idempotency_key),
+        expires_at: m.expires_at,
+        manifest: hex::encode(&row.manifest),
+        signature: hex::encode(&row.signature),
+    }))
 }
 
 /// The conversation's current membership epoch (members only; one generic 403 otherwise). A
