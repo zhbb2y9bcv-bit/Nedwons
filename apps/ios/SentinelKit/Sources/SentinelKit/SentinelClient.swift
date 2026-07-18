@@ -726,7 +726,53 @@ public enum MembershipVerifyResult: Sendable, Equatable {
     case badSignature
 }
 
+/// A sealed-sender certificate issued by the server for this device (ADR-0012 Slice 1b): the
+/// certificate plus its signature and the server's cert public key. The device embeds
+/// `certificate` + `signature` inside the E2EE payload of a sealed-sender message; the recipient
+/// verifies them under its **pinned** cert public key — never the `certPublicKeyX963` echoed here.
+public struct IssuedSenderCertificate: Sendable {
+    public let certificate: SenderCertificate
+    public let signature: Data
+    /// The server's sender-cert public key as returned by the endpoint — for pinning/discovery
+    /// only. A recipient MUST verify against its own out-of-band-pinned copy, not this field.
+    public let certPublicKeyX963: Data
+
+    /// True while the certificate is still valid at `now`.
+    public func isFresh(now: UInt64) -> Bool { now <= certificate.expiresAt }
+
+    /// Convenience: verify this issued certificate under a caller-supplied **pinned** cert key.
+    public func verify(pinnedCertPublicKeyX963: Data, now: UInt64) -> Bool {
+        certificate.verify(
+            signature: signature, certPublicKeyX963: pinnedCertPublicKeyX963, now: now)
+    }
+}
+
 extension SentinelClient {
+    /// Fetch a fresh sealed-sender certificate for this device (`GET /v1/sender-certificate`,
+    /// ADR-0012 Slice 1b). The device caches it until `expiresAt` and embeds it inside the E2EE
+    /// payload of sealed-sender messages so the recipient verifies the sender the relay never saw.
+    public func fetchSenderCertificate(accessToken: String) async throws -> IssuedSenderCertificate {
+        struct Res: Decodable {
+            let account_id: String
+            let device_id: String
+            let sender_public_key: String
+            let expires_at: UInt64
+            let signature: String
+            let cert_public_key: String
+        }
+        let request = authed("GET", "/v1/sender-certificate", accessToken: accessToken)
+        let res: Res = try decode(await perform(request))
+        let cert = SenderCertificate(
+            accountID: try hex(res.account_id),
+            deviceID: try hex(res.device_id),
+            senderPublicKeyX963: try hex(res.sender_public_key),
+            expiresAt: res.expires_at)
+        return IssuedSenderCertificate(
+            certificate: cert,
+            signature: try hex(res.signature),
+            certPublicKeyX963: try hex(res.cert_public_key))
+    }
+
     /// The conversation's current membership epoch (members only). Read this to rebase after a
     /// `staleEpoch` outcome.
     public func conversationEpoch(accessToken: String, conversationID: String) async throws -> UInt64
