@@ -21,8 +21,9 @@ See [ADR-0001](docs/adr/0001-messaging-protocol.md) for the protocol selection r
 | Constant-time comparison | `subtle` | RustCrypto | For token/hash equality. |
 | Secret zeroization | `zeroize` | RustCrypto | Best-effort wipe of sensitive buffers. |
 
-All versions are pinned via `Cargo.lock`; advisories tracked with `cargo-audit` in CI
-(intent recorded; see RISK_REGISTER R-501).
+All versions are pinned via `Cargo.lock`; advisories are enforced by a `cargo-audit` CI gate over
+all three workspaces (documented exceptions in `docs/SECURITY_AUDIT_EXCEPTIONS.md`), and a
+CycloneDX **SBOM** is generated per build (R-501, `scripts/generate_sbom.sh`).
 
 ## 2. Properties the protocol must provide (and MLS does)
 
@@ -88,9 +89,15 @@ Rust backend produce byte-identical transcripts.
 - **Safety numbers / fingerprints** with QR scanning; clear identity-change warnings that
   are *not* trained-away noise (shown only on real changes).
 - **Key transparency** (append-only log or auditable key directory) is the mechanism that
-  makes malicious server key substitution *detectable*. It is **not implemented yet**
-  (RISK_REGISTER R-201) and is a launch blocker for any claim stronger than
-  trust-on-first-use + manual verification.
+  makes malicious server key substitution *detectable*. An **RFC 6962-compatible append-only
+  Merkle-log primitive is implemented** inside an application-specific KT design (`auth_core::
+  transparency`, `services/api/src/transparency.rs`, `SentinelKit/Transparency.swift`): every
+  account→device-key binding is logged (registration, enrollment, recovery), Signed Tree Heads are
+  ECDSA-P256-signed, and clients self-monitor (inclusion + consistency under a pinned log key). It
+  is **MITIGATING, not complete** (RISK_REGISTER R-201): split-view/gossip, a verifiable map for
+  efficient non-inclusion, log-key rotation, and an external audit remain. Until those land,
+  **manual safety-number verification stays the primary guarantee** — do not claim "the server
+  cannot substitute keys."
 
 ## 7. What is NOT protected (honest limits)
 
