@@ -51,11 +51,20 @@ These are outside what any messaging app can prevent, and SENTINEL does not clai
 
 ## Multi-device
 
-The current implementation enforces the single-view guarantee **per device**. Account-wide
-single-consumption across a user's multiple devices (so opening on phone A also consumes it on
-tablet B) is **not implemented or verified** — it requires encrypted cross-device synchronization of
-the consumption state, designed in [ADR-0015](adr/0015-secret-message-multidevice.md) (Proposed).
-Until that ships, treat the guarantee as **single-device**.
+Account-wide single-consumption **is implemented** ([ADR-0015](adr/0015-secret-message-multidevice.md)):
+when one of your devices opens a secret, it sends an **end-to-end-encrypted, relay-blind**
+"consumed" control message to your other devices, which then consume their copy too — so opening on
+your phone also consumes it on your tablet. The relay never learns a message is secret or that it
+was consumed.
+
+Two honest caveats, inherent to keeping this relay-blind (not hidden):
+
+- **Concurrency:** if two of your devices open the *same* secret within the brief window before the
+  consumed message propagates, both may show it once. Neither can ever re-open it afterward — there
+  is never a *second* viewing, only a possible sub-second overlap.
+- **Offline devices:** a device that is offline when the consumed message is sent applies it on next
+  sync. Until it syncs, that offline device could still open its own copy once. Account-wide
+  consumption is **eventually consistent**, not instantaneous.
 
 ## Where the enforcement lives (for reviewers)
 

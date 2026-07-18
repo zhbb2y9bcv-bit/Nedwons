@@ -11,11 +11,25 @@ import SentinelUI
 /// exercised against the real core by `SecretMessageViewModelRealCoreTests`.
 public final class MlsClientSecretEngine: SecretEngine {
     private let client: MlsClient
+    /// ADR-0015: given the opaque consumption envelope produced when a reveal begins, deliver it to
+    /// the account's OTHER devices (the app's send path — client-side fan-out through the
+    /// conversation; the relay stays blind). Omit on a single-device client — no message is emitted.
+    private let broadcastConsumption: ((Data) throws -> Void)?
 
-    public init(client: MlsClient) { self.client = client }
+    public init(client: MlsClient, broadcastConsumption: ((Data) throws -> Void)? = nil) {
+        self.client = client
+        self.broadcastConsumption = broadcastConsumption
+    }
 
     public func beginReveal(secretID: Data, nowMs: UInt64) throws {
         try client.beginSecretReveal(secretId: secretID, nowMs: nowMs)
+        // Account-wide single-view (ADR-0015): emit the consumption control message once and fan it
+        // out. Only when a broadcast path is wired — a single-device client skips this.
+        if let broadcast = broadcastConsumption,
+            let envelope = try client.secretConsumptionEnvelope(secretId: secretID)
+        {
+            try broadcast(envelope)
+        }
     }
 
     public func phase(secretID: Data, nowMs: UInt64) throws -> SentinelUI.SecretPhase {

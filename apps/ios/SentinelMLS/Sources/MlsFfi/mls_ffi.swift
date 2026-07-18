@@ -620,6 +620,16 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func processInbound(envelopeId: UInt64, ciphertext: Data) throws  -> InboundResult
     
     /**
+     * Build (once) the **consumption control message** for a secret this device revealed (ADR-0015,
+     * account-wide single-view). Returns the opaque envelope to broadcast to the account's other
+     * devices through the conversation (via the normal send path — the relay stays blind), or
+     * `None` if the secret is unknown, is the sender's own, or has not been revealed here.
+     * Idempotent: repeated calls return the same envelope and never double-advance the ratchet.
+     * A single-device client simply never calls this.
+     */
+    func secretConsumptionEnvelope(secretId: Data) throws  -> Data?
+    
+    /**
      * The current reveal phase of a secret at `now_ms` (advancing + persisting a state change).
      */
     func secretPhase(secretId: Data, nowMs: UInt64) throws  -> SecretPhase
@@ -980,6 +990,22 @@ open func processInbound(envelopeId: UInt64, ciphertext: Data)throws  -> Inbound
     uniffi_mls_ffi_fn_method_mlsclient_process_inbound(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(envelopeId),
         FfiConverterData.lower(ciphertext),$0
+    )
+})
+}
+    
+    /**
+     * Build (once) the **consumption control message** for a secret this device revealed (ADR-0015,
+     * account-wide single-view). Returns the opaque envelope to broadcast to the account's other
+     * devices through the conversation (via the normal send path — the relay stays blind), or
+     * `None` if the secret is unknown, is the sender's own, or has not been revealed here.
+     * Idempotent: repeated calls return the same envelope and never double-advance the ratchet.
+     * A single-device client simply never calls this.
+     */
+open func secretConsumptionEnvelope(secretId: Data)throws  -> Data?  {
+    return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_secret_consumption_envelope(self.uniffiClonePointer(),
+        FfiConverterData.lower(secretId),$0
     )
 })
 }
@@ -1676,6 +1702,13 @@ public enum InboundResult {
      */
     case secretSealed(secretId: Data
     )
+    /**
+     * A **consumption** control message arrived (ADR-0015): another of this account's devices
+     * revealed `secret_id`, so this device consumed its copy (account-wide single-view). No
+     * user-visible content; refresh any placeholder for `secret_id` to its tombstone.
+     */
+    case secretConsumedRemotely(secretId: Data
+    )
 }
 
 
@@ -1703,6 +1736,9 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         case 4: return .secretSealed(secretId: try FfiConverterData.read(from: &buf)
         )
         
+        case 5: return .secretConsumedRemotely(secretId: try FfiConverterData.read(from: &buf)
+        )
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -1726,6 +1762,11 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         
         case let .secretSealed(secretId):
             writeInt(&buf, Int32(4))
+            FfiConverterData.write(secretId, into: &buf)
+            
+        
+        case let .secretConsumedRemotely(secretId):
+            writeInt(&buf, Int32(5))
             FfiConverterData.write(secretId, into: &buf)
             
         }
@@ -2221,6 +2262,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_process_inbound() != 58528) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_secret_consumption_envelope() != 28742) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_secret_phase() != 29195) {

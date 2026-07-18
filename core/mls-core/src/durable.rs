@@ -27,7 +27,7 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 use crate::content::{Content, ContentError, SECRET_ID_LEN};
-use crate::secret::{SecretRecord, SecretState};
+use crate::secret::{SecretRecord, SecretSide, SecretState};
 use crate::{Conversation, Incoming, Member};
 
 /// On-disk blob schema version. Bumped when the serialized `{store, meta}` layout changes so an
@@ -126,6 +126,12 @@ pub enum InboundOutcome {
     /// UI can show a sealed placeholder; the body is NOT returned here (it is revealed once, later,
     /// via the reveal state machine).
     SecretSealed {
+        secret_id: [u8; SECRET_ID_LEN],
+    },
+    /// A **consumption** control message arrived (ADR-0015): another of this account's devices
+    /// revealed `secret_id`, so this device consumed its copy too (account-wide single-view). If
+    /// this device held that secret it is now `Consumed`; otherwise this is a harmless no-op.
+    SecretConsumedRemotely {
         secret_id: [u8; SECRET_ID_LEN],
     },
 }
@@ -496,6 +502,15 @@ impl<J: Journal> DurableSession<J> {
                             InboundOutcome::SecretSealed { secret_id }
                         }
                     }
+                    // ADR-0015: another of this account's devices revealed this secret. Force-consume
+                    // our copy (idempotent) so it can never be opened here — account-wide single-view.
+                    // No user-visible message; a device that never held this secret simply no-ops.
+                    Content::SecretConsumed { secret_id } => {
+                        if let Some(rec) = meta.secrets.get_mut(&sid_key(&secret_id)) {
+                            rec.consume();
+                        }
+                        InboundOutcome::SecretConsumedRemotely { secret_id }
+                    }
                 }
             }
             Incoming::StateAdvanced => InboundOutcome::StateAdvanced,
@@ -605,28 +620,32 @@ impl<J: Journal> DurableSession<J> {
             entry.status = OutboundStatus::Encrypted;
         }
         let display = match &content {
-            Content::Normal { body } => Message {
+            Content::Normal { body } => Some(Message {
                 local_id: local_id_for_msg,
                 direction: Direction::Outbound,
                 plaintext: body.clone(),
                 envelope_id: None,
                 secret_id: None,
-            },
+            }),
             Content::Secret { secret_id, .. } => {
                 meta.secrets.insert(
                     sid_key(secret_id),
                     SecretRecord::tombstone_sender(*secret_id),
                 );
-                Message {
+                Some(Message {
                     local_id: local_id_for_msg,
                     direction: Direction::Outbound,
                     plaintext: Vec::new(),
                     envelope_id: None,
                     secret_id: Some(*secret_id),
-                }
+                })
             }
+            // A consumption control message (ADR-0015) is not user-visible — no message log entry.
+            Content::SecretConsumed { .. } => None,
         };
-        meta.messages.push(display);
+        if let Some(display) = display {
+            meta.messages.push(display);
+        }
         self.commit(meta)?;
         Ok(ciphertext)
     }
@@ -670,6 +689,49 @@ impl<J: Journal> DurableSession<J> {
             .ok_or(DurableError::UnknownLocal)?;
         rec.begin_reveal(now_ms).map_err(|_| DurableError::Mls)?;
         self.commit(meta)
+    }
+
+    /// Build (once) the **consumption control message** for a secret whose reveal has begun on THIS
+    /// recipient device (ADR-0015, account-wide single-view). Returns the outbound `local_id` to
+    /// `encrypt` + broadcast to the account's other devices (through the same MLS group — opaque to
+    /// the relay), or `None` if the secret is unknown, is the sender's own copy, or has not been
+    /// revealed here. **Idempotent:** repeated calls return the same `local_id`, so the message is
+    /// built + ratchet-advanced at most once. A caller that does not broadcast (single device) simply
+    /// never calls this — no message is enqueued.
+    pub fn emit_secret_consumption(
+        &mut self,
+        secret_id: &[u8; SECRET_ID_LEN],
+    ) -> Result<Option<u64>, DurableError> {
+        let rec = match self.meta.secrets.get(&sid_key(secret_id)) {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+        if rec.side != SecretSide::Recipient || rec.state == SecretState::Sealed {
+            return Ok(None);
+        }
+        if let Some(existing) = rec.consumption_local_id {
+            return Ok(Some(existing));
+        }
+        let mut meta = self.meta.clone();
+        let local_id = meta.take_local_id();
+        meta.outbox.insert(
+            local_id,
+            Outbound {
+                local_id,
+                plaintext: Content::SecretConsumed {
+                    secret_id: *secret_id,
+                }
+                .encode(),
+                status: OutboundStatus::Queued,
+                ciphertext: None,
+                secret_id: None, // a control message, not a user-visible secret placeholder
+            },
+        );
+        if let Some(rec) = meta.secrets.get_mut(&sid_key(secret_id)) {
+            rec.consumption_local_id = Some(local_id);
+        }
+        self.commit(meta)?;
+        Ok(Some(local_id))
     }
 
     /// The current reveal state of a secret (advancing it for `now_ms`). Persists the advance when it

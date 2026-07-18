@@ -72,6 +72,11 @@ pub struct SecretRecord {
     pub view_deadline_ms: u64,
     /// Highest `now_ms` observed — the monotonic guard against clock rewind.
     pub last_now_ms: u64,
+    /// Recipient side, ADR-0015: the outbound local id of the `SecretConsumed` control message this
+    /// device emitted to its OTHER devices when the reveal began, so it is built + encrypted at most
+    /// once (idempotent). `None` until emitted (or on the sender side, which never emits).
+    #[serde(default)]
+    pub consumption_local_id: Option<u64>,
 }
 
 /// Attempted an invalid or backward state transition.
@@ -89,6 +94,7 @@ impl SecretRecord {
             countdown_deadline_ms: 0,
             view_deadline_ms: 0,
             last_now_ms: 0,
+            consumption_local_id: None,
         }
     }
 
@@ -102,6 +108,7 @@ impl SecretRecord {
             countdown_deadline_ms: 0,
             view_deadline_ms: 0,
             last_now_ms: 0,
+            consumption_local_id: None,
         }
     }
 
