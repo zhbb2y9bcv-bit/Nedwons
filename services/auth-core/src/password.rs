@@ -65,6 +65,18 @@ pub(crate) fn hasher() -> Argon2<'static> {
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
+/// Build the Argon2id hasher with a **server-side pepper** (Argon2's keyed "secret"), R-303. The
+/// pepper is a deployment secret sourced from a KMS/HSM — never stored in the database — so a
+/// database-only compromise cannot offline-crack passwords/recovery secrets. The SAME pepper must
+/// be used to hash and to verify; changing it invalidates all existing hashes (enable it before
+/// any users exist, or run a rehash-on-next-login migration).
+pub(crate) fn hasher_with_pepper(pepper: &'static [u8]) -> Argon2<'static> {
+    let params = Params::new(MEMORY_KIB, ITERATIONS, PARALLELISM, None)
+        .expect("static Argon2 parameters are valid");
+    Argon2::new_with_secret(pepper, Algorithm::Argon2id, Version::V0x13, params)
+        .expect("pepper length is within Argon2 limits")
+}
+
 /// Hash a password, returning a PHC string (contains algorithm, version, params, salt).
 pub(crate) fn hash_password(argon2: &Argon2<'_>, password: &str) -> Result<String, AuthError> {
     // Generate the salt from the OS CSPRNG rather than relying on a specific rand feature
