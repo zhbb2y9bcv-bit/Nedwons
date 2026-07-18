@@ -14,7 +14,7 @@ See [ADR-0001](docs/adr/0001-messaging-protocol.md) for the protocol selection r
 | Group + 1:1 messaging protocol | **MLS (RFC 9420)** via **OpenMLS 0.8.1** | crates.io, MIT license (verified 2026-07-17) | Integrated in `core/mls-core` behind a narrow API. One protocol for 1:1 and groups; epoch-based membership; forward secrecy + post-compromise security. Tests prove no plaintext in ciphertext and removed-member epoch exclusion. |
 | Message AEAD / KDF | Provided by MLS ciphersuite | RustCrypto within OpenMLS | We do **not** mix suites ad hoc; the ciphersuite is chosen explicitly and versioned. Default: `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (classical). |
 | Device proof-of-possession signature | **ECDSA P-256** | `p256` crate (RustCrypto) | Server-side verification; client signer is the Secure Enclave. Deterministic (RFC 6979) on the software test side. |
-| Password hashing | **Argon2id (RFC 9106)** | `argon2` crate (RustCrypto) | Unique per-account salt; params benchmarked per environment; optional KMS pepper. |
+| Password hashing | **Argon2id (RFC 9106)** | `argon2` crate (RustCrypto) | Unique per-account salt; params benchmarked per environment (§Argon2 tuning); optional KMS pepper (R-303). |
 | Attachment encryption | Per-object random key, chunked AEAD | RustCrypto AEAD | Fresh key per attachment; keys travel only inside the E2EE envelope. |
 | RNG | Platform CSPRNG | `getrandom` / SecRandomCopyBytes (iOS) | No custom RNG. |
 | Transcript hashing | SHA-256 | `sha2` (RustCrypto) | Used inside ECDSA and for domain-separated transcript digests. |
@@ -103,3 +103,28 @@ Rust backend produce byte-identical transcripts.
 - **No backdoor**: there is no universal key, moderation key, support-decryption, or silent
   AI upload. A future server-side feature needing plaintext would be a new, explicit,
   opt-in design — not a quiet change to this one.
+
+## Argon2id tuning (R-302)
+
+The password/recovery-secret KDF is **Argon2id (RFC 9106)**. The committed parameters are an
+OWASP-aligned **floor**, not a production-tuned value:
+
+| Parameter | Value | Source |
+|-----------|-------|--------|
+| Memory | 19 456 KiB (19 MiB) | `auth_core::password::MEMORY_KIB` |
+| Iterations (time cost) | 2 | `auth_core::password::ITERATIONS` |
+| Parallelism (lanes) | 1 | `auth_core::password::PARALLELISM` |
+| Algorithm / version | Argon2id / 0x13 (v1.3) | fixed |
+
+**Methodology.** On each production hardware class, run the benchmark and raise the parameters
+(prefer more memory, then more iterations) until one hash costs the target **~0.25–0.5 s**:
+
+```
+cargo run --release -p auth-core --example argon2_bench 50
+```
+
+On a fast dev laptop the floor measures only ~10–15 ms/hash — far too cheap for production, which is
+exactly why per-environment tuning is required. Record the chosen values **and a params version**
+here when set; a raise is applied on the next successful login (rehash-on-verify) or password change.
+Argon2's cost is independent of password length, so the generous max length is free. The optional
+server-side pepper (R-303) is orthogonal and stacks on top of these parameters.
