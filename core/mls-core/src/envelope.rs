@@ -47,7 +47,11 @@ mod tests {
     fn wrap_unwrap_round_trips_and_prefixes_the_version() {
         let payload = b"opaque-mls-ciphertext";
         let env = wrap(payload);
-        assert_eq!(&env[..2], &VERSION.to_be_bytes(), "version is the 2-byte BE prefix");
+        assert_eq!(
+            &env[..2],
+            &VERSION.to_be_bytes(),
+            "version is the 2-byte BE prefix"
+        );
         assert_eq!(unwrap(&env).unwrap(), payload);
     }
 
