@@ -9,6 +9,7 @@ pub mod http;
 pub mod membership;
 pub mod notify;
 pub mod pgstore;
+pub mod proof;
 pub mod relay;
 pub mod social;
 pub mod transparency;

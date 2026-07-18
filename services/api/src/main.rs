@@ -170,6 +170,13 @@ async fn serve(
         .ok()
         .filter(|s| !s.trim().is_empty())
         .and_then(|s| axum::http::HeaderName::from_bytes(s.trim().as_bytes()).ok());
+    // Sender-constrained access tokens (ADR-0011, R-308): opt-in during migration.
+    let require_proof = std::env::var("SENTINEL_REQUIRE_PROOF")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if require_proof {
+        tracing::info!("sender-constrained access tokens (DPoP proofs) REQUIRED");
+    }
     let app = http::build_router_cfg(
         service,
         relay,
@@ -179,6 +186,7 @@ async fn serve(
         membership,
         rate_per_min,
         trusted_ip_header,
+        require_proof,
     );
     let listener = match tokio::net::TcpListener::bind(bind).await {
         Ok(l) => l,
