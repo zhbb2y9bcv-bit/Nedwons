@@ -41,6 +41,24 @@ public struct SenderCertificate: Sendable {
         return key.isValidSignature(sig, for: canonicalBytes())
     }
 
+    /// Verify this certificate for **sealed-sender receipt** (ADR-0012 Slice 2). Three checks, all
+    /// required: the signature is valid under the recipient's **pinned** sender-cert public key; the
+    /// certificate has not expired at `now`; and its bound `senderPublicKeyX963` **equals the key MLS
+    /// attributes this message to**. The last check is what ties a relay-invisible sender to the
+    /// actual MLS sender — without it, a valid certificate for device A could be wrapped around a
+    /// message MLS says came from device B. Fail-closed boolean.
+    public func verifySealedSender(
+        signature: Data,
+        pinnedCertPublicKeyX963: Data,
+        mlsSenderPublicKeyX963: Data,
+        now: UInt64
+    ) -> Bool {
+        guard verify(signature: signature, certPublicKeyX963: pinnedCertPublicKeyX963, now: now)
+        else { return false }
+        // Public keys — a plain equality check is sufficient (no secret-dependent timing).
+        return senderPublicKeyX963 == mlsSenderPublicKeyX963
+    }
+
     private static func putLengthPrefixed(_ out: inout Data, _ field: Data) {
         withUnsafeBytes(of: UInt32(field.count).bigEndian) { out.append(contentsOf: $0) }
         out.append(field)
