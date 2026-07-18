@@ -104,3 +104,40 @@ public enum SelfMonitorResult: Sendable, Equatable {
     /// A binding's inclusion proof did not verify against the signed root.
     case badProof
 }
+
+/// Result of an **account-level** device-set audit (#8): does the set of devices the transparency
+/// log proves are bound to this account match the set the user knowingly enrolled? An *unexpected*
+/// logged device is the alarm — it means a device was bound that the user never added (e.g. a
+/// server-injected key), which no per-device self-check would catch.
+public enum AccountDeviceAudit: Sendable, Equatable {
+    /// The logged (non-revoked) device set exactly matches the expected set.
+    case ok
+    /// **ALARM:** devices are bound in the log that the user did not enroll.
+    case unexpectedDevices([String])
+    /// Expected devices are not yet in the log (e.g. an enrollment not yet propagated) — softer.
+    case missingDevices([String])
+    /// Both discrepancies at once.
+    case discrepancy(unexpected: [String], missing: [String])
+    /// The STH signature did not verify under the pinned log key.
+    case badSignature
+    /// The log advertised a different public key than the one pinned.
+    case logKeyChanged
+    /// A binding's inclusion proof did not verify against the signed root.
+    case badProof
+}
+
+public enum KeyTransparencyAudit {
+    /// Pure set-comparison of the (proof-verified) logged active devices against the expected set.
+    /// Separated from the network + proof checks so the alarm logic is trivially testable.
+    public static func classify(loggedActive: Set<String>, expected: Set<String>) -> AccountDeviceAudit
+    {
+        let unexpected = loggedActive.subtracting(expected).sorted()
+        let missing = expected.subtracting(loggedActive).sorted()
+        switch (unexpected.isEmpty, missing.isEmpty) {
+        case (true, true): return .ok
+        case (false, true): return .unexpectedDevices(unexpected)
+        case (true, false): return .missingDevices(missing)
+        case (false, false): return .discrepancy(unexpected: unexpected, missing: missing)
+        }
+    }
+}

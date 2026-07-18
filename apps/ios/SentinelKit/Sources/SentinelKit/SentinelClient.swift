@@ -505,6 +505,54 @@ public extension SentinelClient {
         return included ? .ok : .badProof
     }
 
+    /// **Account-level device audit** (#8): verify the STH under the pinned log key, fetch this
+    /// account's logged bindings, verify each one's inclusion proof, and compare the proven set of
+    /// currently-bound (non-revoked) devices against `expectedDeviceIDs` — the devices the user
+    /// knowingly enrolled. An *unexpected* logged device means the server bound a device the user
+    /// never added (a server-injected key); that is the alarm a per-device self-check cannot raise.
+    /// A background task should call this on launch and periodically. The client trusts nothing the
+    /// server asserts — every membership claim is checked against the signed root.
+    func auditAccountDevices(
+        accessToken: String,
+        accountID: String,
+        expectedDeviceIDs: Set<String>,
+        pinnedLogPublicKeyX963: Data
+    ) async throws -> AccountDeviceAudit {
+        let sth = try await transparencySignedTreeHead(accessToken: accessToken)
+        guard let root = Hex.decode(sth.rootHash), let sig = Hex.decode(sth.signature),
+            let advertised = Hex.decode(sth.logPublicKey)
+        else { return .badSignature }
+        if advertised != pinnedLogPublicKeyX963 { return .logKeyChanged }
+        guard Transparency.verifySTHSignature(
+            treeSize: sth.treeSize, root: root, timestamp: sth.timestamp,
+            signature: sig, logPublicKeyX963: pinnedLogPublicKeyX963)
+        else { return .badSignature }
+
+        let view = try await transparencyAccount(
+            accessToken: accessToken, accountID: accountID, treeSize: sth.treeSize)
+
+        // Every leaf's inclusion is verified against the signed root, so the server cannot omit or
+        // fabricate a binding. A device is "active" iff it has a binding leaf and no revocation.
+        var boundDevices = Set<String>()
+        var revokedDevices = Set<String>()
+        for b in view.bindings {
+            guard let entry = Hex.decode(b.entry) else { return .badProof }
+            let proof = b.proof.compactMap { Hex.decode($0) }
+            guard proof.count == b.proof.count,
+                Transparency.verifyInclusion(
+                    leaf: Transparency.hashLeaf(entry), index: Int(b.leafIndex),
+                    treeSize: Int(sth.treeSize), proof: proof, root: root)
+            else { return .badProof }
+            if b.revokedAt != nil {
+                revokedDevices.insert(b.deviceID)
+            } else {
+                boundDevices.insert(b.deviceID)
+            }
+        }
+        let active = boundDevices.subtracting(revokedDevices)
+        return KeyTransparencyAudit.classify(loggedActive: active, expected: expectedDeviceIDs)
+    }
+
     /// Extract the revocation leaves from an account view (pure — no proof verification). The
     /// verified counterpart is `monitorDeviceRevocations`.
     static func revocationLeaves(in view: TransparencyAccountView) -> [LoggedRevocation] {
