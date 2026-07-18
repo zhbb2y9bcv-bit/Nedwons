@@ -8,8 +8,8 @@ vulnerability-disclosure process. It complements [THREAT_MODEL.md](THREAT_MODEL.
 
 - **OWASP MASVS/MASTG** — mobile verification baseline (iOS).
 - **OWASP ASVS** + **OWASP API Security Top 10** — backend/API controls.
-- **NIST SP 800-63B** — authentication guidance (used as guidance; no claim of formal
-  government compliance without independent assessment).
+- **NIST SP 800-63B-4** — authentication guidance, current revision (used as guidance; no
+  claim of formal government compliance without independent assessment).
 - **NIST SSDF** — secure development lifecycle.
 
 A traceability matrix mapping each control to code, tests, evidence, exceptions, and owners

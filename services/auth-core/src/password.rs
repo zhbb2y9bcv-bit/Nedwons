@@ -17,10 +17,12 @@ const MEMORY_KIB: u32 = 19_456;
 const ITERATIONS: u32 = 2;
 const PARALLELISM: u32 = 1;
 
-/// Password policy per NIST SP 800-63B: prioritize length, no composition puzzles, no
-/// periodic rotation. NIST's floor is 8 characters with 15 recommended; the product policy
-/// here is a 12-character minimum. The generous maximum supports long passphrases and
-/// password managers (Argon2 cost is length-independent after hashing input).
+/// Password policy per **NIST SP 800-63B-4** (the current revision; earlier revisions are
+/// superseded): prioritize length, no composition puzzles, no periodic rotation. 800-63B-4
+/// verifiers SHALL require ≥ 8 characters and SHOULD require ≥ 15; the product policy here is
+/// a 12-character minimum (exceeds the SHALL; blocklist + length carry the strength). The
+/// generous maximum supports long passphrases and password managers (Argon2 cost is
+/// length-independent after hashing input).
 pub const MIN_PASSWORD_CHARS: usize = 12;
 pub const MAX_PASSWORD_BYTES: usize = 1024;
 

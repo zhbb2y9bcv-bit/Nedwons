@@ -24,6 +24,12 @@ pub mod durable;
 /// The single, explicit ciphersuite for v1 (CRYPTOGRAPHY.md §1). No silent negotiation.
 pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
+/// This crate's version, surfaced across the FFI so the client can assert compatibility.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Human-readable ciphersuite name (stable string for the FFI `capabilities()` report).
+pub const CIPHERSUITE_NAME: &str = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
+
 #[derive(Debug, thiserror::Error)]
 pub enum MlsError {
     #[error("mls library error: {0}")]

@@ -33,7 +33,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::groups::{InviteOutcome, PgGroups};
 use crate::notify::DeliveryNotifier;
-use crate::relay::{FanoutOutcome, PgRelay};
+use crate::relay::{FanoutOutcome, PgRelay, SendOutcome};
 use crate::social::{FriendRequestOutcome, PgSocial};
 use crate::transparency::PgTransparency;
 
@@ -233,6 +233,12 @@ fn forbidden() -> ApiError {
     // The relay uses a generic 403 for "not a member" so it does not confirm a
     // conversation's existence or membership to non-members.
     ApiError(StatusCode::FORBIDDEN, "forbidden")
+}
+
+fn idempotency_conflict() -> ApiError {
+    // An idempotency key was reused with a different payload/conversation. The client must
+    // retry with a fresh key; the original message under this key was not overwritten.
+    ApiError(StatusCode::CONFLICT, "idempotency_conflict")
 }
 
 impl From<auth_core::store::StoreError> for ApiError {
@@ -1262,6 +1268,9 @@ async fn send_message(
     .await?;
     match outcome {
         FanoutOutcome::Forbidden => Err(forbidden()),
+        // Key reused for a different payload/conversation: refusing (409) beats silently
+        // deduping, which would drop the new message while reporting success.
+        FanoutOutcome::IdempotencyMismatch => Err(idempotency_conflict()),
         FanoutOutcome::Delivered { newly_queued } => {
             // Wake any long-poll waiters for the recipients that just got mail.
             for device in &newly_queued {
@@ -1289,7 +1298,7 @@ async fn send_welcome(
 
     let relay = state.relay.clone();
     let recipient_bytes = recipient.0;
-    let envelope_id = blocking_store(move || {
+    let outcome = blocking_store(move || {
         relay.send_targeted(
             &conversation_id,
             &me.device_id,
@@ -1298,8 +1307,12 @@ async fn send_welcome(
             &idempotency_key,
         )
     })
-    .await?
-    .ok_or_else(forbidden)?;
+    .await?;
+    let envelope_id = match outcome {
+        SendOutcome::Forbidden => return Err(forbidden()),
+        SendOutcome::IdempotencyMismatch => return Err(idempotency_conflict()),
+        SendOutcome::Queued(id) => id,
+    };
     state.notifier.wake(&recipient_bytes);
     Ok(Json(ReceiptDto { envelope_id }))
 }

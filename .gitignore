@@ -19,6 +19,18 @@ apps/ios/**/.swiftpm/
 *.dSYM.zip
 *.dSYM
 
+# MLS UniFFI bridge derived artifacts — large/rebuildable via scripts/build_mls_ffi.sh (ADR-0007).
+# The generated Swift (apps/ios/SentinelMLS/Sources/MlsFfi/mls_ffi.swift) IS committed and
+# stale-checked in CI; the XCFramework binary + provenance manifest + scratch generation are not.
+apps/ios/**/*.xcframework
+apps/ios/**/.build-xc/
+apps/ios/SentinelMLS/ARTIFACTS.md
+core/mls-ffi/generated/
+
+# cargo-fuzz: keep the target + a small seed corpus committed; ignore crash artifacts + coverage.
+core/mls-ffi/fuzz/artifacts/
+core/mls-ffi/fuzz/coverage/
+
 # Secrets — must never be committed. Real values live in a KMS/secret manager.
 *.p8
 *.p12

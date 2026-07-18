@@ -114,13 +114,22 @@ async fn serve(
     transparency: Arc<sentinel_api::transparency::PgTransparency>,
 ) {
     // Retention hygiene (DATA_RETENTION.md): every minute purge expired challenges/access
-    // tokens AND stale envelopes past the 30-day queue TTL. Failure is logged and retried
-    // next tick — never fatal.
+    // tokens AND stale envelopes past the queue TTL. Failure is logged and retried next
+    // tick — never fatal. The TTL is env-tunable but defaults to the documented 30 days;
+    // envelope deletion runs in bounded batches so a large backlog can never turn the
+    // minutely tick into one long table-locking DELETE (it drains across ticks instead).
     {
+        let ttl_days: u64 = std::env::var("SENTINEL_ENVELOPE_TTL_DAYS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+        let envelope_ttl = std::time::Duration::from_secs(ttl_days * 24 * 60 * 60);
+        const PURGE_BATCH_SIZE: i64 = 5_000;
+        const PURGE_MAX_BATCHES: u32 = 20;
+        tracing::info!("envelope retention TTL: {ttl_days} days");
         let stores = stores.clone();
         let relay = relay.clone();
         tokio::spawn(async move {
-            const ENVELOPE_TTL_DAYS: i32 = 30;
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 tick.tick().await;
@@ -132,7 +141,11 @@ async fn serve(
                         .map(|d| d.as_secs())
                         .unwrap_or(0);
                     let auth = stores.purge_expired(now)?;
-                    let mail = relay.purge_stale_envelopes(ENVELOPE_TTL_DAYS)?;
+                    let mail = relay.purge_stale_envelopes(
+                        envelope_ttl,
+                        PURGE_BATCH_SIZE,
+                        PURGE_MAX_BATCHES,
+                    )?;
                     Ok::<u64, auth_core::store::StoreError>(auth + mail)
                 })
                 .await;
