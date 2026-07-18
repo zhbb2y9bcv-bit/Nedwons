@@ -197,10 +197,18 @@ async fn serve(
                         PURGE_BATCH_SIZE,
                         PURGE_MAX_BATCHES,
                     )?;
+                    // Same retention TTL for self-group envelopes (ADR-0015 option 3).
+                    let self_group = relay.purge_stale_self_group(
+                        envelope_ttl,
+                        PURGE_BATCH_SIZE,
+                        PURGE_MAX_BATCHES,
+                    )?;
                     // MLS prekey hygiene: drop key packages past their TTL.
                     let prekeys = relay
                         .purge_expired_key_packages(sentinel_api::relay::KEY_PACKAGE_TTL_SECS)?;
-                    Ok::<u64, auth_core::store::StoreError>(auth + mail + sealed + prekeys)
+                    Ok::<u64, auth_core::store::StoreError>(
+                        auth + mail + sealed + self_group + prekeys,
+                    )
                 })
                 .await;
                 match purged {
