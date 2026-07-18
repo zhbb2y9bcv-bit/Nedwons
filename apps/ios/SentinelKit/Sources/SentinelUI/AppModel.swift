@@ -82,6 +82,7 @@ public final class AppModel: ObservableObject {
                 username: username, password: password, signer: enrolled.signer
             )
             session = s
+            acknowledgedDeviceIDs = [s.deviceID] // this device is trusted from enrollment
             if enrolled.assurance == .software {
                 banner = "This device has no Secure Enclave — using a lower-assurance software key."
             }
@@ -101,6 +102,7 @@ public final class AppModel: ObservableObject {
                 username: username, password: password, signer: enrolled.signer
             )
             session = s
+            acknowledgedDeviceIDs = [s.deviceID]
             await loadInitial()
         }
     }
@@ -132,6 +134,65 @@ public final class AppModel: ObservableObject {
             guard let token else { return }
             conversations = try await client.listConversations(accessToken: token)
         }
+    }
+
+    // MARK: Devices, linking & key-transparency monitoring (#8/#9)
+
+    /// This account's devices (management list).
+    @Published public var devices: [DeviceSummary] = []
+    /// Sibling devices enrolled but not yet linked into the self-group (candidates to link).
+    @Published public var pendingLinkDevices: [String] = []
+    /// Result of the last account-level transparency audit (nil until run).
+    @Published public var deviceAudit: AccountDeviceAudit?
+    /// Devices the user has ACKNOWLEDGED as their own — the trusted expected set the audit compares
+    /// the transparency log against. Seeded with the current device on sign-in; the user confirms
+    /// others. (A real app persists this locally; here it lives for the session.)
+    @Published public var acknowledgedDeviceIDs: Set<String> = []
+    /// The out-of-band-pinned transparency log key (fetched once at sign-in in this shell).
+    private var pinnedLogKey: Data?
+
+    public func refreshDevices() async {
+        await run { [self] in
+            guard let token else { return }
+            devices = try await client.listDevices(accessToken: token)
+            pendingLinkDevices = try await client.pendingSelfGroupDevices(accessToken: token)
+        }
+    }
+
+    /// The user confirms a device is theirs, adding it to the trusted expected set.
+    public func acknowledgeDevice(_ deviceID: String) {
+        acknowledgedDeviceIDs.insert(deviceID)
+    }
+
+    /// Audit the account's logged device set against the acknowledged set (#8). An unexpected logged
+    /// device raises the alarm banner.
+    public func auditDevices() async {
+        await run { [self] in
+            guard let token, let account = session?.accountID else { return }
+            let pinned = try await currentPinnedLogKey()
+            deviceAudit = try await client.auditAccountDevices(
+                accessToken: token, accountID: account,
+                expectedDeviceIDs: acknowledgedDeviceIDs, pinnedLogPublicKeyX963: pinned)
+        }
+    }
+
+    /// Register this device's push token so it is woken when not connected (#4).
+    public func registerPush(token pushToken: Data) async {
+        await run { [self] in
+            guard let token else { return }
+            try await client.registerPushToken(accessToken: token, token: pushToken)
+        }
+    }
+
+    private func currentPinnedLogKey() async throws -> Data {
+        if let pinnedLogKey { return pinnedLogKey }
+        guard let token else { throw SentinelClient.ClientError.decoding }
+        let sth = try await client.transparencySignedTreeHead(accessToken: token)
+        guard let key = Hex.decode(sth.logPublicKey) else {
+            throw SentinelClient.ClientError.decoding
+        }
+        pinnedLogKey = key
+        return key
     }
 
     // MARK: Profile
