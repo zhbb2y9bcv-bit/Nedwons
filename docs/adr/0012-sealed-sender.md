@@ -78,7 +78,11 @@ ephemeral fallback in dev; distinct from the auth/transparency keys) and `GET
 for the authenticated device. The response includes the cert public key so clients can pin it out of
 band and verify without the relay ever seeing the sender; the relay stays MLS-blind (it only signs
 `{account, device, device pubkey, expiry}` bytes). Integration-tested: the signature verifies under
-the returned key, binds the device's own public key, and a tampered key fails. **Slice 2:** the sealed-sender delivery
+the returned key, binds the device's own public key, and a tampered key fails. The **client half**
+also landed: `SentinelClient.fetchSenderCertificate` decodes the issuance response into an
+`IssuedSenderCertificate` (certificate + signature + echoed cert key) with
+`verify(pinnedCertPublicKeyX963:now:)`, unit-tested via a stub transport (verifies under the pinned
+key, rejects a substituted key, rejects once expired). **Slice 2:** the sealed-sender delivery
 endpoint (NULL sender, recipient-token abuse control) + recipient extraction/verification wired
 through the MLS payload + `PRIVACY.md` updates. R-204 stays **OPEN/MITIGATING** until Slice 2 ships
 and the relay demonstrably stores no sender for sealed messages.
