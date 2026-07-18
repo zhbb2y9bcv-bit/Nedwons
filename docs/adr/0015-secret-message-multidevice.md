@@ -107,6 +107,28 @@ Adopt **option 2** with a race rule and a fail-closed default:
 Until step 2 lands, the Secret Message guarantee remains **single-device**, as stated in
 `docs/SECRET_MESSAGES.md` and RISK_REGISTER.
 
+## Self-group lifecycle: 3+ devices and revocation re-key (2026-07-18)
+
+- **3+ devices.** Adding the third (and later) device requires the add-commit to be applied by the
+  existing self-group member(s), not just a Welcome to the newcomer. `add_self_device` returns
+  (commit, welcome); existing members apply the commit via `process_self_inbound`. Over the FFI the
+  commit is **envelope-wrapped** (so it round-trips through the same unwrap path as any self-group
+  message) while the Welcome stays raw for `join_self_group`. Proven at mls-core with a real 4-member
+  conversation + 3-device self-group: a consumption fans out to BOTH other devices, each consuming
+  its own held copy (this also closes the earlier "both devices hold the same secret" gap at the core
+  level).
+- **Revocation re-key (forward secrecy).** Relay-side exclusion of a revoked device is not enough —
+  the device still holds valid self-group ratchet state. `DurableSession::remove_self_device` /
+  `MlsClient.remove_self_device` issue an **MLS remove-commit**; once a remaining device applies it,
+  the epoch advances and the removed device can no longer decrypt self-group traffic even if handed
+  the exact ciphertext. Proven at mls-core (`three_device_self_group_fans_out_then_revocation_rekeys`:
+  the revoked laptop's later copy stays sealed) and FFI
+  (`self_group_three_device_add_and_revocation_rekey_across_the_ffi`). The backend also drops the
+  revoked device from `self_group_members` on `/v1/devices/revoke` (housekeeping; the fan-out query
+  already excluded revoked devices) — proven by `self_group.rs::revoking_a_device_drops_it_from_the_self_group`.
+  The **trigger** (a remaining device noticing a revocation and issuing the remove-commit) is a client
+  reconciliation step, wired in the app layer.
+
 ## Backend transport — device-linking flow (landed 2026-07-18, `services/api`)
 
 The option-3 self-group needs a relay path to establish and use it across the account's devices. The

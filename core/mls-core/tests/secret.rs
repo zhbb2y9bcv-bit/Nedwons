@@ -510,3 +510,132 @@ fn self_group_persists_across_reopen() {
         "the self-group is reloaded from the persisted blob"
     );
 }
+
+/// ADR-0015 option 3, full lifecycle: a THREE-device self-group (phone + tablet + laptop) where
+/// adding the third device requires a commit to the existing member; a consumption fans out to BOTH
+/// other devices (each consuming its own held copy); and — the security-critical part — when the
+/// laptop is REVOKED, an existing device re-keys the self-group with an MLS remove-commit, after
+/// which the laptop cannot decrypt subsequent self-group traffic (cryptographic forward secrecy, not
+/// merely relay-side exclusion).
+#[test]
+fn three_device_self_group_fans_out_then_revocation_rekeys() {
+    // Conversation: alice (sender) + phone + tablet + laptop (Bob's three devices).
+    let alice = Member::new(b"alice-dev").unwrap();
+    let phone = Member::new(b"bob-phone").unwrap();
+    let tablet = Member::new(b"bob-tablet").unwrap();
+    let laptop = Member::new(b"bob-laptop").unwrap();
+    let mut ga = alice.create_group().unwrap();
+    let add_phone = ga
+        .add_member(&alice, &phone.key_package_bytes().unwrap())
+        .unwrap();
+    let mut gp = phone.join_from_welcome(&add_phone.welcome).unwrap();
+    let add_tablet = ga
+        .add_member(&alice, &tablet.key_package_bytes().unwrap())
+        .unwrap();
+    gp.process(&phone, &add_tablet.commit).unwrap();
+    let mut gt = tablet.join_from_welcome(&add_tablet.welcome).unwrap();
+    let add_laptop = ga
+        .add_member(&alice, &laptop.key_package_bytes().unwrap())
+        .unwrap();
+    gp.process(&phone, &add_laptop.commit).unwrap();
+    gt.process(&tablet, &add_laptop.commit).unwrap();
+    let gl = laptop.join_from_welcome(&add_laptop.welcome).unwrap();
+
+    let mut da = DurableSession::adopt(alice, ga, InMemoryJournal::new()).unwrap();
+    let mut dp = DurableSession::adopt(phone, gp, InMemoryJournal::new()).unwrap();
+    let mut dt = DurableSession::adopt(tablet, gt, InMemoryJournal::new()).unwrap();
+    let mut dl = DurableSession::adopt(laptop, gl, InMemoryJournal::new()).unwrap();
+
+    // The self-group of all THREE devices: phone creates it, adds tablet, then adds laptop — the
+    // laptop-add commit must be applied by the existing self-group member (tablet).
+    dp.create_self_group().unwrap();
+    let (_c_tablet, w_tablet) = dp.add_self_device(&dt.key_package().unwrap()).unwrap();
+    dt.join_self_group(&w_tablet).unwrap();
+    let (c_laptop, w_laptop) = dp.add_self_device(&dl.key_package().unwrap()).unwrap();
+    assert!(matches!(
+        dt.process_self_inbound(100, &c_laptop).unwrap(),
+        InboundOutcome::StateAdvanced
+    ));
+    dl.join_self_group(&w_laptop).unwrap();
+    assert!(dp.has_self_group() && dt.has_self_group() && dl.has_self_group());
+
+    // Alice sends secret #1; all three of Bob's devices seal it.
+    let (env1, sid1) = send_secret(&mut da, b"first-secret-1111");
+    for (d, id) in [(&mut dp, 1u64), (&mut dt, 1), (&mut dl, 1)] {
+        assert!(matches!(
+            d.process_inbound(id, &env1).unwrap(),
+            InboundOutcome::SecretSealed { .. }
+        ));
+    }
+
+    // Phone reveals #1; the consumption fans out over the self-group to BOTH tablet and laptop,
+    // each consuming its OWN held copy — account-wide single-view across three devices.
+    dp.begin_secret_reveal(&sid1, 0).unwrap();
+    let cid1 = dp
+        .emit_secret_consumption(&sid1)
+        .unwrap()
+        .expect("consume1");
+    let consume1 = dp.encrypt(cid1).unwrap();
+    assert!(matches!(
+        dt.process_self_inbound(101, &consume1).unwrap(),
+        InboundOutcome::SecretConsumedRemotely { secret_id } if secret_id == sid1
+    ));
+    assert!(matches!(
+        dl.process_self_inbound(101, &consume1).unwrap(),
+        InboundOutcome::SecretConsumedRemotely { secret_id } if secret_id == sid1
+    ));
+    assert_eq!(
+        dt.secret_state(&sid1, 0).unwrap(),
+        Some(SecretState::Consumed)
+    );
+    assert_eq!(
+        dl.secret_state(&sid1, 0).unwrap(),
+        Some(SecretState::Consumed)
+    );
+
+    // --- Revocation re-key: the laptop is revoked from the account. An existing device removes it
+    // from the self-group (MLS remove-commit); the remaining member (tablet) applies it. ---
+    let remove_commit = dp.remove_self_device(b"bob-laptop").unwrap();
+    assert!(matches!(
+        dt.process_self_inbound(102, &remove_commit).unwrap(),
+        InboundOutcome::StateAdvanced
+    ));
+
+    // Alice sends secret #2; conversation membership is unchanged, so all three still seal a copy.
+    let (env2, sid2) = send_secret(&mut da, b"second-secret-2222");
+    for (d, id) in [(&mut dp, 2u64), (&mut dt, 2), (&mut dl, 2)] {
+        assert!(matches!(
+            d.process_inbound(id, &env2).unwrap(),
+            InboundOutcome::SecretSealed { .. }
+        ));
+    }
+
+    // Phone reveals #2; the consumption goes out on the NEW self-group epoch (phone + tablet only).
+    dp.begin_secret_reveal(&sid2, 0).unwrap();
+    let cid2 = dp
+        .emit_secret_consumption(&sid2)
+        .unwrap()
+        .expect("consume2");
+    let consume2 = dp.encrypt(cid2).unwrap();
+    // Tablet (still a member) consumes its #2 copy.
+    assert!(matches!(
+        dt.process_self_inbound(103, &consume2).unwrap(),
+        InboundOutcome::SecretConsumedRemotely { secret_id } if secret_id == sid2
+    ));
+    assert_eq!(
+        dt.secret_state(&sid2, 0).unwrap(),
+        Some(SecretState::Consumed)
+    );
+
+    // FORWARD SECRECY: the revoked laptop, even handed the exact ciphertext, CANNOT decrypt the
+    // post-revocation self-group message — so its #2 copy is never consumed by the removed device.
+    assert!(
+        dl.process_self_inbound(103, &consume2).is_err(),
+        "a removed device cannot decrypt self-group traffic sent after its removal"
+    );
+    assert_eq!(
+        dl.secret_state(&sid2, 0).unwrap(),
+        Some(SecretState::Sealed),
+        "no valid consumption reached the removed device"
+    );
+}
