@@ -735,6 +735,36 @@ public extension SentinelClient {
 
     // ----- Device self-group: linking + consumption fan-out (ADR-0015 option 3) -----
 
+    /// Fetch a single-use App Attest challenge (`GET /v1/attest/challenge`, #10) to fold into the
+    /// attestation object. Returns the raw challenge bytes.
+    public func attestChallenge(accessToken: String) async throws -> Data {
+        struct Res: Decodable { let challenge: String }
+        let res: Res = try decode(
+            await perform(authed("GET", "/v1/attest/challenge", accessToken: accessToken)))
+        guard let bytes = Hex.decode(res.challenge) else { throw ClientError.decoding }
+        return bytes
+    }
+
+    /// Submit an App Attest attestation (`POST /v1/attest/key`, #10). The `challenge` must be the one
+    /// just issued (single-use, anti-replay). The server stores it (its Apple-root verification is
+    /// the hardware-gated step).
+    public func submitAttestation(
+        accessToken: String, keyID: String, challenge: Data, attestation: Data
+    ) async throws {
+        struct Body: Encodable {
+            let key_id: String
+            let challenge: String
+            let attestation: String
+        }
+        var request = authed("POST", "/v1/attest/key", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            Body(
+                key_id: keyID, challenge: Hex.encode(challenge),
+                attestation: Hex.encode(attestation)))
+        _ = try await perform(request)
+    }
+
     /// Register (or rotate) this device's APNs push token (`POST /v1/push/register`) so it can be
     /// woken to fetch its inbox when not connected (#4). The token addresses a **contentless** wake
     /// push — no E2EE content is ever sent through APNs.
