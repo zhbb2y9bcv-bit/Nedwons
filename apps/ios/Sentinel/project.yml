@@ -1,0 +1,43 @@
+# XcodeGen spec for the SENTINEL demo app (closes the software half of R-101 — a runnable @main
+# iOS target). Generate the project with `xcodegen generate` (in this directory), then build/run
+# for a simulator. The app links the local SwiftPM packages by relative path, so no versions are
+# pinned here. Regenerate whenever this file changes; the generated .xcodeproj is a build artifact
+# (gitignored).
+name: Sentinel
+options:
+  bundleIdPrefix: app.sentinel
+  deploymentTarget:
+    iOS: "17.0"
+  createIntermediateGroups: true
+
+packages:
+  SentinelKit:
+    path: ../SentinelKit
+  SentinelMLS:
+    path: ../SentinelMLS
+  SentinelApp:
+    path: ../SentinelApp
+
+targets:
+  Sentinel:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    dependencies:
+      - package: SentinelKit
+        product: SentinelUI
+      - package: SentinelMLS
+        product: MlsFfi
+      - package: SentinelApp
+        product: SentinelAppKit
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.sentinel.demo
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_CFBundleDisplayName: Sentinel
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "6.0"
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"

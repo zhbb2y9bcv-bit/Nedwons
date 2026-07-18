@@ -50,3 +50,8 @@ secrets/
 # CycloneDX SBOMs (R-501) — generated build artifacts (CI uploads them)
 sbom/
 **/*.cdx.json
+
+# Generated Xcode app project (xcodegen from apps/ios/Sentinel/project.yml — regenerable)
+apps/ios/**/*.xcodeproj
+# Auto-grown fuzz corpus (regenerable); the deterministic tests + harness are what matter.
+core/mls-ffi/fuzz/corpus/secret_state/
