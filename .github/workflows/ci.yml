@@ -71,6 +71,25 @@ jobs:
       - name: Test (E2EE properties)
         run: cargo test
 
+  mls-ffi:
+    name: mls-ffi (UniFFI boundary)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: core/mls-ffi
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Format check
+        run: cargo fmt -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Test (FFI object semantics + adversarial corpus)
+        run: cargo test
+
   sca:
     name: dependency advisories (SCA)
     runs-on: ubuntu-latest
@@ -108,6 +127,18 @@ jobs:
             --ignore RUSTSEC-2026-0211 \
             --ignore RUSTSEC-2026-0212 \
             --ignore RUSTSEC-2026-0173
+      - name: cargo audit (mls-ffi)
+        working-directory: core/mls-ffi
+        run: |
+          cargo audit \
+            --ignore RUSTSEC-2026-0124 \
+            --ignore RUSTSEC-2026-0207 \
+            --ignore RUSTSEC-2026-0208 \
+            --ignore RUSTSEC-2026-0209 \
+            --ignore RUSTSEC-2026-0210 \
+            --ignore RUSTSEC-2026-0211 \
+            --ignore RUSTSEC-2026-0212 \
+            --ignore RUSTSEC-2026-0173
       - name: Secret scan
         uses: gitleaks/gitleaks-action@v2
 
@@ -122,6 +153,28 @@ jobs:
       - name: Test (transcript/interop unit tests)
         working-directory: apps/ios/SentinelKit
         run: swift test
+
+  mls-bridge:
+    name: mls-ffi Apple packaging + Swift MLS integration
+    runs-on: macos-15   # Xcode 26 / Swift 6 + Apple SDKs
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust + Apple targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, aarch64-apple-ios, aarch64-apple-ios-sim
+      - name: Build XCFramework + generate bindings (ADR-0007)
+        run: scripts/build_mls_ffi.sh
+      - name: Fail if committed Swift bindings are stale
+        run: scripts/build_mls_ffi.sh --check
+      - name: Swift ↔ Rust MLS integration test (host / macOS slice)
+        working-directory: apps/ios/SentinelMLS
+        run: swift test
+      - name: Compile iOS simulator + device slices (device is compile-only, R-101)
+        working-directory: apps/ios/SentinelMLS
+        run: |
+          xcodebuild build -scheme SentinelMLS -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO
+          xcodebuild build -scheme SentinelMLS -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO
 
   ios-app:
     name: ios app target (Xcode)
@@ -140,7 +193,7 @@ jobs:
   release-gate:
     name: release gate
     runs-on: ubuntu-latest
-    needs: [backend, mls-core, sca, swift-package]
+    needs: [backend, mls-core, mls-ffi, sca, swift-package, mls-bridge]
     steps:
       - uses: actions/checkout@v4
       # A release build must additionally fail on: any Critical RISK_REGISTER item still OPEN

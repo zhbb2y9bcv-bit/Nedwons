@@ -42,7 +42,10 @@ results, remaining risks, and the next smallest step.
       (`scripts/swift_backend_smoke.sh` → SMOKE_OK): register → whoami → login → whoami, plus
       the INV-2 negative check (a different device with the same password is denied).
 - [ ] iOS app target (`@main`) built in Xcode; real Secure Enclave enrollment + App Attest
-      verified on device; UniFFI MLS binding (ADR-0007). *(R-101 — needs Xcode/hardware)*
+      verified on device; the MLS bridge *run* on hardware. *(R-101 — needs a physical device)*
+- [x] **UniFFI MLS binding (ADR-0007)** implemented + packaged headlessly: `core/mls-ffi`,
+      `MlsFfi.xcframework` (macOS+iOS+sim via `scripts/build_mls_ffi.sh`), a Swift↔Rust integration
+      test (`apps/ios/SentinelMLS`), plus adversarial + fuzz. On-device *execution* still R-101.
 - [ ] Recovery-kit flow. *(R-304)*
 - **Acceptance:** valid credentials from an unregistered device cannot log in — *logic proven
   now in `auth-core`; the client signing path is proven to interoperate with the server
@@ -58,7 +61,9 @@ results, remaining risks, and the next smallest step.
 - [x] **Evidence server/DB contain no plaintext (INV-1, R-104)**: `relay_e2ee.rs` sends real
       MLS ciphertext through the HTTP relay and a direct `SELECT` on `envelopes` confirms no
       plaintext at rest. Server library never links `mls-core`.
-- [ ] UniFFI Swift bindings so two devices exchange text on-device. *(Section 3 / R-101)*
+- [x] UniFFI Swift bindings — two Rust-backed clients exchange a real MLS message through the
+      generated Swift (host slice runs; sim + device slices compile). On-device *run* pending.
+      *(ADR-0007; R-101)*
 - [ ] Offline retry/dedup polish, local encrypted persistence, identity verification UI,
       push wake-up. *(Milestone 3)*
 
