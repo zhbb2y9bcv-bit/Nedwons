@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
+pub mod envelope;
 
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
