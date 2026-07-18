@@ -46,3 +46,7 @@ secrets/
 .idea/
 .vscode/
 *.swp
+
+# CycloneDX SBOMs (R-501) — generated build artifacts (CI uploads them)
+sbom/
+**/*.cdx.json
