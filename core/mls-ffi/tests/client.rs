@@ -263,3 +263,24 @@ fn recipient_refuses_a_commit_that_does_not_match_the_manifest() {
     assert_eq!(err, MlsClientError::InvalidMessage);
     assert_eq!(bob.epoch().unwrap(), epoch, "state must not follow a lie");
 }
+
+#[test]
+fn process_inbound_rejects_an_unknown_envelope_version() {
+    let (alice, bob) = two_party(&tmp("alice"), &tmp("bob"));
+    let id = alice.enqueue(b"hi".to_vec()).unwrap();
+    let mut env = alice.encrypt(id).unwrap();
+    // Rewrite the 2-byte version prefix to a future, unsupported version.
+    env[0] = 0x00;
+    env[1] = 0x02;
+    assert_eq!(
+        bob.process_inbound(1, env).unwrap_err(),
+        MlsClientError::InvalidMessage
+    );
+    // A correctly-versioned message from alice still works (sanity).
+    let id2 = alice.enqueue(b"real".to_vec()).unwrap();
+    let good = alice.encrypt(id2).unwrap();
+    matches!(
+        bob.process_inbound(2, good).unwrap(),
+        InboundResult::Application { .. }
+    );
+}
