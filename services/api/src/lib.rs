@@ -6,6 +6,7 @@
 
 pub mod groups;
 pub mod http;
+pub mod membership;
 pub mod notify;
 pub mod pgstore;
 pub mod relay;
