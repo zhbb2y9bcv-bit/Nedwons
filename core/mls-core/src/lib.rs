@@ -13,7 +13,9 @@
 #![forbid(unsafe_code)]
 
 pub mod client;
+pub mod content;
 pub mod envelope;
+pub mod secret;
 
 use openmls::prelude::tls_codec::{Deserialize as _, Serialize as _};
 use openmls::prelude::*;
