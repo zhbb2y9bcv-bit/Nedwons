@@ -58,6 +58,8 @@ struct AccountsInner {
     accounts_by_username: HashMap<String, AccountRecord>,
     devices_by_id: HashMap<DeviceId, DeviceRecord>,
     recovery_by_account: HashMap<AccountId, String>,
+    /// (failed_count, locked_until) for recovery-attempt throttling.
+    recovery_lock: HashMap<AccountId, (i32, Option<u64>)>,
 }
 
 impl CredentialStore for MemAccountStore {
@@ -113,6 +115,37 @@ impl CredentialStore for MemAccountStore {
             .recovery_by_account
             .get(account_id)
             .cloned())
+    }
+
+    fn recovery_locked_until(&self, account_id: &AccountId) -> StoreResult<Option<u64>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .recovery_lock
+            .get(account_id)
+            .and_then(|(_, until)| *until))
+    }
+
+    fn bump_recovery_failure(
+        &self,
+        account_id: &AccountId,
+        max_failures: i32,
+        lockout_secs: u64,
+        now: u64,
+    ) -> StoreResult<()> {
+        let mut inner = self.inner.lock().unwrap();
+        let entry = inner.recovery_lock.entry(*account_id).or_insert((0, None));
+        entry.0 += 1;
+        if entry.0 >= max_failures {
+            *entry = (0, Some(now + lockout_secs));
+        }
+        Ok(())
+    }
+
+    fn clear_recovery_failures(&self, account_id: &AccountId) -> StoreResult<()> {
+        self.inner.lock().unwrap().recovery_lock.remove(account_id);
+        Ok(())
     }
 }
 

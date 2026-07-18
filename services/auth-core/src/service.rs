@@ -399,6 +399,11 @@ impl AuthService {
     /// (not user-chosen), so this is a sanity floor, not a strength policy.
     pub const MIN_RECOVERY_SECRET_CHARS: usize = 20;
 
+    /// Failed recovery attempts before recovery is locked (R-304 throttling).
+    pub const MAX_RECOVERY_FAILURES: i32 = 5;
+    /// How long recovery stays locked after hitting the failure ceiling.
+    pub const RECOVERY_LOCKOUT_SECS: u64 = 15 * 60;
+
     /// Set (or replace) the account's recovery secret, stored only as an Argon2id hash. Called by
     /// an authenticated device (the caller must already hold an active device — recovery is set up
     /// while you still have access). A too-short secret is a client-correctable `WeakPassword`.
@@ -487,11 +492,34 @@ impl AuthService {
             }
         };
 
+        // Recovery-attempt throttling (R-304): if the account is currently locked out, refuse —
+        // and if the secret was wrong, record the failure (locking after too many). A locked
+        // account cannot be probed even with the right secret until the cooldown elapses.
+        if let Some(acct) = &account {
+            let locked = self
+                .creds
+                .recovery_locked_until(&acct.account_id)?
+                .is_some_and(|until| until > self.clock.now_unix());
+            if locked {
+                return Err(AuthError::Denied);
+            }
+            if !secret_ok {
+                self.creds.bump_recovery_failure(
+                    &acct.account_id,
+                    Self::MAX_RECOVERY_FAILURES,
+                    Self::RECOVERY_LOCKOUT_SECS,
+                    self.clock.now_unix(),
+                )?;
+            }
+        }
+
         let (challenge, account) = match (challenge, account) {
             (Some(c), Some(a)) if c.account_id == a.account_id && secret_ok => (c, a),
             _ => return Err(AuthError::Denied),
         };
         self.check_challenge(&challenge, Action::DeviceEnroll)?;
+        // Success: clear any recovery-failure state.
+        self.creds.clear_recovery_failures(&account.account_id)?;
 
         // The recovering device proves possession of its key (self-signed, like registration).
         let transcript = Transcript {

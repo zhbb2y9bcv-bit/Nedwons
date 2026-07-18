@@ -175,6 +175,57 @@ impl CredentialStore for PgStores {
             .map_err(db_err)?;
         Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
     }
+
+    fn recovery_locked_until(&self, account_id: &AccountId) -> StoreResult<Option<u64>> {
+        let mut conn = self.conn()?;
+        let row = conn
+            .query_opt(
+                "SELECT recovery_locked_until FROM accounts WHERE account_id = $1",
+                &[&account_id.as_bytes()],
+            )
+            .map_err(db_err)?;
+        Ok(row
+            .and_then(|r| r.get::<_, Option<i64>>(0))
+            .map(|v| v as u64))
+    }
+
+    fn bump_recovery_failure(
+        &self,
+        account_id: &AccountId,
+        max_failures: i32,
+        lockout_secs: u64,
+        now: u64,
+    ) -> StoreResult<()> {
+        // One statement: increment, and when the (incremented) count reaches the max, lock until
+        // `now + lockout` and reset the counter; otherwise just keep counting.
+        let mut conn = self.conn()?;
+        conn.execute(
+            "UPDATE accounts SET
+                 recovery_failed_count = CASE WHEN recovery_failed_count + 1 >= $2 THEN 0
+                                              ELSE recovery_failed_count + 1 END,
+                 recovery_locked_until = CASE WHEN recovery_failed_count + 1 >= $2 THEN $3
+                                              ELSE recovery_locked_until END
+             WHERE account_id = $1",
+            &[
+                &account_id.as_bytes(),
+                &max_failures,
+                &((now + lockout_secs) as i64),
+            ],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    fn clear_recovery_failures(&self, account_id: &AccountId) -> StoreResult<()> {
+        let mut conn = self.conn()?;
+        conn.execute(
+            "UPDATE accounts SET recovery_failed_count = 0, recovery_locked_until = NULL
+             WHERE account_id = $1",
+            &[&account_id.as_bytes()],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
 }
 
 impl DeviceStore for PgStores {
