@@ -301,10 +301,27 @@ them locally and then calls `/v1/inbox/ack`; a crash between peek and persist lo
 (at-least-once). With `?wait=N` (seconds, capped at 30) this **long-polls**: returns
 immediately if mail is present, otherwise parks until a send wakes it or `N` elapses —
 near-zero idle latency without holding a DB connection.
+**Sealed-sender envelopes** (ADR-0014) also appear here with `"sealed": true`, **no**
+`sender_device`, and **no** `conversation_id` (the relay never learned them; the recipient
+recovers the sender + conversation from the decrypted payload). Sealed ids are a **separate id
+space** from identified ones — ack them via `sealed_ids`, not `ids`.
 
 ### `POST /v1/inbox/ack` → `204`
-`{ "ids": [<envelope id>, …] }`. Acknowledge durably-persisted envelopes so they stop being
-served and become eligible for retention purge. Scoped to the caller's own device; idempotent.
+`{ "ids": [<envelope id>, …], "sealed_ids": [<sealed envelope id>, …] }`. Acknowledge
+durably-persisted envelopes so they stop being served and become eligible for retention purge.
+`sealed_ids` is optional (existing clients that send only `ids` are unaffected). Scoped to the
+caller's own device; idempotent.
+
+### `POST /v1/sealed/deliver` → `202` | `403` | `429` (ADR-0014 Slice 2b, R-204)
+**Unauthenticated.** Delivers a sealed-sender message. Header `X-Delivery-Key: <hex K_r>` (the
+recipient's 32-byte delivery access key; **never logged**); body
+`{ recipient_device, ciphertext, idempotency_key }` (all hex; `idempotency_key` is a
+sender-chosen 128-bit random). The relay verifies `SHA-256(K_r)` against the recipient account's
+registered verifier and, on match, stores an envelope with **no sender and no conversation** →
+`202`. Unknown device, unset verifier, and wrong/absent key all return the **same** `403` (no
+existence oracle; the constant-time compare runs on every path). Authorized deliveries are
+rate-limited per **recipient** device (`429`). Idempotent on `(recipient_device, idempotency_key)`.
+Register/rotate the verifier via `PUT /v1/delivery-access-key`.
 
 ### `GET /v1/stream` (WebSocket)
 Upgrade with `Authorization: Bearer <access-token hex>` on the handshake. The server **pushes**

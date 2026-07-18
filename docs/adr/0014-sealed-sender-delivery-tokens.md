@@ -122,9 +122,17 @@ identified + sealed envelopes; sealed ones carry no sender field.
   `delivery_access_keys`. Integration-tested: register, rotate (old key revoked), malformed
   verifier → 400, unauth → 401. **No delivery path yet** — registering a verifier changes no
   delivery behavior, so this slice carries no trust-model change.
-- **2b — sealed delivery.** `sealed_envelopes` migration + unauthenticated `POST /v1/sealed/deliver`
-  with the DAK gate + per-recipient rate limit + uniform-response no-oracle behavior + inbox
-  surfacing. This is the **trust-model change** — gated on this ADR being Accepted + external review.
+- **2b — sealed delivery (landed 2026-07-18, user-greenlit).** Migration V17 `sealed_envelopes`
+  (no `sender_device`/`conversation_id`; idempotency `(recipient_device, key)`) +
+  `PgRelay::deliver_sealed`/`peek_sealed_inbox`/`ack_sealed`/`purge_stale_sealed` +
+  `account_for_device` + unauthenticated `POST /v1/sealed/deliver` (DAK gate with the
+  timing-equalized constant-time compare; per-recipient limiter that counts only *authorized*
+  deliveries so a bad-key flood can't exhaust a victim's quota; uniform `403`). Inbox surfaces sealed
+  envelopes with `sealed:true`/no sender/no conversation; ack via `sealed_ids`; sealed purge on the
+  retention tick. Integration-tested: a sealed message is delivered, read without a sender, deduped,
+  and acked; wrong/absent key + unknown device are uniformly refused; a recipient with no verifier
+  can't receive sealed. **WebSocket-sealed deferred** (per-source watermark) — sealed rides the
+  long-poll inbox for now. Identified delivery + streaming verified untouched (full suite green).
 - **2c — client.** Sender: obtain the recipient DAK (delivered via E2EE on contact/Welcome), send
   sealed via client-side fan-out. Recipient: `verifySealedSender` (already landed) + recipient-side
   block drop + block→rotate. Message-request fallback for non-holders.
@@ -132,6 +140,27 @@ identified + sealed envelopes; sealed ones carry no sender field.
 
 R-204 stays **OPEN/MITIGATING** until 2a–2c ship and a test demonstrates the relay stores **no**
 sender for a sealed message while a rotated DAK denies a revoked sender.
+
+## Reviewer findings folded into 2b (2026-07-18)
+
+A review pass against the actual delivery code before implementing 2b surfaced four under-specified
+points; the resolutions below are part of the 2b implementation:
+
+1. **Inbox id-space collision.** `sealed_envelopes.id` (BIGSERIAL) collides with `envelopes.id`, and
+   the inbox returns a bare `id` that ack deletes by. Resolution: the inbox item gains a `sealed`
+   flag; the ack body gains a **separate `sealed_ids` array** so the identified `ids` field stays
+   byte-identical — existing clients are unaffected. Sealed items carry no `sender_device`/
+   `conversation_id`.
+2. **Streaming watermark.** The `/v1/stream` socket tracks one monotonic `last_sent`; two id spaces
+   would break its `id > last_sent` filter. 2b surfaces sealed envelopes on **long-poll `GET
+   /v1/inbox` only**; WebSocket-sealed is a bounded follow-up (needs a per-source watermark), so the
+   proven stream path is not destabilized.
+3. **Device-existence timing oracle.** An unknown recipient device returns before the key compare; a
+   bad key after. 2b **always runs the constant-time verify** (against a fixed dummy verifier when
+   the device or verifier is absent) so unknown-device and bad-key share one path and one generic
+   `403`. Residual DB-lookup timing is documented, not eliminated.
+4. **Header hygiene.** `X-Delivery-Key` carries `K_r`; it must never be logged (request logging must
+   redact it).
 
 ## Alternatives considered
 

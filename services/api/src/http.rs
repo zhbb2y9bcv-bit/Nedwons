@@ -40,6 +40,9 @@ use crate::social::{FriendRequestOutcome, PgSocial};
 use crate::transparency::PgTransparency;
 
 type IpLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultClock>;
+/// Per-recipient-device limiter for unauthenticated sealed delivery (ADR-0014): the sender is
+/// unknown, so flooding is bounded by the *recipient* device instead.
+type DeviceLimiter = RateLimiter<[u8; 16], DefaultKeyedStateStore<[u8; 16]>, DefaultClock>;
 
 /// Maximum request body on auth endpoints. Message envelopes may be larger (attachments
 /// are chunked separately), so the relay routes get their own higher cap.
@@ -71,6 +74,9 @@ pub struct AppState {
     /// `SENTINEL_SENDER_CERT_KEY` (hex) or ephemeral (dev). Distinct from the auth/transparency
     /// keys. Its public key is returned with issued certificates; production clients pin it.
     sender_cert_key: Arc<p256::ecdsa::SigningKey>,
+    /// Per-recipient-device rate limiter for the unauthenticated sealed-delivery endpoint
+    /// (ADR-0014). Bounds flooding when the sender is unknown.
+    sealed_limiter: Arc<DeviceLimiter>,
 }
 
 /// Load the sender-certificate signing key from `SENTINEL_SENDER_CERT_KEY` (hex), or generate an
@@ -152,6 +158,8 @@ pub fn build_router_cfg(
         require_proof,
         proof_cache: Arc::new(crate::proof::ProofReplayCache::new()),
         sender_cert_key: Arc::new(load_or_generate_sender_cert_key()),
+        // Reuse the per-IP quota for the per-recipient sealed-delivery cap.
+        sealed_limiter: Arc::new(RateLimiter::keyed(quota)),
     };
 
     // Relay routes accept larger bodies (opaque envelopes) than auth routes.
@@ -202,6 +210,9 @@ pub fn build_router_cfg(
         .route("/v1/inbox", get(fetch_inbox))
         .route("/v1/inbox/ack", post(ack_inbox))
         .route("/v1/stream", get(stream_handler))
+        // sealed-sender delivery (ADR-0014 Slice 2b, R-204): UNAUTHENTICATED — gated by the
+        // recipient's delivery access key, not by a sender token.
+        .route("/v1/sealed/deliver", post(deliver_sealed_handler))
         // profiles & social
         .route("/v1/profile", get(get_my_profile).put(update_profile))
         .route("/v1/profile/{account_id}", get(get_profile_by_id))
@@ -1172,9 +1183,17 @@ struct ReceiptDto {
 #[derive(Serialize)]
 struct InboxEnvelopeDto {
     id: i64,
-    conversation_id: String,
-    sender_device: String,
+    /// Absent for a **sealed** envelope (the recipient learns the conversation from the payload).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conversation_id: Option<String>,
+    /// Absent for a **sealed** envelope (the relay never learned the sender — ADR-0014).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sender_device: Option<String>,
     ciphertext: String,
+    /// True for a sealed envelope. Sealed ids live in a **separate id space** from identified ones,
+    /// so a client acks them via `AckBody.sealed_ids`, not `ids`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    sealed: bool,
 }
 
 #[derive(Deserialize)]
@@ -1187,8 +1206,12 @@ struct InboxQuery {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AckBody {
-    /// Envelope ids the client has durably persisted and no longer needs served.
+    /// Identified envelope ids the client has durably persisted and no longer needs served.
     ids: Vec<i64>,
+    /// **Sealed** envelope ids to ack — a separate id space from `ids` (ADR-0014). Optional so
+    /// existing clients that only send `ids` are unaffected.
+    #[serde(default)]
+    sealed_ids: Vec<i64>,
 }
 
 /// Publish a key package for the authenticated device.
@@ -1337,6 +1360,76 @@ async fn set_delivery_access_key(
     let account = me.account_id;
     blocking_store(move || relay.set_delivery_verifier(&account, &verifier)).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedDeliverBody {
+    /// Recipient device (hex, 16 bytes) to enqueue for.
+    recipient_device: String,
+    /// Opaque MLS ciphertext (hex).
+    ciphertext: String,
+    /// Sender-chosen 128-bit random idempotency key (hex, 16 bytes).
+    idempotency_key: String,
+}
+
+/// HTTP header carrying the recipient's delivery access key `K_r` (hex). MUST NOT be logged.
+const DELIVERY_KEY_HEADER: &str = "x-delivery-key";
+
+/// Deliver a **sealed-sender** message (ADR-0014 Slice 2b, R-204). **Unauthenticated:** the caller
+/// proves the right to deliver by presenting the recipient's delivery access key `K_r` (header
+/// `X-Delivery-Key`), not by authenticating as a sender — so the relay stores the envelope with **no
+/// sender and no conversation**. The DAK is verified against the recipient account's registered
+/// verifier `V_r = SHA-256(K_r)`; unknown device, unset verifier, and wrong key all return the SAME
+/// generic 403 (no existence oracle), and the constant-time compare runs on every path.
+async fn deliver_sealed_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SealedDeliverBody>,
+) -> Result<StatusCode, ApiError> {
+    let recipient = DeviceId(id16_from_hex(&body.recipient_device)?);
+    let ciphertext = decode_ciphertext(&body.ciphertext)?;
+    let idem = id16_from_hex(&body.idempotency_key)?;
+    // A missing or malformed delivery key is treated exactly like a wrong one — uniform reject.
+    let dak = match headers
+        .get(DELIVERY_KEY_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| hex::decode(s).ok())
+    {
+        Some(k) if k.len() == auth_core::delivery_key::DAK_LEN => k,
+        _ => return Err(forbidden()),
+    };
+
+    // Verify the DAK off the async thread. Always run the constant-time compare (against a dummy
+    // verifier when the device/verifier is absent) so unknown-device and bad-key share one path.
+    let relay = state.relay.clone();
+    let rec = recipient;
+    let authorized = blocking_store(move || {
+        let verifier = match relay.account_for_device(&rec)? {
+            Some(account) => relay.delivery_verifier(&account)?,
+            None => None,
+        };
+        let dummy = [0u8; auth_core::delivery_key::VERIFIER_LEN];
+        let vref = verifier.as_deref().unwrap_or(&dummy);
+        Ok(auth_core::delivery_key::verify(&dak, vref))
+    })
+    .await?;
+    if !authorized {
+        return Err(forbidden());
+    }
+
+    // Rate-limit only AUTHORIZED deliveries, keyed on the recipient device, so a bad-key flood can't
+    // exhaust a victim's quota (that path is bounded by the per-IP limiter instead).
+    if state.sealed_limiter.check_key(&recipient.0).is_err() {
+        return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
+    }
+
+    let relay = state.relay.clone();
+    let rec = recipient;
+    blocking_store(move || relay.deliver_sealed(&rec, &ciphertext, &idem)).await?;
+    // Wake a waiting inbox/long-poll for the recipient.
+    state.notifier.wake(&recipient.0);
+    Ok(StatusCode::ACCEPTED)
 }
 
 #[derive(Serialize)]
@@ -2224,28 +2317,35 @@ async fn fetch_inbox(
 
     // Register interest BEFORE the first read to avoid a lost-wakeup window.
     let notified = state.notifier.handle(&device);
-    let mut envelopes = read_inbox(&state, me.device_id).await?;
+    let (mut identified, mut sealed) = read_all_inbox(&state, me.device_id).await?;
 
-    if envelopes.is_empty() && query.wait > 0 {
+    if identified.is_empty() && sealed.is_empty() && query.wait > 0 {
         let wait = std::time::Duration::from_secs(query.wait.min(MAX_INBOX_WAIT_SECS));
         tokio::select! {
             _ = notified.notified() => {}
             _ = tokio::time::sleep(wait) => {}
         }
-        envelopes = read_inbox(&state, me.device_id).await?;
+        (identified, sealed) = read_all_inbox(&state, me.device_id).await?;
     }
 
-    Ok(Json(
-        envelopes
-            .into_iter()
-            .map(|e| InboxEnvelopeDto {
-                id: e.id,
-                conversation_id: hex::encode(e.conversation_id),
-                sender_device: hex::encode(e.sender_device),
-                ciphertext: hex::encode(e.ciphertext),
-            })
-            .collect(),
-    ))
+    let mut out: Vec<InboxEnvelopeDto> = identified
+        .into_iter()
+        .map(|e| InboxEnvelopeDto {
+            id: e.id,
+            conversation_id: Some(hex::encode(e.conversation_id)),
+            sender_device: Some(hex::encode(e.sender_device)),
+            ciphertext: hex::encode(e.ciphertext),
+            sealed: false,
+        })
+        .collect();
+    out.extend(sealed.into_iter().map(|e| InboxEnvelopeDto {
+        id: e.id,
+        conversation_id: None,
+        sender_device: None,
+        ciphertext: hex::encode(e.ciphertext),
+        sealed: true,
+    }));
+    Ok(Json(out))
 }
 
 /// Acknowledge durably-persisted envelopes so the server can purge them. At-least-once: a
@@ -2256,11 +2356,17 @@ async fn ack_inbox(
     Json(body): Json<AckBody>,
 ) -> Result<StatusCode, ApiError> {
     let me = authed_device(&state, &headers).await?;
-    if body.ids.len() > 1000 {
+    if body.ids.len() > 1000 || body.sealed_ids.len() > 1000 {
         return Err(bad_request());
     }
     let relay = state.relay.clone();
-    blocking_store(move || relay.ack_envelopes(&me.device_id, &body.ids)).await?;
+    let device = me.device_id;
+    blocking_store(move || {
+        relay.ack_envelopes(&device, &body.ids)?;
+        relay.ack_sealed(&device, &body.sealed_ids)?;
+        Ok(())
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2271,6 +2377,28 @@ async fn read_inbox(
     let relay = state.relay.clone();
     // Peek (do NOT mark delivered); the client acks after persisting (at-least-once).
     blocking_store(move || relay.peek_inbox(&device_id, 100)).await
+}
+
+/// Peek both identified and sealed envelopes for a device (ADR-0014). Sealed ones live in a separate
+/// table/id space, so they are returned as a separate list the caller tags distinctly.
+#[allow(clippy::type_complexity)]
+async fn read_all_inbox(
+    state: &AppState,
+    device_id: DeviceId,
+) -> Result<
+    (
+        Vec<crate::relay::EnvelopeOut>,
+        Vec<crate::relay::SealedEnvelopeOut>,
+    ),
+    ApiError,
+> {
+    let relay = state.relay.clone();
+    blocking_store(move || {
+        let identified = relay.peek_inbox(&device_id, 100)?;
+        let sealed = relay.peek_sealed_inbox(&device_id, 100)?;
+        Ok((identified, sealed))
+    })
+    .await
 }
 
 // ----- WebSocket streaming delivery ---------------------------------------------------
@@ -2327,9 +2455,10 @@ async fn stream_socket(
                     .filter(|e| e.id > last_sent)
                     .map(|e| InboxEnvelopeDto {
                         id: e.id,
-                        conversation_id: hex::encode(e.conversation_id),
-                        sender_device: hex::encode(e.sender_device),
+                        conversation_id: Some(hex::encode(e.conversation_id)),
+                        sender_device: Some(hex::encode(e.sender_device)),
                         ciphertext: hex::encode(e.ciphertext),
+                        sealed: false,
                     })
                     .collect();
                 if let Some(max_id) = fresh.iter().map(|e| e.id).max() {
