@@ -171,6 +171,32 @@ fn oversized_input_is_rejected_before_processing() {
 }
 
 #[test]
+fn message_pagination_windows_the_log() {
+    let (alice, _bob) = two_party(&tmp("alice"), &tmp("bob"));
+    for i in 0..5u8 {
+        let id = alice.enqueue(vec![i]).unwrap();
+        let _ = alice.encrypt(id).unwrap();
+    }
+    assert_eq!(alice.message_count().unwrap(), 5);
+
+    // Window in the middle, oldest first.
+    let page = alice.messages_page(1, 2).unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0].plaintext, vec![1]);
+    assert_eq!(page[1].plaintext, vec![2]);
+
+    // Window clipped at the end; offset past the end is an empty page, not an error.
+    assert_eq!(alice.messages_page(4, 10).unwrap().len(), 1);
+    assert_eq!(alice.messages_page(99, 10).unwrap().len(), 0);
+
+    // A huge limit is clamped, never unbounded.
+    assert!(alice.messages_page(0, u32::MAX).unwrap().len() <= 256);
+
+    // Consistent with the full accessor.
+    assert_eq!(alice.messages().unwrap().len(), 5);
+}
+
+#[test]
 fn capabilities_report_the_pinned_contract() {
     let c = capabilities();
     assert_eq!(c.protocol, "MLS 1.0 (RFC 9420)");

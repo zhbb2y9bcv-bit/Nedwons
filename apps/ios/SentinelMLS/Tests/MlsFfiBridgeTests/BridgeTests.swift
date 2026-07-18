@@ -115,6 +115,20 @@ final class MlsFfiBridgeTests: XCTestCase {
         }
     }
 
+    func testMessagePaginationAcrossTheBoundary() throws {
+        let (alice, _) = try twoParty()
+        for i in 0..<5 {
+            let id = try alice.enqueue(plaintext: Data([UInt8(i)]))
+            _ = try alice.encrypt(localId: id)
+        }
+        XCTAssertEqual(try alice.messageCount(), 5)
+        let page = try alice.messagesPage(offset: 1, limit: 2)
+        XCTAssertEqual(page.count, 2)
+        XCTAssertEqual(page[0].plaintext, Data([1]))
+        XCTAssertEqual(page[1].plaintext, Data([2]))
+        XCTAssertEqual(try alice.messagesPage(offset: 99, limit: 10).count, 0)
+    }
+
     func testCapabilitiesReportPinnedContract() {
         let c = capabilities()
         XCTAssertEqual(c.protocol, "MLS 1.0 (RFC 9420)")
