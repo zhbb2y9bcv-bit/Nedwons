@@ -8,7 +8,10 @@ mod common;
 use std::time::Duration;
 
 use axum::http::StatusCode;
-use common::{befriend, get_auth, http_register, make_app, post_json_auth, unique_username};
+use common::{
+    befriend, enroll_device, get_auth, http_register, make_app, post_json_auth, unique_username,
+    TestDevice,
+};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -125,6 +128,95 @@ async fn websocket_pushes_new_envelopes_instantly() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     let (_, inbox) = get_auth(&app, "/v1/inbox", &bob_token).await;
     assert_eq!(inbox.as_array().unwrap().len(), 0, "both messages acked");
+
+    let _ = ws.close(None).await;
+}
+
+/// The WebSocket carries **self-group** envelopes (ADR-0015 option 3), not just identified
+/// conversation mail — so a real-time view-once consumption fan-out reaches a connected device the
+/// instant it is sent — and they are acked over their own `self_group_ack` id space.
+#[tokio::test]
+async fn websocket_pushes_self_group_envelopes() {
+    let app = make_app(100_000).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let served = app.clone();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, served.into_make_service()).await;
+    });
+
+    // Account with two devices: phone (primary) + tablet (enrolled).
+    let (phone_dev, phone) = http_register(&app, &unique_username("wssgphone")).await;
+    let phone_token = phone["access_token"].as_str().unwrap();
+    let account = phone["account_id"].as_str().unwrap();
+    let phone_device = phone["device_id"].as_str().unwrap().to_string();
+    let tablet_dev = TestDevice::new();
+    let tablet = enroll_device(&app, phone_token, account, &phone_dev, &tablet_dev).await;
+    let tablet_token = tablet["access_token"].as_str().unwrap().to_string();
+    let tablet_device = tablet["device_id"].as_str().unwrap().to_string();
+
+    // The tablet connects to the stream FIRST.
+    let mut request = format!("ws://{addr}/v1/stream")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "authorization",
+        format!("Bearer {tablet_token}").parse().unwrap(),
+    );
+    let (mut ws, _resp) = tokio_tungstenite::connect_async(request)
+        .await
+        .expect("ws connect");
+
+    // The phone delivers a self-group message targeted at the tablet (e.g. a consumption control
+    // message). It must arrive over the socket near-instantly, tagged self_group.
+    let start = std::time::Instant::now();
+    let (status, receipt) = post_json_auth(
+        &app,
+        "/v1/self-group/deliver",
+        phone_token,
+        json!({
+            "recipient_device": tablet_device,
+            "ciphertext": hex::encode(b"consumed-over-ws"),
+            "idempotency_key": hex::encode([3u8; 16]),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "deliver: {receipt}");
+
+    let push = recv_json(&mut ws).await;
+    let elapsed = start.elapsed();
+    let env = &push["envelopes"][0];
+    assert_eq!(env["self_group"], true, "flagged as a self-group envelope");
+    // `sealed`/`conversation_id` are omitted (not literal false/null) when absent — this is a
+    // self-group, non-sealed, non-conversation envelope.
+    assert!(!env["sealed"].as_bool().unwrap_or(false), "not sealed");
+    assert!(env["conversation_id"].is_null(), "not a conversation");
+    assert_eq!(env["sender_device"].as_str().unwrap(), phone_device);
+    assert_eq!(env["ciphertext"], hex::encode(b"consumed-over-ws"));
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "self-group push should be near-instant, took {elapsed:?}"
+    );
+
+    // Ack it over the self-group id space; the tablet's inbox then holds no self-group envelope.
+    let sg_id = env["id"].as_i64().unwrap();
+    ws.send(Message::Text(
+        json!({ "self_group_ack": [sg_id] }).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (_, inbox) = get_auth(&app, "/v1/inbox", &tablet_token).await;
+    let remaining_self_group = inbox
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| e["self_group"].as_bool().unwrap_or(false))
+        .count();
+    assert_eq!(
+        remaining_self_group, 0,
+        "self-group envelope acked away: {inbox}"
+    );
 
     let _ = ws.close(None).await;
 }

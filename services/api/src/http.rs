@@ -2529,15 +2529,6 @@ async fn ack_inbox(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn read_inbox(
-    state: &AppState,
-    device_id: DeviceId,
-) -> Result<Vec<crate::relay::EnvelopeOut>, ApiError> {
-    let relay = state.relay.clone();
-    // Peek (do NOT mark delivered); the client acks after persisting (at-least-once).
-    blocking_store(move || relay.peek_inbox(&device_id, 100)).await
-}
-
 /// Peek identified, sealed (ADR-0014), and self-group (ADR-0015 option 3) envelopes for a device.
 /// Each lives in a separate table/id space, so they are returned as separate lists the caller tags
 /// distinctly (`sealed` / `self_group` flags), and the client acks each via its own id list.
@@ -2570,10 +2561,18 @@ struct StreamPush {
     envelopes: Vec<InboxEnvelopeDto>,
 }
 
+/// Client → server ack over the socket. Each channel has its own id space (identified conversation
+/// mail, sealed-sender, self-group), so acks are carried in three separate lists — a client acks
+/// each envelope in the list matching its `sealed` / `self_group` flag. All optional (a client that
+/// only receives identified mail sends `ack` alone).
 #[derive(Deserialize)]
 struct StreamAck {
     #[serde(default)]
     ack: Vec<i64>,
+    #[serde(default)]
+    sealed_ack: Vec<i64>,
+    #[serde(default)]
+    self_group_ack: Vec<i64>,
 }
 
 /// Authenticated WebSocket push channel: `GET /v1/stream` with `Authorization: Bearer
@@ -2604,28 +2603,61 @@ async fn stream_socket(
     let device = me.device_id;
     let notify = state.notifier.handle(&device.0);
     // Only push envelopes newer than what we've already sent this session; unacked ones are
-    // re-served from the DB on reconnect (last_sent resets to 0).
-    let mut last_sent: i64 = 0;
+    // re-served from the DB on reconnect (the cursors reset to 0). Each channel has its own
+    // BIGSERIAL id space (separate tables), so it needs its own cursor — a single one would let a
+    // high id in one channel suppress a lower id in another.
+    let mut last_identified: i64 = 0;
+    let mut last_sealed: i64 = 0;
+    let mut last_self_group: i64 = 0;
     let heartbeat = std::time::Duration::from_secs(30);
 
     loop {
-        // Deliver anything pending and not yet pushed this session.
-        match read_inbox(&state, device).await {
-            Ok(pending) => {
-                let fresh: Vec<InboxEnvelopeDto> = pending
-                    .into_iter()
-                    .filter(|e| e.id > last_sent)
-                    .map(|e| InboxEnvelopeDto {
-                        id: e.id,
-                        conversation_id: Some(hex::encode(e.conversation_id)),
-                        sender_device: Some(hex::encode(e.sender_device)),
-                        ciphertext: hex::encode(e.ciphertext),
-                        sealed: false,
-                        self_group: false,
-                    })
-                    .collect();
-                if let Some(max_id) = fresh.iter().map(|e| e.id).max() {
-                    last_sent = max_id;
+        // Deliver anything pending and not yet pushed this session, across ALL three channels
+        // (identified conversation mail, sealed-sender, self-group) so real-time delivery — e.g. a
+        // view-once consumption fan-out — rides the socket, not just the HTTP long-poll.
+        match read_all_inbox(&state, device).await {
+            Ok((identified, sealed, self_group)) => {
+                let mut fresh: Vec<InboxEnvelopeDto> = Vec::new();
+                for e in identified {
+                    if e.id > last_identified {
+                        last_identified = last_identified.max(e.id);
+                        fresh.push(InboxEnvelopeDto {
+                            id: e.id,
+                            conversation_id: Some(hex::encode(e.conversation_id)),
+                            sender_device: Some(hex::encode(e.sender_device)),
+                            ciphertext: hex::encode(e.ciphertext),
+                            sealed: false,
+                            self_group: false,
+                        });
+                    }
+                }
+                for e in sealed {
+                    if e.id > last_sealed {
+                        last_sealed = last_sealed.max(e.id);
+                        fresh.push(InboxEnvelopeDto {
+                            id: e.id,
+                            conversation_id: None,
+                            sender_device: None,
+                            ciphertext: hex::encode(e.ciphertext),
+                            sealed: true,
+                            self_group: false,
+                        });
+                    }
+                }
+                for e in self_group {
+                    if e.id > last_self_group {
+                        last_self_group = last_self_group.max(e.id);
+                        fresh.push(InboxEnvelopeDto {
+                            id: e.id,
+                            conversation_id: None,
+                            sender_device: Some(hex::encode(e.sender_device)),
+                            ciphertext: hex::encode(e.ciphertext),
+                            sealed: false,
+                            self_group: true,
+                        });
+                    }
+                }
+                if !fresh.is_empty() {
                     let payload = serde_json::to_string(&StreamPush { envelopes: fresh })
                         .unwrap_or_else(|_| "{\"envelopes\":[]}".to_string());
                     if socket.send(Message::Text(payload.into())).await.is_err() {
@@ -2640,10 +2672,21 @@ async fn stream_socket(
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
-                        if let Ok(StreamAck { ack }) = serde_json::from_str::<StreamAck>(&text) {
-                            if !ack.is_empty() && ack.len() <= 1000 {
+                        if let Ok(StreamAck { ack, sealed_ack, self_group_ack }) =
+                            serde_json::from_str::<StreamAck>(&text)
+                        {
+                            if ack.len() <= 1000 && sealed_ack.len() <= 1000
+                                && self_group_ack.len() <= 1000
+                                && !(ack.is_empty() && sealed_ack.is_empty() && self_group_ack.is_empty())
+                            {
                                 let relay = state.relay.clone();
-                                let _ = blocking_store(move || relay.ack_envelopes(&device, &ack)).await;
+                                let _ = blocking_store(move || {
+                                    relay.ack_envelopes(&device, &ack)?;
+                                    relay.ack_sealed(&device, &sealed_ack)?;
+                                    relay.ack_self_group(&device, &self_group_ack)?;
+                                    Ok(())
+                                })
+                                .await;
                             }
                         }
                     }

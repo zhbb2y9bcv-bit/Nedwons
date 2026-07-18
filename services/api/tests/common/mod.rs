@@ -453,6 +453,48 @@ pub fn sign_challenge(device: &TestDevice, challenge: &Value, action: Action) ->
     hex::encode(device.sign(&transcript.encode()))
 }
 
+/// Enroll a NEW device onto `trusted`'s account over HTTP (ADR-0008 trusted-device ceremony).
+/// Returns the new device's session JSON. `trusted_signer` is the already-enrolled device's key.
+pub async fn enroll_device(
+    app: &Router,
+    trusted_token: &str,
+    trusted_account_hex: &str,
+    trusted_signer: &TestDevice,
+    new_device: &TestDevice,
+) -> Value {
+    let (status, ch) =
+        post_json_auth(app, "/v1/devices/enroll/begin", trusted_token, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "enroll begin: {ch}");
+    let account = AccountId(id16_from_hex(trusted_account_hex));
+    let new_device_id = DeviceId(id16_from_hex(ch["device_id"].as_str().unwrap()));
+    let txn_id = TxnId(id16_from_hex(ch["txn_id"].as_str().unwrap()));
+    let nonce = hex::decode(ch["nonce"].as_str().unwrap()).unwrap();
+    let expires_at = ch["expires_at"].as_u64().unwrap();
+    let transcript = Transcript {
+        action: Action::DeviceEnroll,
+        account_id: &account,
+        device_id: &new_device_id,
+        public_key: &new_device.public_key,
+        challenge: &nonce,
+        expires_at,
+        txn_id: &txn_id,
+    };
+    let signature = trusted_signer.sign(&transcript.encode());
+    let (status, session) = post_json_auth(
+        app,
+        "/v1/devices/enroll/finish",
+        trusted_token,
+        json!({
+            "txn_id": hex::encode(txn_id.as_bytes()),
+            "device_public_key": hex::encode(&new_device.public_key),
+            "signature": hex::encode(signature),
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "enroll finish: {session}");
+    session
+}
+
 /// Register a fresh account over HTTP; returns (device, session JSON).
 pub async fn http_register(app: &Router, username: &str) -> (TestDevice, Value) {
     let device = TestDevice::new();
