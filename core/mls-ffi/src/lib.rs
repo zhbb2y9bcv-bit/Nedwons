@@ -537,13 +537,15 @@ fn map_durable_input(e: DurableError) -> MlsClientError {
 fn map_mls_local(e: MlsError) -> MlsClientError {
     match e {
         MlsError::MemberNotFound => MlsClientError::NotFound,
-        MlsError::Codec | MlsError::Lib(_) => MlsClientError::Internal,
+        MlsError::Codec | MlsError::Lib(_) | MlsError::ManifestMismatch => MlsClientError::Internal,
     }
 }
 
 fn map_mls_input(e: MlsError) -> MlsClientError {
     match e {
         MlsError::MemberNotFound => MlsClientError::NotFound,
-        MlsError::Codec | MlsError::Lib(_) => MlsClientError::InvalidMessage,
+        MlsError::Codec | MlsError::Lib(_) | MlsError::ManifestMismatch => {
+            MlsClientError::InvalidMessage
+        }
     }
 }
