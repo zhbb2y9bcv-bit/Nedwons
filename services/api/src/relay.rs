@@ -741,22 +741,24 @@ impl PgRelay {
         Ok(row.is_some())
     }
 
-    /// Store a device's submitted App Attest attestation (unverified — the Apple-root verification is
-    /// the hardware-gated step). Upsert.
+    /// Store a device's submitted App Attest attestation. `verified` records whether the
+    /// attestation object passed cryptographic verification against the pinned Apple root
+    /// (`crate::attest`); unconfigured (bootstrap) deployments store `false`. Upsert.
     pub fn store_attestation(
         &self,
         device: &DeviceId,
         key_id: &str,
         attestation: &[u8],
+        verified: bool,
     ) -> StoreResult<()> {
         let mut conn = self.conn()?;
         conn.execute(
             "INSERT INTO app_attest_keys (device_id, key_id, attestation, verified)
-             VALUES ($1, $2, $3, FALSE)
+             VALUES ($1, $2, $3, $4)
              ON CONFLICT (device_id)
              DO UPDATE SET key_id = EXCLUDED.key_id, attestation = EXCLUDED.attestation,
-                           verified = FALSE, created_at = now()",
-            &[&device.as_bytes(), &key_id, &attestation],
+                           verified = EXCLUDED.verified, created_at = now()",
+            &[&device.as_bytes(), &key_id, &attestation, &verified],
         )
         .map_err(db_err)?;
         Ok(())

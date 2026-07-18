@@ -77,6 +77,10 @@ pub struct AppState {
     /// Per-recipient-device rate limiter for the unauthenticated sealed-delivery endpoint
     /// (ADR-0014). Bounds flooding when the sender is unknown.
     sealed_limiter: Arc<DeviceLimiter>,
+    /// App Attest verification config (#10). `Some` when `SENTINEL_APP_ATTEST_APP_ID` is set: a
+    /// submitted attestation is then cryptographically verified against the pinned Apple root and
+    /// rejected on failure. `None` ⇒ attestations are stored unverified (bootstrap mode).
+    attest_config: Option<Arc<crate::attest::AttestationConfig>>,
 }
 
 /// Load the sender-certificate signing key from `SENTINEL_SENDER_CERT_KEY` (hex), or generate an
@@ -179,6 +183,7 @@ pub fn build_router_cfg(
         sender_cert_key: Arc::new(load_or_generate_sender_cert_key()),
         // Reuse the per-IP quota for the per-recipient sealed-delivery cap.
         sealed_limiter: Arc::new(RateLimiter::keyed(quota)),
+        attest_config: crate::attest::AttestationConfig::from_env().map(Arc::new),
     };
 
     // Relay routes accept larger bodies (opaque envelopes) than auth routes.
@@ -1687,9 +1692,11 @@ struct AttestSubmitBody {
 }
 
 /// Submit an App Attest attestation for the authenticated device (#10). The outstanding challenge is
-/// consumed (anti-replay) and the attestation stored. **Honest limit:** the cryptographic
-/// verification of the attestation object against Apple's App Attest root is the remaining
-/// hardware-gated step (docs/APP_ATTEST.md); the stored row's `verified` flag stays false until then.
+/// consumed (anti-replay); then, when `SENTINEL_APP_ATTEST_APP_ID` is configured, the attestation
+/// object is **cryptographically verified** (`crate::attest`: chain to the pinned Apple root, nonce,
+/// key id, authData) and rejected outright on failure — a verified row is stored with
+/// `verified=true`. Unconfigured deployments store unverified (bootstrap mode). **Honest limit:**
+/// producing a real attestation still requires a physical device (docs/APP_ATTEST.md).
 async fn attest_submit_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1703,15 +1710,35 @@ async fn attest_submit_handler(
     let attestation = decode_ciphertext(&body.attestation)?; // bounded, non-empty opaque bytes
     let relay = state.relay.clone();
     let device = me.device_id;
+    let presented = challenge.clone();
     let matched =
-        blocking_store(move || relay.consume_attest_challenge(&device, &challenge)).await?;
+        blocking_store(move || relay.consume_attest_challenge(&device, &presented)).await?;
     if !matched {
         // Unknown / expired / mismatched challenge — refuse (no replay).
         return Err(bad_request());
     }
+    let verified = match &state.attest_config {
+        None => false, // bootstrap mode: stored, explicitly unverified
+        Some(cfg) => {
+            let key_id = crate::attest::decode_key_id(&body.key_id).ok_or_else(bad_request)?;
+            // The client attested over SHA-256(challenge) (see `AppAttestation.attestKey`), so that
+            // hash is the clientDataHash bound into the nonce.
+            let client_data_hash = auth_core::crypto::sha256(&challenge);
+            crate::attest::verify_attestation(
+                &attestation,
+                &key_id,
+                &client_data_hash,
+                cfg,
+                std::time::SystemTime::now(),
+            )
+            .map_err(|_| bad_request())?;
+            true
+        }
+    };
     let relay = state.relay.clone();
     let device = me.device_id;
-    blocking_store(move || relay.store_attestation(&device, &body.key_id, &attestation)).await?;
+    blocking_store(move || relay.store_attestation(&device, &body.key_id, &attestation, verified))
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
