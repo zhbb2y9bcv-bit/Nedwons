@@ -57,6 +57,13 @@ when one of your devices opens a secret, it sends an **end-to-end-encrypted, rel
 your phone also consumes it on your tablet. The relay never learns a message is secret or that it
 was consumed.
 
+That "consumed" message travels over your account's **device self-group** — a separate MLS group of
+only your own devices. Because the person who sent you the secret is **not** a member of that group,
+they never receive, and cannot decrypt, the signal that you opened it: opening a view-once message
+is **not** a read receipt to the sender. (An earlier design routed it through the conversation, which
+did disclose the open to the sender; the self-group upgrade closes that. A single-device or not-yet-
+linked account falls back to the conversation route until a second device is linked.)
+
 Two honest caveats, inherent to keeping this relay-blind (not hidden):
 
 - **Concurrency:** if two of your devices open the *same* secret within the brief window before the

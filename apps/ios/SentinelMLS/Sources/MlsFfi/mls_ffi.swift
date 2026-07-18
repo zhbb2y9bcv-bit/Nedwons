@@ -432,6 +432,30 @@ fileprivate struct FfiConverterUInt64: FfiConverterPrimitive {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterBool : FfiConverter {
+    typealias FfiType = Int8
+    typealias SwiftType = Bool
+
+    public static func lift(_ value: Int8) throws -> Bool {
+        return value != 0
+    }
+
+    public static func lower(_ value: Bool) -> Int8 {
+        return value ? 1 : 0
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Bool {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: Bool, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterString: FfiConverter {
     typealias SwiftType = String
     typealias FfiType = RustBuffer
@@ -508,6 +532,13 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func addMember(keyPackage: Data) throws  -> AddOutcome
     
     /**
+     * Add another of this account's devices to the self-group by its key-package bytes. Returns
+     * commit + welcome (deliver to existing devices / the new device). `WrongState` if no self-group
+     * exists yet.
+     */
+    func addSelfDevice(keyPackage: Data) throws  -> AddOutcome
+    
+    /**
      * Begin revealing a sealed secret (recipient tapped the placeholder). **Atomic + fail-closed:**
      * the transition + deadlines are committed before this returns `Ok`. An invalid transition
      * (double tap, replay, wrong state) or a failed state write returns `Err` and reveals nothing.
@@ -539,6 +570,12 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func consumeSecret(secretId: Data) throws 
     
     /**
+     * Create this account's self-group with this device as its sole member. Persists before
+     * returning. `WrongState` if one already exists.
+     */
+    func createSelfGroup() throws 
+    
+    /**
      * Encrypt a queued message into a versioned opaque envelope (`app-envelope v1`, R-506).
      * **Idempotent:** a retry returns the same bytes and never advances the ratchet again (no
      * double-spend of a message key) — `wrap` is deterministic over the cached ciphertext.
@@ -564,10 +601,21 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func epoch() throws  -> UInt64
     
     /**
+     * True if this client has an established device self-group.
+     */
+    func hasSelfGroup() throws  -> Bool
+    
+    /**
      * Join the group described by a Welcome (produced by another member's `add_member`). Transitions
      * `Pending` → `Active` and persists. On a bad Welcome the client stays `Pending` (retryable).
      */
     func joinGroup(welcome: Data) throws 
+    
+    /**
+     * Join this account's self-group from a Welcome produced by another device's `add_self_device`.
+     * Persists before returning. `WrongState` if a self-group is already established here.
+     */
+    func joinSelfGroup(welcome: Data) throws 
     
     /**
      * This client's key package bytes (a one-time prekey) to publish so others can add it.
@@ -620,12 +668,24 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func processInbound(envelopeId: UInt64, ciphertext: Data) throws  -> InboundResult
     
     /**
+     * Process an inbound envelope that arrived on the account's **self-group** channel (ADR-0015
+     * option 3) — a `SecretConsumed` control message from one of this account's OTHER devices, or a
+     * self-group membership commit. Decrypts with the self-group (which the conversation's other
+     * party is not in), so the read signal stays private to the account. Same idempotent dedup + ack
+     * contract as [`Self::process_inbound`]. `WrongState` if no self-group is established here.
+     */
+    func processSelfInbound(envelopeId: UInt64, ciphertext: Data) throws  -> InboundResult
+    
+    /**
      * Build (once) the **consumption control message** for a secret this device revealed (ADR-0015,
-     * account-wide single-view). Returns the opaque envelope to broadcast to the account's other
-     * devices through the conversation (via the normal send path — the relay stays blind), or
-     * `None` if the secret is unknown, is the sender's own, or has not been revealed here.
-     * Idempotent: repeated calls return the same envelope and never double-advance the ratchet.
-     * A single-device client simply never calls this.
+     * account-wide single-view). Returns the opaque envelope to deliver to the account's other
+     * devices, or `None` if the secret is unknown, is the sender's own, or has not been revealed
+     * here. If this client has a device self-group (option 3) the message is encrypted with it — the
+     * conversation's other party is not a member and never learns of the open — and the recipient
+     * devices apply it via [`Self::process_self_inbound`]; otherwise it falls back to the
+     * conversation channel (option 2) and [`Self::process_inbound`]. Idempotent: repeated calls
+     * return the same envelope and never double-advance the ratchet. A single-device client simply
+     * never calls this.
      */
     func secretConsumptionEnvelope(secretId: Data) throws  -> Data?
     
@@ -785,6 +845,19 @@ open func addMember(keyPackage: Data)throws  -> AddOutcome  {
 }
     
     /**
+     * Add another of this account's devices to the self-group by its key-package bytes. Returns
+     * commit + welcome (deliver to existing devices / the new device). `WrongState` if no self-group
+     * exists yet.
+     */
+open func addSelfDevice(keyPackage: Data)throws  -> AddOutcome  {
+    return try  FfiConverterTypeAddOutcome_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_add_self_device(self.uniffiClonePointer(),
+        FfiConverterData.lower(keyPackage),$0
+    )
+})
+}
+    
+    /**
      * Begin revealing a sealed secret (recipient tapped the placeholder). **Atomic + fail-closed:**
      * the transition + deadlines are committed before this returns `Ok`. An invalid transition
      * (double tap, replay, wrong state) or a failed state write returns `Err` and reveals nothing.
@@ -840,6 +913,16 @@ open func consumeSecret(secretId: Data)throws   {try rustCallWithError(FfiConver
 }
     
     /**
+     * Create this account's self-group with this device as its sole member. Persists before
+     * returning. `WrongState` if one already exists.
+     */
+open func createSelfGroup()throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_create_self_group(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+    /**
      * Encrypt a queued message into a versioned opaque envelope (`app-envelope v1`, R-506).
      * **Idempotent:** a retry returns the same bytes and never advances the ratchet again (no
      * double-spend of a message key) — `wrap` is deterministic over the cached ciphertext.
@@ -888,11 +971,32 @@ open func epoch()throws  -> UInt64  {
 }
     
     /**
+     * True if this client has an established device self-group.
+     */
+open func hasSelfGroup()throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_has_self_group(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * Join the group described by a Welcome (produced by another member's `add_member`). Transitions
      * `Pending` → `Active` and persists. On a bad Welcome the client stays `Pending` (retryable).
      */
 open func joinGroup(welcome: Data)throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_join_group(self.uniffiClonePointer(),
+        FfiConverterData.lower(welcome),$0
+    )
+}
+}
+    
+    /**
+     * Join this account's self-group from a Welcome produced by another device's `add_self_device`.
+     * Persists before returning. `WrongState` if a self-group is already established here.
+     */
+open func joinSelfGroup(welcome: Data)throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_join_self_group(self.uniffiClonePointer(),
         FfiConverterData.lower(welcome),$0
     )
 }
@@ -995,12 +1099,31 @@ open func processInbound(envelopeId: UInt64, ciphertext: Data)throws  -> Inbound
 }
     
     /**
+     * Process an inbound envelope that arrived on the account's **self-group** channel (ADR-0015
+     * option 3) — a `SecretConsumed` control message from one of this account's OTHER devices, or a
+     * self-group membership commit. Decrypts with the self-group (which the conversation's other
+     * party is not in), so the read signal stays private to the account. Same idempotent dedup + ack
+     * contract as [`Self::process_inbound`]. `WrongState` if no self-group is established here.
+     */
+open func processSelfInbound(envelopeId: UInt64, ciphertext: Data)throws  -> InboundResult  {
+    return try  FfiConverterTypeInboundResult_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_process_self_inbound(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(envelopeId),
+        FfiConverterData.lower(ciphertext),$0
+    )
+})
+}
+    
+    /**
      * Build (once) the **consumption control message** for a secret this device revealed (ADR-0015,
-     * account-wide single-view). Returns the opaque envelope to broadcast to the account's other
-     * devices through the conversation (via the normal send path — the relay stays blind), or
-     * `None` if the secret is unknown, is the sender's own, or has not been revealed here.
-     * Idempotent: repeated calls return the same envelope and never double-advance the ratchet.
-     * A single-device client simply never calls this.
+     * account-wide single-view). Returns the opaque envelope to deliver to the account's other
+     * devices, or `None` if the secret is unknown, is the sender's own, or has not been revealed
+     * here. If this client has a device self-group (option 3) the message is encrypted with it — the
+     * conversation's other party is not a member and never learns of the open — and the recipient
+     * devices apply it via [`Self::process_self_inbound`]; otherwise it falls back to the
+     * conversation channel (option 2) and [`Self::process_inbound`]. Idempotent: repeated calls
+     * return the same envelope and never double-advance the ratchet. A single-device client simply
+     * never calls this.
      */
 open func secretConsumptionEnvelope(secretId: Data)throws  -> Data?  {
     return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -2210,6 +2333,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_add_member() != 6758) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_add_self_device() != 51482) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mls_ffi_checksum_method_mlsclient_begin_secret_reveal() != 18181) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2225,6 +2351,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_consume_secret() != 45075) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_create_self_group() != 55270) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mls_ffi_checksum_method_mlsclient_encrypt() != 43898) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2237,7 +2366,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_epoch() != 23643) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_has_self_group() != 40073) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mls_ffi_checksum_method_mlsclient_join_group() != 28817) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_join_self_group() != 60768) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_key_package() != 28909) {
@@ -2264,7 +2399,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_process_inbound() != 58528) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_secret_consumption_envelope() != 28742) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_process_self_inbound() != 48161) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_secret_consumption_envelope() != 12709) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_secret_phase() != 29195) {
