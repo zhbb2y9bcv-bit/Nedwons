@@ -29,13 +29,33 @@ emulators and tampered builds.
   device. Migration `V20`; proven by `services/api/tests/app_attest.rs` (challenge → submit →
   stored-unverified; a consumed or wrong challenge is refused).
 
-**Hardware-gated (honest limits):**
+**Cryptographic verification — DONE (`services/api/src/attest.rs`).** A submitted attestation object
+is fully verified server-side per Apple's spec:
 
-1. **Cryptographic verification** of the attestation object — CBOR decode, the X.509 chain to
-   Apple's App Attest root, the nonce (`clientDataHash`) and app-id / counter checks — is not yet
-   implemented; the stored row's `verified` flag stays `false` until it is. (It is a self-contained
-   backend task; it does not need hardware to *write*, but is untestable end-to-end without a real
-   attestation from a device.)
-2. **Live attestation** requires a **physical iOS device** + the app's App Attest entitlement +
-   Apple Developer provisioning. The Simulator cannot produce attestations. This is the same
-   hardware gate as observing real Secure Enclave key custody.
+1. **Certificate chain** — the `x5c` chain (credential cert → intermediate) verifies up to the
+   **pinned Apple App Attestation Root CA** (fetched from Apple's CA page and embedded as
+   `apple_app_attest_root.pem`; SHA-256 fingerprint `1CB9823B…42C932`, valid to 2045), with
+   validity-window checks. ECDSA P-256/P-384 (SHA-256/384) via vetted RustCrypto crates
+   (`x509-cert`, `p256`, `p384`, `ciborium`, `sha2`).
+2. **Nonce** — `SHA-256(authData ‖ clientDataHash)` must equal the credential cert's Apple nonce
+   extension (OID `1.2.840.113635.100.8.2`), binding the attestation to the server's single-use
+   challenge. (`clientDataHash = SHA-256(challenge)`, matching the client's `attestKey`.)
+3. **Key id** = `SHA-256(credential public key)` and the authData `credentialId`.
+4. **authData** — RP ID hash = `SHA-256(app_id)`, counter `0`, aaguid = `appattest` (production;
+   `appattestdevelop` only when explicitly allowed).
+
+Wired into `POST /v1/attest/key`: when `SENTINEL_APP_ATTEST_APP_ID` is set, a failed verification is
+**rejected** and a passing one stores `verified=true`; unconfigured deployments store `verified=false`
+(bootstrap). Config: `SENTINEL_APP_ATTEST_APP_ID` (`TeamID.bundle-id`), optional
+`SENTINEL_APP_ATTEST_ROOT_PEM` override, `SENTINEL_APP_ATTEST_DEV` to accept development builds.
+
+**Proven without hardware:** `services/api/tests/attest_verify.rs` mints a synthetic chain (test
+root → intermediate → credential cert with the real Apple nonce-extension shape) via `rcgen` and a
+well-formed CBOR object, then checks the happy path **and** every tamper — wrong/spliced nonce, wrong
+challenge, wrong key id, wrong app id, non-zero counter, development aaguid, a chain to a *different*
+root, garbage/wrong-format CBOR — each rejected with the right typed error. An in-module test asserts
+the embedded pin really is Apple's P-384 root.
+
+**Still hardware-gated (honest limit):** *producing* an attestation requires a **physical iOS
+device** + the App Attest entitlement + Apple provisioning — the Simulator cannot. The verifier is
+complete and tested; feed it a real device attestation and it runs unchanged against the Apple root.
