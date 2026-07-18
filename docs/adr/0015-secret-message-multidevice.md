@@ -134,3 +134,19 @@ a stranger can neither claim a sibling's key package (`404`) nor deliver into an
 self-group (`403`); idempotent redelivery is a no-op; a lone device's fan-out reaches nobody. The
 Swift `SentinelClient` gained the matching methods (`publishKeyPackage`, `registerSelfGroupMember`,
 `pendingSelfGroupDevices`, `claimSelfGroupKeyPackage`, `deliverSelfGroup`, self-group inbox/ack).
+
+### Live end-to-end run (2026-07-18)
+
+A runnable proof that the whole **Swift app stack** interoperates with the real backend:
+`scripts/self_group_live_run.sh` boots the real `sentinel-api` against PostgreSQL and runs the
+`SelfGroupLiveRun` Swift client (`apps/ios/SentinelApp`, the only composition point that links BOTH
+`SentinelClient`/HTTP and `MlsFfi`/`MlsClient`). With **real MLS bytes crossing the real relay** it
+drives: register + trusted-device enroll; a real secret delivered sender → phone through a
+conversation (phone holds it sealed); self-group establishment phone↔tablet where the tablet
+**actually `joinSelfGroup`s** the real `addSelfDevice` Welcome delivered over `/v1/self-group/deliver`;
+and the consumption round-trip where the phone reveals, produces a real `SecretConsumed` envelope,
+fans it out over the live self-group, and the tablet **decrypts it with its real self-group ratchet**
+(`processSelfInbound` → `SecretConsumedRemotely`) — while the sender never receives it. Prints
+`LIVE_OK`. Honest scope: the phone (not the tablet) holds the *original* secret here; seeding BOTH of
+an account's devices with the same secret needs multi-device conversation membership (the
+MLS-authoritative commit path), tracked as the next step.

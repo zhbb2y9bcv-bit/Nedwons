@@ -25,6 +25,16 @@ let package = Package(
                 .product(name: "SentinelKit", package: "SentinelKit"),
                 .product(name: "MlsFfi", package: "SentinelMLS"),
             ]),
+        // A runnable live-integration client: links BOTH the HTTP client (SentinelKit) and the real
+        // MLS core (MlsFfi), driven against a booted sentinel-api server by
+        // scripts/self_group_live_run.sh. This is the only composition point that can prove the whole
+        // Swift app stack — networking + MLS — against the real relay in one process.
+        .executableTarget(
+            name: "SelfGroupLiveRun",
+            dependencies: [
+                .product(name: "SentinelKit", package: "SentinelKit"),
+                .product(name: "MlsFfi", package: "SentinelMLS"),
+            ]),
         .testTarget(name: "SentinelAppKitTests", dependencies: ["SentinelAppKit"]),
     ]
 )
