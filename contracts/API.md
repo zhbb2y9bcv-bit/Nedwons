@@ -17,6 +17,7 @@ Errors are generic by design (enumeration resistance, fail-closed):
 | 400  | `weak_password` | Password fails policy (length/blocklist). Client-correctable. |
 | 401  | `denied` | Any authentication/authorization/replay/expiry failure. No detail. |
 | 409  | `username_unavailable` | Registration only: username taken. |
+| 409  | `idempotency_conflict` | Send only: the idempotency key was already used by this sender device for a **different** ciphertext or conversation. Keys name one logical send; retry with a fresh key. Refused rather than silently deduplicated, which would drop the new message while reporting success. |
 | 422  | (axum) | JSON shape/unknown-field rejection. |
 | 429  | `rate_limited` | Per-IP quota exceeded. |
 | 500  | `internal` | Storage/internal fault. No detail. |
