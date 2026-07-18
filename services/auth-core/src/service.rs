@@ -370,6 +370,18 @@ impl AuthService {
         Ok(account)
     }
 
+    /// The enrolled (unrevoked) device's SEC1 public key — used to verify device-signed
+    /// artifacts beyond login, e.g. membership manifests (ADR-0010). Fails closed on
+    /// unknown/revoked devices.
+    pub fn device_public_key(&self, device_id: &DeviceId) -> Result<Vec<u8>> {
+        let device = self
+            .devices
+            .device(device_id)?
+            .filter(|d| !d.revoked)
+            .ok_or(AuthError::Denied)?;
+        Ok(device.public_key)
+    }
+
     /// Revoke the family owning this refresh token and the device's access tokens
     /// (logout on one device). Idempotent; unknown tokens are a no-op.
     pub fn logout(&self, refresh_token: &[u8]) -> Result<()> {
