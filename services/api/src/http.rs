@@ -62,6 +62,10 @@ pub struct AppState {
     /// set by a trusted reverse proxy. When `None`, the peer socket IP is used and any such header
     /// is ignored, so a client cannot spoof its IP. See [`build_router_cfg`].
     trusted_ip_header: Option<HeaderName>,
+    /// When true, every request bearing an `Authorization` token must also carry a valid
+    /// DPoP-style device proof (ADR-0011, R-308). Off by default during migration.
+    require_proof: bool,
+    proof_cache: Arc<crate::proof::ProofReplayCache>,
 }
 
 /// Build the router with per-IP rate limiting keyed on the **peer** socket IP (correct when the
@@ -85,6 +89,7 @@ pub fn build_router(
         membership,
         per_ip_per_minute,
         None,
+        false,
     )
 }
 
@@ -110,6 +115,7 @@ pub fn build_router_cfg(
     membership: Arc<PgMembership>,
     per_ip_per_minute: u32,
     trusted_ip_header: Option<HeaderName>,
+    require_proof: bool,
 ) -> Router {
     let quota =
         Quota::per_minute(NonZeroU32::new(per_ip_per_minute.max(1)).expect("max(1) is non-zero"));
@@ -123,6 +129,8 @@ pub fn build_router_cfg(
         notifier: DeliveryNotifier::default(),
         limiter: Arc::new(RateLimiter::keyed(quota)),
         trusted_ip_header,
+        require_proof,
+        proof_cache: Arc::new(crate::proof::ProofReplayCache::new()),
     };
 
     // Relay routes accept larger bodies (opaque envelopes) than auth routes.
@@ -204,6 +212,7 @@ pub fn build_router_cfg(
         )
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .merge(relay_routes)
+        .layer(middleware::from_fn_with_state(state.clone(), proof_layer))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .route("/healthz", get(|| async { "ok" }))
         .layer(middleware::from_fn(security_headers))
@@ -259,6 +268,101 @@ impl From<auth_core::store::StoreError> for ApiError {
     fn from(_: auth_core::store::StoreError) -> Self {
         internal()
     }
+}
+
+// ----- sender-constrained access tokens (DPoP-style, ADR-0011, R-308) -----------------
+
+/// When enforcement is on, any request carrying an `Authorization` token must ALSO carry a valid
+/// device proof binding the method + path + token + timestamp + a single-use nonce, signed by the
+/// device's enrolled key. Requests without an `Authorization` header (register/login/refresh/
+/// healthz) are untouched — the rule is precisely "a bearer token is only honored with proof of
+/// possession of the enrolling key." Off by default during migration.
+async fn proof_layer(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    if state.require_proof && request.headers().contains_key(header::AUTHORIZATION) {
+        // Extract owned inputs synchronously — never hold `&Request` across an `.await`, or the
+        // middleware future stops being `Send` (Body is not `Sync`).
+        let bearer = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(str::to_owned);
+        let proof_hdr = request
+            .headers()
+            .get("x-sentinel-proof")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let method = request.method().as_str().as_bytes().to_vec();
+        let path = request.uri().path().as_bytes().to_vec();
+        if let Err(e) = verify_request_proof(&state, bearer, proof_hdr, method, path).await {
+            return e.into_response();
+        }
+    }
+    next.run(request).await
+}
+
+async fn verify_request_proof(
+    state: &AppState,
+    bearer: Option<String>,
+    proof_hdr: Option<String>,
+    method: Vec<u8>,
+    path: Vec<u8>,
+) -> Result<(), ApiError> {
+    let denied = || ApiError(StatusCode::UNAUTHORIZED, "denied");
+    let bearer = bearer.ok_or_else(denied)?;
+    let access_token = hex_exact(&bearer, 32).map_err(|_| denied())?;
+    let parsed = proof_hdr
+        .as_deref()
+        .and_then(crate::proof::parse_proof_header)
+        .ok_or_else(denied)?;
+
+    let token_hash = auth_core::crypto::sha256(&access_token);
+    let now = now_unix();
+
+    let proof = auth_core::request_proof::RequestProof {
+        method: &method,
+        path: &path,
+        access_token_hash: &token_hash,
+        timestamp: parsed.timestamp,
+        nonce: &parsed.nonce,
+    };
+    // Cheap freshness gate before any DB work.
+    if !proof.is_fresh(now) {
+        return Err(denied());
+    }
+
+    // Resolve the token's device and its enrolled key, then verify the proof under that key.
+    let service = state.service.clone();
+    let token_for_lookup = access_token.clone();
+    let account = blocking(move || service.validate_access(&token_for_lookup))
+        .await
+        .map_err(|_| denied())?;
+    let service = state.service.clone();
+    let device_id = account.device_id;
+    let public_key = blocking(move || service.device_public_key(&device_id))
+        .await
+        .map_err(|_| denied())?;
+    if !proof.verify(&public_key, &parsed.signature) {
+        return Err(denied());
+    }
+
+    // Single-use within the freshness window (a valid proof cannot be replayed).
+    if !state.proof_cache.check_and_record(
+        &account.device_id.0,
+        &parsed.nonce,
+        now + auth_core::request_proof::MAX_SKEW_SECS + 5,
+        now,
+    ) {
+        return Err(denied());
+    }
+    Ok(())
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 // ----- rate limiting ------------------------------------------------------------------

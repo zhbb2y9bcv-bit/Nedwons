@@ -203,6 +203,29 @@ pub async fn make_app(per_ip_per_minute: u32) -> Router {
     .expect("app setup")
 }
 
+/// Build the app with DPoP-style proof enforcement ON (ADR-0011, R-308), so tests can exercise
+/// sender-constrained access tokens.
+#[allow(dead_code)]
+pub async fn make_app_with_proof(per_ip_per_minute: u32) -> Router {
+    tokio::task::spawn_blocking(move || {
+        let stores = shared_stores();
+        let service = Arc::new(make_service(&stores));
+        sentinel_api::http::build_router_cfg(
+            service,
+            shared_relay(),
+            shared_social(),
+            shared_groups(),
+            shared_transparency(),
+            shared_membership(),
+            per_ip_per_minute,
+            None,
+            true,
+        )
+    })
+    .await
+    .expect("app setup")
+}
+
 /// Build the app trusting a client-IP header (`x-real-client-ip`) for rate limiting, so tests can
 /// exercise per-client-IP buckets behind a proxy.
 pub async fn make_app_with_trusted_ip_header(per_ip_per_minute: u32) -> Router {
@@ -218,6 +241,7 @@ pub async fn make_app_with_trusted_ip_header(per_ip_per_minute: u32) -> Router {
             shared_membership(),
             per_ip_per_minute,
             Some(axum::http::HeaderName::from_static("x-real-client-ip")),
+            false,
         )
     })
     .await
