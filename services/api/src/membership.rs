@@ -35,6 +35,12 @@ pub enum ApplyOutcome {
     Invalid,
 }
 
+/// A stored membership event's evidence (canonical manifest bytes + device signature).
+pub struct MembershipEventRow {
+    pub manifest: Vec<u8>,
+    pub signature: Vec<u8>,
+}
+
 /// One accepted membership change, fully described (what `apply_commit` persists and fans out).
 pub struct CommitRequest<'a> {
     pub conversation_id: &'a [u8; 16],
@@ -337,6 +343,28 @@ impl PgMembership {
 
         txn.commit().map_err(db_err)?;
         Ok(ApplyOutcome::Applied { woken })
+    }
+
+    /// The stored manifest + signature for a specific epoch transition (`next_epoch`), for a
+    /// recipient's correspondence check. `None` if no such event. Auth/membership is enforced by
+    /// the caller (the HTTP layer) before this runs.
+    pub fn event_for_epoch(
+        &self,
+        conversation_id: &[u8; 16],
+        next_epoch: u64,
+    ) -> StoreResult<Option<MembershipEventRow>> {
+        let mut conn = self.conn()?;
+        let row = conn
+            .query_opt(
+                "SELECT manifest, signature FROM membership_events
+                 WHERE conversation_id = $1 AND next_epoch = $2",
+                &[&conversation_id.as_slice(), &(next_epoch as i64)],
+            )
+            .map_err(db_err)?;
+        Ok(row.map(|r| MembershipEventRow {
+            manifest: r.get::<_, Vec<u8>>(0),
+            signature: r.get::<_, Vec<u8>>(1),
+        }))
     }
 
     /// Current membership epoch of a conversation the caller belongs to (`None` = not a member —
