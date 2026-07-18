@@ -868,3 +868,79 @@ extension SentinelClient {
         }
     }
 }
+
+// MARK: - Controlled multi-device (ADR-0008, R-903)
+
+/// A device in the account's device list.
+public struct DeviceSummary: Decodable, Sendable, Identifiable {
+    public let deviceID: String
+    public let revoked: Bool
+    public let current: Bool
+    public var id: String { deviceID }
+    enum CodingKeys: String, CodingKey {
+        case deviceID = "device_id", revoked, current
+    }
+}
+
+extension SentinelClient {
+    /// Enroll a NEW device onto this account from a TRUSTED (already-enrolled) device (ADR-0008).
+    /// `trustedSigner` is the trusted device's key; `newDevicePublicKeyX963` is the new device's
+    /// SEC1 public key (obtained over the pairing channel, e.g. a scanned QR). Returns the new
+    /// device's provisioned session, which the trusted device relays to it. A stolen
+    /// username/password can never do this — only a trusted device's signature authorizes a device.
+    public func enrollDevice(
+        accessToken: String,
+        accountID: String,
+        trustedSigner: DeviceSigner,
+        newDevicePublicKeyX963: Data
+    ) async throws -> Session {
+        struct Begin: Decodable {
+            let device_id: String
+            let txn_id: String
+            let nonce: String
+            let expires_at: UInt64
+        }
+        var beginReq = authed("POST", "/v1/devices/enroll/begin", accessToken: accessToken)
+        beginReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        beginReq.httpBody = try JSONEncoder().encode([String: String]())
+        let ch: Begin = try decode(await perform(beginReq))
+
+        guard let account = Hex.decode(accountID), let newDeviceID = Hex.decode(ch.device_id),
+            let nonce = Hex.decode(ch.nonce), let txnID = Hex.decode(ch.txn_id)
+        else { throw ClientError.decoding }
+        let transcript = ClientTranscripts.deviceEnroll(
+            accountID: account, newDeviceID: newDeviceID,
+            newDevicePublicKey: newDevicePublicKeyX963, challengeNonce: nonce,
+            expiresAt: ch.expires_at, txnID: txnID)
+        let signature = try trustedSigner.sign(transcript)
+
+        struct Finish: Encodable {
+            let txn_id: String
+            let device_public_key: String
+            let signature: String
+        }
+        var finishReq = authed("POST", "/v1/devices/enroll/finish", accessToken: accessToken)
+        finishReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        finishReq.httpBody = try JSONEncoder().encode(
+            Finish(
+                txn_id: ch.txn_id,
+                device_public_key: Hex.encode(newDevicePublicKeyX963),
+                signature: Hex.encode(signature)))
+        let session: SessionResponse = try decode(await perform(finishReq))
+        return session.model
+    }
+
+    /// This account's devices (management list).
+    public func listDevices(accessToken: String) async throws -> [DeviceSummary] {
+        try decode(await perform(authed("GET", "/v1/devices", accessToken: accessToken)))
+    }
+
+    /// Revoke one of this account's devices (cascades tokens + refresh families).
+    public func revokeDevice(accessToken: String, deviceID: String) async throws {
+        struct Body: Encodable { let device_id: String }
+        var request = authed("POST", "/v1/devices/revoke", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(Body(device_id: deviceID))
+        _ = try await perform(request)
+    }
+}

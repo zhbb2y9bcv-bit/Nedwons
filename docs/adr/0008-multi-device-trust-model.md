@@ -1,6 +1,6 @@
 # ADR-0008: Controlled multi-device trust (replaces strict single-active-device)
 
-- **Status:** Accepted (design only — no code in this change)
+- **Status:** Accepted — **server-side ceremony implemented 2026-07-18** (enrollment, per-account cap, device list + owner-scoped revoke; migration V13 drops the single-active index). The on-device QR/SAS pairing UX, recovery-secret enrollment, transparency-logging of device events, and blocking software-signers from approving are follow-ups (R-101/R-304).
 - **Date:** 2026-07-17
 - **Deciders:** security architect, iOS lead, backend lead, crypto integrator
 - **Supersedes:** the single-active-device posture of ADR-0002 / R-903 (does **not** relax the

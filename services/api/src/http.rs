@@ -200,6 +200,11 @@ pub fn build_router_cfg(
         .route("/v1/session/refresh", post(refresh))
         .route("/v1/session/logout", post(logout))
         .route("/v1/session/whoami", get(whoami))
+        // controlled multi-device (ADR-0008): enroll a new device via a trusted device, list, revoke
+        .route("/v1/devices", get(list_devices_handler))
+        .route("/v1/devices/enroll/begin", post(enroll_begin))
+        .route("/v1/devices/enroll/finish", post(enroll_finish))
+        .route("/v1/devices/revoke", post(revoke_device_handler))
         // key transparency (R-201): the log is auditable; reads require a bearer token.
         .route("/v1/transparency/sth", get(transparency_sth))
         .route(
@@ -770,6 +775,123 @@ async fn whoami(
         account_id: hex::encode(who.account_id.as_bytes()),
         device_id: hex::encode(who.device_id.as_bytes()),
     }))
+}
+
+// ----- controlled multi-device (ADR-0008, R-903) --------------------------------------
+
+#[derive(Serialize)]
+struct EnrollChallengeDto {
+    /// The reserved id for the NEW device (the trusted device binds this in its signature).
+    device_id: String,
+    txn_id: String,
+    nonce: String,
+    expires_at: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EnrollFinishBody {
+    txn_id: String,
+    /// SEC1 uncompressed P-256 public key of the NEW device (130 hex chars).
+    device_public_key: String,
+    /// The TRUSTED device's signature over the `DeviceEnroll` transcript (128 hex chars).
+    signature: String,
+}
+
+#[derive(Serialize)]
+struct DeviceDto {
+    device_id: String,
+    revoked: bool,
+    /// True for the device making this request.
+    current: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceRefBody {
+    device_id: String,
+}
+
+/// Stage 1 of trusted-device enrollment: the authenticated (trusted) device reserves the new
+/// device's id + a nonce to sign.
+async fn enroll_begin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<EnrollChallengeDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let service = state.service.clone();
+    let ch = blocking(move || service.enroll_device_begin(&me)).await?;
+    Ok(Json(EnrollChallengeDto {
+        device_id: hex::encode(ch.device_id.as_bytes()),
+        txn_id: hex::encode(ch.txn_id.as_bytes()),
+        nonce: hex::encode(ch.nonce),
+        expires_at: ch.expires_at,
+    }))
+}
+
+/// Stage 2: the trusted device submits the new device's public key + its signature authorizing it.
+/// Returns a **session for the new device**, relayed to it over the pairing channel.
+async fn enroll_finish(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<EnrollFinishBody>,
+) -> Result<Json<SessionDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let txn_id = txn_from_hex(&body.txn_id)?;
+    let device_public_key = hex_exact(&body.device_public_key, 65)?;
+    let signature = hex_exact(&body.signature, 64)?;
+    let service = state.service.clone();
+    let session = blocking(move || {
+        service.enroll_device_finish(
+            &me,
+            auth_core::EnrollRequest {
+                txn_id,
+                device_public_key,
+                signature,
+            },
+        )
+    })
+    .await?;
+    Ok(Json(SessionDto::from(session)))
+}
+
+/// The account's devices (management list). Members-of-account only (the caller's own account).
+async fn list_devices_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<DeviceDto>>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let service = state.service.clone();
+    let account = me.account_id;
+    let current = me.device_id;
+    let devices = blocking(move || service.list_devices(&account)).await?;
+    Ok(Json(
+        devices
+            .into_iter()
+            .map(|d| DeviceDto {
+                current: d.device_id.0 == current.0,
+                device_id: hex::encode(d.device_id.as_bytes()),
+                revoked: d.revoked,
+            })
+            .collect(),
+    ))
+}
+
+/// Revoke one of the caller's own devices (cascades tokens + refresh families + fails closed).
+async fn revoke_device_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DeviceRefBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let target = DeviceId(id16_from_hex(&body.device_id)?);
+    let service = state.service.clone();
+    let account = me.account_id;
+    let revoked = blocking(move || service.revoke_own_device(&account, &target)).await?;
+    if !revoked {
+        return Err(forbidden());
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ----- relay (E2EE message routing; server never decrypts) ----------------------------
