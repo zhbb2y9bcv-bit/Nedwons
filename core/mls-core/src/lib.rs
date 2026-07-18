@@ -38,6 +38,11 @@ pub enum MlsError {
     Codec,
     #[error("member not found in group")]
     MemberNotFound,
+    /// A commit's actual cryptographic effect does not match the sender's signed membership
+    /// manifest (ADR-0010 correspondence check). The commit was NOT merged; group state is
+    /// unchanged. Treat as a security event: the committer (or the server) lied.
+    #[error("commit does not match its membership manifest")]
+    ManifestMismatch,
 }
 
 type Result<T> = core::result::Result<T, MlsError>;
@@ -286,6 +291,88 @@ impl Conversation {
             }
             _ => Ok(Incoming::StateAdvanced),
         }
+    }
+
+    /// Process an inbound **commit** with the ADR-0010 correspondence check: the commit's actual
+    /// cryptographic effect must equal the sender's signed membership manifest, otherwise the
+    /// commit is **discarded without merging** (group state unchanged) and
+    /// [`MlsError::ManifestMismatch`] is returned.
+    ///
+    /// This is the half of membership verification only clients can do — the MLS-blind relay
+    /// verified the manifest's *signature/authorization/ordering*; the recipient verifies the
+    /// *correspondence* between the routing claim and the cryptographic change.
+    ///
+    /// `expected_added`/`expected_removed` are the manifest's device identities (credential
+    /// identity bytes); `expected_next_epoch` is the manifest's `next_epoch`.
+    pub fn process_commit_checked(
+        &mut self,
+        me: &Member,
+        mut envelope: &[u8],
+        expected_next_epoch: u64,
+        expected_added: &[Vec<u8>],
+        expected_removed: &[Vec<u8>],
+    ) -> Result<()> {
+        // The manifest must describe exactly the next epoch relative to our local state; a
+        // stale or skipped epoch is a divergence, not something to merge through.
+        if expected_next_epoch != self.epoch() + 1 {
+            return Err(MlsError::ManifestMismatch);
+        }
+
+        let message = MlsMessageIn::tls_deserialize(&mut envelope).map_err(|_| MlsError::Codec)?;
+        let protocol = message
+            .try_into_protocol_message()
+            .map_err(|_| MlsError::Codec)?;
+        let processed = self
+            .group
+            .process_message(&me.provider, protocol)
+            .map_err(lib)?;
+        let staged = match processed.into_content() {
+            ProcessedMessageContent::StagedCommitMessage(staged) => staged,
+            // Not a commit at all — cannot satisfy a membership manifest.
+            _ => return Err(MlsError::ManifestMismatch),
+        };
+
+        // What the commit ACTUALLY does, read from the staged (not yet merged) state.
+        let mut actual_added: Vec<Vec<u8>> = staged
+            .add_proposals()
+            .map(|p| {
+                p.add_proposal()
+                    .key_package()
+                    .leaf_node()
+                    .credential()
+                    .serialized_content()
+                    .to_vec()
+            })
+            .collect();
+        // Removed leaves are resolved against the PRE-merge member list.
+        let mut actual_removed: Vec<Vec<u8>> = Vec::new();
+        for p in staged.remove_proposals() {
+            let leaf = p.remove_proposal().removed();
+            let identity = self
+                .group
+                .members()
+                .find(|m| m.index == leaf)
+                .map(|m| m.credential.serialized_content().to_vec())
+                .ok_or(MlsError::ManifestMismatch)?;
+            actual_removed.push(identity);
+        }
+
+        let mut expected_added = expected_added.to_vec();
+        let mut expected_removed = expected_removed.to_vec();
+        actual_added.sort();
+        actual_removed.sort();
+        expected_added.sort();
+        expected_removed.sort();
+        if actual_added != expected_added || actual_removed != expected_removed {
+            // Drop the staged commit unmerged: our cryptographic state must not follow a lie.
+            return Err(MlsError::ManifestMismatch);
+        }
+
+        self.group
+            .merge_staged_commit(&me.provider, *staged)
+            .map_err(lib)?;
+        debug_assert_eq!(self.epoch(), expected_next_epoch);
+        Ok(())
     }
 
     /// The MLS group id — the key under which this group's state lives in the store. Not a secret.

@@ -252,11 +252,14 @@ fn catch<T>(
 }
 
 /// Map errors from **inbound-processing** paths: malformed/unverifiable input is caller-supplied,
-/// so it is reported as `InvalidMessage` (redacted — no library detail).
+/// so it is reported as `InvalidMessage` (redacted — no library detail). A manifest mismatch is
+/// also hostile input at this boundary.
 fn map_input(e: MlsError) -> ClientError {
     match e {
         MlsError::MemberNotFound => ClientError::NotFound,
-        MlsError::Codec | MlsError::Lib(_) => ClientError::InvalidMessage,
+        MlsError::Codec | MlsError::Lib(_) | MlsError::ManifestMismatch => {
+            ClientError::InvalidMessage
+        }
     }
 }
 
@@ -265,6 +268,6 @@ fn map_input(e: MlsError) -> ClientError {
 fn map_local(e: MlsError) -> ClientError {
     match e {
         MlsError::MemberNotFound => ClientError::NotFound,
-        MlsError::Codec | MlsError::Lib(_) => ClientError::Internal,
+        MlsError::Codec | MlsError::Lib(_) | MlsError::ManifestMismatch => ClientError::Internal,
     }
 }
