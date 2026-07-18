@@ -1036,6 +1036,13 @@ async fn revoke_device_handler(
     let transparency = state.transparency.clone();
     let now = now_unix();
     let _ = blocking_store(move || transparency.append_revocation(&account, &target, now)).await;
+    // Housekeeping (ADR-0015 option 3): drop the revoked device from its account's self-group
+    // membership so the relay stops routing self-group traffic to it and the pending-devices view
+    // stays accurate. Best-effort — the *cryptographic* re-key is a separate client action (an
+    // existing device issues an MLS remove-commit via `MlsClient.remove_self_device`). The fan-out
+    // query already excludes revoked devices, so this is cleanup, not a security dependency.
+    let relay = state.relay.clone();
+    let _ = blocking_store(move || relay.remove_self_group_member(&account, &target)).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
