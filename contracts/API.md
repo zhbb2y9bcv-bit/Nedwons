@@ -137,7 +137,26 @@ resolved server-side (never client-asserted).
 
 ### `POST /v1/conversations/{id}/members/remove` → `204` | `403`
 `{ "account_id" }` — **admin** removes a member: same exit path as leave (routing removal, queued
-mail purged, role dropped). Removing yourself is a `leave` (`400`).
+mail purged, role dropped). Removing yourself is a `leave` (`400`). *(Legacy routing-only path;
+being migrated to `/commit` — ADR-0010 / R-506.)*
+
+### `POST /v1/conversations/{id}/commit` → `200` | `403` | `409` | `400` (ADR-0010, R-506)
+MLS-commit-authoritative membership change. Body:
+`{ control_type (1=add,2=remove,3=self-leave), prev_epoch, next_epoch, commit_hash (32B hex),
+added: [{account_id, device_id}], removed: [device_id...], idempotency_key (16B hex), expires_at,
+signature (hex), commit (hex), welcomes: [hex...] }`. `signature` is ECDSA-P256 by the actor's
+enrolled device key over the canonical manifest (`auth_core::membership`); lists must be sorted +
+duplicate-free; one welcome per added device. The MLS-blind server verifies signature + commit-hash
+binding + governance (ADR-0009) + a per-conversation **epoch compare-and-swap**, then atomically
+applies routing, fans the opaque commit to pre-change members (minus actor/removed) + targeted
+welcomes, cuts removed devices' queued mail, and appends to the audit log. Returns
+`{ applied, next_epoch }` (`applied:false` on an idempotent retry). `409 stale_epoch` = a concurrent
+commit won (rebase on `/epoch` and retry); `409 idempotency_conflict` = key reused with a different
+manifest. **Recipients MUST run the commit↔manifest correspondence check before merging** — the
+server cannot verify an opaque commit's content matches the manifest.
+
+### `GET /v1/conversations/{id}/epoch` → `200` | `403`
+Members only. `{ epoch }` — the current membership epoch, for rebasing after `stale_epoch`.
 
 ## Group governance (ADR-0009): admins, invites, join requests
 
