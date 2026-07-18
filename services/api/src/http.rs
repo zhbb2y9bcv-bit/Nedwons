@@ -145,6 +145,22 @@ pub fn build_router_cfg(
 ) -> Router {
     let quota =
         Quota::per_minute(NonZeroU32::new(per_ip_per_minute.max(1)).expect("max(1) is non-zero"));
+    let notifier = DeliveryNotifier::default();
+
+    // Push wiring (#4): a device that is not connected is reached by a contentless APNs wake push.
+    // Configured from SENTINEL_APNS_* (disabled otherwise). The production HTTP/2 socket adapter is
+    // supplied at deployment; until then this is a NullTransport (the mechanism runs, sends nothing).
+    let push =
+        crate::push::PushService::from_env(relay.clone(), Arc::new(crate::push::NullTransport));
+    if push.is_enabled() {
+        let push = push.clone();
+        // Every delivery `wake` also dispatches a push, off the request path (best-effort).
+        notifier.set_wake_hook(Arc::new(move |device| {
+            let push = push.clone();
+            tokio::task::spawn_blocking(move || push.notify_device_blocking(&device));
+        }));
+    }
+
     let state = AppState {
         service,
         relay,
@@ -152,7 +168,7 @@ pub fn build_router_cfg(
         groups,
         transparency,
         membership,
-        notifier: DeliveryNotifier::default(),
+        notifier,
         limiter: Arc::new(RateLimiter::keyed(quota)),
         trusted_ip_header,
         require_proof,
@@ -175,6 +191,8 @@ pub fn build_router_cfg(
             post(self_group_claim_key_package),
         )
         .route("/v1/self-group/deliver", post(self_group_deliver))
+        // Push notifications (#4): register this device's APNs wake token.
+        .route("/v1/push/register", post(register_push_token_handler))
         // sealed-sender certificate issuance (ADR-0012, R-204)
         .route("/v1/sender-certificate", get(issue_sender_certificate))
         // sealed-sender delivery access key registration (ADR-0014 Slice 2a, R-204)
@@ -1043,6 +1061,9 @@ async fn revoke_device_handler(
     // query already excludes revoked devices, so this is cleanup, not a security dependency.
     let relay = state.relay.clone();
     let _ = blocking_store(move || relay.remove_self_group_member(&account, &target)).await;
+    // Drop the revoked device's push tokens so it is never woken again (#4). Best-effort.
+    let relay = state.relay.clone();
+    let _ = blocking_store(move || relay.delete_push_tokens(&target)).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1585,6 +1606,35 @@ async fn self_group_deliver(
     Ok(Json(FanoutReceiptDto {
         delivered: newly_queued.len(),
     }))
+}
+
+// ----- Push notifications (#4) ---------------------------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterPushBody {
+    /// Push platform — `apns` today.
+    platform: String,
+    /// The opaque device push token (APNs registration token). NOT message content.
+    token: String,
+}
+
+/// Register (or rotate) this device's push token so it can be woken to fetch its inbox when not
+/// connected (#4). The token addresses a **contentless** wake push; no E2EE content is ever pushed.
+async fn register_push_token_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RegisterPushBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    // Only known platforms, bounded token length.
+    if body.platform != "apns" || body.token.is_empty() || body.token.len() > 4096 {
+        return Err(bad_request());
+    }
+    let relay = state.relay.clone();
+    let device = me.device_id;
+    blocking_store(move || relay.register_push_token(&device, &body.platform, &body.token)).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Serialize)]
