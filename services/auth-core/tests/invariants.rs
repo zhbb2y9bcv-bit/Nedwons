@@ -686,3 +686,117 @@ fn enrollment_is_capped_and_revoke_cascades() {
     let replacement = TestDevice::new();
     assert!(enroll(&service, &trusted, &device_a, &replacement).is_ok());
 }
+
+// ----- Account recovery (ADR-0003 / R-304) ----------------------------------------------
+
+use auth_core::RecoveryRequest;
+
+const RECOVERY_SECRET: &str = "recover-code-3f9a2b8c7d1e0f4a5b6c"; // >= 20 chars
+
+/// Recover onto `new_device` using `secret`. Returns the provisioned session.
+fn recover(
+    service: &AuthService,
+    username: &str,
+    secret: &str,
+    new_device: &TestDevice,
+) -> Result<Session, AuthError> {
+    let ch = service.recover_begin(username);
+    let transcript = Transcript {
+        action: Action::DeviceEnroll,
+        account_id: &ch.account_id,
+        device_id: &ch.device_id,
+        public_key: &new_device.public_key,
+        challenge: &ch.nonce,
+        expires_at: ch.expires_at,
+        txn_id: &ch.txn_id,
+    };
+    let new_device_signature = new_device.sign(&transcript.encode());
+    service.recover_finish(RecoveryRequest {
+        username: username.to_string(),
+        recovery_secret: secret.to_string(),
+        txn_id: ch.txn_id,
+        new_device_public_key: new_device.public_key.clone(),
+        new_device_signature,
+    })
+}
+
+#[test]
+fn recovery_with_the_secret_enrolls_a_working_new_device() {
+    let (service, _clock) = make_service();
+    let (_device_a, reg) = register(&service, "recover_ok");
+    let trusted = AccountDevice {
+        account_id: reg.account_id,
+        device_id: reg.device_id,
+    };
+    service
+        .set_recovery_secret(&trusted, RECOVERY_SECRET)
+        .expect("set recovery");
+
+    // Lost device A → recover with a brand-new device C using the secret.
+    let device_c = TestDevice::new();
+    let session_c = recover(&service, "recover_ok", RECOVERY_SECRET, &device_c).expect("recover");
+    assert_eq!(session_c.account_id, reg.account_id);
+    assert_ne!(session_c.device_id, reg.device_id);
+    assert!(service.validate_access(&session_c.access_token).is_ok());
+    // The recovered device is active alongside the original (the user revokes the lost one after).
+    assert_eq!(
+        service
+            .list_devices(&reg.account_id)
+            .unwrap()
+            .iter()
+            .filter(|d| !d.revoked)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn recovery_rejects_a_wrong_secret() {
+    let (service, _clock) = make_service();
+    let (_device_a, reg) = register(&service, "recover_wrong");
+    let trusted = AccountDevice {
+        account_id: reg.account_id,
+        device_id: reg.device_id,
+    };
+    service
+        .set_recovery_secret(&trusted, RECOVERY_SECRET)
+        .expect("set recovery");
+    let device_c = TestDevice::new();
+    assert!(matches!(
+        recover(
+            &service,
+            "recover_wrong",
+            "totally-wrong-secret-000",
+            &device_c
+        ),
+        Err(AuthError::Denied)
+    ));
+    // No device added.
+    assert_eq!(service.list_devices(&reg.account_id).unwrap().len(), 1);
+}
+
+#[test]
+fn recovery_denied_when_no_secret_is_set() {
+    let (service, _clock) = make_service();
+    let (_device_a, _reg) = register(&service, "recover_none");
+    let device_c = TestDevice::new();
+    // Even with the "right" string, recovery fails when the account never set a secret.
+    assert!(matches!(
+        recover(&service, "recover_none", RECOVERY_SECRET, &device_c),
+        Err(AuthError::Denied)
+    ));
+}
+
+#[test]
+fn recovery_rejects_a_too_short_secret_at_setup() {
+    let (service, _clock) = make_service();
+    let (_device_a, reg) = register(&service, "recover_short");
+    let trusted = AccountDevice {
+        account_id: reg.account_id,
+        device_id: reg.device_id,
+    };
+    assert!(matches!(
+        service.set_recovery_secret(&trusted, "too-short"),
+        Err(AuthError::WeakPassword)
+    ));
+}

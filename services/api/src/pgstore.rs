@@ -153,6 +153,28 @@ impl CredentialStore for PgStores {
         })
         .transpose()
     }
+
+    fn set_recovery_phc(&self, account_id: &AccountId, phc: &str) -> StoreResult<bool> {
+        let mut conn = self.conn()?;
+        let updated = conn
+            .execute(
+                "UPDATE accounts SET recovery_phc = $2 WHERE account_id = $1",
+                &[&account_id.as_bytes(), &phc],
+            )
+            .map_err(db_err)?;
+        Ok(updated == 1)
+    }
+
+    fn recovery_phc(&self, account_id: &AccountId) -> StoreResult<Option<String>> {
+        let mut conn = self.conn()?;
+        let row = conn
+            .query_opt(
+                "SELECT recovery_phc FROM accounts WHERE account_id = $1",
+                &[&account_id.as_bytes()],
+            )
+            .map_err(db_err)?;
+        Ok(row.and_then(|r| r.get::<_, Option<String>>(0)))
+    }
 }
 
 impl DeviceStore for PgStores {
