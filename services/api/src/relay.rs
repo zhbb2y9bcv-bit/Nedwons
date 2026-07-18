@@ -29,6 +29,22 @@ pub struct EnvelopeOut {
     pub ciphertext: Vec<u8>,
 }
 
+/// A queued **sealed-sender** envelope (ADR-0014): the relay knows only who to deliver it to and the
+/// opaque ciphertext — never the sender or conversation.
+pub struct SealedEnvelopeOut {
+    pub id: i64,
+    pub ciphertext: Vec<u8>,
+}
+
+/// Outcome of a sealed delivery.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SealedSendOutcome {
+    /// Stored for the recipient device.
+    Enqueued { id: i64 },
+    /// The (recipient_device, idempotency_key) pair already exists — a retry, deduplicated.
+    Duplicate,
+}
+
 /// A claimed key package plus the device it belongs to.
 pub struct ClaimedKeyPackage {
     pub device_id: [u8; 16],
@@ -119,8 +135,24 @@ impl PgRelay {
         Ok(())
     }
 
+    /// The owning account of a **non-revoked** device, or `None` if the device is unknown or
+    /// revoked. Used by sealed delivery to find whose delivery-access verifier gates the recipient.
+    pub fn account_for_device(&self, device: &DeviceId) -> StoreResult<Option<AccountId>> {
+        let mut conn = self.conn()?;
+        let row = conn
+            .query_opt(
+                "SELECT account_id FROM devices WHERE device_id = $1 AND NOT revoked",
+                &[&device.as_bytes()],
+            )
+            .map_err(db_err)?;
+        match row {
+            Some(r) => Ok(Some(AccountId(id16(r.get::<_, &[u8]>(0))?))),
+            None => Ok(None),
+        }
+    }
+
     /// The account's registered delivery access verifier, or `None` if it has not set one. Used by
-    /// the (future, Slice 2b) sealed-delivery endpoint to gate a presented key.
+    /// the sealed-delivery endpoint to gate a presented key.
     pub fn delivery_verifier(&self, account: &AccountId) -> StoreResult<Option<Vec<u8>>> {
         let mut conn = self.conn()?;
         let row = conn
@@ -521,6 +553,101 @@ impl PgRelay {
             total += purged;
             if purged < batch_size as u64 {
                 break; // backlog drained
+            }
+        }
+        Ok(total)
+    }
+
+    /// Store a **sealed** envelope for `recipient_device` (ADR-0014 Slice 2b). No sender or
+    /// conversation is recorded. Idempotent on `(recipient_device, idempotency_key)`: a retry with
+    /// the same key is a `Duplicate` no-op (the key is a 128-bit sender-chosen random, so a
+    /// cross-sender collision is ~2^-128). The DAK gate is enforced by the caller *before* this.
+    pub fn deliver_sealed(
+        &self,
+        recipient_device: &DeviceId,
+        ciphertext: &[u8],
+        idempotency_key: &[u8; 16],
+    ) -> StoreResult<SealedSendOutcome> {
+        let mut conn = self.conn()?;
+        let idem = idempotency_key.as_slice();
+        let row = conn
+            .query_opt(
+                "INSERT INTO sealed_envelopes (recipient_device, ciphertext, idempotency_key)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (recipient_device, idempotency_key) DO NOTHING
+                 RETURNING id",
+                &[&recipient_device.as_bytes(), &ciphertext, &idem],
+            )
+            .map_err(db_err)?;
+        Ok(match row {
+            Some(r) => SealedSendOutcome::Enqueued { id: r.get(0) },
+            None => SealedSendOutcome::Duplicate,
+        })
+    }
+
+    /// Peek a device's undelivered **sealed** envelopes (at-least-once, like [`Self::peek_inbox`]).
+    pub fn peek_sealed_inbox(
+        &self,
+        device: &DeviceId,
+        limit: i64,
+    ) -> StoreResult<Vec<SealedEnvelopeOut>> {
+        let mut conn = self.conn()?;
+        let rows = conn
+            .query(
+                "SELECT id, ciphertext FROM sealed_envelopes
+                 WHERE recipient_device = $1 AND NOT delivered
+                 ORDER BY id LIMIT $2",
+                &[&device.as_bytes(), &limit],
+            )
+            .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| SealedEnvelopeOut {
+                id: r.get(0),
+                ciphertext: r.get::<_, Vec<u8>>(1),
+            })
+            .collect())
+    }
+
+    /// Acknowledge (delete) sealed envelopes, scoped to the caller's own device.
+    pub fn ack_sealed(&self, device: &DeviceId, ids: &[i64]) -> StoreResult<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn()?;
+        let acked = conn
+            .execute(
+                "DELETE FROM sealed_envelopes WHERE recipient_device = $1 AND id = ANY($2)",
+                &[&device.as_bytes(), &ids],
+            )
+            .map_err(db_err)?;
+        Ok(acked)
+    }
+
+    /// Retention purge for sealed envelopes (mirrors [`Self::purge_stale_envelopes`]).
+    pub fn purge_stale_sealed(
+        &self,
+        ttl: std::time::Duration,
+        batch_size: i64,
+        max_batches: u32,
+    ) -> StoreResult<u64> {
+        let mut conn = self.conn()?;
+        let ttl_secs = ttl.as_secs_f64();
+        let mut total: u64 = 0;
+        for _ in 0..max_batches {
+            let purged = conn
+                .execute(
+                    "DELETE FROM sealed_envelopes WHERE id IN (
+                         SELECT id FROM sealed_envelopes
+                         WHERE created_at < now() - make_interval(secs => $1)
+                         ORDER BY created_at
+                         LIMIT $2)",
+                    &[&ttl_secs, &batch_size],
+                )
+                .map_err(db_err)?;
+            total += purged;
+            if purged < batch_size as u64 {
+                break;
             }
         }
         Ok(total)
