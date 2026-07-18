@@ -33,6 +33,14 @@ use crate::{Conversation, Incoming, Member};
 /// the client via the FFI `capabilities()` call.
 pub const BLOB_FORMAT_VERSION: u32 = 1;
 
+/// Upper bound on the out-of-order dedup tail retained above [`Meta::dedup_watermark`] (R-105).
+/// The whole blob is rewritten on every commit, so an unbounded `seen_inbound` set would make each
+/// write grow without limit. Near-in-order at-least-once delivery keeps the tail tiny; this cap only
+/// bites under a pathological permanent gap, where the watermark is force-advanced (see
+/// [`compact_dedup`]). Blob-level dedup is a fast path — OpenMLS's ratchet rejects a genuinely
+/// replayed ciphertext regardless — so bounding it never weakens replay protection.
+const MAX_SEEN_ABOVE_WATERMARK: usize = 4096;
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DurableError {
     #[error("mls error")]
@@ -107,7 +115,14 @@ struct Meta {
     identity: Vec<u8>,
     public_key: Vec<u8>,
     group_id: Vec<u8>,
-    /// Envelope ids already processed — dedup for at-least-once delivery.
+    /// Every envelope id `<= dedup_watermark` is considered already processed. The contiguous
+    /// low prefix of seen ids is collapsed into this watermark so it need not be stored id-by-id
+    /// (R-105 bounded dedup). `#[serde(default)]` ⇒ pre-watermark blobs load as 0 and self-heal on
+    /// the next commit.
+    #[serde(default)]
+    dedup_watermark: u64,
+    /// Processed envelope ids **above** `dedup_watermark` — the out-of-order tail only, bounded by
+    /// [`MAX_SEEN_ABOVE_WATERMARK`]. Combined with the watermark this is the full dedup set.
     seen_inbound: BTreeSet<u64>,
     /// Envelope ids durably processed and therefore safe to acknowledge to the server.
     ack_eligible: BTreeSet<u64>,
@@ -121,6 +136,46 @@ impl Meta {
         let id = self.next_local_id;
         self.next_local_id += 1;
         id
+    }
+
+    /// True if `envelope_id` was already processed (below the watermark or in the tracked tail).
+    fn is_seen(&self, envelope_id: u64) -> bool {
+        envelope_id <= self.dedup_watermark || self.seen_inbound.contains(&envelope_id)
+    }
+
+    /// Mark `envelope_id` processed, then compact so the stored tail stays bounded (R-105).
+    fn record_seen(&mut self, envelope_id: u64) {
+        if envelope_id > self.dedup_watermark {
+            self.seen_inbound.insert(envelope_id);
+        }
+        self.compact_dedup();
+    }
+
+    /// Collapse the contiguous low prefix of `seen_inbound` into `dedup_watermark`, then, if the
+    /// non-contiguous tail still exceeds the cap, force the watermark up to absorb the lowest ids.
+    /// Forcing only ever marks *older* ids as seen (never un-sees a newer one), so a not-yet-seen
+    /// low id could at worst be treated as a duplicate later — bounded, and the ratchet is the real
+    /// replay guard (see [`MAX_SEEN_ABOVE_WATERMARK`]).
+    fn compact_dedup(&mut self) {
+        // Drop anything already covered by the watermark, and advance over the contiguous prefix.
+        while let Some(&lowest) = self.seen_inbound.iter().next() {
+            if lowest <= self.dedup_watermark {
+                self.seen_inbound.remove(&lowest);
+            } else if lowest == self.dedup_watermark + 1 {
+                self.dedup_watermark = lowest;
+                self.seen_inbound.remove(&lowest);
+            } else {
+                break;
+            }
+        }
+        // Hard cap on the out-of-order tail.
+        while self.seen_inbound.len() > MAX_SEEN_ABOVE_WATERMARK {
+            let Some(&lowest) = self.seen_inbound.iter().next() else {
+                break;
+            };
+            self.dedup_watermark = self.dedup_watermark.max(lowest);
+            self.seen_inbound.remove(&lowest);
+        }
     }
 }
 
@@ -335,7 +390,7 @@ impl<J: Journal> DurableSession<J> {
         envelope_id: u64,
         ciphertext: &[u8],
     ) -> Result<InboundOutcome, DurableError> {
-        if self.meta.seen_inbound.contains(&envelope_id) {
+        if self.meta.is_seen(envelope_id) {
             return Ok(InboundOutcome::Duplicate);
         }
         let incoming = {
@@ -360,7 +415,7 @@ impl<J: Journal> DurableSession<J> {
             }
             Incoming::StateAdvanced => InboundOutcome::StateAdvanced,
         };
-        meta.seen_inbound.insert(envelope_id);
+        meta.record_seen(envelope_id);
         meta.ack_eligible.insert(envelope_id);
         self.commit(meta)?;
         Ok(outcome)
@@ -656,5 +711,73 @@ impl Journal for JournalKind {
             JournalKind::File(j) => j.load(),
             JournalKind::Memory(j) => j.load(),
         }
+    }
+}
+
+#[cfg(test)]
+mod dedup_tests {
+    use super::{Meta, MAX_SEEN_ABOVE_WATERMARK};
+
+    #[test]
+    fn contiguous_ids_collapse_into_the_watermark() {
+        let mut meta = Meta::default();
+        for id in 1..=100 {
+            meta.record_seen(id);
+        }
+        // The whole contiguous run folded into the watermark; nothing stored id-by-id.
+        assert_eq!(meta.dedup_watermark, 100);
+        assert!(meta.seen_inbound.is_empty());
+        // Every id in the run is still recognized as seen; the next one is not.
+        assert!(meta.is_seen(1));
+        assert!(meta.is_seen(100));
+        assert!(!meta.is_seen(101));
+    }
+
+    #[test]
+    fn out_of_order_ids_are_retained_until_the_gap_fills() {
+        let mut meta = Meta::default();
+        meta.record_seen(1);
+        meta.record_seen(3); // gap at 2
+        assert_eq!(meta.dedup_watermark, 1);
+        assert_eq!(meta.seen_inbound.iter().copied().collect::<Vec<_>>(), [3]);
+        assert!(meta.is_seen(1));
+        assert!(!meta.is_seen(2));
+        assert!(meta.is_seen(3));
+        // Filling the gap collapses everything.
+        meta.record_seen(2);
+        assert_eq!(meta.dedup_watermark, 3);
+        assert!(meta.seen_inbound.is_empty());
+        assert!(meta.is_seen(2));
+    }
+
+    #[test]
+    fn redelivery_below_the_watermark_is_still_a_duplicate() {
+        let mut meta = Meta::default();
+        for id in 1..=10 {
+            meta.record_seen(id);
+        }
+        assert_eq!(meta.dedup_watermark, 10);
+        // Re-recording an already-collapsed id is a no-op and stays seen.
+        assert!(meta.is_seen(5));
+        meta.record_seen(5);
+        assert_eq!(meta.dedup_watermark, 10);
+        assert!(meta.seen_inbound.is_empty());
+    }
+
+    #[test]
+    fn tail_is_hard_bounded_under_a_permanent_gap() {
+        let mut meta = Meta::default();
+        // A permanent gap at id 1: every later id arrives out of order and can never collapse.
+        for id in 2..(MAX_SEEN_ABOVE_WATERMARK as u64 + 3_000) {
+            meta.record_seen(id);
+        }
+        // Memory stays bounded rather than growing without limit.
+        assert!(meta.seen_inbound.len() <= MAX_SEEN_ABOVE_WATERMARK);
+        // The most recently seen ids are still recognized...
+        let highest = MAX_SEEN_ABOVE_WATERMARK as u64 + 2_999;
+        assert!(meta.is_seen(highest));
+        // ...and forcing the watermark up only ever marks OLDER ids as seen (never un-sees a newer
+        // one): the watermark never exceeds the highest processed id.
+        assert!(meta.dedup_watermark <= highest);
     }
 }
