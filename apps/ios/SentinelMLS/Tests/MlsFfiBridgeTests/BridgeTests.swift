@@ -129,6 +129,45 @@ final class MlsFfiBridgeTests: XCTestCase {
         XCTAssertEqual(try alice.messagesPage(offset: 99, limit: 10).count, 0)
     }
 
+    func testStagedCommitProposerAndRecipient() throws {
+        let (alice, bob) = try twoParty()
+        let epoch = try alice.epoch()
+        let carol = try MlsClient.newJoiner(
+            identity: Data("carol-device".utf8), dbPath: tmp("carol"), atRestKey: key)
+
+        // Stage adding carol — the epoch must NOT advance until the server confirms.
+        _ = try alice.stageAdd(keyPackage: try carol.keyPackage())
+        XCTAssertEqual(try alice.epoch(), epoch, "staging must not advance the epoch")
+
+        // Simulate the server rejecting (stale epoch): discard; state unchanged.
+        try alice.clearStaged()
+        XCTAssertEqual(try alice.epoch(), epoch)
+
+        // Rebuild; server accepts: merge.
+        let staged = try alice.stageAdd(keyPackage: try carol.keyPackage())
+        try alice.mergeStaged()
+        XCTAssertEqual(try alice.epoch(), epoch + 1)
+
+        // Recipient bob verifies the commit against the honest manifest delta, then merges.
+        try bob.processCommit(
+            envelope: staged.commit, nextEpoch: epoch + 1,
+            added: [Data("carol-device".utf8)], removed: [])
+        XCTAssertEqual(try bob.epoch(), try alice.epoch())
+
+        // A lying manifest is refused and bob does not advance.
+        let mallory = try MlsClient.newJoiner(
+            identity: Data("mallory".utf8), dbPath: tmp("mallory"), atRestKey: key)
+        let staged2 = try alice.stageAdd(keyPackage: try mallory.keyPackage())
+        try alice.mergeStaged()
+        let bobEpoch = try bob.epoch()
+        XCTAssertThrowsError(
+            try bob.processCommit(
+                envelope: staged2.commit, nextEpoch: bobEpoch + 1,
+                added: [Data("someone-else".utf8)], removed: [])
+        ) { error in XCTAssertEqual(error as? MlsClientError, .InvalidMessage) }
+        XCTAssertEqual(try bob.epoch(), bobEpoch, "state must not follow a lie")
+    }
+
     func testCapabilitiesReportPinnedContract() {
         let c = capabilities()
         XCTAssertEqual(c.protocol, "MLS 1.0 (RFC 9420)")

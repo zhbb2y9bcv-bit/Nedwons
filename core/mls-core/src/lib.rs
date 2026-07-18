@@ -259,6 +259,66 @@ impl Conversation {
         commit.tls_serialize_detached().map_err(|_| MlsError::Codec)
     }
 
+    // ----- Staged commits (ADR-0010) --------------------------------------------------------
+    //
+    // For MLS-commit-authoritative membership the proposer must NOT advance its own group state
+    // until the server's epoch compare-and-swap confirms its commit won. `stage_*` build a commit
+    // but leave it PENDING (epoch unchanged); `merge_staged` applies it (server accepted),
+    // `clear_staged` discards it (server rejected / rebase). This prevents a race loser from
+    // desyncing by merging a commit the group never accepted.
+
+    /// Stage an add: build the commit + welcome WITHOUT merging. The epoch is unchanged until
+    /// [`merge_staged`](Self::merge_staged).
+    pub fn stage_add_member(
+        &mut self,
+        me: &Member,
+        mut key_package_bytes: &[u8],
+    ) -> Result<AddResult> {
+        let kp_in =
+            KeyPackageIn::tls_deserialize(&mut key_package_bytes).map_err(|_| MlsError::Codec)?;
+        let key_package = kp_in
+            .validate(me.provider.crypto(), ProtocolVersion::Mls10)
+            .map_err(lib)?;
+        let (commit, welcome, _group_info) = self
+            .group
+            .add_members(&me.provider, &me.signer, &[key_package])
+            .map_err(lib)?;
+        Ok(AddResult {
+            commit: commit
+                .tls_serialize_detached()
+                .map_err(|_| MlsError::Codec)?,
+            welcome: welcome
+                .tls_serialize_detached()
+                .map_err(|_| MlsError::Codec)?,
+        })
+    }
+
+    /// Stage a remove: build the commit WITHOUT merging.
+    pub fn stage_remove_member(&mut self, me: &Member, identity: &[u8]) -> Result<Vec<u8>> {
+        let leaf = self
+            .leaf_for_identity(identity)
+            .ok_or(MlsError::MemberNotFound)?;
+        let (commit, _welcome, _info) = self
+            .group
+            .remove_members(&me.provider, &me.signer, &[leaf])
+            .map_err(lib)?;
+        commit.tls_serialize_detached().map_err(|_| MlsError::Codec)
+    }
+
+    /// Merge the pending staged commit — the server accepted it (its epoch CAS won). Advances the
+    /// epoch. No-op-safe only if a commit is actually pending; otherwise it is a library error.
+    pub fn merge_staged(&mut self, me: &Member) -> Result<()> {
+        self.group.merge_pending_commit(&me.provider).map_err(lib)
+    }
+
+    /// Discard the pending staged commit — the server rejected it (stale epoch / governance), or
+    /// the client is rebasing. The epoch is unchanged; the caller rebuilds against fresh state.
+    pub fn clear_staged(&mut self, me: &Member) -> Result<()> {
+        self.group
+            .clear_pending_commit(me.provider.storage())
+            .map_err(lib)
+    }
+
     /// Encrypt an application message. The returned bytes are an opaque envelope.
     pub fn encrypt(&mut self, me: &Member, plaintext: &[u8]) -> Result<Vec<u8>> {
         let out = self
