@@ -78,13 +78,21 @@ The log is append-only; existing v1 binding leaves **cannot be rewritten**. So:
 1. **auth-core:** add `LeafKind`, `encode_leaf_v2` (Binding + Revocation), and a `decode_leaf`
    that returns the kind + fields, keeping `encode_binding` (v1) for the historical golden vector.
    New golden vectors for both v2 kinds. *(pure, fully testable — the safe first slice.)*
-2. **api:** append a Revocation leaf inside `revoke_own_device` (best-effort, mirroring
-   `append_binding_best_effort`); switch new binding appends to v2; expose revocation leaves in the
-   account view.
-3. **SentinelKit:** parse both schemas; add the "was my device revoked without my action?" monitor.
+2. **api (landed 2026-07-18):** `PgTransparency::append_revocation` writes a v2 Revocation leaf;
+   `revoke_device_handler` appends one best-effort after a successful revoke (a log hiccup never
+   fails the revocation — the device is already revoked in the source-of-truth store); the account
+   view surfaces `revoked_at` per leaf (omitted for bindings, so older clients are unaffected).
+   End-to-end tested (`device_revocation_is_logged_in_transparency`): a revocation leaf appears for
+   the revoked device **and** its original binding leaf is still present and unmarked, so an existing
+   self-monitor (which reads the earliest leaf) is undisturbed. **Deliberately NOT done in this
+   slice:** switching *binding* appends to v2 — the shipped Swift verifier reconstructs v1 binding
+   leaves, so that flip must wait until slice 3 teaches the client to parse both.
+3. **SentinelKit (remaining):** parse both schemas; add the "was my device revoked without my
+   action?" monitor. Only after that is it safe to flip binding appends to v2.
 
-Each slice is committed and tested on its own. Until slice 1 lands this ADR is **Proposed**, and
-R-201 keeps its current wording (adds are auditable; **removals are not yet**).
+Each slice is committed and tested on its own. Slices 1–2 have landed; slice 3 (client) remains, so
+R-201 records that **removals are now logged server-side but the client-side removal monitor is not
+yet wired** — do not yet claim end-to-end removal auditability.
 
 ## Consequences
 
