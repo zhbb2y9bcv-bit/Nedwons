@@ -800,3 +800,62 @@ fn recovery_rejects_a_too_short_secret_at_setup() {
         Err(AuthError::WeakPassword)
     ));
 }
+
+// ----- Compromised-credential check (R-305) ---------------------------------------------
+
+use auth_core::breach::StaticCorpus;
+
+fn try_register_password(
+    service: &AuthService,
+    username: &str,
+    password: &str,
+) -> Result<Session, AuthError> {
+    let device = TestDevice::new();
+    let ch = service.register_begin().expect("register_begin");
+    let transcript = Transcript {
+        action: Action::Register,
+        account_id: &ch.account_id,
+        device_id: &ch.device_id,
+        public_key: &device.public_key,
+        challenge: &ch.nonce,
+        expires_at: ch.expires_at,
+        txn_id: &ch.txn_id,
+    };
+    let signature = device.sign(&transcript.encode());
+    service.register_finish(RegisterRequest {
+        username: username.to_string(),
+        password: password.to_string(),
+        device_public_key: device.public_key.clone(),
+        txn_id: ch.txn_id,
+        signature,
+    })
+}
+
+#[test]
+fn registration_rejects_a_breached_password_via_the_corpus() {
+    let (service, _clock) = make_service();
+    // A breached password that PASSES the length/blocklist policy (>= 12 chars) but is in the
+    // compromised-credential corpus.
+    let breached = "hunter2-long-breached-pass";
+    let service = service.with_breach_provider(Arc::new(StaticCorpus::from_passwords(&[
+        breached,
+        "another-bad-one-here",
+    ])));
+
+    assert!(matches!(
+        try_register_password(&service, "breach_user", breached),
+        Err(AuthError::WeakPassword)
+    ));
+    // A strong, un-breached password of the same shape registers fine.
+    assert!(
+        try_register_password(&service, "clean_user", "a-fresh-unbreached-passphrase-42").is_ok()
+    );
+}
+
+#[test]
+fn breach_check_is_off_by_default() {
+    // Without a provider, a password that WOULD be breached still registers (policy is length +
+    // embedded blocklist only) — the corpus is an opt-in layer.
+    let (service, _clock) = make_service();
+    assert!(try_register_password(&service, "nocorpus", "hunter2-long-breached-pass").is_ok());
+}
