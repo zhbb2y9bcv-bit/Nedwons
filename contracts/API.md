@@ -158,6 +158,15 @@ server cannot verify an opaque commit's content matches the manifest.
 ### `GET /v1/conversations/{id}/epoch` → `200` | `403`
 Members only. `{ epoch }` — the current membership epoch, for rebasing after `stale_epoch`.
 
+### `GET /v1/conversations/{id}/membership/{epoch}` → `200` | `403` (ADR-0010)
+Members only (generic `403` for non-members and unknown epochs — no oracle). `{epoch}` is the
+event's `next_epoch`. Returns the stored manifest decoded plus its evidence:
+`{ control_type, prev_epoch, next_epoch, commit_hash, actor_device, added: [{account_id, device_id}],
+removed: [device_id...], idempotency_key, expires_at, manifest (hex), signature (hex) }`. A recipient
+at local epoch N fetches `N+1` to learn the `added`/`removed` device identities for the client-side
+commit↔manifest correspondence check (and, once the key directory exposes the actor's device key,
+to verify `signature` over `manifest`).
+
 ## Group governance (ADR-0009): admins, invites, join requests
 
 The group creator is its first **admin**. All of the following except `invites/accept` require the

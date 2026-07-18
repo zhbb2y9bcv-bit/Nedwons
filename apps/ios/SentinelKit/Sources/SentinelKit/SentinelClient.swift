@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// HTTP client for the Sentinel auth API (contracts/API.md). This is the exact flow the iOS
@@ -605,5 +606,190 @@ private struct SessionResponse: Decodable {
             refreshToken: refresh_token,
             refreshExpiresAt: refresh_expires_at
         )
+    }
+}
+
+// MARK: - MLS-commit-authoritative membership (ADR-0010, R-506)
+
+/// A membership change to commit: the opaque MLS commit (from `mls-ffi` stage_add/stage_remove),
+/// the delta it encodes, the epoch it was built against, and the welcomes for added devices.
+public struct MembershipChange: Sendable {
+    public let control: MembershipControl
+    public let prevEpoch: UInt64
+    /// (account, device) 16-byte ids, sorted + duplicate-free; empty unless `.add`.
+    public let added: [(account: Data, device: Data)]
+    /// device 16-byte ids, sorted + duplicate-free; empty unless `.remove`/`.leave`.
+    public let removed: [Data]
+    public let commit: Data
+    public let welcomes: [Data]
+
+    public init(
+        control: MembershipControl,
+        prevEpoch: UInt64,
+        added: [(account: Data, device: Data)],
+        removed: [Data],
+        commit: Data,
+        welcomes: [Data]
+    ) {
+        self.control = control
+        self.prevEpoch = prevEpoch
+        self.added = added
+        self.removed = removed
+        self.commit = commit
+        self.welcomes = welcomes
+    }
+}
+
+/// The interpreted outcome of a `/commit` POST, so the caller knows whether to merge or discard its
+/// staged MLS commit.
+public enum MembershipCommitOutcome: Sendable, Equatable {
+    /// The server's epoch CAS won — the caller must now `mergeStaged()` its local commit.
+    case applied(nextEpoch: UInt64)
+    /// An idempotent retry of an already-applied commit (also merge / treat as success).
+    case alreadyApplied(nextEpoch: UInt64)
+    /// A concurrent commit won (`409 stale_epoch`) — the caller must `clearStaged()`, refetch the
+    /// epoch, and rebuild.
+    case staleEpoch
+    /// The idempotency key was reused with a different manifest (`409`).
+    case idempotencyConflict
+    /// Governance/authz refused the change (`403`).
+    case forbidden
+}
+
+/// A stored membership event fetched for a recipient's correspondence check.
+public struct MembershipEventMember: Decodable, Sendable {
+    public let accountID: String
+    public let deviceID: String
+    enum CodingKeys: String, CodingKey {
+        case accountID = "account_id"
+        case deviceID = "device_id"
+    }
+}
+
+public struct MembershipEvent: Decodable, Sendable {
+    public let controlType: UInt8
+    public let prevEpoch: UInt64
+    public let nextEpoch: UInt64
+    public let commitHash: String
+    public let actorDevice: String
+    public let added: [MembershipEventMember]
+    public let removed: [String]
+    public let idempotencyKey: String
+    public let expiresAt: UInt64
+    /// Canonical manifest bytes (hex) + device signature (hex), for future signature verification.
+    public let manifest: String
+    public let signature: String
+
+    enum CodingKeys: String, CodingKey {
+        case controlType = "control_type"
+        case prevEpoch = "prev_epoch"
+        case nextEpoch = "next_epoch"
+        case commitHash = "commit_hash"
+        case actorDevice = "actor_device"
+        case added, removed
+        case idempotencyKey = "idempotency_key"
+        case expiresAt = "expires_at"
+        case manifest, signature
+    }
+
+    /// The added devices' credential identities — exactly what `MlsClient.processCommit(added:)`
+    /// compares the staged commit against.
+    public var addedDeviceIDs: [Data] { added.compactMap { Hex.decode($0.deviceID) } }
+    public var removedDeviceIDs: [Data] { removed.compactMap { Hex.decode($0) } }
+}
+
+extension SentinelClient {
+    /// The conversation's current membership epoch (members only). Read this to rebase after a
+    /// `staleEpoch` outcome.
+    public func conversationEpoch(accessToken: String, conversationID: String) async throws -> UInt64
+    {
+        struct Res: Decodable { let epoch: UInt64 }
+        let request = authed(
+            "GET", "/v1/conversations/\(conversationID)/epoch", accessToken: accessToken)
+        let res: Res = try decode(await perform(request))
+        return res.epoch
+    }
+
+    /// Fetch a stored membership event (`epoch` = its `next_epoch`) so a recipient can run the
+    /// correspondence check against `added`/`removed`.
+    public func membershipEvent(
+        accessToken: String, conversationID: String, epoch: UInt64
+    ) async throws -> MembershipEvent {
+        let request = authed(
+            "GET", "/v1/conversations/\(conversationID)/membership/\(epoch)",
+            accessToken: accessToken)
+        return try decode(await perform(request))
+    }
+
+    /// Build + sign the ADR-0010 manifest for `change` with `signer` (the device key — the private
+    /// key never leaves the signer), then POST `/commit`. The returned outcome tells the caller
+    /// whether to `mergeStaged()` (applied) or `clearStaged()` + rebase (staleEpoch) its local MLS
+    /// commit. The commit hash is computed here, binding the manifest to these exact commit bytes.
+    public func commitMembership(
+        accessToken: String,
+        conversationID: String,
+        actorDevice: Data,
+        change: MembershipChange,
+        idempotencyKey: Data,
+        ttlSeconds: UInt64,
+        signer: DeviceSigner
+    ) async throws -> MembershipCommitOutcome {
+        guard let groupID = Hex.decode(conversationID) else { throw ClientError.decoding }
+        let commitHash = Data(SHA256.hash(data: change.commit))
+        let nextEpoch = change.prevEpoch + 1
+        let expiresAt = UInt64(Date().timeIntervalSince1970) + ttlSeconds
+        let manifest = MembershipManifest(
+            control: change.control, groupID: groupID, prevEpoch: change.prevEpoch,
+            nextEpoch: nextEpoch, commitHash: commitHash, actorDevice: actorDevice,
+            added: change.added, removed: change.removed, idempotencyKey: idempotencyKey,
+            expiresAt: expiresAt)
+        let signature = try signer.sign(manifest.canonicalBytes())
+
+        struct AddDto: Encodable {
+            let account_id: String
+            let device_id: String
+        }
+        struct Body: Encodable {
+            let control_type: UInt8
+            let prev_epoch: UInt64
+            let next_epoch: UInt64
+            let commit_hash: String
+            let added: [AddDto]
+            let removed: [String]
+            let idempotency_key: String
+            let expires_at: UInt64
+            let signature: String
+            let commit: String
+            let welcomes: [String]
+        }
+        let body = Body(
+            control_type: change.control.rawValue, prev_epoch: change.prevEpoch,
+            next_epoch: nextEpoch, commit_hash: Hex.encode(commitHash),
+            added: change.added.map {
+                AddDto(account_id: Hex.encode($0.account), device_id: Hex.encode($0.device))
+            },
+            removed: change.removed.map { Hex.encode($0) },
+            idempotency_key: Hex.encode(idempotencyKey), expires_at: expiresAt,
+            signature: Hex.encode(signature), commit: Hex.encode(change.commit),
+            welcomes: change.welcomes.map { Hex.encode($0) })
+        var request = authed(
+            "POST", "/v1/conversations/\(conversationID)/commit", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(body)
+
+        struct Res: Decodable {
+            let applied: Bool
+            let next_epoch: UInt64
+        }
+        do {
+            let res: Res = try decode(await perform(request))
+            return res.applied
+                ? .applied(nextEpoch: res.next_epoch) : .alreadyApplied(nextEpoch: res.next_epoch)
+        } catch ClientError.http(let status, let body) {
+            if status == 409, body.contains("stale_epoch") { return .staleEpoch }
+            if status == 409, body.contains("idempotency_conflict") { return .idempotencyConflict }
+            if status == 403 { return .forbidden }
+            throw ClientError.http(status: status, body: body)
+        }
     }
 }

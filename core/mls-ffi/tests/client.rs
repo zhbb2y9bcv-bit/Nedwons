@@ -207,3 +207,59 @@ fn capabilities_report_the_pinned_contract() {
     assert_eq!(c.storage_format_version, 1);
     assert_eq!(c.max_plaintext, 64 * 1024);
 }
+
+#[test]
+fn staged_commit_proposer_and_recipient_paths() {
+    // Two-party group; alice stages adding carol, the "server accepts", alice merges, and bob (the
+    // recipient) verifies the commit against the manifest's delta before merging.
+    let (alice, bob) = two_party(&tmp("alice"), &tmp("bob"));
+    let epoch = alice.epoch().unwrap();
+
+    // A third identity (carol) to be added, with its own key package.
+    let carol = MlsClient::new_joiner(b"carol".to_vec(), tmp("carol"), key()).unwrap();
+    let carol_kp = carol.key_package().unwrap();
+
+    // Stage: no epoch advance yet. (This first staged commit is discarded below.)
+    let _ = alice.stage_add(carol_kp).unwrap();
+    assert_eq!(alice.epoch().unwrap(), epoch, "staging must not advance");
+
+    // Simulate the server REJECTING first (stale epoch): discard, state unchanged, still usable.
+    alice.clear_staged().unwrap();
+    assert_eq!(alice.epoch().unwrap(), epoch);
+
+    // Rebuild and this time the server ACCEPTS: merge.
+    let carol_kp2 = carol.key_package().unwrap();
+    let staged = alice.stage_add(carol_kp2).unwrap();
+    alice.merge_staged().unwrap();
+    assert_eq!(alice.epoch().unwrap(), epoch + 1);
+
+    // Recipient bob: the honest manifest claims carol was added → merges and advances.
+    bob.process_commit(
+        staged.commit.clone(),
+        epoch + 1,
+        vec![b"carol".to_vec()],
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(bob.epoch().unwrap(), alice.epoch().unwrap());
+
+    // Carol joins from the welcome and can read subsequent traffic.
+    carol.join_group(staged.welcome).unwrap();
+}
+
+#[test]
+fn recipient_refuses_a_commit_that_does_not_match_the_manifest() {
+    let (alice, bob) = two_party(&tmp("alice"), &tmp("bob"));
+    let epoch = alice.epoch().unwrap();
+    let mallory = MlsClient::new_joiner(b"mallory".to_vec(), tmp("mallory"), key()).unwrap();
+
+    let staged = alice.stage_add(mallory.key_package().unwrap()).unwrap();
+    alice.merge_staged().unwrap();
+
+    // The manifest LIES (claims "carol"); bob refuses and does not advance.
+    let err = bob
+        .process_commit(staged.commit, epoch + 1, vec![b"carol".to_vec()], vec![])
+        .unwrap_err();
+    assert_eq!(err, MlsClientError::InvalidMessage);
+    assert_eq!(bob.epoch().unwrap(), epoch, "state must not follow a lie");
+}

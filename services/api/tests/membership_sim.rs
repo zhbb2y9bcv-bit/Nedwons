@@ -711,3 +711,217 @@ async fn expired_and_non_canonical_manifests_are_rejected() {
     .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 }
+
+/// Fetch the stored membership event for `next_epoch` and return its (added, removed) device ids —
+/// what a recipient feeds into the correspondence check.
+async fn fetch_event_delta(
+    app: &Router,
+    conv_hex: &str,
+    next_epoch: u64,
+    token: &str,
+) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+    let (status, body) = get_auth(
+        app,
+        &format!("/v1/conversations/{conv_hex}/membership/{next_epoch}"),
+        token,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "membership event {next_epoch}: {body}"
+    );
+    let added = body["added"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| hex::decode(a["device_id"].as_str().unwrap()).unwrap())
+        .collect();
+    let removed = body["removed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| hex::decode(d.as_str().unwrap()).unwrap())
+        .collect();
+    (added, removed)
+}
+
+/// The full client story with the REAL staged proposer flow and a REAL two-admin race:
+/// stage (no local merge) → POST → merge on accept / discard + catch-up + rebase on stale_epoch.
+/// A race loser must NOT desync — it discards its staged commit, processes the winner's commit to
+/// catch up, then rebuilds. Also exercises the recipient's manifest fetch + correspondence check.
+#[tokio::test]
+async fn staged_two_admin_race_loser_discards_catches_up_and_rebases() {
+    let app = make_app(100_000).await;
+    let alice = actor(&app, "msimga").await;
+    let bob = actor(&app, "msimgb").await;
+    let carol = actor(&app, "msimgc").await;
+    let dave = actor(&app, "msimgd").await;
+
+    let (_, conv) = post_json_auth(&app, "/v1/conversations", alice.token(), json!({})).await;
+    let conv_hex = conv["conversation_id"].as_str().unwrap().to_string();
+
+    // Alice (admin) stages + commits adding bob (epoch 0 → 1); bob joins for real.
+    let mut group_a = alice.mls.create_group().unwrap();
+    let add_bob = group_a
+        .stage_add_member(&alice.mls, &bob.mls.key_package_bytes().unwrap())
+        .unwrap();
+    let (s, _) = post_commit(
+        &app,
+        &conv_hex,
+        &alice,
+        ControlType::Add,
+        0,
+        &[(AccountId(bob.account), DeviceId(bob.device_id))],
+        &[],
+        [1u8; 16],
+        &add_bob.commit,
+        std::slice::from_ref(&add_bob.welcome),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    group_a.merge_staged(&alice.mls).unwrap(); // server accepted → merge
+    let (_, welcome) = drain_inbox(&app, bob.token()).await.remove(0);
+    let mut group_b = bob.mls.join_from_welcome(&welcome).unwrap();
+    assert_eq!(group_a.epoch(), 1);
+    assert_eq!(group_b.epoch(), 1);
+
+    // Promote bob to admin so both can propose. Now the race: both stage an add at epoch 1.
+    let (s, _) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conv_hex}/admins"),
+        alice.token(),
+        json!({ "account_id": hex::encode(bob.account) }),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+
+    let alice_add_carol = group_a
+        .stage_add_member(&alice.mls, &carol.mls.key_package_bytes().unwrap())
+        .unwrap();
+    let bob_add_dave = group_b
+        .stage_add_member(&bob.mls, &dave.mls.key_package_bytes().unwrap())
+        .unwrap();
+
+    // Bob posts first and wins the epoch CAS (1 → 2); bob merges.
+    let (s, _) = post_commit(
+        &app,
+        &conv_hex,
+        &bob,
+        ControlType::Add,
+        1,
+        &[(AccountId(dave.account), DeviceId(dave.device_id))],
+        &[],
+        [2u8; 16],
+        &bob_add_dave.commit,
+        std::slice::from_ref(&bob_add_dave.welcome),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    group_b.merge_staged(&bob.mls).unwrap();
+
+    // Alice posts her competing commit at the now-stale epoch 1 → refused, nothing applied.
+    let (s, body) = post_commit(
+        &app,
+        &conv_hex,
+        &alice,
+        ControlType::Add,
+        1,
+        &[(AccountId(carol.account), DeviceId(carol.device_id))],
+        &[],
+        [3u8; 16],
+        &alice_add_carol.commit,
+        std::slice::from_ref(&alice_add_carol.welcome),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(body["error"], "stale_epoch");
+
+    // Alice DISCARDS her staged commit (must not desync) and catches up by processing bob's commit,
+    // fetching the manifest delta to run the correspondence check.
+    group_a.clear_staged(&alice.mls).unwrap();
+    assert_eq!(group_a.epoch(), 1, "discard must not advance");
+    let (_, bob_commit_ct) = drain_inbox(&app, alice.token()).await.remove(0);
+    let (added, removed) = fetch_event_delta(&app, &conv_hex, 2, alice.token()).await;
+    assert_eq!(added, vec![dave.device_id.to_vec()]);
+    assert!(removed.is_empty());
+    group_a
+        .process_commit_checked(&alice.mls, &bob_commit_ct, 2, &added, &removed)
+        .unwrap();
+    assert_eq!(group_a.epoch(), 2, "alice caught up to the winner's epoch");
+
+    // Alice rebases at epoch 2 and her add of carol now succeeds.
+    let alice_add_carol2 = group_a
+        .stage_add_member(&alice.mls, &carol.mls.key_package_bytes().unwrap())
+        .unwrap();
+    let (s, _) = post_commit(
+        &app,
+        &conv_hex,
+        &alice,
+        ControlType::Add,
+        2,
+        &[(AccountId(carol.account), DeviceId(carol.device_id))],
+        &[],
+        [4u8; 16],
+        &alice_add_carol2.commit,
+        std::slice::from_ref(&alice_add_carol2.welcome),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    group_a.merge_staged(&alice.mls).unwrap();
+    assert_eq!(server_epoch(&app, &conv_hex, alice.token()).await, 3);
+    assert_eq!(group_a.epoch(), 3);
+}
+
+/// The membership-event endpoint is members-only and returns the correct decoded delta.
+#[tokio::test]
+async fn membership_event_endpoint_is_members_only() {
+    let app = make_app(100_000).await;
+    let alice = actor(&app, "msimha").await;
+    let bob = actor(&app, "msimhb").await;
+    let outsider = actor(&app, "msimho").await;
+
+    let (_, conv) = post_json_auth(&app, "/v1/conversations", alice.token(), json!({})).await;
+    let conv_hex = conv["conversation_id"].as_str().unwrap().to_string();
+    let mut group_a = alice.mls.create_group().unwrap();
+    let add_bob = group_a
+        .add_member(&alice.mls, &bob.mls.key_package_bytes().unwrap())
+        .unwrap();
+    let (s, _) = post_commit(
+        &app,
+        &conv_hex,
+        &alice,
+        ControlType::Add,
+        0,
+        &[(AccountId(bob.account), DeviceId(bob.device_id))],
+        &[],
+        [5u8; 16],
+        &add_bob.commit,
+        std::slice::from_ref(&add_bob.welcome),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+
+    // A member reads the decoded event.
+    let (added, removed) = fetch_event_delta(&app, &conv_hex, 1, alice.token()).await;
+    assert_eq!(added, vec![bob.device_id.to_vec()]);
+    assert!(removed.is_empty());
+
+    // An outsider gets a generic 403 (no oracle).
+    let (s, _) = get_auth(
+        &app,
+        &format!("/v1/conversations/{conv_hex}/membership/1"),
+        outsider.token(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // A non-existent epoch is also a generic 403 (no oracle on which epochs exist).
+    let (s, _) = get_auth(
+        &app,
+        &format!("/v1/conversations/{conv_hex}/membership/99"),
+        alice.token(),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+}

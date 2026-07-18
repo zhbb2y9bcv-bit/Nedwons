@@ -1,7 +1,9 @@
 # ADR-0010: MLS-commit-authoritative membership via device-signed manifests (R-506)
 
-- **Status:** Accepted — reference implementation + headless multi-client simulation in this repo;
-  Swift/app wiring and legacy-path migration are follow-ups (tracked below)
+- **Status:** Accepted — reference implementation + headless multi-client simulation + **client
+  wiring** (staged commits through `mls-ffi`, a byte-identical Swift manifest encoder, and the
+  proposer/recipient endpoints) landed in this repo. Legacy-path migration, application-envelope
+  versioning, recipient signature verification, and the `@main` app screens (R-101) are follow-ups.
 - **Date:** 2026-07-18
 - **Deciders:** crypto integrator, backend lead
 - **Supersedes/extends:** ADR-0009's "MLS membership becomes authoritative" sketch

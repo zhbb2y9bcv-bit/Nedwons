@@ -213,3 +213,81 @@ fn application_message_cannot_satisfy_a_manifest() {
         .unwrap_err();
     assert!(matches!(err, MlsError::ManifestMismatch));
 }
+
+// ----- Staged commits (ADR-0010): the proposer must not advance until the server confirms -----
+
+#[test]
+fn staged_add_is_not_applied_until_merged() {
+    let alice = Member::new(b"alice-device").unwrap();
+    let bob = Member::new(b"bob-device").unwrap();
+    let carol = Member::new(b"carol-device").unwrap();
+
+    let mut group_a = alice.create_group().unwrap();
+    let add_bob = group_a
+        .add_member(&alice, &bob.key_package_bytes().unwrap())
+        .unwrap();
+    let mut group_b = bob.join_from_welcome(&add_bob.welcome).unwrap();
+    let epoch = group_a.epoch();
+
+    // Stage adding carol: commit built, but the epoch has NOT advanced.
+    let staged = group_a
+        .stage_add_member(&alice, &carol.key_package_bytes().unwrap())
+        .unwrap();
+    assert_eq!(group_a.epoch(), epoch, "staging must not advance the epoch");
+
+    // The server accepted (epoch CAS won): merge. Now the epoch advances and bob follows via the
+    // checked path with the honest manifest.
+    group_a.merge_staged(&alice).unwrap();
+    assert_eq!(group_a.epoch(), epoch + 1);
+    group_b
+        .process_commit_checked(
+            &bob,
+            &staged.commit,
+            epoch + 1,
+            &[b"carol-device".to_vec()],
+            &[],
+        )
+        .unwrap();
+    assert_eq!(group_b.epoch(), group_a.epoch());
+}
+
+#[test]
+fn discarded_stage_leaves_state_untouched_and_can_be_rebuilt() {
+    let alice = Member::new(b"alice-device").unwrap();
+    let bob = Member::new(b"bob-device").unwrap();
+    let carol = Member::new(b"carol-device").unwrap();
+
+    let mut group_a = alice.create_group().unwrap();
+    let add_bob = group_a
+        .add_member(&alice, &bob.key_package_bytes().unwrap())
+        .unwrap();
+    let _ = bob.join_from_welcome(&add_bob.welcome).unwrap();
+    let epoch = group_a.epoch();
+
+    // Stage, then the server REJECTED (stale epoch): discard. State is unchanged.
+    let _ = group_a
+        .stage_add_member(&alice, &carol.key_package_bytes().unwrap())
+        .unwrap();
+    group_a.clear_staged(&alice).unwrap();
+    assert_eq!(
+        group_a.epoch(),
+        epoch,
+        "a discarded stage must not advance the epoch"
+    );
+
+    // After discarding, the group is healthy: it can send, and it can stage+merge a fresh commit.
+    let _ = group_a.encrypt(&alice, b"still working").unwrap();
+    let dave = Member::new(b"dave-device").unwrap();
+    let staged = group_a
+        .stage_add_member(&alice, &dave.key_package_bytes().unwrap())
+        .unwrap();
+    group_a.merge_staged(&alice).unwrap();
+    assert_eq!(group_a.epoch(), epoch + 1);
+    // The rebuilt commit is real: dave joins from its welcome.
+    let mut group_d = dave.join_from_welcome(&staged.welcome).unwrap();
+    let envelope = group_a.encrypt(&alice, b"hi dave").unwrap();
+    match group_d.process(&dave, &envelope).unwrap() {
+        Incoming::Application(pt) => assert_eq!(pt, b"hi dave"),
+        _ => panic!("expected application message"),
+    }
+}

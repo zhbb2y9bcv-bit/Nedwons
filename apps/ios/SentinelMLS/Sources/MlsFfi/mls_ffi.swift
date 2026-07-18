@@ -508,6 +508,12 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func addMember(keyPackage: Data) throws  -> AddOutcome
     
     /**
+     * Discard the pending staged commit — the server rejected it (stale epoch / governance) or the
+     * client is rebasing. State is unchanged.
+     */
+    func clearStaged() throws 
+    
+    /**
      * Explicitly invalidate the client and drop its MLS state. Idempotent; subsequent calls return
      * `Closed`. Durable state on disk is untouched (reopen with `open`).
      */
@@ -551,6 +557,11 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func markSent(localId: UInt64) throws 
     
     /**
+     * Merge the pending staged commit — the server accepted it. Advances the epoch and persists.
+     */
+    func mergeStaged() throws 
+    
+    /**
      * Number of stored messages. Cheap: no payload crosses the boundary.
      */
     func messageCount() throws  -> UInt64
@@ -571,11 +582,34 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func messagesPage(offset: UInt64, limit: UInt32) throws  -> [StoredMessage]
     
     /**
+     * Recipient path (ADR-0010): process an inbound membership commit, merging ONLY if its actual
+     * cryptographic effect equals the sender's signed manifest — `next_epoch` and the `added` /
+     * `removed` credential identities come from that manifest. On mismatch the commit is discarded
+     * unmerged and `InvalidMessage` is returned; group state is unchanged.
+     */
+    func processCommit(envelope: Data, nextEpoch: UInt64, added: [Data], removed: [Data]) throws 
+    
+    /**
      * Process an inbound envelope: application plaintext, a state advance, or a dedup no-op. All
      * effects (advanced ratchet, stored message, dedup marker, ack-eligibility) are durable
      * together before returning.
      */
     func processInbound(envelopeId: UInt64, ciphertext: Data) throws  -> InboundResult
+    
+    /**
+     * Stage an add for MLS-commit-authoritative membership (ADR-0010): build commit + welcome
+     * WITHOUT advancing the group. The caller signs a manifest, POSTs `/commit`, then calls
+     * [`merge_staged`](Self::merge_staged) on success or [`clear_staged`](Self::clear_staged) on
+     * rejection. Never merge before the server's epoch CAS confirms — that is how a race loser
+     * desyncs.
+     */
+    func stageAdd(keyPackage: Data) throws  -> AddOutcome
+    
+    /**
+     * Stage a remove (see [`stage_add`](Self::stage_add)). `identity` is the target member's
+     * credential identity bytes. Returns the commit; the group is not advanced until merged.
+     */
+    func stageRemove(identity: Data) throws  -> Data
     
     /**
      * Storage schema version of the loaded blob (0 = pre-versioning; a Pending client reports 0).
@@ -702,6 +736,16 @@ open func addMember(keyPackage: Data)throws  -> AddOutcome  {
 }
     
     /**
+     * Discard the pending staged commit — the server rejected it (stale epoch / governance) or the
+     * client is rebasing. State is unchanged.
+     */
+open func clearStaged()throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_clear_staged(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+    /**
      * Explicitly invalidate the client and drop its MLS state. Idempotent; subsequent calls return
      * `Closed`. Durable state on disk is untouched (reopen with `open`).
      */
@@ -786,6 +830,15 @@ open func markSent(localId: UInt64)throws   {try rustCallWithError(FfiConverterT
 }
     
     /**
+     * Merge the pending staged commit — the server accepted it. Advances the epoch and persists.
+     */
+open func mergeStaged()throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_merge_staged(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+    /**
      * Number of stored messages. Cheap: no payload crosses the boundary.
      */
 open func messageCount()throws  -> UInt64  {
@@ -823,6 +876,22 @@ open func messagesPage(offset: UInt64, limit: UInt32)throws  -> [StoredMessage] 
 }
     
     /**
+     * Recipient path (ADR-0010): process an inbound membership commit, merging ONLY if its actual
+     * cryptographic effect equals the sender's signed manifest — `next_epoch` and the `added` /
+     * `removed` credential identities come from that manifest. On mismatch the commit is discarded
+     * unmerged and `InvalidMessage` is returned; group state is unchanged.
+     */
+open func processCommit(envelope: Data, nextEpoch: UInt64, added: [Data], removed: [Data])throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_process_commit(self.uniffiClonePointer(),
+        FfiConverterData.lower(envelope),
+        FfiConverterUInt64.lower(nextEpoch),
+        FfiConverterSequenceData.lower(added),
+        FfiConverterSequenceData.lower(removed),$0
+    )
+}
+}
+    
+    /**
      * Process an inbound envelope: application plaintext, a state advance, or a dedup no-op. All
      * effects (advanced ratchet, stored message, dedup marker, ack-eligibility) are durable
      * together before returning.
@@ -832,6 +901,33 @@ open func processInbound(envelopeId: UInt64, ciphertext: Data)throws  -> Inbound
     uniffi_mls_ffi_fn_method_mlsclient_process_inbound(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(envelopeId),
         FfiConverterData.lower(ciphertext),$0
+    )
+})
+}
+    
+    /**
+     * Stage an add for MLS-commit-authoritative membership (ADR-0010): build commit + welcome
+     * WITHOUT advancing the group. The caller signs a manifest, POSTs `/commit`, then calls
+     * [`merge_staged`](Self::merge_staged) on success or [`clear_staged`](Self::clear_staged) on
+     * rejection. Never merge before the server's epoch CAS confirms — that is how a race loser
+     * desyncs.
+     */
+open func stageAdd(keyPackage: Data)throws  -> AddOutcome  {
+    return try  FfiConverterTypeAddOutcome_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_stage_add(self.uniffiClonePointer(),
+        FfiConverterData.lower(keyPackage),$0
+    )
+})
+}
+    
+    /**
+     * Stage a remove (see [`stage_add`](Self::stage_add)). `identity` is the target member's
+     * credential identity bytes. Returns the commit; the group is not advanced until merged.
+     */
+open func stageRemove(identity: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_stage_remove(self.uniffiClonePointer(),
+        FfiConverterData.lower(identity),$0
     )
 })
 }
@@ -1543,6 +1639,31 @@ fileprivate struct FfiConverterSequenceUInt64: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
+    typealias SwiftType = [Data]
+
+    public static func write(_ value: [Data], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterData.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [Data] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [Data]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterData.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeStoredMessage: FfiConverterRustBuffer {
     typealias SwiftType = [StoredMessage]
 
@@ -1610,6 +1731,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_add_member() != 6758) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_clear_staged() != 582) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mls_ffi_checksum_method_mlsclient_close() != 59860) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1634,6 +1758,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_mark_sent() != 51681) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_merge_staged() != 57352) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mls_ffi_checksum_method_mlsclient_message_count() != 45788) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -1643,7 +1770,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_messages_page() != 2744) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_process_commit() != 58491) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mls_ffi_checksum_method_mlsclient_process_inbound() != 58528) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_stage_add() != 15693) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_stage_remove() != 13093) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_storage_format_version() != 23944) {
