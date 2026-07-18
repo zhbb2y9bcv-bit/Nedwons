@@ -178,7 +178,7 @@ drives this.
 |------|-----------|----------------|
 | **Rust unit/integration** (`cargo test`) | ✅ host | MLS correctness, durable crash-safety, FFI-object semantics, adversarial corpus. |
 | **Swift ↔ Rust host integration** (SwiftPM test linking the host static lib) | ✅ host (macOS) | The generated bindings drive the real core: two `MlsClient`s exchange real MLS messages, persist, relaunch, retry-without-re-encrypt, and reject hostile input — **no simulator needed**. This is the primary bridge proof. |
-| **Simulator slice** (`aarch64-apple-ios-sim`) | ✅ compile + link into xcframework | The device-family library builds and packages. Running it in a simulator needs a test-host app (Xcode project, R-101). |
+| **Simulator slice** (`aarch64-apple-ios-sim`) | ✅ **RUNS** (`scripts/test_mls_sim.sh`) | The full bridge test suite executes **in the iOS simulator** — xcodebuild hosts the XCTest bundle directly from the Swift package, no Xcode project needed. Gotcha codified in the script: derived data must live outside TCC-protected folders (Desktop/Documents) or the sim's runner can't read the bundle. |
 | **Device slice** (`aarch64-apple-ios`) | ⚙️ **compile-only** | Cross-compiles + packages. **Cannot run** — no physical device (R-101); App Attest and the Enclave-wrapped at-rest key are device-only. |
 
 ### Consequences

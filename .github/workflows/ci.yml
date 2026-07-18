@@ -162,7 +162,7 @@ jobs:
       - name: Install Rust + Apple targets
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin, aarch64-apple-ios, aarch64-apple-ios-sim
+          targets: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
       - name: Build XCFramework + generate bindings (ADR-0007)
         run: scripts/build_mls_ffi.sh
       - name: Fail if committed Swift bindings are stale
@@ -170,11 +170,11 @@ jobs:
       - name: Swift ↔ Rust MLS integration test (host / macOS slice)
         working-directory: apps/ios/SentinelMLS
         run: swift test
-      - name: Compile iOS simulator + device slices (device is compile-only, R-101)
+      - name: RUN bridge tests on the iOS simulator (ios-arm64-simulator slice)
+        run: scripts/test_mls_sim.sh
+      - name: Compile iOS device slice (compile-only — running needs hardware, R-101)
         working-directory: apps/ios/SentinelMLS
-        run: |
-          xcodebuild build -scheme SentinelMLS -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO
-          xcodebuild build -scheme SentinelMLS -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO
+        run: xcodebuild build -scheme SentinelMLS -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO
 
   ios-app:
     name: ios app target (Xcode)
