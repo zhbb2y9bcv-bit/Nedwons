@@ -32,6 +32,126 @@ pub fn encode_binding(account: &AccountId, device: &DeviceId, public_key: &[u8])
     out
 }
 
+/// Versioned domain-separation tag for **leaf schema v2** (ADR-0013). A v2 leaf begins with
+/// `len32(DOMAIN) || u8(kind) || body`; the kind byte makes leaf types disjoint by construction,
+/// so a revocation leaf can never be confused with a binding leaf. v1 binding leaves (see
+/// [`encode_binding`]) have no header and coexist forever in the append-only log.
+pub const LEAF_DOMAIN_V2: &[u8] = b"app.sentinel.kt-leaf.v2";
+
+/// The kind of a v2 transparency leaf (ADR-0013).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeafKind {
+    /// account→device-key binding (device added: registration / enrollment / recovery).
+    Binding = 1,
+    /// device revoked at `revoked_at` — makes *removals* auditable, not just additions.
+    Revocation = 2,
+}
+
+impl LeafKind {
+    fn from_u8(b: u8) -> Option<Self> {
+        match b {
+            1 => Some(LeafKind::Binding),
+            2 => Some(LeafKind::Revocation),
+            _ => None,
+        }
+    }
+}
+
+/// A decoded v2 leaf.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedLeafV2 {
+    pub kind: LeafKind,
+    pub account: [u8; 16],
+    pub device: [u8; 16],
+    /// Binding only: the SEC1 public key. Empty for a revocation.
+    pub public_key: Vec<u8>,
+    /// Revocation only: unix seconds the device was revoked. 0 for a binding.
+    pub revoked_at: u64,
+}
+
+fn put_lp32(out: &mut Vec<u8>, field: &[u8]) {
+    out.extend_from_slice(&(field.len() as u32).to_be_bytes());
+    out.extend_from_slice(field);
+}
+
+/// v2 **binding** leaf: `len32(DOMAIN) || u8(1) || account(16) || device(16) || len32(pk) || pk`.
+pub fn encode_binding_v2(account: &AccountId, device: &DeviceId, public_key: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + LEAF_DOMAIN_V2.len() + 1 + 16 + 16 + 4 + public_key.len());
+    put_lp32(&mut out, LEAF_DOMAIN_V2);
+    out.push(LeafKind::Binding as u8);
+    out.extend_from_slice(account.as_bytes());
+    out.extend_from_slice(device.as_bytes());
+    put_lp32(&mut out, public_key);
+    out
+}
+
+/// v2 **revocation** leaf: `len32(DOMAIN) || u8(2) || account(16) || device(16) || u64(revoked_at)`.
+pub fn encode_revocation_v2(account: &AccountId, device: &DeviceId, revoked_at: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + LEAF_DOMAIN_V2.len() + 1 + 16 + 16 + 8);
+    put_lp32(&mut out, LEAF_DOMAIN_V2);
+    out.push(LeafKind::Revocation as u8);
+    out.extend_from_slice(account.as_bytes());
+    out.extend_from_slice(device.as_bytes());
+    out.extend_from_slice(&revoked_at.to_be_bytes());
+    out
+}
+
+/// Decode a **v2** leaf. Returns `None` if `entry` does not carry the v2 domain header (e.g. it is a
+/// legacy v1 binding), or is malformed. Strict: every length must match exactly, so a truncated or
+/// over-long entry is rejected rather than partially trusted.
+pub fn decode_leaf_v2(entry: &[u8]) -> Option<DecodedLeafV2> {
+    let dom_len = LEAF_DOMAIN_V2.len();
+    // len32(DOMAIN) || DOMAIN
+    let header_len = 4 + dom_len;
+    if entry.len() < header_len + 1 {
+        return None;
+    }
+    if u32::from_be_bytes(entry[0..4].try_into().ok()?) as usize != dom_len {
+        return None;
+    }
+    if &entry[4..header_len] != LEAF_DOMAIN_V2 {
+        return None;
+    }
+    let kind = LeafKind::from_u8(entry[header_len])?;
+    let rest = &entry[header_len + 1..];
+    if rest.len() < 32 {
+        return None;
+    }
+    let account: [u8; 16] = rest[0..16].try_into().ok()?;
+    let device: [u8; 16] = rest[16..32].try_into().ok()?;
+    let tail = &rest[32..];
+    match kind {
+        LeafKind::Binding => {
+            if tail.len() < 4 {
+                return None;
+            }
+            let pk_len = u32::from_be_bytes(tail[0..4].try_into().ok()?) as usize;
+            if tail.len() != 4 + pk_len {
+                return None; // strict: no trailing bytes
+            }
+            Some(DecodedLeafV2 {
+                kind,
+                account,
+                device,
+                public_key: tail[4..].to_vec(),
+                revoked_at: 0,
+            })
+        }
+        LeafKind::Revocation => {
+            if tail.len() != 8 {
+                return None;
+            }
+            Some(DecodedLeafV2 {
+                kind,
+                account,
+                device,
+                public_key: Vec::new(),
+                revoked_at: u64::from_be_bytes(tail.try_into().ok()?),
+            })
+        }
+    }
+}
+
 /// A signed tree head (the log's commitment to its current state).
 pub struct SignedTreeHead {
     pub tree_size: u64,
@@ -227,4 +347,93 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod leaf_v2_tests {
+    use super::*;
+    use auth_core::ids::{AccountId, DeviceId};
+
+    fn ids() -> (AccountId, DeviceId) {
+        (AccountId([0xA1; 16]), DeviceId([0xB2; 16]))
+    }
+
+    #[test]
+    fn binding_v2_roundtrips() {
+        let (a, d) = ids();
+        let pk: Vec<u8> = std::iter::once(0x04).chain(0..64).collect();
+        let entry = encode_binding_v2(&a, &d, &pk);
+        let decoded = decode_leaf_v2(&entry).expect("decode");
+        assert_eq!(decoded.kind, LeafKind::Binding);
+        assert_eq!(decoded.account, a.0);
+        assert_eq!(decoded.device, d.0);
+        assert_eq!(decoded.public_key, pk);
+        assert_eq!(decoded.revoked_at, 0);
+    }
+
+    #[test]
+    fn revocation_v2_roundtrips() {
+        let (a, d) = ids();
+        let entry = encode_revocation_v2(&a, &d, 1_700_000_000);
+        let decoded = decode_leaf_v2(&entry).expect("decode");
+        assert_eq!(decoded.kind, LeafKind::Revocation);
+        assert_eq!(decoded.account, a.0);
+        assert_eq!(decoded.device, d.0);
+        assert!(decoded.public_key.is_empty());
+        assert_eq!(decoded.revoked_at, 1_700_000_000);
+    }
+
+    #[test]
+    fn binding_and_revocation_leaves_are_disjoint() {
+        // Same account+device: the kind byte alone must make the two encodings differ, so no
+        // revocation can ever be read as a binding (leaf-type confusion is the schema's whole point).
+        let (a, d) = ids();
+        let b = encode_binding_v2(&a, &d, &[0x04, 0x01, 0x02]);
+        let r = encode_revocation_v2(&a, &d, 0);
+        assert_ne!(b, r);
+        assert_eq!(decode_leaf_v2(&b).unwrap().kind, LeafKind::Binding);
+        assert_eq!(decode_leaf_v2(&r).unwrap().kind, LeafKind::Revocation);
+    }
+
+    #[test]
+    fn legacy_v1_binding_is_not_decoded_as_v2() {
+        // A v1 leaf (no domain header) must yield None, so the two schemas never cross-parse.
+        let (a, d) = ids();
+        let v1 = encode_binding(&a, &d, &[0x04, 0x09, 0x09]);
+        assert!(decode_leaf_v2(&v1).is_none());
+    }
+
+    #[test]
+    fn truncated_or_overlong_entries_are_rejected() {
+        let (a, d) = ids();
+        let entry = encode_binding_v2(&a, &d, &[0x04, 0x01]);
+        assert!(decode_leaf_v2(&entry[..entry.len() - 1]).is_none()); // truncated pk
+        let mut overlong = entry.clone();
+        overlong.push(0x00); // trailing byte
+        assert!(decode_leaf_v2(&overlong).is_none());
+        let mut bad_kind = entry.clone();
+        bad_kind[4 + LEAF_DOMAIN_V2.len()] = 9; // unknown kind
+        assert!(decode_leaf_v2(&bad_kind).is_none());
+    }
+
+    #[test]
+    fn golden_vectors_are_stable() {
+        let (a, d) = ids();
+        let pk: Vec<u8> = std::iter::once(0x04).chain(0..64).collect();
+        let bind_hex: String = encode_binding_v2(&a, &d, &pk)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let rev_hex: String = encode_revocation_v2(&a, &d, 1_700_000_000)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        // Pin the exact bytes so a cross-language (Swift) verifier can reproduce them.
+        assert!(bind_hex.starts_with("00000017")); // len32(23) domain length
+        assert!(bind_hex.contains(&hex::encode(LEAF_DOMAIN_V2)));
+        assert_eq!(
+            rev_hex.len(),
+            (4 + LEAF_DOMAIN_V2.len() + 1 + 16 + 16 + 8) * 2
+        );
+    }
 }
