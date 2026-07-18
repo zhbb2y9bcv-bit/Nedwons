@@ -325,9 +325,11 @@ impl MlsClient {
         })
     }
 
-    /// Add another of this account's devices to the self-group by its key-package bytes. Returns
-    /// commit + welcome (deliver to existing devices / the new device). `WrongState` if no self-group
-    /// exists yet.
+    /// Add another of this account's devices to the self-group by its key-package bytes. Returns a
+    /// **wrapped** `commit` (deliver to the EXISTING self-group members, who apply it via
+    /// [`Self::process_self_inbound`], which unwraps) plus the **raw** `welcome` (deliver to the new
+    /// device, which applies it via [`Self::join_self_group`], which does not unwrap). `WrongState`
+    /// if no self-group exists yet.
     pub fn add_self_device(&self, key_package: Vec<u8>) -> Result<AddOutcome, MlsClientError> {
         catch(move || {
             bound(key_package.len(), MAX_KEY_PACKAGE_LEN)?;
@@ -336,7 +338,12 @@ impl MlsClient {
             let (commit, welcome) = session
                 .add_self_device(&key_package)
                 .map_err(map_durable_input)?;
-            Ok(AddOutcome { commit, welcome })
+            // Wrap the commit for the self-group inbound path; the welcome goes to `join_self_group`
+            // (which reads a raw Welcome), so it is left unwrapped.
+            Ok(AddOutcome {
+                commit: mls_core::envelope::wrap(&commit),
+                welcome,
+            })
         })
     }
 
@@ -348,6 +355,22 @@ impl MlsClient {
             let mut g = self.lock()?;
             let session = active_mut(&mut g)?;
             session.join_self_group(&welcome).map_err(map_durable_input)
+        })
+    }
+
+    /// Remove a device from the self-group by its credential `identity` (used when that device is
+    /// revoked from the account). Returns the MLS remove-commit to fan out to the remaining
+    /// self-group members; applying it advances the epoch so the removed device can no longer decrypt
+    /// self-group traffic. `WrongState` if there is no self-group; `NotFound` if no such member.
+    pub fn remove_self_device(&self, identity: Vec<u8>) -> Result<Vec<u8>, MlsClientError> {
+        catch(move || {
+            bound(identity.len(), MAX_IDENTITY_LEN)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            let commit = session
+                .remove_self_device(&identity)
+                .map_err(map_durable_input)?;
+            Ok(mls_core::envelope::wrap(&commit))
         })
     }
 

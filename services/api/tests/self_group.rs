@@ -15,60 +15,10 @@ mod common;
 
 use axum::http::StatusCode;
 use axum::Router;
-use common::{get_auth, http_register, make_app, post_json_auth, unique_username, TestDevice};
+use common::{
+    enroll_device, get_auth, http_register, make_app, post_json_auth, unique_username, TestDevice,
+};
 use serde_json::{json, Value};
-
-use auth_core::transcript::{Action, Transcript};
-
-/// Enroll `new_device` onto `trusted`'s account (ADR-0008). Returns the new device's session JSON.
-async fn enroll_device(
-    app: &Router,
-    trusted_token: &str,
-    trusted_account_hex: &str,
-    trusted_signer: &TestDevice,
-    new_device: &TestDevice,
-) -> Value {
-    let (status, ch) =
-        post_json_auth(app, "/v1/devices/enroll/begin", trusted_token, json!({})).await;
-    assert_eq!(status, StatusCode::OK, "enroll begin: {ch}");
-    let account: [u8; 16] = hex::decode(trusted_account_hex)
-        .unwrap()
-        .try_into()
-        .unwrap();
-    let new_device_id: [u8; 16] = hex::decode(ch["device_id"].as_str().unwrap())
-        .unwrap()
-        .try_into()
-        .unwrap();
-    let txn_id: [u8; 16] = hex::decode(ch["txn_id"].as_str().unwrap())
-        .unwrap()
-        .try_into()
-        .unwrap();
-    let nonce = hex::decode(ch["nonce"].as_str().unwrap()).unwrap();
-    let expires_at = ch["expires_at"].as_u64().unwrap();
-    let transcript = Transcript {
-        action: Action::DeviceEnroll,
-        account_id: &auth_core::ids::AccountId(account),
-        device_id: &auth_core::ids::DeviceId(new_device_id),
-        public_key: &new_device.public_key,
-        challenge: &nonce,
-        expires_at,
-        txn_id: &auth_core::ids::TxnId(txn_id),
-    };
-    let signature = trusted_signer.sign(&transcript.encode());
-    let (status, session) = post_json_auth(
-        app,
-        "/v1/devices/enroll/finish",
-        trusted_token,
-        json!({
-            "txn_id": hex::encode(txn_id),
-            "device_public_key": hex::encode(&new_device.public_key),
-            "signature": hex::encode(signature),
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "enroll finish: {session}");
-    session
-}
 
 /// Fetch the caller's inbox and return only the **self-group** envelopes.
 async fn self_group_inbox(app: &Router, token: &str) -> Vec<Value> {
@@ -319,5 +269,66 @@ async fn a_stranger_cannot_touch_another_accounts_self_group() {
         receipt["delivered"].as_u64().unwrap(),
         0,
         "a lone device's self-group fanout reaches nobody"
+    );
+}
+
+/// Revoking a device drops it from its account's self-group membership (ADR-0015 option 3
+/// housekeeping), so the relay stops fanning self-group traffic to it. (The cryptographic re-key is
+/// a separate client action via `MlsClient.remove_self_device`.)
+#[tokio::test]
+async fn revoking_a_device_drops_it_from_the_self_group() {
+    let app = make_app(100_000).await;
+    let (phone_dev, phone) = http_register(&app, &unique_username("sgrevoke")).await;
+    let phone_token = phone["access_token"].as_str().unwrap();
+    let account = phone["account_id"].as_str().unwrap();
+    let tablet_dev = TestDevice::new();
+    let tablet = enroll_device(&app, phone_token, account, &phone_dev, &tablet_dev).await;
+    let tablet_token = tablet["access_token"].as_str().unwrap();
+    let tablet_device = tablet["device_id"].as_str().unwrap().to_string();
+
+    // Both devices are self-group members.
+    for token in [phone_token, tablet_token] {
+        let (status, _) = post_json_auth(&app, "/v1/self-group/register", token, json!({})).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    // A fan-out reaches the tablet.
+    let (status, receipt) = post_json_auth(
+        &app,
+        "/v1/self-group/deliver",
+        phone_token,
+        json!({ "ciphertext": "aa", "idempotency_key": "0000000000000000000000000000000a" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        receipt["delivered"].as_u64().unwrap(),
+        1,
+        "reaches the tablet"
+    );
+
+    // Revoke the tablet.
+    let (status, _) = post_json_auth(
+        &app,
+        "/v1/devices/revoke",
+        phone_token,
+        json!({ "device_id": tablet_device }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // A new fan-out now reaches nobody — the revoked device was dropped from the self-group.
+    let (status, receipt) = post_json_auth(
+        &app,
+        "/v1/self-group/deliver",
+        phone_token,
+        json!({ "ciphertext": "bb", "idempotency_key": "0000000000000000000000000000000b" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        receipt["delivered"].as_u64().unwrap(),
+        0,
+        "the revoked device no longer receives self-group traffic"
     );
 }
