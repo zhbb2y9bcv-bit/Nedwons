@@ -103,6 +103,35 @@ impl PgRelay {
             .map_err(|e| StoreError(format!("pool: {e}")))
     }
 
+    /// Register (or rotate) the account's sealed-sender **delivery access verifier**
+    /// `V_r = SHA-256(K_r)` (ADR-0014 Slice 2a). Upsert: a second call replaces the previous
+    /// verifier (rotation), instantly revoking every holder of the old key at the relay. The relay
+    /// stores only the 32-byte hash, never `K_r`.
+    pub fn set_delivery_verifier(&self, account: &AccountId, verifier: &[u8]) -> StoreResult<()> {
+        let mut conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO delivery_access_keys (account_id, verifier, updated_at)
+             VALUES ($1, $2, now())
+             ON CONFLICT (account_id) DO UPDATE SET verifier = EXCLUDED.verifier, updated_at = now()",
+            &[&account.as_bytes(), &verifier],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// The account's registered delivery access verifier, or `None` if it has not set one. Used by
+    /// the (future, Slice 2b) sealed-delivery endpoint to gate a presented key.
+    pub fn delivery_verifier(&self, account: &AccountId) -> StoreResult<Option<Vec<u8>>> {
+        let mut conn = self.conn()?;
+        let row = conn
+            .query_opt(
+                "SELECT verifier FROM delivery_access_keys WHERE account_id = $1",
+                &[&account.as_bytes()],
+            )
+            .map_err(db_err)?;
+        Ok(row.map(|r| r.get::<_, Vec<u8>>(0)))
+    }
+
     /// Publish a key package for a device.
     pub fn publish_key_package(
         &self,

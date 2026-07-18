@@ -133,6 +133,14 @@ SEC1 signing-key public key — production clients **pin** it out of band; it is
 bootstrap/discovery. The relay stays MLS-blind (it signs only the four bound fields). Certificates
 are short-lived (24h) so a leaked or rotated cert key stops being trusted quickly.
 
+### `PUT /v1/delivery-access-key` → `204` | `400` | `401` (ADR-0014 Slice 2a, R-204)
+Authed. Body `{ verifier }` (hex `SHA-256(K_r)`, exactly 32 bytes) registers/rotates the caller
+account's sealed-sender **delivery access verifier**. The relay stores only the hash, never the
+delivery access key `K_r` itself (the recipient distributes `K_r` to approved senders over the E2EE
+channel). A second call replaces the verifier — rotation instantly revokes old-key holders at the
+relay. No sealed-delivery endpoint consumes this yet (Slice 2b, gated on ADR-0014 review), so
+registering a verifier changes no delivery behavior today.
+
 ### `POST /v1/conversations` → `200`
 Optional body `{ mls_authoritative?: bool }` (default false). When `true`, the conversation is
 **MLS-commit-authoritative** (ADR-0010): its routing membership changes ONLY through `/commit`, and
