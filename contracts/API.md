@@ -122,6 +122,17 @@ Authed. `{ available, low_watermark }` — how many non-expired key packages the
 has published. The client publishes more when `available ≤ low_watermark`, so the device stays
 addable while offline.
 
+### `GET /v1/sender-certificate` → `200` | `401` (ADR-0012, R-204)
+Authed. Issues a short-lived sealed-sender certificate for the caller's device:
+`{ account_id, device_id, sender_public_key, expires_at, signature, cert_public_key }` (all hex).
+`signature` is a 64-byte r‖s ECDSA-P256 signature, made with the server's dedicated
+sender-certificate key, over the canonical `SenderCert` encoding (`app.sentinel.sender-cert.v1`).
+The device embeds the certificate inside the E2EE payload of a sealed-sender message so the
+recipient verifies who sent it while the relay never learns the sender. `cert_public_key` is the
+SEC1 signing-key public key — production clients **pin** it out of band; it is returned for
+bootstrap/discovery. The relay stays MLS-blind (it signs only the four bound fields). Certificates
+are short-lived (24h) so a leaked or rotated cert key stops being trusted quickly.
+
 ### `POST /v1/conversations` → `200`
 Optional body `{ mls_authoritative?: bool }` (default false). When `true`, the conversation is
 **MLS-commit-authoritative** (ADR-0010): its routing membership changes ONLY through `/commit`, and

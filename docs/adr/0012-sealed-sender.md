@@ -72,8 +72,13 @@ recipient still cryptographically verifies the sender (no spoofing). Content sec
 Adopt Signal-style sealed sender. **Slice 1a (this change):** the sender-certificate primitive
 (`auth_core::sender_cert` — canonical encode + verify with expiry) and the client-side verifier
 (`SentinelKit.SenderCertificate`, byte-identical + golden-tested cross-language). **Slice 1b
-(next):** a dedicated server cert key + `GET /v1/sender-certificate` issuance for the authenticated
-device (mechanical: mirrors the transparency-key plumbing). **Slice 2:** the sealed-sender delivery
+(landed 2026-07-18):** a dedicated server sender-certificate key (`SENTINEL_SENDER_CERT_KEY`,
+ephemeral fallback in dev; distinct from the auth/transparency keys) and `GET
+/v1/sender-certificate`, which issues a short-lived (`SENDER_CERT_TTL_SECS`, 24h) signed certificate
+for the authenticated device. The response includes the cert public key so clients can pin it out of
+band and verify without the relay ever seeing the sender; the relay stays MLS-blind (it only signs
+`{account, device, device pubkey, expiry}` bytes). Integration-tested: the signature verifies under
+the returned key, binds the device's own public key, and a tampered key fails. **Slice 2:** the sealed-sender delivery
 endpoint (NULL sender, recipient-token abuse control) + recipient extraction/verification wired
 through the MLS payload + `PRIVACY.md` updates. R-204 stays **OPEN/MITIGATING** until Slice 2 ships
 and the relay demonstrably stores no sender for sealed messages.
