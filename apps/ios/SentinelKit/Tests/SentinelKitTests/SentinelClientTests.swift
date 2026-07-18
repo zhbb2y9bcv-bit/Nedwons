@@ -7,8 +7,13 @@ import XCTest
 final class StubURLProtocol: URLProtocol {
     nonisolated(unsafe) static var responseBody: Data = Data()
     nonisolated(unsafe) static var statusCode: Int = 200
+    /// The most recent request, for asserting method/path/headers a client call produced.
+    nonisolated(unsafe) static var lastRequest: URLRequest?
 
-    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canInit(with request: URLRequest) -> Bool {
+        lastRequest = request
+        return true
+    }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
         let response = HTTPURLResponse(
