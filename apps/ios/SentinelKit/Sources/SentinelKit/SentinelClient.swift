@@ -13,6 +13,9 @@ public struct SentinelClient: Sendable {
         case http(status: Int, body: String)
         case decoding
         case transport(String)
+        /// A cryptographic check failed (e.g. a transparency STH signature, a pinned log-key
+        /// mismatch, or an inclusion proof) — fail closed, never treat as "nothing found".
+        case verificationFailed
     }
 
     public struct Session: Sendable, Equatable {
@@ -209,17 +212,29 @@ public struct SignedTreeHead: Decodable, Sendable {
     }
 }
 
-/// One logged account→device-key binding with its inclusion proof.
+/// One logged transparency leaf with its inclusion proof. Usually an account→device-key **binding**;
+/// since ADR-0013 it may instead be a **revocation** of `deviceID` (`revokedAt != nil`), so the full
+/// device lifecycle — additions and removals — is auditable under the signed root.
 public struct TransparencyBinding: Decodable, Sendable {
     public let leafIndex: UInt64
     public let deviceID: String
     public let publicKey: String
     public let entry: String
     public let proof: [String]
+    /// Unix seconds if this leaf is a **revocation** of `deviceID`; `nil` for a binding (ADR-0013).
+    public let revokedAt: UInt64?
     enum CodingKeys: String, CodingKey {
         case leafIndex = "leaf_index", deviceID = "device_id"
         case publicKey = "public_key", entry, proof
+        case revokedAt = "revoked_at"
     }
+}
+
+/// A verified device revocation found in the transparency log (ADR-0013).
+public struct LoggedRevocation: Sendable, Equatable {
+    public let deviceID: String
+    public let revokedAt: UInt64
+    public let leafIndex: UInt64
 }
 
 public struct TransparencyAccountView: Decodable, Sendable {
@@ -453,6 +468,56 @@ public extension SentinelClient {
             root: root
         )
         return included ? .ok : .badProof
+    }
+
+    /// Extract the revocation leaves from an account view (pure — no proof verification). The
+    /// verified counterpart is `monitorDeviceRevocations`.
+    static func revocationLeaves(in view: TransparencyAccountView) -> [LoggedRevocation] {
+        view.bindings.compactMap { b in
+            b.revokedAt.map {
+                LoggedRevocation(deviceID: b.deviceID, revokedAt: $0, leafIndex: b.leafIndex)
+            }
+        }
+    }
+
+    /// Monitor the account's transparency log for device **revocations**, each proven included under
+    /// the STH signed by the PINNED log key (ADR-0013 Slice 3, R-201). The app compares the returned
+    /// list against revocations it initiated; anything extra is a device removed **without the
+    /// user's action** — raise the same identity-change alarm as a substituted key. (A *revoked*
+    /// device's own token is dead, so this runs from another live device of the account.) Throws
+    /// `badSignature` on a swapped log key, bad STH signature, or an unverifiable inclusion proof —
+    /// fail closed, never silently report "no revocations."
+    public func monitorDeviceRevocations(
+        accessToken: String,
+        accountID: String,
+        pinnedLogPublicKeyX963: Data
+    ) async throws -> [LoggedRevocation] {
+        let sth = try await transparencySignedTreeHead(accessToken: accessToken)
+        guard let root = Hex.decode(sth.rootHash), let sig = Hex.decode(sth.signature),
+            let advertised = Hex.decode(sth.logPublicKey)
+        else { throw ClientError.decoding }
+        guard advertised == pinnedLogPublicKeyX963 else { throw ClientError.verificationFailed }
+        guard Transparency.verifySTHSignature(
+            treeSize: sth.treeSize, root: root, timestamp: sth.timestamp,
+            signature: sig, logPublicKeyX963: pinnedLogPublicKeyX963)
+        else { throw ClientError.verificationFailed }
+
+        let view = try await transparencyAccount(
+            accessToken: accessToken, accountID: accountID, treeSize: sth.treeSize)
+        var verified: [LoggedRevocation] = []
+        for b in view.bindings {
+            guard let revokedAt = b.revokedAt else { continue }
+            guard let entry = Hex.decode(b.entry) else { throw ClientError.decoding }
+            let proof = b.proof.compactMap { Hex.decode($0) }
+            guard proof.count == b.proof.count,
+                Transparency.verifyInclusion(
+                    leaf: Transparency.hashLeaf(entry), index: Int(b.leafIndex),
+                    treeSize: Int(sth.treeSize), proof: proof, root: root)
+            else { throw ClientError.verificationFailed }
+            verified.append(
+                LoggedRevocation(deviceID: b.deviceID, revokedAt: revokedAt, leafIndex: b.leafIndex))
+        }
+        return verified
     }
 
     /// Mint an invite-link token for a conversation (admin only). Strangers join with the token —
