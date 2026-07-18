@@ -130,6 +130,10 @@ pub enum InboundResult {
     /// A **secret** (view-once) message arrived and is stored sealed. The body is NOT delivered
     /// here; show a sealed placeholder and reveal it later via [`MlsClient::begin_secret_reveal`].
     SecretSealed { secret_id: Vec<u8> },
+    /// A **consumption** control message arrived (ADR-0015): another of this account's devices
+    /// revealed `secret_id`, so this device consumed its copy (account-wide single-view). No
+    /// user-visible content; refresh any placeholder for `secret_id` to its tombstone.
+    SecretConsumedRemotely { secret_id: Vec<u8> },
 }
 
 /// Capability/version record so the Swift side can assert it links a compatible core and refuse on
@@ -429,6 +433,30 @@ impl MlsClient {
         })
     }
 
+    /// Build (once) the **consumption control message** for a secret this device revealed (ADR-0015,
+    /// account-wide single-view). Returns the opaque envelope to broadcast to the account's other
+    /// devices through the conversation (via the normal send path — the relay stays blind), or
+    /// `None` if the secret is unknown, is the sender's own, or has not been revealed here.
+    /// Idempotent: repeated calls return the same envelope and never double-advance the ratchet.
+    /// A single-device client simply never calls this.
+    pub fn secret_consumption_envelope(
+        &self,
+        secret_id: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, MlsClientError> {
+        catch(move || {
+            let id = secret_id_arg(&secret_id)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            match session.emit_secret_consumption(&id).map_err(map_durable)? {
+                Some(local_id) => {
+                    let payload = session.encrypt(local_id).map_err(map_durable)?;
+                    Ok(Some(mls_core::envelope::wrap(&payload)))
+                }
+                None => Ok(None),
+            }
+        })
+    }
+
     /// The current reveal phase of a secret at `now_ms` (advancing + persisting a state change).
     pub fn secret_phase(
         &self,
@@ -519,6 +547,11 @@ impl MlsClient {
                 InboundOutcome::SecretSealed { secret_id } => InboundResult::SecretSealed {
                     secret_id: secret_id.to_vec(),
                 },
+                InboundOutcome::SecretConsumedRemotely { secret_id } => {
+                    InboundResult::SecretConsumedRemotely {
+                        secret_id: secret_id.to_vec(),
+                    }
+                }
             })
         })
     }

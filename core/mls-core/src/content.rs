@@ -22,6 +22,7 @@ pub const MAX_CONTENT_BODY: usize = 16 * 1024;
 
 const KIND_NORMAL: u8 = 0;
 const KIND_SECRET: u8 = 1;
+const KIND_SECRET_CONSUMED: u8 = 2;
 
 /// Length of a secret-message id (a sender-chosen random, used for placeholder tracking + replay
 /// rejection on the recipient).
@@ -37,6 +38,10 @@ pub enum Content {
         secret_id: [u8; SECRET_ID_LEN],
         body: Vec<u8>,
     },
+    /// A **consumption** control message (ADR-0015): the account's device that revealed `secret_id`
+    /// tells its OTHER devices to consume that secret too (account-wide single-view). Carries no
+    /// body — only the id. E2EE + relay-blind like any other content.
+    SecretConsumed { secret_id: [u8; SECRET_ID_LEN] },
 }
 
 /// Typed, **redacted** decode failure — carries no payload bytes, so logging one leaks nothing.
@@ -53,28 +58,38 @@ pub enum ContentError {
 }
 
 impl Content {
-    /// The body regardless of kind.
+    /// The body regardless of kind (empty for a `SecretConsumed` control message).
     pub fn body(&self) -> &[u8] {
         match self {
             Content::Normal { body } | Content::Secret { body, .. } => body,
+            Content::SecretConsumed { .. } => &[],
         }
     }
 
     /// Canonical encoding:
-    /// `u16(CONTENT_VERSION) || u8(kind) || [secret_id(16) if Secret] || u32(body_len) || body`.
+    /// - Normal:         `u16(ver) || u8(0) || u32(len) || body`
+    /// - Secret:         `u16(ver) || u8(1) || secret_id(16) || u32(len) || body`
+    /// - SecretConsumed: `u16(ver) || u8(2) || secret_id(16)`   (no body)
     pub fn encode(&self) -> Vec<u8> {
-        let body = self.body();
-        let mut out = Vec::with_capacity(2 + 1 + SECRET_ID_LEN + 4 + body.len());
+        let mut out = Vec::with_capacity(2 + 1 + SECRET_ID_LEN + 4 + self.body().len());
         out.extend_from_slice(&CONTENT_VERSION.to_be_bytes());
         match self {
-            Content::Normal { .. } => out.push(KIND_NORMAL),
-            Content::Secret { secret_id, .. } => {
+            Content::Normal { body } => {
+                out.push(KIND_NORMAL);
+                out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+                out.extend_from_slice(body);
+            }
+            Content::Secret { secret_id, body } => {
                 out.push(KIND_SECRET);
+                out.extend_from_slice(secret_id);
+                out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+                out.extend_from_slice(body);
+            }
+            Content::SecretConsumed { secret_id } => {
+                out.push(KIND_SECRET_CONSUMED);
                 out.extend_from_slice(secret_id);
             }
         }
-        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-        out.extend_from_slice(body);
         out
     }
 
@@ -89,42 +104,55 @@ impl Content {
         }
         let rest = &bytes[2..];
         let (&kind, rest) = rest.split_first().ok_or(ContentError::Malformed)?;
-        let (secret_id, rest) = match kind {
-            KIND_NORMAL => (None, rest),
+        match kind {
+            KIND_NORMAL => Ok(Content::Normal {
+                body: decode_lp_body(rest)?,
+            }),
             KIND_SECRET => {
-                if rest.len() < SECRET_ID_LEN {
-                    return Err(ContentError::Malformed);
-                }
-                let (id, rest) = rest.split_at(SECRET_ID_LEN);
-                let mut arr = [0u8; SECRET_ID_LEN];
-                arr.copy_from_slice(id);
-                (Some(arr), rest)
+                let (secret_id, rest) = split_secret_id(rest)?;
+                Ok(Content::Secret {
+                    secret_id,
+                    body: decode_lp_body(rest)?,
+                })
             }
-            other => return Err(ContentError::UnknownKind(other)),
-        };
-        if rest.len() < 4 {
-            return Err(ContentError::Malformed);
+            KIND_SECRET_CONSUMED => {
+                let (secret_id, rest) = split_secret_id(rest)?;
+                if !rest.is_empty() {
+                    return Err(ContentError::Malformed); // control message has no trailer
+                }
+                Ok(Content::SecretConsumed { secret_id })
+            }
+            other => Err(ContentError::UnknownKind(other)),
         }
-        let (len_bytes, body) = rest.split_at(4);
-        let body_len =
-            u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
-        if body_len > MAX_CONTENT_BODY {
-            return Err(ContentError::TooLarge);
-        }
-        if body.len() != body_len {
-            // Exact: no trailing bytes, no truncation.
-            return Err(ContentError::Malformed);
-        }
-        Ok(match secret_id {
-            None => Content::Normal {
-                body: body.to_vec(),
-            },
-            Some(secret_id) => Content::Secret {
-                secret_id,
-                body: body.to_vec(),
-            },
-        })
     }
+}
+
+/// Split a leading 16-byte secret id, returning it and the remaining bytes.
+fn split_secret_id(rest: &[u8]) -> Result<([u8; SECRET_ID_LEN], &[u8]), ContentError> {
+    if rest.len() < SECRET_ID_LEN {
+        return Err(ContentError::Malformed);
+    }
+    let (id, rest) = rest.split_at(SECRET_ID_LEN);
+    let mut arr = [0u8; SECRET_ID_LEN];
+    arr.copy_from_slice(id);
+    Ok((arr, rest))
+}
+
+/// Decode a `u32(len) || body` trailer, exact (no trailing/truncation) and bounded.
+fn decode_lp_body(rest: &[u8]) -> Result<Vec<u8>, ContentError> {
+    if rest.len() < 4 {
+        return Err(ContentError::Malformed);
+    }
+    let (len_bytes, body) = rest.split_at(4);
+    let body_len =
+        u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+    if body_len > MAX_CONTENT_BODY {
+        return Err(ContentError::TooLarge);
+    }
+    if body.len() != body_len {
+        return Err(ContentError::Malformed);
+    }
+    Ok(body.to_vec())
 }
 
 #[cfg(test)]
@@ -151,6 +179,35 @@ mod tests {
             Content::Secret { secret_id, .. } => assert_eq!(secret_id, [0xAB; SECRET_ID_LEN]),
             _ => panic!("expected secret"),
         }
+    }
+
+    #[test]
+    fn secret_consumed_round_trips_and_has_no_body() {
+        let c = Content::SecretConsumed {
+            secret_id: [0x5C; SECRET_ID_LEN],
+        };
+        let decoded = Content::decode(&c.encode()).unwrap();
+        assert_eq!(decoded, c);
+        assert!(decoded.body().is_empty());
+        // A trailing byte after the id is rejected (control message has no body).
+        let mut over = c.encode();
+        over.push(0);
+        assert_eq!(Content::decode(&over), Err(ContentError::Malformed));
+        // A truncated id is rejected.
+        let short = &c.encode()[..c.encode().len() - 1];
+        assert_eq!(Content::decode(short), Err(ContentError::Malformed));
+    }
+
+    #[test]
+    fn kinds_are_disjoint_encodings() {
+        let sid = [0x11; SECRET_ID_LEN];
+        let secret = Content::Secret {
+            secret_id: sid,
+            body: vec![],
+        }
+        .encode();
+        let consumed = Content::SecretConsumed { secret_id: sid }.encode();
+        assert_ne!(secret, consumed, "kind byte keeps them disjoint");
     }
 
     #[test]

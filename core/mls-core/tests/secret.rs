@@ -274,6 +274,115 @@ fn multiple_secrets_are_independent_sealed_placeholders() {
     );
 }
 
+/// ADR-0015: account-wide single-consumption across a recipient's TWO devices. Alice sends a secret
+/// to a group containing Bob's phone AND tablet. When the phone reveals it, it emits an E2EE
+/// `SecretConsumed` control message; delivering that to the tablet consumes the tablet's copy too,
+/// so the tablet can never open it. The sender's copy no-ops. The relay only ever sees opaque MLS
+/// ciphertext (asserted).
+#[test]
+fn revealing_on_one_device_consumes_it_on_the_other() {
+    use mls_core::secret::SecretState;
+
+    // Build a 3-member group at the MLS level: alice (sender) + phone + tablet (Bob's two devices).
+    let alice = Member::new(b"alice-device").unwrap();
+    let phone = Member::new(b"bob-phone").unwrap();
+    let tablet = Member::new(b"bob-tablet").unwrap();
+    let mut ga = alice.create_group().unwrap();
+    let add_phone = ga
+        .add_member(&alice, &phone.key_package_bytes().unwrap())
+        .unwrap();
+    let mut gp = phone.join_from_welcome(&add_phone.welcome).unwrap();
+    let add_tablet = ga
+        .add_member(&alice, &tablet.key_package_bytes().unwrap())
+        .unwrap();
+    gp.process(&phone, &add_tablet.commit).unwrap(); // phone advances to the tablet-add epoch
+    let gt = tablet.join_from_welcome(&add_tablet.welcome).unwrap();
+
+    let mut da = DurableSession::adopt(alice, ga, InMemoryJournal::new()).unwrap();
+    let mut dp = DurableSession::adopt(phone, gp, InMemoryJournal::new()).unwrap();
+    let mut dt = DurableSession::adopt(tablet, gt, InMemoryJournal::new()).unwrap();
+
+    // Alice sends a secret; BOTH of Bob's devices receive it sealed.
+    let (env, sid) = send_secret(&mut da, b"the vault code is 7788");
+    assert!(
+        !env.windows(4).any(|w| w == b"7788"),
+        "relay sees only ciphertext"
+    );
+    assert!(matches!(
+        dp.process_inbound(1, &env).unwrap(),
+        InboundOutcome::SecretSealed { .. }
+    ));
+    assert!(matches!(
+        dt.process_inbound(1, &env).unwrap(),
+        InboundOutcome::SecretSealed { .. }
+    ));
+    assert_eq!(dt.secret_state(&sid, 0).unwrap(), Some(SecretState::Sealed));
+
+    // The PHONE reveals it, then emits the consumption control message.
+    dp.begin_secret_reveal(&sid, 0).unwrap();
+    let cid = dp
+        .emit_secret_consumption(&sid)
+        .unwrap()
+        .expect("a consumption message");
+    // Idempotent: a second emit returns the same outbound id (no duplicate message).
+    assert_eq!(dp.emit_secret_consumption(&sid).unwrap(), Some(cid));
+    let consumption_env = dp.encrypt(cid).unwrap();
+    assert!(!consumption_env.windows(4).any(|w| w == b"7788"));
+
+    // Deliver it to the TABLET: it consumes its copy — account-wide single-view.
+    assert!(matches!(
+        dt.process_inbound(2, &consumption_env).unwrap(),
+        InboundOutcome::SecretConsumedRemotely { secret_id } if secret_id == sid
+    ));
+    assert_eq!(
+        dt.secret_state(&sid, 0).unwrap(),
+        Some(SecretState::Consumed)
+    );
+    assert!(
+        dt.secret_visible_body(&sid, 3_000).unwrap().is_none(),
+        "tablet can never open it"
+    );
+    assert!(
+        dt.begin_secret_reveal(&sid, 0).is_err(),
+        "tablet reveal is refused"
+    );
+
+    // The phone (which opened first) still views it within its window — first device wins.
+    assert_eq!(
+        dp.secret_state(&sid, 3_000).unwrap(),
+        Some(SecretState::Visible)
+    );
+    assert_eq!(
+        dp.secret_visible_body(&sid, 3_000).unwrap().as_deref(),
+        Some(&b"the vault code is 7788"[..])
+    );
+
+    // The SENDER receiving the consumption message is a harmless idempotent no-op (already tombstone).
+    assert!(matches!(
+        da.process_inbound(2, &consumption_env).unwrap(),
+        InboundOutcome::SecretConsumedRemotely { .. }
+    ));
+    assert_eq!(
+        da.secret_state(&sid, 0).unwrap(),
+        Some(SecretState::Consumed)
+    );
+}
+
+/// A device that never held a given secret (or hasn't revealed one) does not emit a consumption
+/// message, and consuming an unknown secret id is a harmless no-op.
+#[test]
+fn emit_and_apply_consumption_are_safe_no_ops_when_not_applicable() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+    let (env, sid) = send_secret(&mut alice, b"x");
+    bob.process_inbound(1, &env).unwrap();
+    // Not revealed yet → nothing to emit.
+    assert_eq!(bob.emit_secret_consumption(&sid).unwrap(), None);
+    // The sender never emits (its copy is the sender tombstone).
+    assert_eq!(alice.emit_secret_consumption(&sid).unwrap(), None);
+    // An unknown id → None.
+    assert_eq!(bob.emit_secret_consumption(&[0xEE; 16]).unwrap(), None);
+}
+
 #[test]
 fn tombstone_text_is_the_exact_string() {
     assert_eq!(TOMBSTONE_TEXT, "a secret message has been sent");
