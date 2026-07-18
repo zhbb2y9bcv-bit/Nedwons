@@ -687,6 +687,23 @@ public extension SentinelClient {
 
     // ----- Device self-group: linking + consumption fan-out (ADR-0015 option 3) -----
 
+    /// Register (or rotate) this device's APNs push token (`POST /v1/push/register`) so it can be
+    /// woken to fetch its inbox when not connected (#4). The token addresses a **contentless** wake
+    /// push — no E2EE content is ever sent through APNs.
+    public func registerPushToken(accessToken: String, platform: String = "apns", token: Data)
+        async throws
+    {
+        struct Body: Encodable {
+            let platform: String
+            let token: String
+        }
+        var request = authed("POST", "/v1/push/register", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            Body(platform: platform, token: Hex.encode(token)))
+        _ = try await perform(request)
+    }
+
     /// Publish an (opaque) MLS key package for this device so its siblings can add it to the
     /// self-group (`POST /v1/keypackages`). The relay stores it verbatim and never parses it.
     public func publishKeyPackage(accessToken: String, keyPackage: Data) async throws {
