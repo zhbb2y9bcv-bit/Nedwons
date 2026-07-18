@@ -252,6 +252,81 @@ impl<J: Journal> DurableSession<J> {
         Ok((added.commit, added.welcome))
     }
 
+    // ----- Staged commits for MLS-commit-authoritative membership (ADR-0010) ------------------
+    //
+    // Staging is deliberately NOT persisted: an in-flight commit awaiting the server's epoch CAS
+    // is discardable, and on a crash the client reopens the last committed (pre-stage) state and
+    // rebuilds. Only `merge_staged` / `process_commit_checked` (state the server accepted) persist.
+
+    /// Stage an add: build commit + welcome without advancing the epoch or persisting.
+    pub fn stage_add_member(
+        &mut self,
+        key_package: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), DurableError> {
+        let Session {
+            member,
+            conversation,
+            ..
+        } = &mut self.session;
+        let added = conversation.stage_add_member(member, key_package)?;
+        Ok((added.commit, added.welcome))
+    }
+
+    /// Stage a remove: build the commit without advancing the epoch or persisting.
+    pub fn stage_remove_member(&mut self, identity: &[u8]) -> Result<Vec<u8>, DurableError> {
+        let Session {
+            member,
+            conversation,
+            ..
+        } = &mut self.session;
+        Ok(conversation.stage_remove_member(member, identity)?)
+    }
+
+    /// Merge the pending staged commit (server accepted) and persist the advanced state.
+    pub fn merge_staged(&mut self) -> Result<(), DurableError> {
+        {
+            let Session {
+                member,
+                conversation,
+                ..
+            } = &mut self.session;
+            conversation.merge_staged(member)?;
+        }
+        let meta = self.meta.clone();
+        self.commit(meta)
+    }
+
+    /// Discard the pending staged commit (server rejected / rebase). Nothing durable changes.
+    pub fn clear_staged(&mut self) -> Result<(), DurableError> {
+        let Session {
+            member,
+            conversation,
+            ..
+        } = &mut self.session;
+        Ok(conversation.clear_staged(member)?)
+    }
+
+    /// Recipient path: process an inbound commit with the ADR-0010 correspondence check, then
+    /// persist the advanced state. On mismatch nothing advances and nothing is persisted.
+    pub fn process_commit_checked(
+        &mut self,
+        envelope: &[u8],
+        next_epoch: u64,
+        added: &[Vec<u8>],
+        removed: &[Vec<u8>],
+    ) -> Result<(), DurableError> {
+        {
+            let Session {
+                member,
+                conversation,
+                ..
+            } = &mut self.session;
+            conversation.process_commit_checked(member, envelope, next_epoch, added, removed)?;
+        }
+        let meta = self.meta.clone();
+        self.commit(meta)
+    }
+
     /// Process an inbound envelope. Idempotent per `envelope_id` (at-least-once redelivery is a
     /// no-op). On success the advanced MLS state, the decrypted message, dedup marker, and
     /// ack-eligibility are all durable **together** before this returns.
