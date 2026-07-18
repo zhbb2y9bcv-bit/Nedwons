@@ -35,10 +35,12 @@ pub enum ApplyOutcome {
     Invalid,
 }
 
-/// A stored membership event's evidence (canonical manifest bytes + device signature).
+/// A stored membership event's evidence (canonical manifest bytes + device signature) plus the
+/// actor's account, so a recipient can locate the actor's transparency-logged device key.
 pub struct MembershipEventRow {
     pub manifest: Vec<u8>,
     pub signature: Vec<u8>,
+    pub actor_account: [u8; 16],
 }
 
 /// One accepted membership change, fully described (what `apply_commit` persists and fans out).
@@ -324,14 +326,15 @@ impl PgMembership {
         txn.execute(
             "INSERT INTO membership_events
                  (conversation_id, prev_epoch, next_epoch, control_type, actor_device,
-                  commit_hash, manifest_hash, manifest, signature, idempotency_key)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                  actor_account, commit_hash, manifest_hash, manifest, signature, idempotency_key)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             &[
                 &conv,
                 &(req.prev_epoch as i64),
                 &(req.next_epoch as i64),
                 &(req.control_type as i16),
                 &req.actor_device.as_bytes(),
+                &req.actor_account.as_bytes(),
                 &req.commit_hash.as_slice(),
                 &req.manifest_hash.as_slice(),
                 &req.manifest,
@@ -356,15 +359,23 @@ impl PgMembership {
         let mut conn = self.conn()?;
         let row = conn
             .query_opt(
-                "SELECT manifest, signature FROM membership_events
+                "SELECT manifest, signature, actor_account FROM membership_events
                  WHERE conversation_id = $1 AND next_epoch = $2",
                 &[&conversation_id.as_slice(), &(next_epoch as i64)],
             )
             .map_err(db_err)?;
-        Ok(row.map(|r| MembershipEventRow {
-            manifest: r.get::<_, Vec<u8>>(0),
-            signature: r.get::<_, Vec<u8>>(1),
-        }))
+        row.map(|r| {
+            let actor_account: [u8; 16] = r
+                .get::<_, &[u8]>(2)
+                .try_into()
+                .map_err(|_| StoreError("bad actor_account length".into()))?;
+            Ok(MembershipEventRow {
+                manifest: r.get::<_, Vec<u8>>(0),
+                signature: r.get::<_, Vec<u8>>(1),
+                actor_account,
+            })
+        })
+        .transpose()
     }
 
     /// Current membership epoch of a conversation the caller belongs to (`None` = not a member —

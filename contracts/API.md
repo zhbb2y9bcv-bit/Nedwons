@@ -18,6 +18,8 @@ Errors are generic by design (enumeration resistance, fail-closed):
 | 401  | `denied` | Any authentication/authorization/replay/expiry failure. No detail. |
 | 409  | `username_unavailable` | Registration only: username taken. |
 | 409  | `idempotency_conflict` | Send only: the idempotency key was already used by this sender device for a **different** ciphertext or conversation. Keys name one logical send; retry with a fresh key. Refused rather than silently deduplicated, which would drop the new message while reporting success. |
+| 409  | `commits_required` | A legacy membership mutation was attempted on an MLS-authoritative conversation; use `POST /commit` (ADR-0010). |
+| 409  | `stale_epoch` | A membership commit's `prev_epoch` was superseded by a concurrent commit; rebase on `/epoch` and retry. |
 | 422  | (axum) | JSON shape/unknown-field rejection. |
 | 429  | `rate_limited` | Per-IP quota exceeded. |
 | 500  | `internal` | Storage/internal fault. No detail. |
@@ -114,6 +116,11 @@ implementation. Bodies may be up to 256 KiB (envelopes).
 Atomically pops one key package for the target account's device (to add them to a group).
 
 ### `POST /v1/conversations` → `200`
+Optional body `{ mls_authoritative?: bool }` (default false). When `true`, the conversation is
+**MLS-commit-authoritative** (ADR-0010): its routing membership changes ONLY through `/commit`, and
+the legacy direct-mutation endpoints below (`/members`, `/members/remove`, `/leave`, `/invites`,
+`/join-requests/approve`) return `409 commits_required`. Absent/`{}` keeps the legacy behavior.
+Genesis (epoch 0) is the creator alone; members are added via commits.
 Body `{}`. Creates a conversation with the caller as first member →
 `{ "conversation_id": "<16B hex>" }`.
 
