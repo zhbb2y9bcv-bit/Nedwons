@@ -174,6 +174,24 @@ at local epoch N fetches `N+1` to learn the `added`/`removed` device identities 
 commit↔manifest correspondence check (and, once the key directory exposes the actor's device key,
 to verify `signature` over `manifest`).
 
+## Account recovery (ADR-0003)
+
+### `POST /v1/recovery/set` → `204` | `400`
+Authed. `{ recovery_secret }` — set/replace the account's recovery secret (a generated
+high-entropy code; stored only as an Argon2id hash). `400 weak_password` if shorter than the
+minimum. Set this while you still hold a device.
+
+### `POST /v1/recover/begin` → `200`
+Unauthenticated. `{ username }` → `{ account_id, device_id, txn_id, nonce, expires_at }`, reserving
+the recovering device's id. **Enumeration-resistant**: a challenge is always returned, whether or
+not the account (or a recovery secret) exists.
+
+### `POST /v1/recover/finish` → `200` | `401`
+Unauthenticated. `{ username, recovery_secret, txn_id, device_public_key (65B hex), signature (64B
+hex) }` — the recovery secret authorizes and the new device self-signs the `DeviceEnroll` transcript
+(proof of possession). Returns a **session for the recovered device**. Generic `401` on a wrong/unset
+secret or a bad signature. Recovery restores **account access, not E2EE message history**.
+
 ## Controlled multi-device (ADR-0008)
 
 ### `POST /v1/devices/enroll/begin` → `200`

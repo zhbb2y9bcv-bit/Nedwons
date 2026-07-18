@@ -944,3 +944,60 @@ extension SentinelClient {
         _ = try await perform(request)
     }
 }
+
+// MARK: - Account recovery (ADR-0003, R-304)
+
+extension SentinelClient {
+    /// Set (or replace) this account's recovery secret (authed; set it up while you hold a device).
+    /// The secret is a generated high-entropy code; the server stores only its Argon2id hash.
+    public func setRecoverySecret(accessToken: String, recoverySecret: String) async throws {
+        struct Body: Encodable { let recovery_secret: String }
+        var request = authed("POST", "/v1/recovery/set", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(Body(recovery_secret: recoverySecret))
+        _ = try await perform(request)
+    }
+
+    /// Recover an account onto a NEW device with the recovery secret (no other device needed). The
+    /// new device self-signs a DeviceEnroll transcript (proof of possession). Returns the new
+    /// device's session. Recovery restores account ACCESS, not E2EE history — the new device has a
+    /// fresh identity and is re-added to conversations by other members.
+    public func recoverAccount(
+        username: String,
+        recoverySecret: String,
+        newDeviceSigner: DeviceSigner
+    ) async throws -> Session {
+        struct Begin: Decodable {
+            let account_id: String
+            let device_id: String
+            let txn_id: String
+            let nonce: String
+            let expires_at: UInt64
+        }
+        let ch: Begin = try await post("/v1/recover/begin", body: ["username": username])
+
+        guard let account = Hex.decode(ch.account_id), let deviceID = Hex.decode(ch.device_id),
+            let nonce = Hex.decode(ch.nonce), let txnID = Hex.decode(ch.txn_id)
+        else { throw ClientError.decoding }
+        let transcript = ClientTranscripts.deviceEnroll(
+            accountID: account, newDeviceID: deviceID,
+            newDevicePublicKey: newDeviceSigner.publicKeyX963, challengeNonce: nonce,
+            expiresAt: ch.expires_at, txnID: txnID)
+        let signature = try newDeviceSigner.sign(transcript)
+
+        struct Finish: Encodable {
+            let username: String
+            let recovery_secret: String
+            let txn_id: String
+            let device_public_key: String
+            let signature: String
+        }
+        let session: SessionResponse = try await post(
+            "/v1/recover/finish",
+            body: Finish(
+                username: username, recovery_secret: recoverySecret, txn_id: ch.txn_id,
+                device_public_key: Hex.encode(newDeviceSigner.publicKeyX963),
+                signature: Hex.encode(signature)))
+        return session.model
+    }
+}
