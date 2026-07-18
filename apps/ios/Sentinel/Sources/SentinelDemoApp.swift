@@ -1,15 +1,20 @@
+import SentinelUI
 import SwiftUI
 
-/// The `@main` entry point (closes the software half of R-101 — a runnable iOS app target). This is
-/// a focused **demonstrator** for the Secret Message feature: it wires SENTINEL's real SwiftUI views
-/// (SentinelUI) to the real on-device MLS core (MlsFfi/Rust) with NO mock crypto. It is not the full
-/// product shell — profiles, sign-in, and the live relay live in the SentinelUI/SentinelKit flows —
-/// but it boots, renders, and drives the actual view-once lifecycle on the simulator.
+/// The `@main` entry point. It boots the **real product shell** — `SentinelAppRoot` gates on auth and
+/// presents Chats / Devices / Settings, wired to the live `AppModel` — against the server + pinned
+/// transparency-log key configured for this build (`AppConfig`, from `Info.plist`; a loopback dev
+/// server by default). The focused view-once demonstrator lives in `SecretDemoView` (still in this
+/// target) for isolated secret-lifecycle testing on the simulator.
 @main
 struct SentinelDemoApp: App {
+    // @StateObject defers construction to the first (main-actor) body render, so the @MainActor
+    // AppModel is built safely and its state persists across renders.
+    @StateObject private var model = AppModel()
+
     var body: some Scene {
         WindowGroup {
-            SecretDemoView()
+            SentinelAppRoot(model: model)
         }
     }
 }

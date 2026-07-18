@@ -1,8 +1,7 @@
-# XcodeGen spec for the SENTINEL demo app (closes the software half of R-101 — a runnable @main
-# iOS target). Generate the project with `xcodegen generate` (in this directory), then build/run
-# for a simulator. The app links the local SwiftPM packages by relative path, so no versions are
-# pinned here. Regenerate whenever this file changes; the generated .xcodeproj is a build artifact
-# (gitignored).
+# XcodeGen spec for the SENTINEL app (a runnable @main iOS target that boots the real product shell).
+# Generate the project with `xcodegen generate` (in this directory), then build/run.
+# The app links the local SwiftPM packages by relative path, so no versions are pinned here.
+# Regenerate whenever this file changes; the generated .xcodeproj is a build artifact (gitignored).
 name: Sentinel
 options:
   bundleIdPrefix: app.sentinel
@@ -31,13 +30,31 @@ targets:
         product: MlsFfi
       - package: SentinelApp
         product: SentinelAppKit
+    # A real Info.plist (not the auto-generated one) so the app can carry custom build config:
+    #   SentinelServerURL          — backend base URL for this build (https on device; empty ⇒ dev)
+    #   SentinelTransparencyLogKey — the out-of-band-pinned KT log public key (hex; empty ⇒ dev TOFU)
+    # Set these per build configuration (or via CI) before a device build; AppConfig reads them.
+    info:
+      path: Sentinel/Info.plist
+      properties:
+        CFBundleDisplayName: Sentinel
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        # Wake the app to fetch its inbox on a contentless push (#4).
+        UIBackgroundModes:
+          - remote-notification
+        # Pairing to link a device scans a QR code (#8 device linking).
+        NSCameraUsageDescription: "Scan a pairing code to securely link another of your devices."
+        SentinelServerURL: ""
+        SentinelTransparencyLogKey: ""
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.sentinel.demo
-        GENERATE_INFOPLIST_FILE: YES
-        INFOPLIST_KEY_UILaunchScreen_Generation: YES
-        INFOPLIST_KEY_CFBundleDisplayName: Sentinel
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_VERSION: "6.0"
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
+        # Capabilities are declared in the entitlements file; the App ID + provisioning profile that
+        # authorize them are configured in the Apple Developer portal (your side).
+        CODE_SIGN_ENTITLEMENTS: Sentinel.entitlements

@@ -55,3 +55,6 @@ sbom/
 apps/ios/**/*.xcodeproj
 # Auto-grown fuzz corpus (regenerable); the deterministic tests + harness are what matter.
 core/mls-ffi/fuzz/corpus/secret_state/
+
+# Generated Info.plist (xcodegen from project.yml info: block — regenerable)
+apps/ios/Sentinel/Sentinel/
