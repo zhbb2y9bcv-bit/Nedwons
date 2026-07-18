@@ -57,6 +57,7 @@ pub struct MemAccountStore {
 struct AccountsInner {
     accounts_by_username: HashMap<String, AccountRecord>,
     devices_by_id: HashMap<DeviceId, DeviceRecord>,
+    recovery_by_account: HashMap<AccountId, String>,
 }
 
 impl CredentialStore for MemAccountStore {
@@ -86,6 +87,31 @@ impl CredentialStore for MemAccountStore {
             .unwrap()
             .accounts_by_username
             .get(username_normalized)
+            .cloned())
+    }
+
+    fn set_recovery_phc(&self, account_id: &AccountId, phc: &str) -> StoreResult<bool> {
+        let mut inner = self.inner.lock().unwrap();
+        let exists = inner
+            .accounts_by_username
+            .values()
+            .any(|a| &a.account_id == account_id);
+        if !exists {
+            return Ok(false);
+        }
+        inner
+            .recovery_by_account
+            .insert(*account_id, phc.to_string());
+        Ok(true)
+    }
+
+    fn recovery_phc(&self, account_id: &AccountId) -> StoreResult<Option<String>> {
+        Ok(self
+            .inner
+            .lock()
+            .unwrap()
+            .recovery_by_account
+            .get(account_id)
             .cloned())
     }
 }

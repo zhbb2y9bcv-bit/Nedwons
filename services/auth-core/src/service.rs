@@ -70,6 +70,28 @@ pub struct RegisterRequest {
     pub signature: Vec<u8>,
 }
 
+/// Challenge returned by [`AuthService::recover_begin`] — enumeration-resistant (always returned).
+/// Carries the reserved NEW device id the recovering device will self-sign for.
+pub struct RecoveryChallenge {
+    pub account_id: AccountId,
+    pub device_id: DeviceId,
+    pub txn_id: TxnId,
+    pub nonce: [u8; 32],
+    pub expires_at: u64,
+}
+
+/// Payload for [`AuthService::recover_finish`]. The `recovery_secret` authorizes (something you
+/// know); the `new_device_signature` proves possession of the new device key (self-signed).
+pub struct RecoveryRequest {
+    pub username: String,
+    pub recovery_secret: String,
+    pub txn_id: TxnId,
+    /// SEC1-encoded P-256 public key of the NEW device.
+    pub new_device_public_key: Vec<u8>,
+    /// The NEW device's signature over the `DeviceEnroll` transcript (proof of possession).
+    pub new_device_signature: Vec<u8>,
+}
+
 /// Challenge returned by [`AuthService::enroll_device_begin`] — the reserved id + nonce for the
 /// NEW device, which the trusted device signs to authorize (ADR-0008).
 pub struct EnrollChallenge {
@@ -336,6 +358,142 @@ impl AuthService {
     /// The account's devices (for the management list). Public keys included; nothing secret.
     pub fn list_devices(&self, account_id: &AccountId) -> Result<Vec<DeviceRecord>> {
         Ok(self.devices.list_devices(account_id)?)
+    }
+
+    // ----- Account recovery (ADR-0003, R-304) ---------------------------------------
+
+    /// Minimum length of a recovery secret. Recovery secrets are **generated** high-entropy codes
+    /// (not user-chosen), so this is a sanity floor, not a strength policy.
+    pub const MIN_RECOVERY_SECRET_CHARS: usize = 20;
+
+    /// Set (or replace) the account's recovery secret, stored only as an Argon2id hash. Called by
+    /// an authenticated device (the caller must already hold an active device — recovery is set up
+    /// while you still have access). A too-short secret is a client-correctable `WeakPassword`.
+    pub fn set_recovery_secret(&self, account: &AccountDevice, secret: &str) -> Result<()> {
+        // The caller's device must be active (defense in depth; the API also authenticates it).
+        self.devices
+            .device(&account.device_id)?
+            .filter(|d| !d.revoked && d.account_id == account.account_id)
+            .ok_or(AuthError::Denied)?;
+        if secret.chars().count() < Self::MIN_RECOVERY_SECRET_CHARS {
+            return Err(AuthError::WeakPassword);
+        }
+        let phc = password::hash_password(&self.argon2, secret)?;
+        if !self.creds.set_recovery_phc(&account.account_id, &phc)? {
+            return Err(AuthError::Denied);
+        }
+        Ok(())
+    }
+
+    /// Stage 1 of recovery: reserve a NEW device id + nonce for the recovering device to self-sign.
+    /// Enumeration-resistant — a real (stored) challenge only when the username exists; otherwise
+    /// an unstored decoy with random ids, so the response does not reveal account existence.
+    pub fn recover_begin(&self, username: &str) -> RecoveryChallenge {
+        let account = normalize_username(username)
+            .ok()
+            .and_then(|u| self.creds.find_by_username(&u).ok().flatten());
+        let device_id = DeviceId::random();
+        let txn_id = TxnId::random();
+        let nonce = random_bytes::<32>();
+        let expires_at = self.clock.now_unix() + self.config.challenge_ttl_secs;
+        match account {
+            Some(acct) => {
+                // Store a real challenge only when a recovery secret is actually set.
+                if matches!(self.creds.recovery_phc(&acct.account_id), Ok(Some(_))) {
+                    let _ = self.challenges.put(ChallengeRecord {
+                        txn_id,
+                        account_id: acct.account_id,
+                        device_id,
+                        action: Action::DeviceEnroll,
+                        nonce,
+                        expires_at,
+                    });
+                }
+                RecoveryChallenge {
+                    account_id: acct.account_id,
+                    device_id,
+                    txn_id,
+                    nonce,
+                    expires_at,
+                }
+            }
+            None => RecoveryChallenge {
+                account_id: AccountId::random(),
+                device_id,
+                txn_id,
+                nonce,
+                expires_at,
+            },
+        }
+    }
+
+    /// Stage 2 of recovery: verify the recovery secret AND the new device's proof-of-possession,
+    /// then enroll the new device and provision it a session. Recovery restores **account access**,
+    /// not E2EE message history: the new device has a fresh MLS identity and is re-added to
+    /// conversations by other members via MLS commits (ADR-0009); no history is silently restored.
+    pub fn recover_finish(&self, req: RecoveryRequest) -> Result<Session> {
+        // Burn the single-use challenge regardless of outcome.
+        let challenge = self.challenges.consume(&req.txn_id)?;
+        let account = normalize_username(&req.username)
+            .ok()
+            .and_then(|u| self.creds.find_by_username(&u).ok().flatten());
+
+        // Always run exactly one Argon2 verification (real or dummy) so timing does not reveal
+        // whether the account exists or has a recovery secret.
+        let phc = account
+            .as_ref()
+            .and_then(|a| self.creds.recovery_phc(&a.account_id).ok().flatten());
+        let secret_ok = match &phc {
+            Some(h) => {
+                password::verify_password(&self.argon2, &req.recovery_secret, h).unwrap_or(false)
+            }
+            None => {
+                let _ =
+                    password::verify_password(&self.argon2, &req.recovery_secret, &self.dummy_hash);
+                false
+            }
+        };
+
+        let (challenge, account) = match (challenge, account) {
+            (Some(c), Some(a)) if c.account_id == a.account_id && secret_ok => (c, a),
+            _ => return Err(AuthError::Denied),
+        };
+        self.check_challenge(&challenge, Action::DeviceEnroll)?;
+
+        // The recovering device proves possession of its key (self-signed, like registration).
+        let transcript = Transcript {
+            action: Action::DeviceEnroll,
+            account_id: &account.account_id,
+            device_id: &challenge.device_id,
+            public_key: &req.new_device_public_key,
+            challenge: &challenge.nonce,
+            expires_at: challenge.expires_at,
+            txn_id: &req.txn_id,
+        };
+        if !verify_p256(
+            &req.new_device_public_key,
+            &transcript.encode(),
+            &req.new_device_signature,
+        ) {
+            return Err(AuthError::Denied);
+        }
+
+        let added = self.devices.add_active_device(
+            DeviceRecord {
+                device_id: challenge.device_id,
+                account_id: account.account_id,
+                public_key: req.new_device_public_key,
+                revoked: false,
+            },
+            Self::MAX_ACTIVE_DEVICES,
+        )?;
+        if !added {
+            return Err(AuthError::Denied);
+        }
+        self.mint_session_new_family(AccountDevice {
+            account_id: account.account_id,
+            device_id: challenge.device_id,
+        })
     }
 
     /// Revoke a device **only if it belongs to `account_id`** (device management, ADR-0008).
