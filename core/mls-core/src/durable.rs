@@ -26,7 +26,7 @@ use aes_gcm::Aes256Gcm;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
-use crate::content::{Content, ContentError, SECRET_ID_LEN};
+use crate::content::{Content, ContentError, DELIVERY_KEY_LEN, SECRET_ID_LEN};
 use crate::secret::{SecretRecord, SecretSide, SecretState};
 use crate::{Conversation, Incoming, Member};
 
@@ -153,6 +153,12 @@ pub enum InboundOutcome {
     /// this device held that secret it is now `Consumed`; otherwise this is a harmless no-op.
     SecretConsumedRemotely {
         secret_id: [u8; SECRET_ID_LEN],
+    },
+    /// A **delivery-key grant** arrived (ADR-0014 Slice 2c): an approved contact shared their
+    /// sealed-sender delivery access key `K_r` over the E2EE channel. The client stores it (keyed by
+    /// the sender) to later send that contact sealed-sender messages. Not a user-visible message.
+    DeliveryKeyGranted {
+        key_r: [u8; DELIVERY_KEY_LEN],
     },
 }
 
@@ -665,6 +671,16 @@ impl<J: Journal> DurableSession<J> {
         Ok((local_id, secret_id))
     }
 
+    /// Queue a **delivery-key grant** (ADR-0014 Slice 2c): share this account's sealed-sender
+    /// delivery access key `K_r` with an approved contact over the E2EE channel. It rides the same
+    /// authenticated MLS pipeline as any message; the relay never sees `K_r`. Returns a local id.
+    pub fn enqueue_delivery_key_grant(
+        &mut self,
+        key_r: &[u8; DELIVERY_KEY_LEN],
+    ) -> Result<u64, DurableError> {
+        self.enqueue_content(Content::DeliveryKeyGrant { key_r: *key_r }, None)
+    }
+
     fn enqueue_content(
         &mut self,
         content: Content,
@@ -751,8 +767,9 @@ impl<J: Journal> DurableSession<J> {
                     secret_id: Some(*secret_id),
                 })
             }
-            // A consumption control message (ADR-0015) is not user-visible — no message log entry.
-            Content::SecretConsumed { .. } => None,
+            // A consumption control message (ADR-0015) / delivery-key grant (ADR-0014 Slice 2c) is
+            // not user-visible — no message log entry.
+            Content::SecretConsumed { .. } | Content::DeliveryKeyGrant { .. } => None,
         };
         if let Some(display) = display {
             meta.messages.push(display);
@@ -1020,6 +1037,9 @@ fn apply_incoming(
                 }
                 InboundOutcome::SecretConsumedRemotely { secret_id }
             }
+            // ADR-0014 Slice 2c: an approved contact granted us their sealed delivery key. Surface it
+            // to the client to store (keyed by sender); no message-log entry.
+            Content::DeliveryKeyGrant { key_r } => InboundOutcome::DeliveryKeyGranted { key_r },
         },
         Incoming::StateAdvanced => InboundOutcome::StateAdvanced,
     })
