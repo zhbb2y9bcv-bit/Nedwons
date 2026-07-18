@@ -1,0 +1,68 @@
+# Secret Messages — what they protect, and what they do not
+
+Secret Messages ("view-once") let a sender share a short text that the recipient can open **once**,
+for a fixed viewing window, after which SENTINEL cannot show it again. This document is deliberately
+honest about the boundary of that promise. **Do not represent Secret Messages as doing more than
+this list.**
+
+## What a Secret Message is
+
+- A normal SENTINEL message in every cryptographic respect: end-to-end encrypted with the same MLS
+  ciphersuite, the same sender authentication, group-membership enforcement, replay protection, and
+  crash-safe delivery as any other message. There is **no** second, weaker path.
+- Classified and carried **inside** the MLS ciphertext (an application-content envelope). The relay
+  never learns that a message is secret, nor its contents — it forwards the same opaque bytes as for
+  any message. There is no server route that says "this is secret".
+- Governed by a one-way, crash-safe state machine enforced in the Rust core:
+  `Sealed → Countdown (3s) → Visible (10s) → Consumed (tombstone)`.
+
+## What "can never be seen again" means (precisely)
+
+It means: **once consumed, the message cannot be reopened through SENTINEL.** The plaintext is
+scrubbed from on-device storage, the state is durably `Consumed`, and:
+
+- Tapping again does nothing — there is no second viewing opportunity.
+- Backgrounding, locking, rotating, app-switching, or **changing the system clock** cannot extend or
+  restart the window (the timer is monotonic elapsed time, not wall-clock).
+- If the app crashes or is killed after a reveal begins, it **fails closed** on relaunch: the
+  message is marked consumed and is not reopened.
+- A replayed or duplicated delivery does not grant a new viewing opportunity.
+
+## What it does NOT protect against — no exceptions
+
+These are outside what any messaging app can prevent, and SENTINEL does not claim otherwise:
+
+- **Screenshots.** iOS reports a screenshot only *as or after* it is taken. SENTINEL reacts to
+  `UIApplication.userDidTakeScreenshotNotification` by immediately expiring the view and removing the
+  plaintext, and uses the task-switcher privacy cover — but a screenshot already captured is out of
+  our hands. This is **detection and fast reaction, not prevention.**
+- **Screen recording / mirroring / AirPlay.** If `UIScreen.isCaptured` is (or becomes) true while a
+  secret is open, SENTINEL obscures/expires it. A recording that started before, or a capture path
+  we cannot observe, is not prevented.
+- **An external camera** photographing the screen. Impossible to prevent by any software.
+- **A compromised device or OS.** Jailbreak, malware, a hostile keyboard/screen-reader, or a
+  modified OS can read anything the legitimate app can. E2EE protects data in transit and at rest on
+  the server, **not** a device already under an attacker's control.
+- **Forensic recovery from flash storage.** Scrubbing is best-effort at the language/OS level;
+  wear-levelling and controller caches mean deleted bytes may physically persist. We do not promise
+  cryptographic erasure of consumed plaintext from the flash medium.
+- **The recipient's intent.** A determined recipient who is meant to see the message once can
+  memorise, transcribe, or photograph it. View-once raises friction; it is not DRM.
+
+## Multi-device
+
+The current implementation enforces the single-view guarantee **per device**. Account-wide
+single-consumption across a user's multiple devices (so opening on phone A also consumes it on
+tablet B) is **not implemented or verified** — it requires encrypted cross-device synchronization of
+the consumption state, designed in [ADR-0015](adr/0015-secret-message-multidevice.md) (Proposed).
+Until that ships, treat the guarantee as **single-device**.
+
+## Where the enforcement lives (for reviewers)
+
+The security-critical logic is in Rust (`core/mls-core/src/content.rs`, `secret.rs`, `durable.rs`),
+reached over the UniFFI `MlsClient` surface (`core/mls-ffi`). The SwiftUI overlay
+(`apps/ios/SentinelKit/Sources/SentinelUI/SecretMessage*.swift`) is presentation only — it never
+enforces a deadline or holds plaintext beyond a frame, and it forwards every decision to the Rust
+core. Tests: `core/mls-core/tests/secret.rs`, `core/mls-ffi/tests/secret.rs`, the fake-clock
+view-model tests, and the real-core view-model tests in `apps/ios/SentinelApp`. The reveal state
+machine is continuously fuzzed (`core/mls-ffi/fuzz/fuzz_targets/secret_state.rs`).
