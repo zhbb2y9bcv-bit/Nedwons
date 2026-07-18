@@ -284,3 +284,71 @@ async fn responses_carry_security_headers() {
     // HSTS is set at the TLS ingress, not by the app.
     assert!(h.get("strict-transport-security").is_none());
 }
+
+/// Sealed-sender certificate issuance (ADR-0012, R-204): the authenticated device receives a
+/// certificate whose signature verifies under the returned cert public key, that binds the
+/// device's own public key, and that carries a future expiry. An unauthenticated request is 401.
+#[tokio::test]
+async fn sender_certificate_issued_and_verifies() {
+    use auth_core::sender_cert::SenderCert;
+
+    let app = make_app(100_000).await;
+    let username = unique_username("sc");
+    let (device, session) = http_register(&app, &username).await;
+    let token = session["access_token"].as_str().unwrap();
+
+    let (status, cert) = get_auth(&app, "/v1/sender-certificate", token).await;
+    assert_eq!(status, StatusCode::OK, "issue: {cert}");
+
+    // The certificate binds this device's own public key and identity.
+    assert_eq!(
+        cert["account_id"].as_str().unwrap(),
+        session["account_id"].as_str().unwrap()
+    );
+    assert_eq!(
+        cert["device_id"].as_str().unwrap(),
+        session["device_id"].as_str().unwrap()
+    );
+    assert_eq!(
+        cert["sender_public_key"].as_str().unwrap(),
+        hex::encode(&device.public_key)
+    );
+
+    // The signature verifies under the returned cert public key at a present time.
+    let account_id = AccountId(id16_from_hex(cert["account_id"].as_str().unwrap()));
+    let device_id = DeviceId(id16_from_hex(cert["device_id"].as_str().unwrap()));
+    let sender_public_key = hex::decode(cert["sender_public_key"].as_str().unwrap()).unwrap();
+    let expires_at = cert["expires_at"].as_u64().unwrap();
+    let signature = hex::decode(cert["signature"].as_str().unwrap()).unwrap();
+    let cert_public_key = hex::decode(cert["cert_public_key"].as_str().unwrap()).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert!(expires_at > now, "certificate expiry must be in the future");
+
+    let rebuilt = SenderCert {
+        account_id: &account_id,
+        device_id: &device_id,
+        sender_public_key: &sender_public_key,
+        expires_at,
+    };
+    assert!(
+        rebuilt.verify(&cert_public_key, &signature, now),
+        "signature must verify under the returned cert public key"
+    );
+    // A tampered public key must NOT verify (the signature is over the exact bound key).
+    let mut wrong_key = sender_public_key.clone();
+    wrong_key[10] ^= 0x01;
+    let tampered = SenderCert {
+        account_id: &account_id,
+        device_id: &device_id,
+        sender_public_key: &wrong_key,
+        expires_at,
+    };
+    assert!(!tampered.verify(&cert_public_key, &signature, now));
+
+    // Unauthenticated request is rejected.
+    let (status, _) = get_auth(&app, "/v1/sender-certificate", "zz").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
