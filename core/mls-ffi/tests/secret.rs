@@ -226,6 +226,56 @@ fn consumption_control_message_over_the_ffi() {
 }
 
 #[test]
+fn self_group_three_device_add_and_revocation_rekey_across_the_ffi() {
+    // Four devices of one account, each with its own durable session (so each is Active and can
+    // hold a self-group). This exercises the FFI surface: a 3rd-device add whose WRAPPED commit an
+    // existing member applies via process_self_inbound, and remove_self_device re-keying the group.
+    let phone = MlsClient::create_group(b"phone".to_vec(), tmp("p"), key()).unwrap();
+    let tablet = MlsClient::create_group(b"tablet".to_vec(), tmp("t"), key()).unwrap();
+    let laptop = MlsClient::create_group(b"laptop".to_vec(), tmp("l"), key()).unwrap();
+    let watch = MlsClient::create_group(b"watch".to_vec(), tmp("w"), key()).unwrap();
+
+    // Build a 3-device self-group: phone creates, adds tablet, then adds laptop (existing member
+    // tablet must apply the laptop-add commit — the wrapped-commit path).
+    phone.create_self_group().unwrap();
+    let add_t = phone
+        .add_self_device(tablet.key_package().unwrap())
+        .unwrap();
+    tablet.join_self_group(add_t.welcome).unwrap();
+    let add_l = phone
+        .add_self_device(laptop.key_package().unwrap())
+        .unwrap();
+    assert!(matches!(
+        tablet.process_self_inbound(1, add_l.commit).unwrap(),
+        InboundResult::StateAdvanced
+    ));
+    laptop.join_self_group(add_l.welcome).unwrap();
+    assert!(phone.has_self_group().unwrap() && laptop.has_self_group().unwrap());
+
+    // Revoke the laptop: an existing device re-keys the self-group with a remove-commit; the
+    // remaining member (tablet) applies it, advancing the epoch.
+    let remove = phone.remove_self_device(b"laptop".to_vec()).unwrap();
+    assert!(matches!(
+        tablet.process_self_inbound(2, remove).unwrap(),
+        InboundResult::StateAdvanced
+    ));
+
+    // A subsequent self-group commit (adding a watch) is on the NEW epoch. Tablet applies it; the
+    // removed laptop — handed the exact bytes — CANNOT decrypt it (forward secrecy over the FFI).
+    let add_w = phone.add_self_device(watch.key_package().unwrap()).unwrap();
+    assert!(matches!(
+        tablet
+            .process_self_inbound(3, add_w.commit.clone())
+            .unwrap(),
+        InboundResult::StateAdvanced
+    ));
+    assert!(
+        laptop.process_self_inbound(4, add_w.commit).is_err(),
+        "a revoked device cannot decrypt post-revocation self-group traffic"
+    );
+}
+
+#[test]
 fn consumption_over_the_self_group_across_the_ffi() {
     // ADR-0015 option 3 through the generated surface: the consumption message is routed over the
     // account's device self-group (phone + tablet), which the sender (alice) is not a member of.

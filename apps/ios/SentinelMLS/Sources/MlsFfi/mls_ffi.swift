@@ -532,9 +532,11 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func addMember(keyPackage: Data) throws  -> AddOutcome
     
     /**
-     * Add another of this account's devices to the self-group by its key-package bytes. Returns
-     * commit + welcome (deliver to existing devices / the new device). `WrongState` if no self-group
-     * exists yet.
+     * Add another of this account's devices to the self-group by its key-package bytes. Returns a
+     * **wrapped** `commit` (deliver to the EXISTING self-group members, who apply it via
+     * [`Self::process_self_inbound`], which unwraps) plus the **raw** `welcome` (deliver to the new
+     * device, which applies it via [`Self::join_self_group`], which does not unwrap). `WrongState`
+     * if no self-group exists yet.
      */
     func addSelfDevice(keyPackage: Data) throws  -> AddOutcome
     
@@ -675,6 +677,14 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
      * contract as [`Self::process_inbound`]. `WrongState` if no self-group is established here.
      */
     func processSelfInbound(envelopeId: UInt64, ciphertext: Data) throws  -> InboundResult
+    
+    /**
+     * Remove a device from the self-group by its credential `identity` (used when that device is
+     * revoked from the account). Returns the MLS remove-commit to fan out to the remaining
+     * self-group members; applying it advances the epoch so the removed device can no longer decrypt
+     * self-group traffic. `WrongState` if there is no self-group; `NotFound` if no such member.
+     */
+    func removeSelfDevice(identity: Data) throws  -> Data
     
     /**
      * Build (once) the **consumption control message** for a secret this device revealed (ADR-0015,
@@ -845,9 +855,11 @@ open func addMember(keyPackage: Data)throws  -> AddOutcome  {
 }
     
     /**
-     * Add another of this account's devices to the self-group by its key-package bytes. Returns
-     * commit + welcome (deliver to existing devices / the new device). `WrongState` if no self-group
-     * exists yet.
+     * Add another of this account's devices to the self-group by its key-package bytes. Returns a
+     * **wrapped** `commit` (deliver to the EXISTING self-group members, who apply it via
+     * [`Self::process_self_inbound`], which unwraps) plus the **raw** `welcome` (deliver to the new
+     * device, which applies it via [`Self::join_self_group`], which does not unwrap). `WrongState`
+     * if no self-group exists yet.
      */
 open func addSelfDevice(keyPackage: Data)throws  -> AddOutcome  {
     return try  FfiConverterTypeAddOutcome_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -1110,6 +1122,20 @@ open func processSelfInbound(envelopeId: UInt64, ciphertext: Data)throws  -> Inb
     uniffi_mls_ffi_fn_method_mlsclient_process_self_inbound(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(envelopeId),
         FfiConverterData.lower(ciphertext),$0
+    )
+})
+}
+    
+    /**
+     * Remove a device from the self-group by its credential `identity` (used when that device is
+     * revoked from the account). Returns the MLS remove-commit to fan out to the remaining
+     * self-group members; applying it advances the epoch so the removed device can no longer decrypt
+     * self-group traffic. `WrongState` if there is no self-group; `NotFound` if no such member.
+     */
+open func removeSelfDevice(identity: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_remove_self_device(self.uniffiClonePointer(),
+        FfiConverterData.lower(identity),$0
     )
 })
 }
@@ -2333,7 +2359,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_add_member() != 6758) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_add_self_device() != 51482) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_add_self_device() != 53993) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_begin_secret_reveal() != 18181) {
@@ -2400,6 +2426,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_process_self_inbound() != 48161) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_remove_self_device() != 26301) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_secret_consumption_envelope() != 12709) {

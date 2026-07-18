@@ -467,6 +467,26 @@ impl<J: Journal> DurableSession<J> {
         self.commit(meta)
     }
 
+    /// Remove a device from the self-group by its credential `identity` (e.g. when that device is
+    /// **revoked** from the account). Returns the MLS remove-commit to fan out to the remaining
+    /// self-group members; applying it advances the epoch so the removed device — even if it still
+    /// holds old ratchet state or is handed later ciphertext — can no longer decrypt self-group
+    /// traffic (cryptographic forward secrecy, not merely relay-side exclusion). The advanced state
+    /// is persisted before returning. Errors with [`DurableError::SelfGroup`] if there is no
+    /// self-group here, or [`DurableError::Mls`] if no such member exists.
+    pub fn remove_self_device(&mut self, identity: &[u8]) -> Result<Vec<u8>, DurableError> {
+        let commit = {
+            let Session {
+                member, self_group, ..
+            } = &mut self.session;
+            let group = self_group.as_mut().ok_or(DurableError::SelfGroup)?;
+            group.remove_member(member, identity)?
+        };
+        let meta = self.meta.clone();
+        self.commit(meta)?;
+        Ok(commit)
+    }
+
     // ----- Staged commits for MLS-commit-authoritative membership (ADR-0010) ------------------
     //
     // Staging is deliberately NOT persisted: an in-flight commit awaiting the server's epoch CAS

@@ -696,6 +696,25 @@ impl PgRelay {
         Ok(())
     }
 
+    /// Drop a device from its account's self-group membership (housekeeping when the device is
+    /// revoked). Idempotent. The *cryptographic* re-key is a client action (an existing device issues
+    /// an MLS remove-commit); this just stops the relay routing self-group traffic to it and keeps
+    /// the pending-devices view accurate. Returns rows removed.
+    pub fn remove_self_group_member(
+        &self,
+        account: &AccountId,
+        device: &DeviceId,
+    ) -> StoreResult<u64> {
+        let mut conn = self.conn()?;
+        let removed = conn
+            .execute(
+                "DELETE FROM self_group_members WHERE account_id = $1 AND device_id = $2",
+                &[&account.as_bytes(), &device.as_bytes()],
+            )
+            .map_err(db_err)?;
+        Ok(removed)
+    }
+
     /// True if `device` is a joined member of `account`'s self-group.
     pub fn is_self_group_member(
         &self,
