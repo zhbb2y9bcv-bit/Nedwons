@@ -897,3 +897,36 @@ fn password_pepper_is_mixed_into_hashing() {
         Err(AuthError::Denied)
     ));
 }
+
+#[test]
+fn recovery_locks_out_after_repeated_failures() {
+    let (service, clock) = make_service();
+    let (_device_a, reg) = register(&service, "recover_lockout");
+    let trusted = AccountDevice {
+        account_id: reg.account_id,
+        device_id: reg.device_id,
+    };
+    service
+        .set_recovery_secret(&trusted, RECOVERY_SECRET)
+        .expect("set recovery");
+
+    // Burn through the failure ceiling with a wrong secret.
+    for _ in 0..AuthService::MAX_RECOVERY_FAILURES {
+        let d = TestDevice::new();
+        assert!(matches!(
+            recover(&service, "recover_lockout", "the-wrong-secret-000000", &d),
+            Err(AuthError::Denied)
+        ));
+    }
+    // Now even the CORRECT secret is refused — recovery is locked out.
+    let d = TestDevice::new();
+    assert!(matches!(
+        recover(&service, "recover_lockout", RECOVERY_SECRET, &d),
+        Err(AuthError::Denied)
+    ));
+
+    // After the cooldown elapses, the correct secret recovers the account again.
+    clock.advance(AuthService::RECOVERY_LOCKOUT_SECS + 1);
+    let d2 = TestDevice::new();
+    assert!(recover(&service, "recover_lockout", RECOVERY_SECRET, &d2).is_ok());
+}
