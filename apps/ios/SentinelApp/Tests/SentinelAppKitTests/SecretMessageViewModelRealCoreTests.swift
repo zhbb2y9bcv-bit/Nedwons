@@ -99,6 +99,36 @@ final class SecretMessageViewModelRealCoreTests: XCTestCase {
         XCTAssertEqual(vm.display, .tombstone)
     }
 
+    /// ADR-0015 through Swift: revealing via the engine (with a broadcast path) EMITS a consumption
+    /// envelope that a peer group member applies as `.secretConsumedRemotely`. This proves the
+    /// adapter's fan-out wiring over the real core; the full two-recipient-device semantics (where
+    /// the peer's OWN copy is consumed) are proven in `mls-core`'s
+    /// `revealing_on_one_device_consumes_it_on_the_other`.
+    func testRevealFansOutAConsumptionMessageAPeerApplies() throws {
+        // `sender` sends a secret to `me`; `sender` is also the peer that applies the consumption.
+        let sender = try MlsClient.createGroup(
+            identity: Data("sender".utf8), dbPath: tmp("s"), atRestKey: key)
+        let me = try MlsClient.newJoiner(identity: Data("me".utf8), dbPath: tmp("me"), atRestKey: key)
+        let add = try sender.addMember(keyPackage: try me.keyPackage())
+        try me.joinGroup(welcome: add.welcome)
+
+        let handle = try sender.enqueueSecret(body: Data("shared".utf8))
+        let env = try sender.encrypt(localId: handle.localId)
+        _ = try me.processInbound(envelopeId: 1, ciphertext: env)  // `me` holds it sealed
+
+        // Reveal on `me` via the engine, capturing the broadcast consumption envelope.
+        var broadcast: Data?
+        let engine = MlsClientSecretEngine(client: me) { broadcast = $0 }
+        let vm = SecretMessageViewModel(secretID: handle.secretId, engine: engine, clock: FakeClock(0))
+        vm.beginReveal()
+
+        let consumption = try XCTUnwrap(broadcast, "reveal should fan out a consumption message")
+        guard case let .secretConsumedRemotely(sid) = try sender.processInbound(
+            envelopeId: 2, ciphertext: consumption)
+        else { return XCTFail("peer should see a consumption message") }
+        XCTAssertEqual(sid, handle.secretId)
+    }
+
     func testTombstoneTextComesFromTheRealCore() throws {
         let (bob, _) = try deliverSecret("x")
         let engine = MlsClientSecretEngine(client: bob)
