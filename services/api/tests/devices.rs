@@ -232,3 +232,57 @@ async fn enrolled_device_binding_is_logged_in_transparency() {
     assert!(logged.contains(&device_a_id), "original device logged");
     assert!(logged.contains(&device_b_id), "enrolled device logged too");
 }
+
+/// Revoking a device publishes a **revocation** leaf to the transparency log, so a device *removal*
+/// is auditable under the signed root — not just additions (ADR-0013 Slice 2, R-201). The original
+/// binding leaf still verifies unchanged, so an existing self-monitor is undisturbed.
+#[tokio::test]
+async fn device_revocation_is_logged_in_transparency() {
+    let app = make_app(100_000).await;
+    let (device_a, session_a) = http_register(&app, &unique_username("ktrev")).await;
+    let token_a = session_a["access_token"].as_str().unwrap();
+    let account = session_a["account_id"].as_str().unwrap();
+
+    let device_b = TestDevice::new();
+    let (status, session_b) = enroll_device(&app, token_a, account, &device_a, &device_b).await;
+    assert_eq!(status, StatusCode::OK);
+    let device_b_id = session_b["device_id"].as_str().unwrap().to_string();
+
+    // Revoke B from the trusted device A.
+    let (status, _) = post_json_auth(
+        &app,
+        "/v1/devices/revoke",
+        token_a,
+        json!({ "device_id": device_b_id }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (_, sth) = get_auth(&app, "/v1/transparency/sth", token_a).await;
+    let tree_size = sth["tree_size"].as_u64().unwrap();
+    let (status, view) = get_auth(
+        &app,
+        &format!("/v1/transparency/account/{account}?tree_size={tree_size}"),
+        token_a,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let leaves = view["bindings"].as_array().unwrap();
+
+    // Exactly one leaf is a revocation of device B, carrying revoked_at.
+    let revocations: Vec<&serde_json::Value> = leaves
+        .iter()
+        .filter(|b| {
+            b["device_id"].as_str() == Some(device_b_id.as_str()) && b["revoked_at"].is_u64()
+        })
+        .collect();
+    assert_eq!(revocations.len(), 1, "one revocation leaf for B: {view}");
+    assert!(revocations[0]["revoked_at"].as_u64().unwrap() > 0);
+
+    // B's original BINDING leaf is still present and is NOT marked revoked — the append-only history
+    // keeps both, so an existing self-monitor (which reads the earliest leaf) is unaffected.
+    let binding_for_b = leaves.iter().find(|b| {
+        b["device_id"].as_str() == Some(device_b_id.as_str()) && b["revoked_at"].is_null()
+    });
+    assert!(binding_for_b.is_some(), "B's binding leaf still present");
+}
