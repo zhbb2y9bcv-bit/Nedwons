@@ -24,10 +24,16 @@ scripts/build_mls_ffi.sh
 # host integration test (links the macOS slice; no simulator needed)
 cd apps/ios/SentinelMLS && swift test
 
-# compile/link the device + simulator slices (device is compile-only — no run without hardware)
-xcodebuild build -scheme SentinelMLS -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO
-xcodebuild build -scheme SentinelMLS -destination 'generic/platform=iOS'           CODE_SIGNING_ALLOWED=NO
+# RUN the same tests in the iOS simulator (ios-arm64-simulator slice)
+scripts/test_mls_sim.sh
+
+# compile/link the device slice (compile-only — running needs a physical iPhone, R-101)
+xcodebuild build -scheme SentinelMLS -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO
 ```
+
+Note: the simulator run uses a derived-data path **outside** TCC-protected folders
+(Desktop/Documents) — the simulator's xctest runner cannot read bundles there and fails with a
+misleading "bundle does not exist" error. `scripts/test_mls_sim.sh` handles this.
 
 ## Security boundary
 
