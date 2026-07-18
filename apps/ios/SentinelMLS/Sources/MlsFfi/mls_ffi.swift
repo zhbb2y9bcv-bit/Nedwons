@@ -590,6 +590,14 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func enqueue(plaintext: Data) throws  -> UInt64
     
     /**
+     * Queue a **delivery-key grant** (ADR-0014 Slice 2c): share this account's sealed-sender
+     * delivery access key `K_r` (exactly 32 bytes) with an approved contact over the E2EE channel.
+     * The relay never sees `K_r`. Returns the outbound local id; `encrypt`/`mark_sent` then proceed
+     * exactly as for a normal message.
+     */
+    func enqueueDeliveryKeyGrant(keyR: Data) throws  -> UInt64
+    
+    /**
      * Queue a **secret** message. The classification + body are wrapped in the content envelope
      * that MLS then encrypts, so the relay never learns it is secret. Same bounds as a normal
      * message. Returns the outbound local id + the 16-byte secret id; `encrypt`/`mark_sent` then
@@ -954,6 +962,20 @@ open func enqueue(plaintext: Data)throws  -> UInt64  {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_enqueue(self.uniffiClonePointer(),
         FfiConverterData.lower(plaintext),$0
+    )
+})
+}
+    
+    /**
+     * Queue a **delivery-key grant** (ADR-0014 Slice 2c): share this account's sealed-sender
+     * delivery access key `K_r` (exactly 32 bytes) with an approved contact over the E2EE channel.
+     * The relay never sees `K_r`. Returns the outbound local id; `encrypt`/`mark_sent` then proceed
+     * exactly as for a normal message.
+     */
+open func enqueueDeliveryKeyGrant(keyR: Data)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_enqueue_delivery_key_grant(self.uniffiClonePointer(),
+        FfiConverterData.lower(keyR),$0
     )
 })
 }
@@ -1858,6 +1880,13 @@ public enum InboundResult {
      */
     case secretConsumedRemotely(secretId: Data
     )
+    /**
+     * A **delivery-key grant** arrived (ADR-0014 Slice 2c): an approved contact shared their
+     * sealed-sender delivery access key `K_r` (32 bytes) over the E2EE channel. Store it keyed by
+     * the sender to later send that contact sealed messages. No user-visible content.
+     */
+    case deliveryKeyGranted(keyR: Data
+    )
 }
 
 
@@ -1886,6 +1915,9 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         )
         
         case 5: return .secretConsumedRemotely(secretId: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 6: return .deliveryKeyGranted(keyR: try FfiConverterData.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -1917,6 +1949,11 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         case let .secretConsumedRemotely(secretId):
             writeInt(&buf, Int32(5))
             FfiConverterData.write(secretId, into: &buf)
+            
+        
+        case let .deliveryKeyGranted(keyR):
+            writeInt(&buf, Int32(6))
+            FfiConverterData.write(keyR, into: &buf)
             
         }
     }
@@ -2384,6 +2421,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue() != 8616) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue_delivery_key_grant() != 37119) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue_secret() != 25668) {
