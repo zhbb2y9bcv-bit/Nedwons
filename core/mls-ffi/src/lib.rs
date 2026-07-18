@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use mls_core::client::{
     MAX_ENVELOPE_LEN, MAX_IDENTITY_LEN, MAX_KEY_PACKAGE_LEN, MAX_PLAINTEXT_LEN, MAX_WELCOME_LEN,
 };
-use mls_core::content::SECRET_ID_LEN;
+use mls_core::content::{HistoryEntry as CoreHistoryEntry, SECRET_ID_LEN};
 use mls_core::durable::{
     Direction as CoreDirection, DurableError, DurableSession, FileJournal, InMemoryJournal,
     InboundOutcome, JournalKind, Message as CoreMessage, BLOB_FORMAT_VERSION,
@@ -118,6 +118,14 @@ pub struct SecretRemaining {
     pub view_ms: u64,
 }
 
+/// One past message in a history-sync batch (#7): `outbound` = this account sent it; `body` is the
+/// plaintext. Secrets are never included (view-once has no re-showable history).
+#[derive(uniffi::Record)]
+pub struct HistoryEntry {
+    pub outbound: bool,
+    pub body: Vec<u8>,
+}
+
 /// Result of processing an inbound envelope.
 #[derive(Debug, uniffi::Enum)]
 pub enum InboundResult {
@@ -138,6 +146,9 @@ pub enum InboundResult {
     /// sealed-sender delivery access key `K_r` (32 bytes) over the E2EE channel. Store it keyed by
     /// the sender to later send that contact sealed messages. No user-visible content.
     DeliveryKeyGranted { key_r: Vec<u8> },
+    /// A **history-sync** batch arrived (#7): `count` past messages were appended to this
+    /// newly-linked device's message log.
+    HistorySynced { count: u64 },
 }
 
 /// Capability/version record so the Swift side can assert it links a compatible core and refuse on
@@ -514,6 +525,44 @@ impl MlsClient {
         })
     }
 
+    /// The most recent (up to `max`) non-secret messages, as a history batch to replicate to a
+    /// newly-linked device (#7). Secrets are excluded (view-once).
+    pub fn history_entries(&self, max: u32) -> Result<Vec<HistoryEntry>, MlsClientError> {
+        catch(move || {
+            let g = self.lock()?;
+            match &*g {
+                ClientState::Active { session } => Ok(session
+                    .history_entries(max as usize)
+                    .into_iter()
+                    .map(|e| HistoryEntry {
+                        outbound: e.outbound,
+                        body: e.body,
+                    })
+                    .collect()),
+                ClientState::Pending { .. } => Err(MlsClientError::WrongState),
+                ClientState::Closed => Err(MlsClientError::Closed),
+            }
+        })
+    }
+
+    /// Queue a **history-sync** batch (#7) to replicate `entries` to the account's newly-linked
+    /// device(s) over the self-group. `WrongState` if no self-group is established. Returns the
+    /// outbound local id; deliver it over the self-group as usual.
+    pub fn enqueue_history_sync(&self, entries: Vec<HistoryEntry>) -> Result<u64, MlsClientError> {
+        catch(move || {
+            let core: Vec<CoreHistoryEntry> = entries
+                .into_iter()
+                .map(|e| CoreHistoryEntry {
+                    outbound: e.outbound,
+                    body: e.body,
+                })
+                .collect();
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session.enqueue_history_sync(core).map_err(map_durable)
+        })
+    }
+
     /// Begin revealing a sealed secret (recipient tapped the placeholder). **Atomic + fail-closed:**
     /// the transition + deadlines are committed before this returns `Ok`. An invalid transition
     /// (double tap, replay, wrong state) or a failed state write returns `Err` and reveals nothing.
@@ -658,6 +707,7 @@ impl MlsClient {
                 InboundOutcome::DeliveryKeyGranted { key_r } => InboundResult::DeliveryKeyGranted {
                     key_r: key_r.to_vec(),
                 },
+                InboundOutcome::HistorySynced { count } => InboundResult::HistorySynced { count },
             })
         })
     }
@@ -697,6 +747,7 @@ impl MlsClient {
                 InboundOutcome::DeliveryKeyGranted { key_r } => InboundResult::DeliveryKeyGranted {
                     key_r: key_r.to_vec(),
                 },
+                InboundOutcome::HistorySynced { count } => InboundResult::HistorySynced { count },
             })
         })
     }

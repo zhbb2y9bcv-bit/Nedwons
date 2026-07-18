@@ -598,6 +598,13 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func enqueueDeliveryKeyGrant(keyR: Data) throws  -> UInt64
     
     /**
+     * Queue a **history-sync** batch (#7) to replicate `entries` to the account's newly-linked
+     * device(s) over the self-group. `WrongState` if no self-group is established. Returns the
+     * outbound local id; deliver it over the self-group as usual.
+     */
+    func enqueueHistorySync(entries: [HistoryEntry]) throws  -> UInt64
+    
+    /**
      * Queue a **secret** message. The classification + body are wrapped in the content envelope
      * that MLS then encrypts, so the relay never learns it is secret. Same bounds as a normal
      * message. Returns the outbound local id + the 16-byte secret id; `encrypt`/`mark_sent` then
@@ -614,6 +621,12 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
      * True if this client has an established device self-group.
      */
     func hasSelfGroup() throws  -> Bool
+    
+    /**
+     * The most recent (up to `max`) non-secret messages, as a history batch to replicate to a
+     * newly-linked device (#7). Secrets are excluded (view-once).
+     */
+    func historyEntries(max: UInt32) throws  -> [HistoryEntry]
     
     /**
      * Join the group described by a Welcome (produced by another member's `add_member`). Transitions
@@ -981,6 +994,19 @@ open func enqueueDeliveryKeyGrant(keyR: Data)throws  -> UInt64  {
 }
     
     /**
+     * Queue a **history-sync** batch (#7) to replicate `entries` to the account's newly-linked
+     * device(s) over the self-group. `WrongState` if no self-group is established. Returns the
+     * outbound local id; deliver it over the self-group as usual.
+     */
+open func enqueueHistorySync(entries: [HistoryEntry])throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_enqueue_history_sync(self.uniffiClonePointer(),
+        FfiConverterSequenceTypeHistoryEntry.lower(entries),$0
+    )
+})
+}
+    
+    /**
      * Queue a **secret** message. The classification + body are wrapped in the content envelope
      * that MLS then encrypts, so the relay never learns it is secret. Same bounds as a normal
      * message. Returns the outbound local id + the 16-byte secret id; `encrypt`/`mark_sent` then
@@ -1010,6 +1036,18 @@ open func epoch()throws  -> UInt64  {
 open func hasSelfGroup()throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_has_self_group(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * The most recent (up to `max`) non-secret messages, as a history batch to replicate to a
+     * newly-linked device (#7). Secrets are excluded (view-once).
+     */
+open func historyEntries(max: UInt32)throws  -> [HistoryEntry]  {
+    return try  FfiConverterSequenceTypeHistoryEntry.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_history_entries(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(max),$0
     )
 })
 }
@@ -1523,6 +1561,80 @@ public func FfiConverterTypeCapabilities_lower(_ value: Capabilities) -> RustBuf
 
 
 /**
+ * One past message in a history-sync batch (#7): `outbound` = this account sent it; `body` is the
+ * plaintext. Secrets are never included (view-once has no re-showable history).
+ */
+public struct HistoryEntry {
+    public var outbound: Bool
+    public var body: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(outbound: Bool, body: Data) {
+        self.outbound = outbound
+        self.body = body
+    }
+}
+
+#if compiler(>=6)
+extension HistoryEntry: Sendable {}
+#endif
+
+
+extension HistoryEntry: Equatable, Hashable {
+    public static func ==(lhs: HistoryEntry, rhs: HistoryEntry) -> Bool {
+        if lhs.outbound != rhs.outbound {
+            return false
+        }
+        if lhs.body != rhs.body {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(outbound)
+        hasher.combine(body)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeHistoryEntry: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> HistoryEntry {
+        return
+            try HistoryEntry(
+                outbound: FfiConverterBool.read(from: &buf), 
+                body: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: HistoryEntry, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.outbound, into: &buf)
+        FfiConverterData.write(value.body, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHistoryEntry_lift(_ buf: RustBuffer) throws -> HistoryEntry {
+    return try FfiConverterTypeHistoryEntry.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHistoryEntry_lower(_ value: HistoryEntry) -> RustBuffer {
+    return FfiConverterTypeHistoryEntry.lower(value)
+}
+
+
+/**
  * Result of queuing a secret message: the outbound local id plus its 16-byte secret id.
  */
 public struct SecretHandle {
@@ -1887,6 +1999,12 @@ public enum InboundResult {
      */
     case deliveryKeyGranted(keyR: Data
     )
+    /**
+     * A **history-sync** batch arrived (#7): `count` past messages were appended to this
+     * newly-linked device's message log.
+     */
+    case historySynced(count: UInt64
+    )
 }
 
 
@@ -1918,6 +2036,9 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         )
         
         case 6: return .deliveryKeyGranted(keyR: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 7: return .historySynced(count: try FfiConverterUInt64.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -1954,6 +2075,11 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         case let .deliveryKeyGranted(keyR):
             writeInt(&buf, Int32(6))
             FfiConverterData.write(keyR, into: &buf)
+            
+        
+        case let .historySynced(count):
+            writeInt(&buf, Int32(7))
+            FfiConverterUInt64.write(count, into: &buf)
             
         }
     }
@@ -2316,6 +2442,31 @@ fileprivate struct FfiConverterSequenceData: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeHistoryEntry: FfiConverterRustBuffer {
+    typealias SwiftType = [HistoryEntry]
+
+    public static func write(_ value: [HistoryEntry], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeHistoryEntry.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [HistoryEntry] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [HistoryEntry]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeHistoryEntry.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeStoredMessage: FfiConverterRustBuffer {
     typealias SwiftType = [StoredMessage]
 
@@ -2426,6 +2577,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue_delivery_key_grant() != 37119) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue_history_sync() != 45500) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue_secret() != 25668) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2433,6 +2587,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_has_self_group() != 40073) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_history_entries() != 63056) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_join_group() != 28817) {
