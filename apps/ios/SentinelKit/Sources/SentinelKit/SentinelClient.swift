@@ -274,11 +274,29 @@ public struct Conversation: Decodable, Sendable, Identifiable {
 
 public struct InboxEnvelope: Decodable, Sendable, Identifiable {
     public let id: Int
-    public let conversationID: String
-    public let senderDevice: String
+    /// Absent for a **sealed-sender** envelope (ADR-0014) — the relay never learned the
+    /// conversation; the client recovers it from the decrypted payload.
+    public let conversationID: String?
+    /// Absent for a **sealed-sender** envelope — the relay never learned the sender; the recipient
+    /// authenticates it via the sender certificate inside the E2EE payload.
+    public let senderDevice: String?
     public let ciphertext: String
+    /// True for a sealed envelope. Sealed ids are a SEPARATE id space from identified ones — ack
+    /// them via `ackInbox(sealedIds:)`, never via `ids`.
+    public let sealed: Bool
+
     enum CodingKeys: String, CodingKey {
-        case id, conversationID = "conversation_id", senderDevice = "sender_device", ciphertext
+        case id, conversationID = "conversation_id", senderDevice = "sender_device", ciphertext,
+            sealed
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decode(Int.self, forKey: .id)
+        conversationID = try c.decodeIfPresent(String.self, forKey: .conversationID)
+        senderDevice = try c.decodeIfPresent(String.self, forKey: .senderDevice)
+        ciphertext = try c.decode(String.self, forKey: .ciphertext)
+        sealed = try c.decodeIfPresent(Bool.self, forKey: .sealed) ?? false
     }
 }
 
@@ -582,11 +600,66 @@ public extension SentinelClient {
         return try decode(await perform(request))
     }
 
-    func ackInbox(accessToken: String, ids: [Int]) async throws {
-        struct Body: Encodable { let ids: [Int] }
+    /// Ack durably-persisted envelopes. `ids` = identified envelopes; `sealedIds` = sealed-sender
+    /// envelopes (a separate id space, ADR-0014). Existing callers passing only `ids` are unchanged.
+    func ackInbox(accessToken: String, ids: [Int], sealedIds: [Int] = []) async throws {
+        struct Body: Encodable {
+            let ids: [Int]
+            let sealed_ids: [Int]
+        }
         var request = authed("POST", "/v1/inbox/ack", accessToken: accessToken)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(Body(ids: ids))
+        request.httpBody = try JSONEncoder().encode(Body(ids: ids, sealed_ids: sealedIds))
+        _ = try await perform(request)
+    }
+
+    // ----- Sealed sender: delivery access keys + sealed delivery (ADR-0014, R-204) -----
+
+    /// Register (or rotate) this account's delivery access **verifier** with the relay
+    /// (`PUT /v1/delivery-access-key`, authenticated). Only `SHA-256(K_r)` leaves the device here;
+    /// `K_r` itself is distributed to approved contacts over the E2EE channel. Rotating (calling
+    /// again with a fresh key) instantly revokes every holder of the old key at the relay — the
+    /// app's block flow should rotate and re-distribute to remaining contacts.
+    public func registerDeliveryAccessKey(
+        accessToken: String, deliveryKey: DeliveryAccessKey
+    ) async throws {
+        struct Body: Encodable { let verifier: String }
+        var request = authed("PUT", "/v1/delivery-access-key", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            Body(verifier: Hex.encode(deliveryKey.verifier)))
+        _ = try await perform(request)
+    }
+
+    /// Deliver a sealed-sender message (`POST /v1/sealed/deliver`, **unauthenticated** — the
+    /// recipient's `K_r` is the gate, presented in the `X-Delivery-Key` header, never logged).
+    /// `ciphertext` is the opaque MLS envelope (with the sender certificate INSIDE the E2EE
+    /// payload); `idempotencyKey` is a fresh 16-byte random per logical message, reused verbatim on
+    /// retry (the relay dedups on it). Sealed sending is client-side fan-out: call once per
+    /// recipient device. Throws `ClientError.http(403, …)` uniformly for a wrong/rotated key or
+    /// unknown device (no oracle), and `429` when the recipient's rate limit is hit.
+    public func deliverSealed(
+        deliveryKey: DeliveryAccessKey,
+        recipientDevice: String,
+        ciphertext: Data,
+        idempotencyKey: Data
+    ) async throws {
+        struct Body: Encodable {
+            let recipient_device: String
+            let ciphertext: String
+            let idempotency_key: String
+        }
+        var request = URLRequest(url: baseURL.appendingPathComponent("/v1/sealed/deliver"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // The delivery key header authorizes WITHOUT identifying the sender. No Authorization
+        // header is attached — an access token here would link the send to this account.
+        request.setValue(Hex.encode(deliveryKey.key), forHTTPHeaderField: "X-Delivery-Key")
+        request.httpBody = try JSONEncoder().encode(
+            Body(
+                recipient_device: recipientDevice,
+                ciphertext: Hex.encode(ciphertext),
+                idempotency_key: Hex.encode(idempotencyKey)))
         _ = try await perform(request)
     }
 

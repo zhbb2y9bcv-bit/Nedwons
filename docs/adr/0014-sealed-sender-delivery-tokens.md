@@ -133,9 +133,18 @@ identified + sealed envelopes; sealed ones carry no sender field.
   and acked; wrong/absent key + unknown device are uniformly refused; a recipient with no verifier
   can't receive sealed. **WebSocket-sealed deferred** (per-source watermark) — sealed rides the
   long-poll inbox for now. Identified delivery + streaming verified untouched (full suite green).
-- **2c — client.** Sender: obtain the recipient DAK (delivered via E2EE on contact/Welcome), send
-  sealed via client-side fan-out. Recipient: `verifySealedSender` (already landed) + recipient-side
-  block drop + block→rotate. Message-request fallback for non-holders.
+- **2c — client (transport half landed 2026-07-18).** `SentinelKit.DeliveryAccessKey` (32-byte
+  CSPRNG `K_r`, verifier = SHA-256 pinned to the same empty-input golden as
+  `auth_core::delivery_key`, truncated material rejected);
+  `SentinelClient.registerDeliveryAccessKey` (only the verifier leaves the device — asserted by
+  test); `SentinelClient.deliverSealed` (**no** `Authorization` header — asserted by test — `K_r`
+  rides `X-Delivery-Key`; per-recipient client-side fan-out; uniform 403 surfaced typed);
+  `InboxEnvelope` decodes sealed envelopes (optional sender/conversation + `sealed` flag — fixing
+  the previously-required fields that would have failed the whole inbox decode on the first sealed
+  envelope); `ackInbox` gained `sealedIds`. **Still open in 2c (app-flow half, needs the AppModel/
+  app target):** distributing `K_r` to contacts over the E2EE channel, recipient-side block-drop
+  after `verifySealedSender`, the block→rotate-and-redistribute policy, and the message-request
+  fallback UX for non-holders.
 - **2d — padding / cover traffic** (size/timing) — separate, later; out of scope here.
 
 R-204 stays **OPEN/MITIGATING** until 2a–2c ship and a test demonstrates the relay stores **no**
