@@ -525,8 +525,9 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func confirmAcked(ids: [UInt64]) throws 
     
     /**
-     * Encrypt a queued message into an opaque envelope. **Idempotent:** a retry returns the cached
-     * ciphertext and never advances the ratchet again (no double-spend of a message key).
+     * Encrypt a queued message into a versioned opaque envelope (`app-envelope v1`, R-506).
+     * **Idempotent:** a retry returns the same bytes and never advances the ratchet again (no
+     * double-spend of a message key) — `wrap` is deterministic over the cached ciphertext.
      */
     func encrypt(localId: UInt64) throws  -> Data
     
@@ -766,8 +767,9 @@ open func confirmAcked(ids: [UInt64])throws   {try rustCallWithError(FfiConverte
 }
     
     /**
-     * Encrypt a queued message into an opaque envelope. **Idempotent:** a retry returns the cached
-     * ciphertext and never advances the ratchet again (no double-spend of a message key).
+     * Encrypt a queued message into a versioned opaque envelope (`app-envelope v1`, R-506).
+     * **Idempotent:** a retry returns the same bytes and never advances the ratchet again (no
+     * double-spend of a message key) — `wrap` is deterministic over the cached ciphertext.
      */
 open func encrypt(localId: UInt64)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -1740,7 +1742,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_confirm_acked() != 17622) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_encrypt() != 4182) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_encrypt() != 43898) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue() != 8616) {

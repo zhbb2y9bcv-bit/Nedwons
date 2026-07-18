@@ -334,13 +334,15 @@ impl MlsClient {
         })
     }
 
-    /// Encrypt a queued message into an opaque envelope. **Idempotent:** a retry returns the cached
-    /// ciphertext and never advances the ratchet again (no double-spend of a message key).
+    /// Encrypt a queued message into a versioned opaque envelope (`app-envelope v1`, R-506).
+    /// **Idempotent:** a retry returns the same bytes and never advances the ratchet again (no
+    /// double-spend of a message key) — `wrap` is deterministic over the cached ciphertext.
     pub fn encrypt(&self, local_id: u64) -> Result<Vec<u8>, MlsClientError> {
         catch(move || {
             let mut g = self.lock()?;
             let session = active_mut(&mut g)?;
-            session.encrypt(local_id).map_err(map_durable)
+            let payload = session.encrypt(local_id).map_err(map_durable)?;
+            Ok(mls_core::envelope::wrap(&payload))
         })
     }
 
@@ -363,10 +365,15 @@ impl MlsClient {
     ) -> Result<InboundResult, MlsClientError> {
         catch(move || {
             bound(ciphertext.len(), MAX_ENVELOPE_LEN)?;
+            // Strip + check the app-envelope version before handing bytes to MLS; an unknown
+            // version is rejected (never fed to MLS as-is).
+            let payload = mls_core::envelope::unwrap(&ciphertext)
+                .map_err(|_| MlsClientError::InvalidMessage)?
+                .to_vec();
             let mut g = self.lock()?;
             let session = active_mut(&mut g)?;
             let outcome = session
-                .process_inbound(envelope_id, &ciphertext)
+                .process_inbound(envelope_id, &payload)
                 .map_err(map_durable_input)?;
             Ok(match outcome {
                 InboundOutcome::Application(pt) => InboundResult::Application { plaintext: pt },
