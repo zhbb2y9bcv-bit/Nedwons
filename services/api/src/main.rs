@@ -191,10 +191,16 @@ async fn serve(
                         PURGE_BATCH_SIZE,
                         PURGE_MAX_BATCHES,
                     )?;
+                    // Same retention TTL for sealed-sender envelopes (ADR-0014).
+                    let sealed = relay.purge_stale_sealed(
+                        envelope_ttl,
+                        PURGE_BATCH_SIZE,
+                        PURGE_MAX_BATCHES,
+                    )?;
                     // MLS prekey hygiene: drop key packages past their TTL.
                     let prekeys = relay
                         .purge_expired_key_packages(sentinel_api::relay::KEY_PACKAGE_TTL_SECS)?;
-                    Ok::<u64, auth_core::store::StoreError>(auth + mail + prekeys)
+                    Ok::<u64, auth_core::store::StoreError>(auth + mail + sealed + prekeys)
                 })
                 .await;
                 match purged {
