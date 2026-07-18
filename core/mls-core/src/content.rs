@@ -23,10 +23,15 @@ pub const MAX_CONTENT_BODY: usize = 16 * 1024;
 const KIND_NORMAL: u8 = 0;
 const KIND_SECRET: u8 = 1;
 const KIND_SECRET_CONSUMED: u8 = 2;
+const KIND_DELIVERY_KEY_GRANT: u8 = 3;
 
 /// Length of a secret-message id (a sender-chosen random, used for placeholder tracking + replay
 /// rejection on the recipient).
 pub const SECRET_ID_LEN: usize = 16;
+
+/// Length of a sealed-sender **delivery access key** `K_r` (ADR-0014). Distributing it to an
+/// approved contact lets them send you sealed-sender messages; it is granted over the E2EE channel.
+pub const DELIVERY_KEY_LEN: usize = 32;
 
 /// A decoded application-content envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +47,10 @@ pub enum Content {
     /// tells its OTHER devices to consume that secret too (account-wide single-view). Carries no
     /// body — only the id. E2EE + relay-blind like any other content.
     SecretConsumed { secret_id: [u8; SECRET_ID_LEN] },
+    /// A **delivery-key grant** (ADR-0014 Slice 2c): shares this account's sealed-sender delivery
+    /// access key `K_r` with an approved contact over the E2EE channel, so they can send sealed
+    /// messages. The relay never sees `K_r` (it travels inside the MLS ciphertext).
+    DeliveryKeyGrant { key_r: [u8; DELIVERY_KEY_LEN] },
 }
 
 /// Typed, **redacted** decode failure — carries no payload bytes, so logging one leaks nothing.
@@ -62,7 +71,7 @@ impl Content {
     pub fn body(&self) -> &[u8] {
         match self {
             Content::Normal { body } | Content::Secret { body, .. } => body,
-            Content::SecretConsumed { .. } => &[],
+            Content::SecretConsumed { .. } | Content::DeliveryKeyGrant { .. } => &[],
         }
     }
 
@@ -88,6 +97,10 @@ impl Content {
             Content::SecretConsumed { secret_id } => {
                 out.push(KIND_SECRET_CONSUMED);
                 out.extend_from_slice(secret_id);
+            }
+            Content::DeliveryKeyGrant { key_r } => {
+                out.push(KIND_DELIVERY_KEY_GRANT);
+                out.extend_from_slice(key_r);
             }
         }
         out
@@ -121,6 +134,14 @@ impl Content {
                     return Err(ContentError::Malformed); // control message has no trailer
                 }
                 Ok(Content::SecretConsumed { secret_id })
+            }
+            KIND_DELIVERY_KEY_GRANT => {
+                if rest.len() != DELIVERY_KEY_LEN {
+                    return Err(ContentError::Malformed); // exactly the 32-byte key, no trailer
+                }
+                let mut key_r = [0u8; DELIVERY_KEY_LEN];
+                key_r.copy_from_slice(rest);
+                Ok(Content::DeliveryKeyGrant { key_r })
             }
             other => Err(ContentError::UnknownKind(other)),
         }
@@ -194,6 +215,23 @@ mod tests {
         over.push(0);
         assert_eq!(Content::decode(&over), Err(ContentError::Malformed));
         // A truncated id is rejected.
+        let short = &c.encode()[..c.encode().len() - 1];
+        assert_eq!(Content::decode(short), Err(ContentError::Malformed));
+    }
+
+    #[test]
+    fn delivery_key_grant_round_trips_and_is_exact() {
+        let c = Content::DeliveryKeyGrant {
+            key_r: [0x9c; DELIVERY_KEY_LEN],
+        };
+        let decoded = Content::decode(&c.encode()).unwrap();
+        assert_eq!(decoded, c);
+        assert!(decoded.body().is_empty());
+        // A trailing byte after the 32-byte key is rejected.
+        let mut over = c.encode();
+        over.push(0);
+        assert_eq!(Content::decode(&over), Err(ContentError::Malformed));
+        // A short key is rejected.
         let short = &c.encode()[..c.encode().len() - 1];
         assert_eq!(Content::decode(short), Err(ContentError::Malformed));
     }

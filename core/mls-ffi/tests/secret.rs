@@ -187,6 +187,27 @@ fn normal_messages_work_before_during_and_after_a_secret() {
 }
 
 #[test]
+fn delivery_key_grant_over_the_ffi() {
+    // ADR-0014 Slice 2c: alice grants bob her sealed delivery key K_r over the E2EE channel; the
+    // relay never sees it, and bob receives it as DeliveryKeyGranted (a control message).
+    let (alice, bob) = two_party(&tmp("a"), &tmp("b"));
+    let key_r = vec![0x7cu8; 32];
+    let id = alice.enqueue_delivery_key_grant(key_r.clone()).unwrap();
+    let env = alice.encrypt(id).unwrap();
+    alice.mark_sent(id).unwrap();
+    assert!(
+        !env.windows(32).any(|w| w == key_r.as_slice()),
+        "K_r must not appear in the ciphertext"
+    );
+    match bob.process_inbound(1, env).unwrap() {
+        InboundResult::DeliveryKeyGranted { key_r: got } => assert_eq!(got, key_r),
+        other => panic!("expected DeliveryKeyGranted, got {other:?}"),
+    }
+    // A non-32-byte key is rejected at the boundary.
+    assert!(alice.enqueue_delivery_key_grant(vec![0u8; 31]).is_err());
+}
+
+#[test]
 fn consumption_control_message_over_the_ffi() {
     // ADR-0015 through the generated surface: after a recipient reveals, it produces an opaque
     // consumption envelope (idempotent) that a peer processes as SecretConsumedRemotely.
