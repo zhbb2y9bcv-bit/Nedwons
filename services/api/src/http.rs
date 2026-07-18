@@ -699,21 +699,37 @@ async fn register_finish(
     })
     .await?;
 
-    // Publish the account→device-key binding to the transparency log (R-201). Best-effort: the
-    // CLIENT self-monitors and is the real check, so a transient log fault must not block a user
-    // from registering. A gap here is a monitorable error (production couples this atomically).
-    let account = session.account_id;
-    let device = session.device_id;
+    append_binding_best_effort(
+        &state,
+        session.account_id,
+        session.device_id,
+        public_key_for_log,
+        "registration",
+    )
+    .await;
+    Ok(Json(session.into()))
+}
+
+/// Publish an account→device-key binding to the transparency log (R-201). Best-effort: the CLIENT
+/// self-monitors and is the real check, so a transient log fault must not block the user. A gap is
+/// a monitorable error (production couples this atomically). Used at every point a device is bound
+/// to an account — registration, trusted-device enrollment, and recovery — so a self-monitoring
+/// client sees EVERY device the server routes for it (a server cannot add a device undetected;
+/// ADR-0008).
+async fn append_binding_best_effort(
+    state: &AppState,
+    account: AccountId,
+    device: DeviceId,
+    public_key: Vec<u8>,
+    context: &'static str,
+) {
     let transparency = state.transparency.clone();
-    if blocking_store(move || transparency.append_binding(&account, &device, &public_key_for_log))
+    if blocking_store(move || transparency.append_binding(&account, &device, &public_key))
         .await
         .is_err()
     {
-        tracing::error!(
-            "transparency log append failed at registration (log gap — must reconcile)"
-        );
+        tracing::error!("transparency log append failed at {context} (log gap — must reconcile)");
     }
-    Ok(Json(session.into()))
 }
 
 async fn login_begin(
@@ -845,6 +861,7 @@ async fn enroll_finish(
     let device_public_key = hex_exact(&body.device_public_key, 65)?;
     let signature = hex_exact(&body.signature, 64)?;
     let service = state.service.clone();
+    let public_key_for_log = device_public_key.clone();
     let session = blocking(move || {
         service.enroll_device_finish(
             &me,
@@ -856,6 +873,14 @@ async fn enroll_finish(
         )
     })
     .await?;
+    append_binding_best_effort(
+        &state,
+        session.account_id,
+        session.device_id,
+        public_key_for_log,
+        "device enrollment",
+    )
+    .await;
     Ok(Json(SessionDto::from(session)))
 }
 
@@ -963,6 +988,7 @@ async fn recover_finish_handler(
     let device_public_key = hex_exact(&body.device_public_key, 65)?;
     let signature = hex_exact(&body.signature, 64)?;
     let service = state.service.clone();
+    let public_key_for_log = device_public_key.clone();
     let session = blocking(move || {
         service.recover_finish(auth_core::RecoveryRequest {
             username: body.username,
@@ -973,6 +999,14 @@ async fn recover_finish_handler(
         })
     })
     .await?;
+    append_binding_best_effort(
+        &state,
+        session.account_id,
+        session.device_id,
+        public_key_for_log,
+        "recovery",
+    )
+    .await;
     Ok(Json(SessionDto::from(session)))
 }
 
