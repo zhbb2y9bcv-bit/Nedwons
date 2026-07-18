@@ -90,6 +90,24 @@ jobs:
       - name: Test (FFI object semantics + adversarial corpus)
         run: cargo test
 
+  sbom:
+    name: SBOM (CycloneDX, R-501)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+      - name: Generate SBOMs for every workspace
+        run: scripts/generate_sbom.sh
+      - name: Upload SBOM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom/*.cdx.json
+          if-no-files-found: error
+
   sca:
     name: dependency advisories (SCA)
     runs-on: ubuntu-latest
