@@ -19,6 +19,7 @@
 pub mod crypto;
 pub mod error;
 pub mod ids;
+pub mod membership;
 pub mod memstore;
 pub mod password;
 pub mod service;

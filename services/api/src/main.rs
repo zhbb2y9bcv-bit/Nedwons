@@ -85,6 +85,9 @@ fn main() {
         stores.pool_clone(),
         log_signing_key,
     ));
+    let membership = Arc::new(sentinel_api::membership::PgMembership::new(
+        stores.pool_clone(),
+    ));
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -99,6 +102,7 @@ fn main() {
         social,
         groups,
         transparency,
+        membership,
     ));
 }
 
@@ -112,6 +116,7 @@ async fn serve(
     social: Arc<sentinel_api::social::PgSocial>,
     groups: Arc<sentinel_api::groups::PgGroups>,
     transparency: Arc<sentinel_api::transparency::PgTransparency>,
+    membership: Arc<sentinel_api::membership::PgMembership>,
 ) {
     // Retention hygiene (DATA_RETENTION.md): every minute purge expired challenges/access
     // tokens AND stale envelopes past the queue TTL. Failure is logged and retried next
@@ -171,6 +176,7 @@ async fn serve(
         social,
         groups,
         transparency,
+        membership,
         rate_per_min,
         trusted_ip_header,
     );

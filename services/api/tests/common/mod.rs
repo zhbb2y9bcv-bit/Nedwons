@@ -93,6 +93,14 @@ pub fn shared_groups() -> Arc<sentinel_api::groups::PgGroups> {
     ))
 }
 
+/// Membership-commit store (ADR-0010 epoch CAS + audit log) over the shared pool.
+#[allow(dead_code)]
+pub fn shared_membership() -> Arc<sentinel_api::membership::PgMembership> {
+    Arc::new(sentinel_api::membership::PgMembership::new(
+        shared_stores().pool_clone(),
+    ))
+}
+
 /// Transparency store over the shared pool, with a process-stable log signing key (so STH
 /// signatures verify against a consistent public key across a test's requests).
 pub fn shared_transparency() -> Arc<sentinel_api::transparency::PgTransparency> {
@@ -187,6 +195,7 @@ pub async fn make_app(per_ip_per_minute: u32) -> Router {
             shared_social(),
             shared_groups(),
             shared_transparency(),
+            shared_membership(),
             per_ip_per_minute,
         )
     })
@@ -206,6 +215,7 @@ pub async fn make_app_with_trusted_ip_header(per_ip_per_minute: u32) -> Router {
             shared_social(),
             shared_groups(),
             shared_transparency(),
+            shared_membership(),
             per_ip_per_minute,
             Some(axum::http::HeaderName::from_static("x-real-client-ip")),
         )

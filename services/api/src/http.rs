@@ -32,6 +32,7 @@ use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::groups::{InviteOutcome, PgGroups};
+use crate::membership::{ApplyOutcome, CommitRequest, PgMembership};
 use crate::notify::DeliveryNotifier;
 use crate::relay::{FanoutOutcome, PgRelay, SendOutcome};
 use crate::social::{FriendRequestOutcome, PgSocial};
@@ -54,6 +55,7 @@ pub struct AppState {
     pub social: Arc<PgSocial>,
     pub groups: Arc<PgGroups>,
     pub transparency: Arc<PgTransparency>,
+    pub membership: Arc<PgMembership>,
     notifier: DeliveryNotifier,
     limiter: Arc<IpLimiter>,
     /// When `Some(h)`, the client IP for rate limiting is taken from header `h` — which MUST be
@@ -71,6 +73,7 @@ pub fn build_router(
     social: Arc<PgSocial>,
     groups: Arc<PgGroups>,
     transparency: Arc<PgTransparency>,
+    membership: Arc<PgMembership>,
     per_ip_per_minute: u32,
 ) -> Router {
     build_router_cfg(
@@ -79,6 +82,7 @@ pub fn build_router(
         social,
         groups,
         transparency,
+        membership,
         per_ip_per_minute,
         None,
     )
@@ -103,6 +107,7 @@ pub fn build_router_cfg(
     social: Arc<PgSocial>,
     groups: Arc<PgGroups>,
     transparency: Arc<PgTransparency>,
+    membership: Arc<PgMembership>,
     per_ip_per_minute: u32,
     trusted_ip_header: Option<HeaderName>,
 ) -> Router {
@@ -114,6 +119,7 @@ pub fn build_router_cfg(
         social,
         groups,
         transparency,
+        membership,
         notifier: DeliveryNotifier::default(),
         limiter: Arc::new(RateLimiter::keyed(quota)),
         trusted_ip_header,
@@ -130,6 +136,10 @@ pub fn build_router_cfg(
         .route("/v1/conversations/{id}/members", post(add_member))
         .route("/v1/conversations/{id}/members/remove", post(remove_member))
         .route("/v1/conversations/{id}/leave", post(leave_conversation))
+        // MLS-commit-authoritative membership (ADR-0010): change membership with a signed
+        // manifest + opaque commit; the epoch CAS linearizes membership history.
+        .route("/v1/conversations/{id}/commit", post(membership_commit))
+        .route("/v1/conversations/{id}/epoch", get(conversation_epoch))
         // group governance (ADR-0009)
         .route(
             "/v1/conversations/{id}/invites",
@@ -1315,6 +1325,220 @@ async fn send_welcome(
     };
     state.notifier.wake(&recipient_bytes);
     Ok(Json(ReceiptDto { envelope_id }))
+}
+
+/// One added member in a membership commit: their account and joining device.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommitAddDto {
+    account_id: String,
+    device_id: String,
+}
+
+/// A membership change as `(signed manifest fields, opaque commit[, welcomes])` (ADR-0010).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembershipCommitBody {
+    /// 1 = add, 2 = remove, 3 = self-leave.
+    control_type: u8,
+    prev_epoch: u64,
+    next_epoch: u64,
+    /// SHA-256 (hex) of `commit` — verified server-side before anything is applied.
+    commit_hash: String,
+    added: Vec<CommitAddDto>,
+    removed: Vec<String>,
+    idempotency_key: String,
+    expires_at: u64,
+    /// ECDSA-P256 signature (hex) over the canonical manifest by the actor's enrolled device key.
+    signature: String,
+    /// The opaque MLS commit ciphertext (hex).
+    commit: String,
+    /// One opaque Welcome (hex) per `added` entry, same order.
+    welcomes: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct MembershipCommitReceiptDto {
+    /// False on an idempotent retry of an already-applied commit.
+    applied: bool,
+    next_epoch: u64,
+}
+
+#[derive(Serialize)]
+struct EpochDto {
+    epoch: u64,
+}
+
+/// Bounds membership-change fan-in per commit (defense in depth; MLS groups this size need the
+/// future attachment path anyway).
+const MAX_COMMIT_MEMBER_DELTA: usize = 32;
+
+/// Apply an MLS membership commit (ADR-0010): verify the device-signed manifest, enforce
+/// governance and the per-group epoch CAS, and atomically apply routing + fan out the commit and
+/// welcomes. The relay never parses the commit — recipients verify correspondence client-side.
+async fn membership_commit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+    Json(body): Json<MembershipCommitBody>,
+) -> Result<Json<MembershipCommitReceiptDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+
+    // ---- Shape + freshness checks (reject before any lookup). ----
+    let control =
+        auth_core::membership::ControlType::from_u8(body.control_type).ok_or_else(bad_request)?;
+    if body.next_epoch != body.prev_epoch.wrapping_add(1) {
+        return Err(bad_request());
+    }
+    if body.added.len() > MAX_COMMIT_MEMBER_DELTA
+        || body.removed.len() > MAX_COMMIT_MEMBER_DELTA
+        || body.welcomes.len() != body.added.len()
+    {
+        return Err(bad_request());
+    }
+    // Control-consistency: exactly one kind of change per commit (v1).
+    let shape_ok = match control {
+        auth_core::membership::ControlType::Add => {
+            !body.added.is_empty() && body.removed.is_empty()
+        }
+        auth_core::membership::ControlType::Remove | auth_core::membership::ControlType::Leave => {
+            body.added.is_empty() && !body.removed.is_empty()
+        }
+    };
+    if !shape_ok {
+        return Err(bad_request());
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    if body.expires_at <= now {
+        return Err(bad_request());
+    }
+
+    // ---- Decode + canonical-order checks. ----
+    let mut added: Vec<(AccountId, DeviceId)> = Vec::with_capacity(body.added.len());
+    for a in &body.added {
+        added.push((
+            AccountId(id16_from_hex(&a.account_id)?),
+            DeviceId(id16_from_hex(&a.device_id)?),
+        ));
+    }
+    let mut removed: Vec<DeviceId> = Vec::with_capacity(body.removed.len());
+    for d in &body.removed {
+        removed.push(DeviceId(id16_from_hex(d)?));
+    }
+    // Sorted + duplicate-free lists are part of the canonical form (the encoding is otherwise
+    // ambiguous between semantically-equal manifests).
+    let sorted_unique_pairs = added
+        .windows(2)
+        .all(|w| (w[0].0.as_bytes(), w[0].1.as_bytes()) < (w[1].0.as_bytes(), w[1].1.as_bytes()));
+    let sorted_unique_removed = removed
+        .windows(2)
+        .all(|w| w[0].as_bytes() < w[1].as_bytes());
+    if !sorted_unique_pairs || !sorted_unique_removed {
+        return Err(bad_request());
+    }
+
+    let commit_hash: [u8; 32] = hex_exact(&body.commit_hash, 32)?
+        .try_into()
+        .map_err(|_| bad_request())?;
+    let idempotency_key = id16_from_hex(&body.idempotency_key)?;
+    let signature = decode_ciphertext(&body.signature)?;
+    let commit = decode_ciphertext(&body.commit)?;
+    let mut welcomes: Vec<Vec<u8>> = Vec::with_capacity(body.welcomes.len());
+    for w in &body.welcomes {
+        welcomes.push(decode_ciphertext(w)?);
+    }
+
+    // ---- Hash binding: the manifest names exactly these commit bytes. ----
+    if auth_core::crypto::sha256(&commit) != commit_hash {
+        return Err(bad_request());
+    }
+
+    // ---- Manifest signature under the actor's enrolled device key. ----
+    let manifest = auth_core::membership::Manifest {
+        control,
+        group_id: &conversation_id,
+        prev_epoch: body.prev_epoch,
+        next_epoch: body.next_epoch,
+        commit_hash: &commit_hash,
+        actor_device: &me.device_id,
+        added: &added,
+        removed: &removed,
+        idempotency_key: &idempotency_key,
+        expires_at: body.expires_at,
+    };
+    let manifest_bytes = manifest.encode();
+    let manifest_hash = manifest.hash();
+    let service = state.service.clone();
+    let actor_device = me.device_id;
+    let actor_key = blocking(move || service.device_public_key(&actor_device)).await?;
+    if !auth_core::crypto::verify_p256(&actor_key, &manifest_bytes, &signature) {
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "denied"));
+    }
+
+    // ---- Atomic application (governance + idempotency + epoch CAS + delta + fanout + log). ----
+    let membership = state.membership.clone();
+    let next_epoch = body.next_epoch;
+    let outcome = blocking_store(move || {
+        membership.apply_commit(&CommitRequest {
+            conversation_id: &conversation_id,
+            actor_account: &me.account_id,
+            actor_device: &me.device_id,
+            control_type: body.control_type,
+            prev_epoch: body.prev_epoch,
+            next_epoch: body.next_epoch,
+            commit_hash: &commit_hash,
+            manifest_hash: &manifest_hash,
+            manifest: &manifest_bytes,
+            signature: &signature,
+            idempotency_key: &idempotency_key,
+            commit: &commit,
+            added: &added,
+            removed: &removed,
+            welcomes: &welcomes,
+        })
+    })
+    .await?;
+
+    match outcome {
+        ApplyOutcome::Applied { woken } => {
+            for device in &woken {
+                state.notifier.wake(device);
+            }
+            Ok(Json(MembershipCommitReceiptDto {
+                applied: true,
+                next_epoch,
+            }))
+        }
+        ApplyOutcome::AlreadyApplied => Ok(Json(MembershipCommitReceiptDto {
+            applied: false,
+            next_epoch,
+        })),
+        ApplyOutcome::Forbidden => Err(forbidden()),
+        ApplyOutcome::StaleEpoch => Err(ApiError(StatusCode::CONFLICT, "stale_epoch")),
+        ApplyOutcome::IdempotencyMismatch => Err(idempotency_conflict()),
+        ApplyOutcome::Invalid => Err(bad_request()),
+    }
+}
+
+/// The conversation's current membership epoch (members only; one generic 403 otherwise). A
+/// client rebasing after `stale_epoch` reads this before rebuilding its commit.
+async fn conversation_epoch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+) -> Result<Json<EpochDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let membership = state.membership.clone();
+    let epoch =
+        blocking_store(move || membership.epoch_for_member(&conversation_id, &me.device_id))
+            .await?
+            .ok_or_else(forbidden)?;
+    Ok(Json(EpochDto { epoch }))
 }
 
 /// Peek the authenticated device's queued envelopes (does NOT mark delivered — the client
