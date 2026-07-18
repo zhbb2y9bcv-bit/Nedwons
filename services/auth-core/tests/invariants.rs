@@ -859,3 +859,41 @@ fn breach_check_is_off_by_default() {
     let (service, _clock) = make_service();
     assert!(try_register_password(&service, "nocorpus", "hunter2-long-breached-pass").is_ok());
 }
+
+// ----- Server-side pepper (R-303) -------------------------------------------------------
+
+#[test]
+fn password_pepper_is_mixed_into_hashing() {
+    // Two services sharing ONE set of stores but with DIFFERENT peppers.
+    let clock = Arc::new(MockClock::new(1_000_000));
+    let accounts = Arc::new(MemAccountStore::default());
+    let challenges = Arc::new(MemChallengeStore::default());
+    let refresh = Arc::new(MemRefreshStore::default());
+    let sessions = Arc::new(MemSessionStore::default());
+    let build = |pepper: &'static [u8]| {
+        AuthService::new(
+            accounts.clone(),
+            accounts.clone(),
+            challenges.clone(),
+            refresh.clone(),
+            sessions.clone(),
+            clock.clone(),
+            Config::default(),
+        )
+        .with_pepper(pepper)
+    };
+
+    let service_a = build(b"pepper-A-0123456789abcdef0123456789");
+    let (device, _reg) = register(&service_a, "peppered_user");
+
+    // Login under the SAME pepper succeeds.
+    assert!(login(&service_a, &device, "peppered_user", PASSWORD).is_ok());
+
+    // Login under a DIFFERENT pepper (against the same stored hash) fails: the pepper is part of
+    // the hash, so a database-only compromise (without the KMS pepper) cannot verify credentials.
+    let service_b = build(b"pepper-B-0123456789abcdef0123456789");
+    assert!(matches!(
+        login(&service_b, &device, "peppered_user", PASSWORD),
+        Err(AuthError::Denied)
+    ));
+}

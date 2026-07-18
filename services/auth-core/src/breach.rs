@@ -43,7 +43,10 @@ pub fn split(hash_hex: &str) -> (String, String) {
 
 /// True iff `password`'s SHA-1 appears in the corpus. Only the 5-char prefix is sent to `provider`
 /// (k-anonymity); the suffix comparison is case-insensitive.
-pub fn is_compromised(provider: &dyn RangeProvider, password: &str) -> Result<bool, BreachUnavailable> {
+pub fn is_compromised(
+    provider: &dyn RangeProvider,
+    password: &str,
+) -> Result<bool, BreachUnavailable> {
     let hash = sha1_hex(password);
     let (prefix, suffix) = split(&hash);
     let suffixes = provider.suffixes(&prefix)?;
