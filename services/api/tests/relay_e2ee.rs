@@ -440,7 +440,7 @@ async fn ack_deletes_rows_and_ttl_purges_stale_mail() {
             )
             .expect("backdate");
         common::shared_relay()
-            .purge_stale_envelopes(30)
+            .purge_stale_envelopes(std::time::Duration::from_secs(30 * 24 * 60 * 60), 5_000, 20)
             .expect("purge")
     })
     .await

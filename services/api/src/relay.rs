@@ -39,9 +39,23 @@ pub struct ConversationSummary {
 pub enum FanoutOutcome {
     /// The sender is not a member of the conversation.
     Forbidden,
+    /// The idempotency key was already used by this sender for a DIFFERENT payload or
+    /// conversation. Refused: silently deduping would drop the new message while reporting
+    /// success (a client bug becomes silent data loss). The client must use a fresh key.
+    IdempotencyMismatch,
     /// Delivered (or already delivered, on an idempotent retry). Carries the recipient
     /// devices that received a *new* envelope, so only those get woken.
     Delivered { newly_queued: Vec<[u8; 16]> },
+}
+
+/// Result of a targeted send.
+pub enum SendOutcome {
+    /// The sender is not a member of the conversation.
+    Forbidden,
+    /// Same as [`FanoutOutcome::IdempotencyMismatch`].
+    IdempotencyMismatch,
+    /// Queued (or already queued, on an idempotent retry) under this envelope id.
+    Queued(i64),
 }
 
 fn db_err(e: postgres::Error) -> StoreError {
@@ -221,9 +235,13 @@ impl PgRelay {
     }
 
     /// Store an opaque envelope for a single recipient device (used for targeted messages
-    /// like MLS Welcomes). Idempotent: a retry with the same `idempotency_key` returns the
-    /// existing envelope id rather than inserting a duplicate. Returns `None` if the sender
-    /// is not a member of the conversation.
+    /// like MLS Welcomes). Idempotent: a retry with the same `idempotency_key` **and identical
+    /// payload** returns the existing envelope id rather than inserting a duplicate.
+    ///
+    /// Idempotency-key scope (defined precisely): a key belongs to the **sender device** and
+    /// identifies one logical send — same conversation, same ciphertext bytes. Reusing a key with
+    /// a different payload or conversation is refused (`IdempotencyMismatch`), never silently
+    /// deduplicated: silent dedup would drop the new message while reporting success.
     pub fn send_targeted(
         &self,
         conversation_id: &[u8; 16],
@@ -231,11 +249,20 @@ impl PgRelay {
         recipient_device: &DeviceId,
         ciphertext: &[u8],
         idempotency_key: &[u8; 16],
-    ) -> StoreResult<Option<i64>> {
+    ) -> StoreResult<SendOutcome> {
         let mut conn = self.conn()?;
         let mut txn = conn.transaction().map_err(db_err)?;
         if !member_in_txn(&mut txn, conversation_id, sender_device.as_bytes())? {
-            return Ok(None);
+            return Ok(SendOutcome::Forbidden);
+        }
+        if idem_key_conflicts(
+            &mut txn,
+            conversation_id,
+            sender_device,
+            ciphertext,
+            idempotency_key,
+        )? {
+            return Ok(SendOutcome::IdempotencyMismatch);
         }
         // Insert, or on idempotent conflict fetch the existing row's id.
         let inserted = txn
@@ -270,7 +297,7 @@ impl PgRelay {
                 .get::<_, i64>(0),
         };
         txn.commit().map_err(db_err)?;
-        Ok(Some(id))
+        Ok(SendOutcome::Queued(id))
     }
 
     /// Fan out one ciphertext to every OTHER member device of a conversation in a single
@@ -289,6 +316,15 @@ impl PgRelay {
         let mut txn = conn.transaction().map_err(db_err)?;
         if !member_in_txn(&mut txn, conversation_id, sender_device.as_bytes())? {
             return Ok(FanoutOutcome::Forbidden);
+        }
+        if idem_key_conflicts(
+            &mut txn,
+            conversation_id,
+            sender_device,
+            ciphertext,
+            idempotency_key,
+        )? {
+            return Ok(FanoutOutcome::IdempotencyMismatch);
         }
         let rows = txn
             .query(
@@ -363,16 +399,67 @@ impl PgRelay {
         Ok(acked)
     }
 
-    /// Retention TTL (DATA_RETENTION.md): purge undelivered envelopes older than `ttl_days` (the
-    /// 30-day queue TTL — the sender's client shows "failed" after this). Returns rows purged.
-    pub fn purge_stale_envelopes(&self, ttl_days: i32) -> StoreResult<u64> {
+    /// Retention TTL (DATA_RETENTION.md): purge envelopes older than `ttl` (the 30-day queue
+    /// TTL — the sender's client shows "failed" after this). Returns rows purged.
+    ///
+    /// Deletes in **bounded batches** (`batch_size` rows via the `envelopes_created_at` index, at
+    /// most `max_batches` per call): one unbounded `DELETE` over a large backlog would hold locks
+    /// and generate a WAL spike that stalls concurrent sends — the failure mode that matters at
+    /// scale. A backlog larger than `batch_size * max_batches` simply drains across successive
+    /// ticks of the minutely purge task.
+    pub fn purge_stale_envelopes(
+        &self,
+        ttl: std::time::Duration,
+        batch_size: i64,
+        max_batches: u32,
+    ) -> StoreResult<u64> {
         let mut conn = self.conn()?;
-        let purged = conn
-            .execute(
-                "DELETE FROM envelopes WHERE created_at < now() - ($1 * interval '1 day')",
-                &[&f64::from(ttl_days)],
-            )
-            .map_err(db_err)?;
-        Ok(purged)
+        let ttl_secs = ttl.as_secs_f64();
+        let mut total: u64 = 0;
+        for _ in 0..max_batches {
+            let purged = conn
+                .execute(
+                    "DELETE FROM envelopes WHERE id IN (
+                         SELECT id FROM envelopes
+                         WHERE created_at < now() - make_interval(secs => $1)
+                         ORDER BY created_at
+                         LIMIT $2)",
+                    &[&ttl_secs, &batch_size],
+                )
+                .map_err(db_err)?;
+            total += purged;
+            if purged < batch_size as u64 {
+                break; // backlog drained
+            }
+        }
+        Ok(total)
     }
+}
+
+/// True if this sender has already used `idempotency_key` for a DIFFERENT payload or
+/// conversation. Runs inside the send transaction, only touching the sender's own rows via the
+/// `envelopes_idem` index prefix. A `true` result must abort the send: the key identifies one
+/// logical message, and silently deduplicating a *different* message would drop it.
+fn idem_key_conflicts(
+    txn: &mut postgres::Transaction<'_>,
+    conversation_id: &[u8; 16],
+    sender_device: &DeviceId,
+    ciphertext: &[u8],
+    idempotency_key: &[u8; 16],
+) -> StoreResult<bool> {
+    let row = txn
+        .query_opt(
+            "SELECT 1 FROM envelopes
+             WHERE sender_device = $1 AND idempotency_key = $2
+               AND (conversation_id <> $3 OR ciphertext <> $4)
+             LIMIT 1",
+            &[
+                &sender_device.as_bytes(),
+                &idempotency_key.as_slice(),
+                &conversation_id.as_slice(),
+                &ciphertext,
+            ],
+        )
+        .map_err(db_err)?;
+    Ok(row.is_some())
 }
