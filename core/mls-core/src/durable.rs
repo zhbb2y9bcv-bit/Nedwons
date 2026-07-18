@@ -26,6 +26,8 @@ use aes_gcm::Aes256Gcm;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
+use crate::content::{Content, ContentError, SECRET_ID_LEN};
+use crate::secret::{SecretRecord, SecretState};
 use crate::{Conversation, Incoming, Member};
 
 /// On-disk blob schema version. Bumped when the serialized `{store, meta}` layout changes so an
@@ -61,6 +63,11 @@ impl From<crate::MlsError> for DurableError {
     }
 }
 
+/// Map a redacted content-decode failure to a redacted durable error (no payload bytes leak).
+fn map_content(_: ContentError) -> DurableError {
+    DurableError::Codec
+}
+
 /// Direction of a stored message.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub enum Direction {
@@ -76,6 +83,12 @@ pub struct Message {
     pub plaintext: Vec<u8>,
     /// Inbound only: the server envelope id this was decrypted from.
     pub envelope_id: Option<u64>,
+    /// `Some` if this message is a **secret** (view-once) message. The `plaintext` field is then
+    /// EMPTY — the body lives (transiently) in [`Meta::secrets`] and is never returned in the message
+    /// log. The UI renders a sealed placeholder / tombstone from the secret's state instead.
+    /// `#[serde(default)]` ⇒ blobs written before secret messages load as `None`.
+    #[serde(default)]
+    pub secret_id: Option<[u8; SECRET_ID_LEN]>,
 }
 
 /// Lifecycle of an outbound message.
@@ -92,9 +105,14 @@ pub enum OutboundStatus {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 struct Outbound {
     local_id: u64,
+    /// The **encoded [`Content`] envelope** to encrypt (not the raw body) — so the classification
+    /// travels inside the MLS ciphertext. Scrubbed to empty once a secret message is sent.
     plaintext: Vec<u8>,
     status: OutboundStatus,
     ciphertext: Option<Vec<u8>>,
+    /// `Some` for a secret message; the sender tombstones it immediately on encrypt.
+    #[serde(default)]
+    secret_id: Option<[u8; SECRET_ID_LEN]>,
 }
 
 /// What processing an inbound envelope yielded.
@@ -102,8 +120,14 @@ struct Outbound {
 pub enum InboundOutcome {
     Application(Vec<u8>),
     StateAdvanced,
-    /// Already processed (at-least-once redelivery). A durable no-op.
+    /// Already processed (at-least-once redelivery, OR a replayed secret id). A durable no-op.
     Duplicate,
+    /// A **secret** message arrived and is stored as a sealed placeholder. Carries its id so the
+    /// UI can show a sealed placeholder; the body is NOT returned here (it is revealed once, later,
+    /// via the reveal state machine).
+    SecretSealed {
+        secret_id: [u8; SECRET_ID_LEN],
+    },
 }
 
 /// Serializable metadata that travels in the committed blob alongside the MLS store snapshot.
@@ -129,6 +153,21 @@ struct Meta {
     next_local_id: u64,
     messages: Vec<Message>,
     outbox: BTreeMap<u64, Outbound>,
+    /// Reveal state for each secret message, keyed by its **hex** id (JSON maps need string keys).
+    /// Crash-safe: every transition is committed here before it becomes observable.
+    /// `#[serde(default)]` ⇒ older blobs load empty.
+    #[serde(default)]
+    secrets: BTreeMap<String, SecretRecord>,
+}
+
+/// Hex key for a secret id (JSON object keys must be strings, so the raw `[u8; 16]` can't be a key).
+fn sid_key(id: &[u8; SECRET_ID_LEN]) -> String {
+    let mut s = String::with_capacity(SECRET_ID_LEN * 2);
+    for b in id {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 impl Meta {
@@ -276,15 +315,32 @@ impl<J: Journal> DurableSession<J> {
     }
 
     /// Reopen the last durably committed session (crash recovery).
+    ///
+    /// **Fail closed for secrets:** any secret whose reveal had begun (recipient side, `Countdown`
+    /// or `Visible`) but was not cleanly consumed is forced to `Consumed` here — a crash or
+    /// termination after reveal begins must never grant another viewing opportunity on relaunch. The
+    /// forced consumption is committed before the session is returned.
     pub fn open(journal: J) -> Result<Self, DurableError> {
         let bytes = journal.load()?.ok_or(DurableError::NoSession)?;
         let blob: Blob = serde_json::from_slice(&bytes).map_err(|_| DurableError::Codec)?;
         let session = Session::restore(&blob.meta, &blob.store)?;
-        Ok(Self {
+        let mut this = Self {
             session,
             meta: blob.meta,
             journal,
-        })
+        };
+        let mut changed = false;
+        for rec in this.meta.secrets.values_mut() {
+            if matches!(rec.state, SecretState::Countdown | SecretState::Visible) {
+                rec.consume();
+                changed = true;
+            }
+        }
+        if changed {
+            let meta = this.meta.clone();
+            this.commit(meta)?;
+        }
+        Ok(this)
     }
 
     /// Publish this member's key package (for others to add them).
@@ -403,15 +459,44 @@ impl<J: Journal> DurableSession<J> {
         };
         let mut meta = self.meta.clone();
         let outcome = match incoming {
-            Incoming::Application(plaintext) => {
-                let local_id = meta.take_local_id();
-                meta.messages.push(Message {
-                    local_id,
-                    direction: Direction::Inbound,
-                    plaintext: plaintext.clone(),
-                    envelope_id: Some(envelope_id),
-                });
-                InboundOutcome::Application(plaintext)
+            // The MLS plaintext is a Content envelope; decode classifies normal vs secret. A decode
+            // failure (an authenticated member sent malformed content) is a typed, redacted error —
+            // the ratchet advance is not committed, matching the existing process-error contract.
+            Incoming::Application(payload) => {
+                match Content::decode(&payload).map_err(map_content)? {
+                    Content::Normal { body } => {
+                        let local_id = meta.take_local_id();
+                        meta.messages.push(Message {
+                            local_id,
+                            direction: Direction::Inbound,
+                            plaintext: body.clone(),
+                            envelope_id: Some(envelope_id),
+                            secret_id: None,
+                        });
+                        InboundOutcome::Application(body)
+                    }
+                    Content::Secret { secret_id, body } => {
+                        if meta.secrets.contains_key(&sid_key(&secret_id)) {
+                            // Replayed secret id (a distinct envelope carrying an already-seen secret).
+                            // Never grant a second sealed placeholder / viewing opportunity.
+                            InboundOutcome::Duplicate
+                        } else {
+                            let local_id = meta.take_local_id();
+                            meta.secrets.insert(
+                                sid_key(&secret_id),
+                                SecretRecord::sealed_recipient(secret_id, body),
+                            );
+                            meta.messages.push(Message {
+                                local_id,
+                                direction: Direction::Inbound,
+                                plaintext: Vec::new(),
+                                envelope_id: Some(envelope_id),
+                                secret_id: Some(secret_id),
+                            });
+                            InboundOutcome::SecretSealed { secret_id }
+                        }
+                    }
+                }
             }
             Incoming::StateAdvanced => InboundOutcome::StateAdvanced,
         };
@@ -436,17 +521,52 @@ impl<J: Journal> DurableSession<J> {
         self.commit(meta)
     }
 
-    /// Queue an outbound message (durable draft). Does NOT advance the ratchet. Returns a local id.
-    pub fn enqueue(&mut self, plaintext: &[u8]) -> Result<u64, DurableError> {
+    /// Queue an outbound **normal** message (durable draft). Does NOT advance the ratchet. The body
+    /// is wrapped in a [`Content::Normal`] envelope so every message shares one typed, versioned
+    /// application format. Returns a local id.
+    pub fn enqueue(&mut self, body: &[u8]) -> Result<u64, DurableError> {
+        self.enqueue_content(
+            Content::Normal {
+                body: body.to_vec(),
+            },
+            None,
+        )
+    }
+
+    /// Queue an outbound **secret** (view-once) message. A random secret id is generated; the body
+    /// is wrapped in a [`Content::Secret`] envelope so the classification is encrypted end-to-end
+    /// (the relay never learns a message is secret). Returns `(local_id, secret_id)`.
+    pub fn enqueue_secret(
+        &mut self,
+        body: &[u8],
+    ) -> Result<(u64, [u8; SECRET_ID_LEN]), DurableError> {
+        let mut secret_id = [0u8; SECRET_ID_LEN];
+        OsRng.fill_bytes(&mut secret_id);
+        let local_id = self.enqueue_content(
+            Content::Secret {
+                secret_id,
+                body: body.to_vec(),
+            },
+            Some(secret_id),
+        )?;
+        Ok((local_id, secret_id))
+    }
+
+    fn enqueue_content(
+        &mut self,
+        content: Content,
+        secret_id: Option<[u8; SECRET_ID_LEN]>,
+    ) -> Result<u64, DurableError> {
         let mut meta = self.meta.clone();
         let local_id = meta.take_local_id();
         meta.outbox.insert(
             local_id,
             Outbound {
                 local_id,
-                plaintext: plaintext.to_vec(),
+                plaintext: content.encode(),
                 status: OutboundStatus::Queued,
                 ciphertext: None,
+                secret_id,
             },
         );
         self.commit(meta)?;
@@ -474,31 +594,167 @@ impl<J: Journal> DurableSession<J> {
             } = &mut self.session;
             conversation.encrypt(member, &plaintext)?
         };
+        // `plaintext` is the encoded Content envelope; decode it to build the DISPLAY message
+        // (never the encoded bytes). A secret becomes an empty-plaintext placeholder + a sender-side
+        // tombstone, so the sender never retains a reopenable copy.
+        let content = Content::decode(&plaintext).map_err(map_content)?;
         let mut meta = self.meta.clone();
         let local_id_for_msg = meta.take_local_id();
         if let Some(entry) = meta.outbox.get_mut(&local_id) {
             entry.ciphertext = Some(ciphertext.clone());
             entry.status = OutboundStatus::Encrypted;
         }
-        meta.messages.push(Message {
-            local_id: local_id_for_msg,
-            direction: Direction::Outbound,
-            plaintext,
-            envelope_id: None,
-        });
+        let display = match &content {
+            Content::Normal { body } => Message {
+                local_id: local_id_for_msg,
+                direction: Direction::Outbound,
+                plaintext: body.clone(),
+                envelope_id: None,
+                secret_id: None,
+            },
+            Content::Secret { secret_id, .. } => {
+                meta.secrets.insert(
+                    sid_key(secret_id),
+                    SecretRecord::tombstone_sender(*secret_id),
+                );
+                Message {
+                    local_id: local_id_for_msg,
+                    direction: Direction::Outbound,
+                    plaintext: Vec::new(),
+                    envelope_id: None,
+                    secret_id: Some(*secret_id),
+                }
+            }
+        };
+        meta.messages.push(display);
         self.commit(meta)?;
         Ok(ciphertext)
     }
 
-    /// Mark a message accepted by the server. Persisted before returning.
+    /// Mark a message accepted by the server. Persisted before returning. For a **secret** message,
+    /// the sender's encoded body is scrubbed from the outbox now that the server has it — the cached
+    /// ciphertext remains for any late retry, but the plaintext body is not retained (the sender
+    /// keeps no reopenable copy).
     pub fn mark_sent(&mut self, local_id: u64) -> Result<(), DurableError> {
         let mut meta = self.meta.clone();
         if let Some(entry) = meta.outbox.get_mut(&local_id) {
             entry.status = OutboundStatus::Sent;
+            if entry.secret_id.is_some() {
+                for b in entry.plaintext.iter_mut() {
+                    *b = 0;
+                }
+                entry.plaintext = Vec::new();
+            }
         } else {
             return Err(DurableError::UnknownLocal);
         }
         self.commit(meta)
+    }
+
+    // --- Secret-message reveal API (view-once ephemeral messages) ---------------------------------
+
+    /// Begin revealing a sealed secret (the recipient tapped its placeholder). **Atomic + fail
+    /// closed:** the transition to `Countdown` (with its deadlines) is committed to durable storage
+    /// BEFORE this returns `Ok`. If the state write fails, or the transition is invalid (not sealed,
+    /// wrong side, already revealed/consumed — a double tap or replay), this returns `Err` and the
+    /// caller MUST NOT show anything. `now_ms` is the caller's monotonic clock.
+    pub fn begin_secret_reveal(
+        &mut self,
+        secret_id: &[u8; SECRET_ID_LEN],
+        now_ms: u64,
+    ) -> Result<(), DurableError> {
+        let mut meta = self.meta.clone();
+        let rec = meta
+            .secrets
+            .get_mut(&sid_key(secret_id))
+            .ok_or(DurableError::UnknownLocal)?;
+        rec.begin_reveal(now_ms).map_err(|_| DurableError::Mls)?;
+        self.commit(meta)
+    }
+
+    /// The current reveal state of a secret (advancing it for `now_ms`). Persists the advance when it
+    /// changes state (so a consumption survives a crash). `None` if the id is unknown.
+    pub fn secret_state(
+        &mut self,
+        secret_id: &[u8; SECRET_ID_LEN],
+        now_ms: u64,
+    ) -> Result<Option<SecretState>, DurableError> {
+        let before = match self.meta.secrets.get(&sid_key(secret_id)) {
+            Some(r) => r.state,
+            None => return Ok(None),
+        };
+        let mut meta = self.meta.clone();
+        let rec = meta
+            .secrets
+            .get_mut(&sid_key(secret_id))
+            .expect("present above");
+        let after = rec.poll(now_ms);
+        if after != before {
+            self.commit(meta)?;
+        }
+        Ok(Some(after))
+    }
+
+    /// The secret's plaintext **iff it is currently visible** at `now_ms` — the plaintext gate.
+    /// `None` while sealed/counting down and forever after expiry. Persists a state advance (incl.
+    /// expiry-driven consumption + scrub) when it occurs.
+    pub fn secret_visible_body(
+        &mut self,
+        secret_id: &[u8; SECRET_ID_LEN],
+        now_ms: u64,
+    ) -> Result<Option<Vec<u8>>, DurableError> {
+        let before = match self.meta.secrets.get(&sid_key(secret_id)) {
+            Some(r) => r.state,
+            None => return Ok(None),
+        };
+        let mut meta = self.meta.clone();
+        let rec = meta
+            .secrets
+            .get_mut(&sid_key(secret_id))
+            .expect("present above");
+        let body = rec.visible_body(now_ms).map(|b| b.to_vec());
+        if rec.state != before {
+            self.commit(meta)?;
+        }
+        Ok(body)
+    }
+
+    /// Remaining countdown / viewing time in ms (0 when not in that phase) — for the UI timer/fade.
+    pub fn secret_remaining_ms(
+        &mut self,
+        secret_id: &[u8; SECRET_ID_LEN],
+        now_ms: u64,
+    ) -> Result<(u64, u64), DurableError> {
+        let mut meta = self.meta.clone();
+        let (countdown, view) = match meta.secrets.get_mut(&sid_key(secret_id)) {
+            Some(r) => {
+                let before = r.state;
+                let c = r.remaining_countdown_ms(now_ms);
+                let v = r.remaining_view_ms(now_ms);
+                if r.state != before {
+                    self.commit(meta)?;
+                }
+                (c, v)
+            }
+            None => (0, 0),
+        };
+        Ok((countdown, view))
+    }
+
+    /// Force a secret to the terminal tombstone (screenshot/capture detected, or an explicit close).
+    /// Idempotent; scrubs the body. Persisted before returning.
+    pub fn consume_secret(&mut self, secret_id: &[u8; SECRET_ID_LEN]) -> Result<(), DurableError> {
+        let mut meta = self.meta.clone();
+        if let Some(rec) = meta.secrets.get_mut(&sid_key(secret_id)) {
+            rec.consume();
+            self.commit(meta)?;
+        }
+        Ok(())
+    }
+
+    /// The exact non-sensitive tombstone text shown for a consumed/sent secret.
+    pub fn secret_tombstone_text() -> &'static str {
+        crate::secret::TOMBSTONE_TEXT
     }
 
     /// Ordered log of stored messages (inbound decrypted + outbound).

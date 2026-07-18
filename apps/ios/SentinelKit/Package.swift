@@ -23,5 +23,6 @@ let package = Package(
         // Live end-to-end smoke test against a running sentinel-api server.
         .executableTarget(name: "SentinelSmoke", dependencies: ["SentinelKit"]),
         .testTarget(name: "SentinelKitTests", dependencies: ["SentinelKit"]),
+        .testTarget(name: "SentinelUITests", dependencies: ["SentinelUI"]),
     ]
 )
