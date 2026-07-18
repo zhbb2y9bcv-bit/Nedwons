@@ -94,8 +94,10 @@ pub trait CredentialStore {
 }
 
 pub trait DeviceStore {
-    /// The single active (non-revoked) device for an account. v1 is single-active-device
-    /// (ADR-0002); the SQL schema enforces it with a partial unique index.
+    /// The account's **primary** active device — the deterministic earliest non-revoked device
+    /// (by creation, then id). This is the login/bootstrap target. Since ADR-0008 an account may
+    /// hold several non-revoked devices (enrolled via the trusted-device ceremony); this returns
+    /// exactly one so login and legacy device resolution stay well-defined.
     fn active_device_for_account(
         &self,
         account_id: &AccountId,
@@ -103,6 +105,14 @@ pub trait DeviceStore {
     fn device(&self, device_id: &DeviceId) -> StoreResult<Option<DeviceRecord>>;
     /// Mark a device revoked. Future signatures from it MUST fail closed (INV-10).
     fn revoke_device(&self, device_id: &DeviceId) -> StoreResult<()>;
+    /// Atomically add a device IF the account currently has fewer than `max_active` non-revoked
+    /// devices. Returns `true` if added, `false` if at the cap (the count + insert are one
+    /// transaction so a race cannot exceed the cap). Used only by the trusted-device enrollment
+    /// ceremony (ADR-0008) — never a password-only path.
+    fn add_active_device(&self, device: DeviceRecord, max_active: usize) -> StoreResult<bool>;
+    /// All of the account's devices (revoked included) for the device-management list, ordered
+    /// deterministically (creation, then id).
+    fn list_devices(&self, account_id: &AccountId) -> StoreResult<Vec<DeviceRecord>>;
 }
 
 pub trait ChallengeStore {

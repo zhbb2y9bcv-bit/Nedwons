@@ -31,7 +31,7 @@ pub mod transparency;
 pub use error::{AuthError, Result};
 pub use ids::{AccountId, DeviceId, FamilyId, TxnId};
 pub use service::{
-    normalize_username, refresh_txn_id, AuthService, Config, LoginChallenge, RegisterRequest,
-    RegistrationChallenge, Session,
+    normalize_username, refresh_txn_id, AuthService, Config, EnrollChallenge, EnrollRequest,
+    LoginChallenge, RegisterRequest, RegistrationChallenge, Session,
 };
 pub use transcript::{Action, Transcript, DOMAIN, PROTOCOL_VERSION};

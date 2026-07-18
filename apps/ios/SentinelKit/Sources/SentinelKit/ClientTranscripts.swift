@@ -28,6 +28,30 @@ public enum ClientTranscripts {
         )
     }
 
+    /// Trusted-device enrollment transcript (ADR-0008): the **trusted** device signs this to
+    /// authorize a NEW device's public key. `deviceID`/`publicKey` are the new device's; the
+    /// signer is the trusted device (verified server-side under the trusted device's enrolled key).
+    public static func deviceEnroll(
+        accountID: Data,
+        newDeviceID: Data,
+        newDevicePublicKey: Data,
+        challengeNonce: Data,
+        expiresAt: UInt64,
+        txnID: Data
+    ) -> Data {
+        AuthTranscript.encode(
+            AuthTranscript.Input(
+                action: .deviceEnroll,
+                accountID: accountID,
+                deviceID: newDeviceID,
+                publicKey: newDevicePublicKey,
+                challenge: challengeNonce,
+                expiresAt: expiresAt,
+                txnID: txnID
+            )
+        )
+    }
+
     /// Login transcript, rebuilt from the server's login challenge.
     public static func login(
         accountID: Data,
