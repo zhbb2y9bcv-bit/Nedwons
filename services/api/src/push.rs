@@ -52,12 +52,87 @@ pub trait PushTransport: Send + Sync {
     fn post(&self, request: &ApnsRequest) -> Result<u16, String>;
 }
 
-/// A transport that sends nothing (the default until a real HTTP/2 adapter is deployed).
+/// A transport that sends nothing (kept for tests and for explicitly-disabled deployments).
 pub struct NullTransport;
 impl PushTransport for NullTransport {
     fn post(&self, _request: &ApnsRequest) -> Result<u16, String> {
         Ok(200)
     }
+}
+
+/// The **real** APNs transport: HTTP/2 to `api.push.apple.com` (rustls, no OpenSSL). APNs requires
+/// HTTP/2, so:
+/// - an `https://` base URL uses TLS with ALPN (Apple negotiates h2);
+/// - an `http://` base URL uses HTTP/2 prior knowledge (h2c) — for local integration tests and dev
+///   loopback servers only.
+///
+/// The client is built lazily on first use **inside** `post` (which always runs on a blocking
+/// thread), because constructing a `reqwest::blocking::Client` inside an async context panics.
+pub struct HttpPushTransport {
+    base_url: String,
+    client: std::sync::OnceLock<Result<reqwest::blocking::Client, String>>,
+}
+
+/// Default APNs production host. Sandbox is `https://api.sandbox.push.apple.com` (set
+/// `SENTINEL_APNS_URL` to override).
+pub const APNS_PRODUCTION_URL: &str = "https://api.push.apple.com";
+
+impl HttpPushTransport {
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+            client: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// Base URL from `SENTINEL_APNS_URL`, defaulting to production APNs.
+    pub fn from_env() -> Self {
+        Self::new(
+            std::env::var("SENTINEL_APNS_URL").unwrap_or_else(|_| APNS_PRODUCTION_URL.to_string()),
+        )
+    }
+
+    fn client(&self) -> Result<&reqwest::blocking::Client, String> {
+        self.client
+            .get_or_init(|| {
+                let builder = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(10));
+                // Plain-HTTP base (tests/dev): HTTP/2 prior knowledge, since there is no ALPN.
+                let builder = if self.base_url.starts_with("http://") {
+                    builder.http2_prior_knowledge()
+                } else {
+                    builder
+                };
+                builder.build().map_err(|e| format!("client build: {e}"))
+            })
+            .as_ref()
+            .map_err(|e| e.clone())
+    }
+}
+
+impl PushTransport for HttpPushTransport {
+    fn post(&self, request: &ApnsRequest) -> Result<u16, String> {
+        let url = format!("{}{}", self.base_url, request.path);
+        let response = self
+            .client()?
+            .post(&url)
+            .header("authorization", &request.authorization)
+            .header("apns-topic", &request.apns_topic)
+            .header("apns-push-type", &request.apns_push_type)
+            .header("content-type", "application/json")
+            .body(request.body.clone())
+            .send()
+            .map_err(|e| format!("apns send: {e}"))?;
+        Ok(response.status().as_u16())
+    }
+}
+
+/// Parse Apple's `.p8` (PKCS#8 PEM) provider key into a P-256 signing key. Accepts literal `\n`
+/// escapes (env-file friendliness). `None` on any malformation — never a partial parse.
+pub fn signing_key_from_p8(p8: &str) -> Option<SigningKey> {
+    use p256::pkcs8::DecodePrivateKey;
+    let pem = p8.replace("\\n", "\n");
+    SigningKey::from_pkcs8_pem(pem.trim()).ok()
 }
 
 fn now_secs() -> u64 {
@@ -148,22 +223,24 @@ impl PushService {
         }
     }
 
-    /// Build from `SENTINEL_APNS_{KEY_HEX,KEY_ID,TEAM_ID,TOPIC}`; returns a disabled service if any is
-    /// absent or the key scalar is malformed. `transport` is the deployment's HTTP/2 adapter (a
-    /// [`NullTransport`] until one is wired — the mechanism is then built but sends nothing).
+    /// Build from the environment; returns a disabled service if the identifiers or key are absent
+    /// or malformed. `transport` is the deployment's HTTP/2 adapter ([`HttpPushTransport`] in
+    /// production; a recording/[`NullTransport`] in tests).
+    ///
+    /// - `SENTINEL_APNS_KEY_ID`, `SENTINEL_APNS_TEAM_ID`, `SENTINEL_APNS_TOPIC` — Apple identifiers.
+    /// - The provider key, either form:
+    ///   - `SENTINEL_APNS_KEY_P8` — the **contents of the `.p8` file from Apple, verbatim** (PKCS#8
+    ///     PEM; literal `\n` sequences are accepted for env-file friendliness), or
+    ///   - `SENTINEL_APNS_KEY_HEX` — the raw P-256 scalar in hex.
     pub fn from_env(relay: Arc<PgRelay>, transport: Arc<dyn PushTransport>) -> Self {
-        let (Ok(key_hex), Ok(key_id), Ok(team_id), Ok(topic)) = (
-            std::env::var("SENTINEL_APNS_KEY_HEX"),
+        let (Ok(key_id), Ok(team_id), Ok(topic)) = (
             std::env::var("SENTINEL_APNS_KEY_ID"),
             std::env::var("SENTINEL_APNS_TEAM_ID"),
             std::env::var("SENTINEL_APNS_TOPIC"),
         ) else {
             return Self::disabled();
         };
-        let Ok(bytes) = hex::decode(key_hex.trim()) else {
-            return Self::disabled();
-        };
-        let Ok(signing_key) = SigningKey::from_slice(&bytes) else {
+        let Some(signing_key) = Self::signing_key_from_env() else {
             return Self::disabled();
         };
         Self::new(
@@ -176,6 +253,18 @@ impl PushService {
             transport,
             relay,
         )
+    }
+
+    /// The provider signing key from `SENTINEL_APNS_KEY_P8` (preferred — Apple's `.p8` verbatim) or
+    /// `SENTINEL_APNS_KEY_HEX`. `None` if absent or malformed (the service then stays disabled —
+    /// never a half-configured signer).
+    fn signing_key_from_env() -> Option<SigningKey> {
+        if let Ok(p8) = std::env::var("SENTINEL_APNS_KEY_P8") {
+            return signing_key_from_p8(&p8);
+        }
+        let key_hex = std::env::var("SENTINEL_APNS_KEY_HEX").ok()?;
+        let bytes = hex::decode(key_hex.trim()).ok()?;
+        SigningKey::from_slice(&bytes).ok()
     }
 
     pub fn is_enabled(&self) -> bool {

@@ -31,9 +31,23 @@ refinery = { version = "0.9", features = ["postgres"] }
 governor = "0.10"
 
 # Key transparency (R-201): sign Signed Tree Heads with the log's ECDSA-P256 key. Vetted
-# RustCrypto primitives — no custom crypto.
-p256 = { version = "0.13", features = ["ecdsa"] }
+# RustCrypto primitives — no custom crypto. `pkcs8`/`pem` let the APNs provider key be loaded
+# straight from Apple's `.p8` file (#4 transport).
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8", "pem"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+
+# APNs (#4): the real HTTP/2 client to api.push.apple.com (rustls; no OpenSSL). Blocking API —
+# every dispatch already runs in spawn_blocking.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "http2"] }
+
+# App Attest verification (#10): CBOR attestation-object decode + X.509 chain to the pinned Apple
+# App Attest root. Vetted RustCrypto/serde-ecosystem parsers — no hand-rolled ASN.1 beyond the
+# tiny Apple nonce-extension walk.
+ciborium = "0.2"
+x509-cert = { version = "0.2", features = ["pem"] }
+p384 = { version = "0.13", features = ["ecdsa"] }
+sha2 = "0.10"
+base64 = "0.22"
 
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -49,3 +63,6 @@ mls-core = { path = "../../core/mls-core" }
 # Test-only WebSocket client for the streaming-delivery test.
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
+# Test-only: mint a synthetic App Attest certificate chain (root -> intermediate -> credential cert
+# with the Apple nonce extension) so the verifier is proven end-to-end without Apple hardware.
+rcgen = "0.13"
