@@ -135,18 +135,21 @@ impl PgRelay {
         .transpose()
     }
 
-    /// Create a conversation and add the creator as its first member (one transaction).
+    /// Create a conversation and add the creator as its first member (one transaction). When
+    /// `mls_authoritative`, membership afterwards may change ONLY through an MLS commit
+    /// (ADR-0010): the legacy direct-mutation endpoints refuse.
     pub fn create_conversation(
         &self,
         conversation_id: [u8; 16],
         creator_account: AccountId,
         creator_device: DeviceId,
+        mls_authoritative: bool,
     ) -> StoreResult<()> {
         let mut conn = self.conn()?;
         let mut txn = conn.transaction().map_err(db_err)?;
         txn.execute(
-            "INSERT INTO conversations (conversation_id) VALUES ($1)",
-            &[&conversation_id.as_slice()],
+            "INSERT INTO conversations (conversation_id, mls_authoritative) VALUES ($1, $2)",
+            &[&conversation_id.as_slice(), &mls_authoritative],
         )
         .map_err(db_err)?;
         txn.execute(
@@ -161,6 +164,20 @@ impl PgRelay {
         .map_err(db_err)?;
         txn.commit().map_err(db_err)?;
         Ok(())
+    }
+
+    /// Whether a conversation is MLS-authoritative (membership changes only via `/commit`).
+    /// Returns `false` for an unknown conversation (safe default; ids are opaque so this leaks
+    /// nothing).
+    pub fn is_authoritative(&self, conversation_id: &[u8; 16]) -> StoreResult<bool> {
+        let mut conn = self.conn()?;
+        let row = conn
+            .query_opt(
+                "SELECT mls_authoritative FROM conversations WHERE conversation_id = $1",
+                &[&conversation_id.as_slice()],
+            )
+            .map_err(db_err)?;
+        Ok(row.map(|r| r.get::<_, bool>(0)).unwrap_or(false))
     }
 
     /// Add a device to a conversation's routing membership (idempotent).
