@@ -12,8 +12,12 @@ import SentinelUI
 public final class MlsClientSecretEngine: SecretEngine {
     private let client: MlsClient
     /// ADR-0015: given the opaque consumption envelope produced when a reveal begins, deliver it to
-    /// the account's OTHER devices (the app's send path — client-side fan-out through the
-    /// conversation; the relay stays blind). Omit on a single-device client — no message is emitted.
+    /// the account's OTHER devices. The envelope is encrypted by the Rust core with this account's
+    /// **device self-group** when one is established (option 3) — the conversation's other party is
+    /// not a member and never learns of the open — so the app routes it to the account's own device
+    /// fan-out, and each recipient device applies it via `MlsClient.processSelfInbound`. Absent a
+    /// self-group it falls back to the conversation channel (option 2). The relay stays blind either
+    /// way. Omit on a single-device client — no message is emitted.
     private let broadcastConsumption: ((Data) throws -> Void)?
 
     public init(client: MlsClient, broadcastConsumption: ((Data) throws -> Void)? = nil) {

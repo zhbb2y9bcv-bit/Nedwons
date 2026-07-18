@@ -296,6 +296,61 @@ impl MlsClient {
         })
     }
 
+    // --- Device self-group (ADR-0015 option 3) ---------------------------------------------------
+    //
+    // The self-group is a second MLS group of only this account's own devices, used to sync
+    // `SecretConsumed` control messages so the conversation's other party never learns a secret was
+    // opened. It shares this client's provider store with the conversation, so it is persisted by the
+    // same atomic blob. These mirror the conversation membership handshake.
+
+    /// True if this client has an established device self-group.
+    pub fn has_self_group(&self) -> Result<bool, MlsClientError> {
+        catch(move || {
+            let g = self.lock()?;
+            match &*g {
+                ClientState::Active { session } => Ok(session.has_self_group()),
+                ClientState::Pending { .. } => Err(MlsClientError::WrongState),
+                ClientState::Closed => Err(MlsClientError::Closed),
+            }
+        })
+    }
+
+    /// Create this account's self-group with this device as its sole member. Persists before
+    /// returning. `WrongState` if one already exists.
+    pub fn create_self_group(&self) -> Result<(), MlsClientError> {
+        catch(move || {
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session.create_self_group().map_err(map_durable)
+        })
+    }
+
+    /// Add another of this account's devices to the self-group by its key-package bytes. Returns
+    /// commit + welcome (deliver to existing devices / the new device). `WrongState` if no self-group
+    /// exists yet.
+    pub fn add_self_device(&self, key_package: Vec<u8>) -> Result<AddOutcome, MlsClientError> {
+        catch(move || {
+            bound(key_package.len(), MAX_KEY_PACKAGE_LEN)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            let (commit, welcome) = session
+                .add_self_device(&key_package)
+                .map_err(map_durable_input)?;
+            Ok(AddOutcome { commit, welcome })
+        })
+    }
+
+    /// Join this account's self-group from a Welcome produced by another device's `add_self_device`.
+    /// Persists before returning. `WrongState` if a self-group is already established here.
+    pub fn join_self_group(&self, welcome: Vec<u8>) -> Result<(), MlsClientError> {
+        catch(move || {
+            bound(welcome.len(), MAX_WELCOME_LEN)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session.join_self_group(&welcome).map_err(map_durable_input)
+        })
+    }
+
     /// Stage an add for MLS-commit-authoritative membership (ADR-0010): build commit + welcome
     /// WITHOUT advancing the group. The caller signs a manifest, POSTs `/commit`, then calls
     /// [`merge_staged`](Self::merge_staged) on success or [`clear_staged`](Self::clear_staged) on
@@ -434,11 +489,14 @@ impl MlsClient {
     }
 
     /// Build (once) the **consumption control message** for a secret this device revealed (ADR-0015,
-    /// account-wide single-view). Returns the opaque envelope to broadcast to the account's other
-    /// devices through the conversation (via the normal send path — the relay stays blind), or
-    /// `None` if the secret is unknown, is the sender's own, or has not been revealed here.
-    /// Idempotent: repeated calls return the same envelope and never double-advance the ratchet.
-    /// A single-device client simply never calls this.
+    /// account-wide single-view). Returns the opaque envelope to deliver to the account's other
+    /// devices, or `None` if the secret is unknown, is the sender's own, or has not been revealed
+    /// here. If this client has a device self-group (option 3) the message is encrypted with it — the
+    /// conversation's other party is not a member and never learns of the open — and the recipient
+    /// devices apply it via [`Self::process_self_inbound`]; otherwise it falls back to the
+    /// conversation channel (option 2) and [`Self::process_inbound`]. Idempotent: repeated calls
+    /// return the same envelope and never double-advance the ratchet. A single-device client simply
+    /// never calls this.
     pub fn secret_consumption_envelope(
         &self,
         secret_id: Vec<u8>,
@@ -539,6 +597,42 @@ impl MlsClient {
             let session = active_mut(&mut g)?;
             let outcome = session
                 .process_inbound(envelope_id, &payload)
+                .map_err(map_durable_input)?;
+            Ok(match outcome {
+                InboundOutcome::Application(pt) => InboundResult::Application { plaintext: pt },
+                InboundOutcome::StateAdvanced => InboundResult::StateAdvanced,
+                InboundOutcome::Duplicate => InboundResult::Duplicate,
+                InboundOutcome::SecretSealed { secret_id } => InboundResult::SecretSealed {
+                    secret_id: secret_id.to_vec(),
+                },
+                InboundOutcome::SecretConsumedRemotely { secret_id } => {
+                    InboundResult::SecretConsumedRemotely {
+                        secret_id: secret_id.to_vec(),
+                    }
+                }
+            })
+        })
+    }
+
+    /// Process an inbound envelope that arrived on the account's **self-group** channel (ADR-0015
+    /// option 3) — a `SecretConsumed` control message from one of this account's OTHER devices, or a
+    /// self-group membership commit. Decrypts with the self-group (which the conversation's other
+    /// party is not in), so the read signal stays private to the account. Same idempotent dedup + ack
+    /// contract as [`Self::process_inbound`]. `WrongState` if no self-group is established here.
+    pub fn process_self_inbound(
+        &self,
+        envelope_id: u64,
+        ciphertext: Vec<u8>,
+    ) -> Result<InboundResult, MlsClientError> {
+        catch(move || {
+            bound(ciphertext.len(), MAX_ENVELOPE_LEN)?;
+            let payload = mls_core::envelope::unwrap(&ciphertext)
+                .map_err(|_| MlsClientError::InvalidMessage)?
+                .to_vec();
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            let outcome = session
+                .process_self_inbound(envelope_id, &payload)
                 .map_err(map_durable_input)?;
             Ok(match outcome {
                 InboundOutcome::Application(pt) => InboundResult::Application { plaintext: pt },
@@ -792,6 +886,8 @@ fn map_durable(e: DurableError) -> MlsClientError {
         DurableError::NoSession => MlsClientError::NoSession,
         DurableError::UnknownLocal => MlsClientError::NotFound,
         DurableError::Journal => MlsClientError::Journal,
+        // A self-group precondition (absent when required / already present) is a state misuse.
+        DurableError::SelfGroup => MlsClientError::WrongState,
         DurableError::Mls | DurableError::Codec => MlsClientError::Internal,
     }
 }
@@ -802,6 +898,7 @@ fn map_durable_input(e: DurableError) -> MlsClientError {
         DurableError::NoSession => MlsClientError::NoSession,
         DurableError::UnknownLocal => MlsClientError::NotFound,
         DurableError::Journal => MlsClientError::Journal,
+        DurableError::SelfGroup => MlsClientError::WrongState,
         DurableError::Mls | DurableError::Codec => MlsClientError::InvalidMessage,
     }
 }

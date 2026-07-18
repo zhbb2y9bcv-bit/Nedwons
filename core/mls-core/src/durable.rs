@@ -55,6 +55,11 @@ pub enum DurableError {
     NoSession,
     #[error("unknown local message")]
     UnknownLocal,
+    /// A self-group precondition was violated: an operation needing the account's device self-group
+    /// (ADR-0015 option 3) was called with none established, or `create_self_group` was called when
+    /// one already exists. Redacted; carries no state.
+    #[error("self-group precondition violated")]
+    SelfGroup,
 }
 
 impl From<crate::MlsError> for DurableError {
@@ -91,6 +96,18 @@ pub struct Message {
     pub secret_id: Option<[u8; SECRET_ID_LEN]>,
 }
 
+/// Which MLS group an outbound message is encrypted with. Normal messages and secrets go through
+/// the **conversation** (with the peer/sender). A `SecretConsumed` control message (ADR-0015
+/// option 3) goes through the account's **self-group** — only this account's own devices — so the
+/// conversation's other party never receives the read signal. `#[serde(default)]` ⇒ blobs written
+/// before this field load as `Conversation`.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Channel {
+    #[default]
+    Conversation,
+    SelfGroup,
+}
+
 /// Lifecycle of an outbound message.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub enum OutboundStatus {
@@ -113,6 +130,9 @@ struct Outbound {
     /// `Some` for a secret message; the sender tombstones it immediately on encrypt.
     #[serde(default)]
     secret_id: Option<[u8; SECRET_ID_LEN]>,
+    /// Which MLS group encrypts this message (ADR-0015 option 3). Defaults to `Conversation`.
+    #[serde(default)]
+    channel: Channel,
 }
 
 /// What processing an inbound envelope yielded.
@@ -164,6 +184,13 @@ struct Meta {
     /// `#[serde(default)]` ⇒ older blobs load empty.
     #[serde(default)]
     secrets: BTreeMap<String, SecretRecord>,
+    /// The MLS group id of this account's **self-group** (ADR-0015 option 3), if one is established —
+    /// the group of only this account's own devices, over which `SecretConsumed` control messages are
+    /// synced without the conversation's other party learning anything. Its ratchet state lives in the
+    /// same provider store as the conversation, so the one `export_store` snapshot persists both.
+    /// `#[serde(default)]` ⇒ older blobs load with no self-group.
+    #[serde(default)]
+    self_group_id: Option<Vec<u8>>,
 }
 
 /// Hex key for a secret id (JSON object keys must be strings, so the raw `[u8; 16]` can't be a key).
@@ -235,6 +262,9 @@ struct Blob {
 struct Session {
     member: Member,
     conversation: Conversation,
+    /// The account's device self-group (ADR-0015 option 3), if established. Shares `member`'s
+    /// provider with `conversation`, so both groups are captured by one `export_store` snapshot.
+    self_group: Option<Conversation>,
     public_key: Vec<u8>,
     group_id: Vec<u8>,
 }
@@ -246,6 +276,7 @@ impl Session {
         Self {
             member,
             conversation,
+            self_group: None,
             public_key,
             group_id,
         }
@@ -254,7 +285,12 @@ impl Session {
     fn restore(meta: &Meta, store: &[u8]) -> Result<Self, DurableError> {
         let member = Member::restore(&meta.identity, store, &meta.public_key)?;
         let conversation = Conversation::reload(&member, &meta.group_id)?;
-        Ok(Self::wrap(member, conversation))
+        let mut session = Self::wrap(member, conversation);
+        // Reload the self-group from the SAME provider store (both groups were exported together).
+        if let Some(self_group_id) = &meta.self_group_id {
+            session.self_group = Some(Conversation::reload(&session.member, self_group_id)?);
+        }
+        Ok(session)
     }
 }
 
@@ -369,6 +405,68 @@ impl<J: Journal> DurableSession<J> {
         Ok((added.commit, added.welcome))
     }
 
+    // ----- Device self-group (ADR-0015 option 3) ----------------------------------------------
+    //
+    // The self-group is a second MLS group whose members are ONLY this account's own devices. It
+    // lives in the SAME `Member` provider as the conversation, so one `export_store` snapshot (and
+    // one atomic commit) persists both. `SecretConsumed` control messages are synced over it so the
+    // conversation's other party never receives the read signal (unlike option 2, which used the
+    // conversation group). The add/join key-package↔welcome handshake mirrors conversation membership.
+
+    /// True if this device has an established self-group.
+    pub fn has_self_group(&self) -> bool {
+        self.session.self_group.is_some()
+    }
+
+    /// Create this account's self-group with this device as its sole initial member, persisting it.
+    /// Errors with [`DurableError::SelfGroup`] if one already exists (never silently orphan a group).
+    pub fn create_self_group(&mut self) -> Result<(), DurableError> {
+        if self.session.self_group.is_some() {
+            return Err(DurableError::SelfGroup);
+        }
+        let self_group = self.session.member.create_group()?;
+        let self_group_id = self_group.group_id();
+        self.session.self_group = Some(self_group);
+        let mut meta = self.meta.clone();
+        meta.self_group_id = Some(self_group_id);
+        self.commit(meta)
+    }
+
+    /// Add another of this account's devices to the self-group by its key package. Returns
+    /// (commit, welcome) to deliver to the existing devices / the new device. The advanced self-group
+    /// state is persisted before returning. Errors with [`DurableError::SelfGroup`] if there is no
+    /// self-group on this device yet.
+    pub fn add_self_device(
+        &mut self,
+        key_package: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), DurableError> {
+        let added = {
+            let Session {
+                member, self_group, ..
+            } = &mut self.session;
+            let group = self_group.as_mut().ok_or(DurableError::SelfGroup)?;
+            group.add_member(member, key_package)?
+        };
+        let meta = self.meta.clone();
+        self.commit(meta)?;
+        Ok((added.commit, added.welcome))
+    }
+
+    /// Join this account's self-group from a Welcome produced by another of its devices'
+    /// [`add_self_device`](Self::add_self_device). Adopts it as this device's self-group and persists.
+    /// Errors with [`DurableError::SelfGroup`] if a self-group is already established here.
+    pub fn join_self_group(&mut self, welcome: &[u8]) -> Result<(), DurableError> {
+        if self.session.self_group.is_some() {
+            return Err(DurableError::SelfGroup);
+        }
+        let self_group = self.session.member.join_from_welcome(welcome)?;
+        let self_group_id = self_group.group_id();
+        self.session.self_group = Some(self_group);
+        let mut meta = self.meta.clone();
+        meta.self_group_id = Some(self_group_id);
+        self.commit(meta)
+    }
+
     // ----- Staged commits for MLS-commit-authoritative membership (ADR-0010) ------------------
     //
     // Staging is deliberately NOT persisted: an in-flight commit awaiting the server's epoch CAS
@@ -464,57 +562,37 @@ impl<J: Journal> DurableSession<J> {
             conversation.process(member, ciphertext)?
         };
         let mut meta = self.meta.clone();
-        let outcome = match incoming {
-            // The MLS plaintext is a Content envelope; decode classifies normal vs secret. A decode
-            // failure (an authenticated member sent malformed content) is a typed, redacted error —
-            // the ratchet advance is not committed, matching the existing process-error contract.
-            Incoming::Application(payload) => {
-                match Content::decode(&payload).map_err(map_content)? {
-                    Content::Normal { body } => {
-                        let local_id = meta.take_local_id();
-                        meta.messages.push(Message {
-                            local_id,
-                            direction: Direction::Inbound,
-                            plaintext: body.clone(),
-                            envelope_id: Some(envelope_id),
-                            secret_id: None,
-                        });
-                        InboundOutcome::Application(body)
-                    }
-                    Content::Secret { secret_id, body } => {
-                        if meta.secrets.contains_key(&sid_key(&secret_id)) {
-                            // Replayed secret id (a distinct envelope carrying an already-seen secret).
-                            // Never grant a second sealed placeholder / viewing opportunity.
-                            InboundOutcome::Duplicate
-                        } else {
-                            let local_id = meta.take_local_id();
-                            meta.secrets.insert(
-                                sid_key(&secret_id),
-                                SecretRecord::sealed_recipient(secret_id, body),
-                            );
-                            meta.messages.push(Message {
-                                local_id,
-                                direction: Direction::Inbound,
-                                plaintext: Vec::new(),
-                                envelope_id: Some(envelope_id),
-                                secret_id: Some(secret_id),
-                            });
-                            InboundOutcome::SecretSealed { secret_id }
-                        }
-                    }
-                    // ADR-0015: another of this account's devices revealed this secret. Force-consume
-                    // our copy (idempotent) so it can never be opened here — account-wide single-view.
-                    // No user-visible message; a device that never held this secret simply no-ops.
-                    Content::SecretConsumed { secret_id } => {
-                        if let Some(rec) = meta.secrets.get_mut(&sid_key(&secret_id)) {
-                            rec.consume();
-                        }
-                        InboundOutcome::SecretConsumedRemotely { secret_id }
-                    }
-                }
-            }
-            Incoming::StateAdvanced => InboundOutcome::StateAdvanced,
+        let outcome = apply_incoming(&mut meta, incoming, envelope_id)?;
+        meta.record_seen(envelope_id);
+        meta.ack_eligible.insert(envelope_id);
+        self.commit(meta)?;
+        Ok(outcome)
+    }
+
+    /// Process an inbound envelope that arrived on the account's **self-group** channel (ADR-0015
+    /// option 3): a `SecretConsumed` control message from one of this account's OTHER devices, or a
+    /// self-group membership commit (a device was linked/unlinked). Decrypts with the self-group —
+    /// which the conversation's other party is not a member of — so the read signal never reaches
+    /// them. Shares the same idempotent dedup + ack machinery as [`process_inbound`]; the caller
+    /// routes an envelope here iff the relay tagged it for the self-group. Returns
+    /// [`DurableError::SelfGroup`] if no self-group is established on this device.
+    pub fn process_self_inbound(
+        &mut self,
+        envelope_id: u64,
+        ciphertext: &[u8],
+    ) -> Result<InboundOutcome, DurableError> {
+        if self.meta.is_seen(envelope_id) {
+            return Ok(InboundOutcome::Duplicate);
+        }
+        let incoming = {
+            let Session {
+                member, self_group, ..
+            } = &mut self.session;
+            let group = self_group.as_mut().ok_or(DurableError::SelfGroup)?;
+            group.process(member, ciphertext)?
         };
+        let mut meta = self.meta.clone();
+        let outcome = apply_incoming(&mut meta, incoming, envelope_id)?;
         meta.record_seen(envelope_id);
         meta.ack_eligible.insert(envelope_id);
         self.commit(meta)?;
@@ -582,6 +660,7 @@ impl<J: Journal> DurableSession<J> {
                 status: OutboundStatus::Queued,
                 ciphertext: None,
                 secret_id,
+                channel: Channel::Conversation,
             },
         );
         self.commit(meta)?;
@@ -601,13 +680,25 @@ impl<J: Journal> DurableSession<J> {
             return Ok(ciphertext.clone());
         }
         let plaintext = existing.plaintext.clone();
+        let channel = existing.channel;
         let ciphertext = {
             let Session {
                 member,
                 conversation,
+                self_group,
                 ..
             } = &mut self.session;
-            conversation.encrypt(member, &plaintext)?
+            match channel {
+                Channel::Conversation => conversation.encrypt(member, &plaintext)?,
+                // A `SecretConsumed` control message (ADR-0015 option 3) is encrypted with the
+                // self-group so the conversation's other party never receives it. If the outbound
+                // was tagged for the self-group but none exists, that is a self-group precondition
+                // violation — fail closed rather than silently leaking it to the conversation.
+                Channel::SelfGroup => self_group
+                    .as_mut()
+                    .ok_or(DurableError::SelfGroup)?
+                    .encrypt(member, &plaintext)?,
+            }
         };
         // `plaintext` is the encoded Content envelope; decode it to build the DISPLAY message
         // (never the encoded bytes). A secret becomes an empty-plaintext placeholder + a sender-side
@@ -712,6 +803,15 @@ impl<J: Journal> DurableSession<J> {
         if let Some(existing) = rec.consumption_local_id {
             return Ok(Some(existing));
         }
+        // Route through the self-group (ADR-0015 option 3) when this account has one established, so
+        // the conversation's other party never learns the secret was opened. If no self-group exists
+        // (a single-device account, or one not yet linked), fall back to the conversation channel
+        // (option 2 semantics) — a graceful degradation, documented in SECRET_MESSAGES.md.
+        let channel = if self.session.self_group.is_some() {
+            Channel::SelfGroup
+        } else {
+            Channel::Conversation
+        };
         let mut meta = self.meta.clone();
         let local_id = meta.take_local_id();
         meta.outbox.insert(
@@ -725,6 +825,7 @@ impl<J: Journal> DurableSession<J> {
                 status: OutboundStatus::Queued,
                 ciphertext: None,
                 secret_id: None, // a control message, not a user-visible secret placeholder
+                channel,
             },
         );
         if let Some(rec) = meta.secrets.get_mut(&sid_key(secret_id)) {
@@ -842,6 +943,66 @@ impl<J: Journal> DurableSession<J> {
         self.meta = meta;
         Ok(())
     }
+}
+
+/// Apply a decrypted inbound message to `meta`, returning what it yielded. Shared by both the
+/// conversation channel ([`DurableSession::process_inbound`]) and the self-group channel
+/// ([`DurableSession::process_self_inbound`]) so the content-envelope handling — normal message,
+/// sealed secret, or `SecretConsumed` control message — is defined in exactly ONE place regardless
+/// of which group decrypted it. The MLS plaintext is a [`Content`] envelope; a decode failure (an
+/// authenticated member sent malformed content) is a typed, redacted error and the caller does NOT
+/// commit the ratchet advance, matching the existing process-error contract.
+fn apply_incoming(
+    meta: &mut Meta,
+    incoming: Incoming,
+    envelope_id: u64,
+) -> Result<InboundOutcome, DurableError> {
+    Ok(match incoming {
+        Incoming::Application(payload) => match Content::decode(&payload).map_err(map_content)? {
+            Content::Normal { body } => {
+                let local_id = meta.take_local_id();
+                meta.messages.push(Message {
+                    local_id,
+                    direction: Direction::Inbound,
+                    plaintext: body.clone(),
+                    envelope_id: Some(envelope_id),
+                    secret_id: None,
+                });
+                InboundOutcome::Application(body)
+            }
+            Content::Secret { secret_id, body } => {
+                if meta.secrets.contains_key(&sid_key(&secret_id)) {
+                    // Replayed secret id (a distinct envelope carrying an already-seen secret).
+                    // Never grant a second sealed placeholder / viewing opportunity.
+                    InboundOutcome::Duplicate
+                } else {
+                    let local_id = meta.take_local_id();
+                    meta.secrets.insert(
+                        sid_key(&secret_id),
+                        SecretRecord::sealed_recipient(secret_id, body),
+                    );
+                    meta.messages.push(Message {
+                        local_id,
+                        direction: Direction::Inbound,
+                        plaintext: Vec::new(),
+                        envelope_id: Some(envelope_id),
+                        secret_id: Some(secret_id),
+                    });
+                    InboundOutcome::SecretSealed { secret_id }
+                }
+            }
+            // ADR-0015: another of this account's devices revealed this secret. Force-consume our
+            // copy (idempotent) so it can never be opened here — account-wide single-view. No
+            // user-visible message; a device that never held this secret simply no-ops.
+            Content::SecretConsumed { secret_id } => {
+                if let Some(rec) = meta.secrets.get_mut(&sid_key(&secret_id)) {
+                    rec.consume();
+                }
+                InboundOutcome::SecretConsumedRemotely { secret_id }
+            }
+        },
+        Incoming::StateAdvanced => InboundOutcome::StateAdvanced,
+    })
 }
 
 fn commit_blob<J: Journal>(

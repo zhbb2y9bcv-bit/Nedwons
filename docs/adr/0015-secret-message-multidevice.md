@@ -1,15 +1,26 @@
 # ADR-0015: Account-wide single-consumption for Secret Messages (multi-device)
 
-- **Status:** **Accepted — implemented 2026-07-18** (option 2). Account-wide single-consumption now
-  works via an E2EE, relay-blind `SecretConsumed` control message. The core race/offline caveats
-  below remain **inherent** and are documented honestly in `docs/SECRET_MESSAGES.md`.
-- **Implementation:** `Content::SecretConsumed { secret_id }` (new versioned content kind, bounded,
-  fuzzed); `DurableSession::emit_secret_consumption` (idempotent, builds the control message once
-  after a recipient reveals) + `process_inbound` force-consumes on receipt (new outcome
+- **Status:** **Accepted — implemented 2026-07-18** (option 2, then upgraded to **option 3**).
+  Account-wide single-consumption works via an E2EE, relay-blind `SecretConsumed` control message. As
+  of the option-3 upgrade it rides the account's **device self-group** (below), so the conversation's
+  other party (the sender) no longer even receives the read signal. The race/offline caveats below
+  remain **inherent** and are documented honestly in `docs/SECRET_MESSAGES.md`.
+- **Implementation (option 2 core):** `Content::SecretConsumed { secret_id }` (new versioned content
+  kind, bounded, fuzzed); `DurableSession::emit_secret_consumption` (idempotent, builds the control
+  message once after a recipient reveals) + `process_inbound` force-consumes on receipt (new outcome
   `SecretConsumedRemotely`); FFI `secret_consumption_envelope` + `InboundResult::SecretConsumedRemotely`;
-  Swift `MlsClientSecretEngine` fans it out via an injected broadcast closure. **Proven:** mls-core
-  `revealing_on_one_device_consumes_it_on_the_other` (real 3-member group: phone reveals → tablet's
-  copy consumed, relay sees only ciphertext), FFI + SentinelApp fan-out tests.
+  Swift `MlsClientSecretEngine` fans it out via an injected broadcast closure.
+- **Implementation (option 3 upgrade, 2026-07-18):** a second MLS group — the account's **self-group**
+  of only its own devices — lives in the same `Member` provider as the conversation, so one atomic
+  blob persists both. `emit_secret_consumption` tags the control message with `Channel::SelfGroup`
+  when a self-group exists; `encrypt` routes it through the self-group; the peer applies it via the
+  new `process_self_inbound` path (`DurableSession` / FFI). Self-group establishment mirrors
+  conversation membership: `create_self_group` / `add_self_device` / `join_self_group` (+ FFI +
+  `has_self_group`). A single-device or unlinked account gracefully falls back to option 2. **Proven:**
+  mls-core `consumption_syncs_over_the_self_group_without_the_sender_learning` (real 4-party: sender +
+  phone + tablet; phone reveals → tablet consumed; the sender is not in the self-group and **cannot
+  decrypt** the signal) + `self_group_persists_across_reopen`; FFI `consumption_over_the_self_group_across_the_ffi`;
+  SentinelApp `testRevealFansOutOverTheSelfGroupSenderNeverSeesIt`. Original option-2 tests retained.
 - **Date:** 2026-07-18
 - **Deciders:** crypto integrator, backend lead, security architect
 - **Context:** ADR-0008 (multi-device trust), ADR-0010 (MLS-authoritative membership), ADR-0012/0014
@@ -38,10 +49,15 @@ consumption signal cannot be a plaintext server flag; it must travel as opaque, 
    Peer devices, on receiving it, transition that `secret_id` straight to `Consumed` (fail-closed:
    the *first* device to open wins; others never open). This reuses the existing content-envelope +
    durable state machine + at-least-once delivery; the relay sees only another opaque envelope.
-3. **Self-group / device-sync channel (variant of 2).** If per-account device fan-out is later
-   modelled as its own MLS sub-group (a "self group" of a user's devices, cf. Signal's sync
-   messages), the consumption message rides that channel instead of the conversation group. Cleaner
-   isolation; more infrastructure. Deferred behind option 2.
+3. **Self-group / device-sync channel (variant of 2) — ADOPTED as the 2026-07-18 upgrade.** Per-account
+   device fan-out is modelled as its own MLS sub-group (a "self group" of a user's devices, cf.
+   Signal's sync messages), and the consumption message rides that channel instead of the conversation
+   group. This closes option 2's one leak: because the conversation's other party is not a member of
+   the self-group, they never receive — and cannot decrypt — the "opened" signal (option 2 sent it
+   through the conversation, so the sender learned of the read, a read-receipt-like disclosure). The
+   cost is the extra self-group: its own MLS ratchet + an establishment handshake (create/add/join)
+   between the account's devices. The self-group shares the conversation's provider store, so it adds
+   no second persistence authority — one atomic blob still persists everything.
 
 ## Decision (proposed)
 
