@@ -23,7 +23,7 @@ use axum::extract::{ConnectInfo, Path, Query, Request, State};
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use governor::clock::DefaultClock;
 use governor::state::keyed::DefaultKeyedStateStore;
@@ -161,6 +161,8 @@ pub fn build_router_cfg(
         .route("/v1/keypackages/count", get(key_package_count))
         // sealed-sender certificate issuance (ADR-0012, R-204)
         .route("/v1/sender-certificate", get(issue_sender_certificate))
+        // sealed-sender delivery access key registration (ADR-0014 Slice 2a, R-204)
+        .route("/v1/delivery-access-key", put(set_delivery_access_key))
         .route(
             "/v1/conversations",
             post(create_conversation).get(list_conversations),
@@ -1307,6 +1309,34 @@ async fn issue_sender_certificate(
         signature: hex::encode(signature.to_bytes()),
         cert_public_key: hex::encode(cert_public_key),
     }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeliveryVerifierBody {
+    /// Hex `SHA-256(K_r)` — the verifier of the caller's sealed-sender delivery access key.
+    verifier: String,
+}
+
+/// Register (or rotate) the caller account's sealed-sender **delivery access verifier**
+/// (ADR-0014 Slice 2a). The recipient computes `V_r = SHA-256(K_r)` on-device and registers it here
+/// while authenticated as itself; the relay stores only the 32-byte hash, never `K_r`. This is the
+/// gate value only — no sealed-delivery endpoint exists yet (Slice 2b, gated on ADR-0014 review),
+/// so registering a verifier changes no delivery behavior today.
+async fn set_delivery_access_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<DeliveryVerifierBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let verifier = hex_exact(&body.verifier, auth_core::delivery_key::VERIFIER_LEN)?;
+    if !auth_core::delivery_key::is_valid_verifier(&verifier) {
+        return Err(bad_request());
+    }
+    let relay = state.relay.clone();
+    let account = me.account_id;
+    blocking_store(move || relay.set_delivery_verifier(&account, &verifier)).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Serialize)]
