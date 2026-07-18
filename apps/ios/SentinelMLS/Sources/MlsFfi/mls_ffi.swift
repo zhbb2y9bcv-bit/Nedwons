@@ -551,9 +551,24 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func markSent(localId: UInt64) throws 
     
     /**
-     * Ordered log of stored messages (inbound decrypted + outbound).
+     * Number of stored messages. Cheap: no payload crosses the boundary.
+     */
+    func messageCount() throws  -> UInt64
+    
+    /**
+     * Ordered log of ALL stored messages (inbound decrypted + outbound). Marshals the entire
+     * history across the boundary — fine for tests and small logs; a UI should render from
+     * [`Self::messages_page`] + [`Self::message_count`] instead.
      */
     func messages() throws  -> [StoredMessage]
+    
+    /**
+     * A bounded window of the message log, oldest first: up to `limit` messages starting at
+     * `offset`. `limit` is clamped to [`MAX_PAGE_MESSAGES`] so a single call can never marshal
+     * an unbounded payload across the FFI; an offset past the end returns an empty page. This is
+     * what a chat UI should call (e.g. the newest window = `count - limit .. count`).
+     */
+    func messagesPage(offset: UInt64, limit: UInt32) throws  -> [StoredMessage]
     
     /**
      * Process an inbound envelope: application plaintext, a state advance, or a dedup no-op. All
@@ -771,11 +786,38 @@ open func markSent(localId: UInt64)throws   {try rustCallWithError(FfiConverterT
 }
     
     /**
-     * Ordered log of stored messages (inbound decrypted + outbound).
+     * Number of stored messages. Cheap: no payload crosses the boundary.
+     */
+open func messageCount()throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_message_count(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Ordered log of ALL stored messages (inbound decrypted + outbound). Marshals the entire
+     * history across the boundary — fine for tests and small logs; a UI should render from
+     * [`Self::messages_page`] + [`Self::message_count`] instead.
      */
 open func messages()throws  -> [StoredMessage]  {
     return try  FfiConverterSequenceTypeStoredMessage.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_messages(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * A bounded window of the message log, oldest first: up to `limit` messages starting at
+     * `offset`. `limit` is clamped to [`MAX_PAGE_MESSAGES`] so a single call can never marshal
+     * an unbounded payload across the FFI; an offset past the end returns an empty page. This is
+     * what a chat UI should call (e.g. the newest window = `count - limit .. count`).
+     */
+open func messagesPage(offset: UInt64, limit: UInt32)throws  -> [StoredMessage]  {
+    return try  FfiConverterSequenceTypeStoredMessage.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_messages_page(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(offset),
+        FfiConverterUInt32.lower(limit),$0
     )
 })
 }
@@ -1592,7 +1634,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_mark_sent() != 51681) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_messages() != 1143) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_message_count() != 45788) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_messages() != 32749) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_messages_page() != 2744) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_process_inbound() != 58528) {

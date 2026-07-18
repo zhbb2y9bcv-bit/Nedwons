@@ -34,6 +34,9 @@ use mls_core::durable::{
 };
 use mls_core::{Member, MlsError, CIPHERSUITE_NAME, VERSION as CORE_VERSION};
 
+/// Maximum messages one `messages_page` call returns (bounds per-call FFI marshalling).
+pub const MAX_PAGE_MESSAGES: u32 = 256;
+
 /// Stable, coarse, **redacted** error surface. Messages are variant-only: no library internals, key
 /// bytes, plaintext, or filesystem paths ever appear (asserted by a redaction test).
 #[derive(Debug, PartialEq, Eq, thiserror::Error, uniffi::Error)]
@@ -326,13 +329,52 @@ impl MlsClient {
         })
     }
 
-    /// Ordered log of stored messages (inbound decrypted + outbound).
+    /// Ordered log of ALL stored messages (inbound decrypted + outbound). Marshals the entire
+    /// history across the boundary — fine for tests and small logs; a UI should render from
+    /// [`Self::messages_page`] + [`Self::message_count`] instead.
     pub fn messages(&self) -> Result<Vec<StoredMessage>, MlsClientError> {
         catch(move || {
             let g = self.lock()?;
             match &*g {
                 ClientState::Active { session } => {
                     Ok(session.messages().iter().map(to_stored).collect())
+                }
+                ClientState::Pending { .. } => Err(MlsClientError::WrongState),
+                ClientState::Closed => Err(MlsClientError::Closed),
+            }
+        })
+    }
+
+    /// Number of stored messages. Cheap: no payload crosses the boundary.
+    pub fn message_count(&self) -> Result<u64, MlsClientError> {
+        catch(move || {
+            let g = self.lock()?;
+            match &*g {
+                ClientState::Active { session } => Ok(session.messages().len() as u64),
+                ClientState::Pending { .. } => Err(MlsClientError::WrongState),
+                ClientState::Closed => Err(MlsClientError::Closed),
+            }
+        })
+    }
+
+    /// A bounded window of the message log, oldest first: up to `limit` messages starting at
+    /// `offset`. `limit` is clamped to [`MAX_PAGE_MESSAGES`] so a single call can never marshal
+    /// an unbounded payload across the FFI; an offset past the end returns an empty page. This is
+    /// what a chat UI should call (e.g. the newest window = `count - limit .. count`).
+    pub fn messages_page(
+        &self,
+        offset: u64,
+        limit: u32,
+    ) -> Result<Vec<StoredMessage>, MlsClientError> {
+        catch(move || {
+            let g = self.lock()?;
+            match &*g {
+                ClientState::Active { session } => {
+                    let capped = limit.min(MAX_PAGE_MESSAGES) as usize;
+                    let all = session.messages();
+                    let start = (offset as usize).min(all.len());
+                    let end = start.saturating_add(capped).min(all.len());
+                    Ok(all[start..end].iter().map(to_stored).collect())
                 }
                 ClientState::Pending { .. } => Err(MlsClientError::WrongState),
                 ClientState::Closed => Err(MlsClientError::Closed),

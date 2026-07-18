@@ -39,9 +39,12 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # Host: full build (also yields the cdylib the bindgen introspects, and the bindgen bin).
 cargo build --release --target "$HOST"
 # iOS device + simulator: staticlib only (no cdylib/bin — avoids linking a dylib/CLI for iOS).
-for T in "$IOS" "$SIM"; do
-  cargo rustc --release --target "$T" --lib --crate-type staticlib
-done
+# Skipped in --check: the stale-bindings comparison only needs the host library.
+if [ "$CHECK_ONLY" != "--check" ]; then
+  for T in "$IOS" "$SIM"; do
+    cargo rustc --release --target "$T" --lib --crate-type staticlib
+  done
+fi
 
 echo "== [2/5] generate Swift bindings (library mode) =="
 rm -rf "$STAGE"; mkdir -p "$STAGE/gen" "$STAGE/headers"
