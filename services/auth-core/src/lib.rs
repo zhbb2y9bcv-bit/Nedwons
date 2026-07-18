@@ -18,6 +18,7 @@
 
 pub mod breach;
 pub mod crypto;
+pub mod delivery_key;
 pub mod error;
 pub mod ids;
 pub mod membership;
