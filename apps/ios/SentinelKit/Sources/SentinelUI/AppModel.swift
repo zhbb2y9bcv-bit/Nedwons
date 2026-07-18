@@ -31,9 +31,20 @@ public final class AppModel: ObservableObject {
     /// assurance (e.g. from a Settings toggle).
     public var provisionPolicy: DeviceProvisionPolicy = .requireHardware
 
-    public init(baseURL: URL, deviceIdentity: DeviceIdentity = DeviceIdentity()) {
+    public init(
+        baseURL: URL,
+        pinnedLogKey: Data? = nil,
+        deviceIdentity: DeviceIdentity = DeviceIdentity()
+    ) {
         client = SentinelClient(baseURL: baseURL)
+        self.pinnedLogKey = pinnedLogKey
         self.deviceIdentity = deviceIdentity
+    }
+
+    /// Convenience: construct from the build's `AppConfig` (server URL + out-of-band-pinned
+    /// transparency log key). This is what the shipped `@main` uses.
+    public convenience init() {
+        self.init(baseURL: AppConfig.serverURL, pinnedLogKey: AppConfig.pinnedTransparencyLogKey)
     }
 
     public var isLoggedIn: Bool { session != nil }

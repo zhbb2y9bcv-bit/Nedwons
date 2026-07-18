@@ -1,21 +1,25 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  App entitlements (DRAFT — least privilege). Add only what the shipped build needs.
-  - App Attest: `com.apple.developer.devicecheck.appattest-environment` (production/development)
-    is configured by capability, not usually a raw entitlement key; enable the App Attest
-    capability in Xcode. Keep it as defense-in-depth only (RISK_REGISTER R-301).
-  - Keychain sharing / access groups: add only if extensions need shared items.
-  - Push: aps-environment for APNs (payloads are opaque wake-ups only, PRIVACY.md).
+  App entitlements (least privilege). Wired into the build via project.yml (CODE_SIGN_ENTITLEMENTS).
+  These declare the capabilities; the matching App ID + provisioning profile are configured in the
+  Apple Developer portal (your side) before a device build will sign.
+  - App Attest (#10): appattest-environment (development here; "production" for release).
+  - Push (#4): aps-environment; payloads are opaque wake-ups only (PRIVACY.md / PUSH_NOTIFICATIONS.md).
+  - Keychain access group (shared with the Notification Service Extension so it can read the same
+    session / at-rest root to decrypt): uncomment once the App ID + app group are provisioned; the
+    identifier must match the real group.
 -->
 <plist version="1.0">
 <dict>
     <key>aps-environment</key>
     <string>development</string>
-    <!-- keychain-access-groups: add only if an extension shares Keychain items.
+    <key>com.apple.developer.devicecheck.appattest-environment</key>
+    <string>development</string>
+    <!-- Enable once the App ID + Keychain group are provisioned (required for the NSE to decrypt):
     <key>keychain-access-groups</key>
     <array>
-        <string>$(AppIdentifierPrefix)app.sentinel.ios</string>
+        <string>$(AppIdentifierPrefix)app.sentinel.shared</string>
     </array>
     -->
 </dict>
