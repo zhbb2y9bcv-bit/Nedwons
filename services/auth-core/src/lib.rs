@@ -24,6 +24,7 @@ pub mod membership;
 pub mod memstore;
 pub mod password;
 pub mod request_proof;
+pub mod sender_cert;
 pub mod service;
 pub mod store;
 pub mod transcript;

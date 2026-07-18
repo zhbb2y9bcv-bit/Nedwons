@@ -23,7 +23,8 @@ pub const PARALLELISM: u32 = 1;
 /// The configured Argon2id parameters, exposed so a benchmark/operator can measure the exact cost
 /// the service uses.
 pub fn argon2_params() -> Params {
-    Params::new(MEMORY_KIB, ITERATIONS, PARALLELISM, None).expect("static Argon2 parameters are valid")
+    Params::new(MEMORY_KIB, ITERATIONS, PARALLELISM, None)
+        .expect("static Argon2 parameters are valid")
 }
 
 /// Password policy per **NIST SP 800-63B-4** (the current revision; earlier revisions are
