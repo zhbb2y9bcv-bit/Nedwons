@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use mls_core::client::{
     MAX_ENVELOPE_LEN, MAX_IDENTITY_LEN, MAX_KEY_PACKAGE_LEN, MAX_PLAINTEXT_LEN, MAX_WELCOME_LEN,
 };
+use mls_core::content::SECRET_ID_LEN;
 use mls_core::durable::{
     Direction as CoreDirection, DurableError, DurableSession, FileJournal, InMemoryJournal,
     InboundOutcome, JournalKind, Message as CoreMessage, BLOB_FORMAT_VERSION,
@@ -83,6 +84,38 @@ pub struct StoredMessage {
     pub direction: Direction,
     pub plaintext: Vec<u8>,
     pub envelope_id: Option<u64>,
+    /// `Some` (16 bytes) for a **secret** message. `plaintext` is then empty — render a sealed
+    /// placeholder / tombstone driven by [`MlsClient::secret_phase`], never the body.
+    pub secret_id: Option<Vec<u8>>,
+}
+
+/// Reveal phase of a secret message across the FFI (mirrors `mls_core::secret::SecretState`).
+#[derive(Debug, PartialEq, Eq, uniffi::Enum)]
+pub enum SecretPhase {
+    /// Received, not tapped; no timer running.
+    Sealed,
+    /// Reveal begun; 3-second countdown running.
+    Countdown,
+    /// Body visible; 10-second window running.
+    Visible,
+    /// Terminal: plaintext gone, tombstone shown, cannot reopen.
+    Consumed,
+    /// No secret with this id is known to this client.
+    Unknown,
+}
+
+/// Result of queuing a secret message: the outbound local id plus its 16-byte secret id.
+#[derive(uniffi::Record)]
+pub struct SecretHandle {
+    pub local_id: u64,
+    pub secret_id: Vec<u8>,
+}
+
+/// Remaining countdown / viewing milliseconds for a secret (both 0 outside that phase).
+#[derive(uniffi::Record)]
+pub struct SecretRemaining {
+    pub countdown_ms: u64,
+    pub view_ms: u64,
 }
 
 /// Result of processing an inbound envelope.
@@ -92,8 +125,11 @@ pub enum InboundResult {
     Application { plaintext: Vec<u8> },
     /// A membership/commit advanced group state (no user-visible content).
     StateAdvanced,
-    /// Already processed (at-least-once redelivery) — a durable no-op.
+    /// Already processed (at-least-once redelivery, or a replayed secret id) — a durable no-op.
     Duplicate,
+    /// A **secret** (view-once) message arrived and is stored sealed. The body is NOT delivered
+    /// here; show a sealed placeholder and reveal it later via [`MlsClient::begin_secret_reveal`].
+    SecretSealed { secret_id: Vec<u8> },
 }
 
 /// Capability/version record so the Swift side can assert it links a compatible core and refuse on
@@ -355,6 +391,107 @@ impl MlsClient {
         })
     }
 
+    // --- Secret (view-once) messages -------------------------------------------------------------
+
+    /// Queue a **secret** message. The classification + body are wrapped in the content envelope
+    /// that MLS then encrypts, so the relay never learns it is secret. Same bounds as a normal
+    /// message. Returns the outbound local id + the 16-byte secret id; `encrypt`/`mark_sent` then
+    /// proceed exactly as for a normal message (same authenticated pipeline, same retry safety).
+    pub fn enqueue_secret(&self, body: Vec<u8>) -> Result<SecretHandle, MlsClientError> {
+        catch(move || {
+            bound(body.len(), MAX_PLAINTEXT_LEN)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            let (local_id, secret_id) = session.enqueue_secret(&body).map_err(map_durable)?;
+            Ok(SecretHandle {
+                local_id,
+                secret_id: secret_id.to_vec(),
+            })
+        })
+    }
+
+    /// Begin revealing a sealed secret (recipient tapped the placeholder). **Atomic + fail-closed:**
+    /// the transition + deadlines are committed before this returns `Ok`. An invalid transition
+    /// (double tap, replay, wrong state) or a failed state write returns `Err` and reveals nothing.
+    /// `now_ms` is the caller's monotonic clock.
+    pub fn begin_secret_reveal(
+        &self,
+        secret_id: Vec<u8>,
+        now_ms: u64,
+    ) -> Result<(), MlsClientError> {
+        catch(move || {
+            let id = secret_id_arg(&secret_id)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session
+                .begin_secret_reveal(&id, now_ms)
+                .map_err(map_durable_input)
+        })
+    }
+
+    /// The current reveal phase of a secret at `now_ms` (advancing + persisting a state change).
+    pub fn secret_phase(
+        &self,
+        secret_id: Vec<u8>,
+        now_ms: u64,
+    ) -> Result<SecretPhase, MlsClientError> {
+        catch(move || {
+            let id = secret_id_arg(&secret_id)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            let state = session.secret_state(&id, now_ms).map_err(map_durable)?;
+            Ok(to_phase(state))
+        })
+    }
+
+    /// The secret's plaintext **iff it is currently visible** at `now_ms` — the plaintext gate.
+    /// `None` while sealed/counting down and forever after expiry (which also scrubs + persists).
+    pub fn secret_visible_body(
+        &self,
+        secret_id: Vec<u8>,
+        now_ms: u64,
+    ) -> Result<Option<Vec<u8>>, MlsClientError> {
+        catch(move || {
+            let id = secret_id_arg(&secret_id)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session
+                .secret_visible_body(&id, now_ms)
+                .map_err(map_durable)
+        })
+    }
+
+    /// Remaining countdown / viewing ms for the UI timer + fade (both 0 outside that phase).
+    pub fn secret_remaining(
+        &self,
+        secret_id: Vec<u8>,
+        now_ms: u64,
+    ) -> Result<SecretRemaining, MlsClientError> {
+        catch(move || {
+            let id = secret_id_arg(&secret_id)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            let (countdown_ms, view_ms) = session
+                .secret_remaining_ms(&id, now_ms)
+                .map_err(map_durable)?;
+            Ok(SecretRemaining {
+                countdown_ms,
+                view_ms,
+            })
+        })
+    }
+
+    /// Force a secret to the terminal tombstone (a screenshot/capture was detected, or the overlay
+    /// was closed). Idempotent; scrubs the body; persisted before returning.
+    pub fn consume_secret(&self, secret_id: Vec<u8>) -> Result<(), MlsClientError> {
+        catch(move || {
+            let id = secret_id_arg(&secret_id)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session.consume_secret(&id).map_err(map_durable)
+        })
+    }
+
     /// Process an inbound envelope: application plaintext, a state advance, or a dedup no-op. All
     /// effects (advanced ratchet, stored message, dedup marker, ack-eligibility) are durable
     /// together before returning.
@@ -379,6 +516,9 @@ impl MlsClient {
                 InboundOutcome::Application(pt) => InboundResult::Application { plaintext: pt },
                 InboundOutcome::StateAdvanced => InboundResult::StateAdvanced,
                 InboundOutcome::Duplicate => InboundResult::Duplicate,
+                InboundOutcome::SecretSealed { secret_id } => InboundResult::SecretSealed {
+                    secret_id: secret_id.to_vec(),
+                },
             })
         })
     }
@@ -515,6 +655,13 @@ impl MlsClient {
     }
 }
 
+/// The exact non-sensitive tombstone text shown for a consumed/sent secret message. Bundled system
+/// text — never an external font/resource that could fail at runtime.
+#[uniffi::export]
+pub fn secret_tombstone_text() -> String {
+    DurableSession::<InMemoryJournal>::secret_tombstone_text().to_string()
+}
+
 /// Rust core version + UniFFI contract tag, for a quick human/log check.
 #[uniffi::export]
 pub fn binding_version() -> String {
@@ -578,6 +725,23 @@ fn to_stored(m: &CoreMessage) -> StoredMessage {
         },
         plaintext: m.plaintext.clone(),
         envelope_id: m.envelope_id,
+        secret_id: m.secret_id.map(|id| id.to_vec()),
+    }
+}
+
+/// Parse a 16-byte secret id from the FFI (bounded, fail-closed on any other length).
+fn secret_id_arg(bytes: &[u8]) -> Result<[u8; SECRET_ID_LEN], MlsClientError> {
+    bytes.try_into().map_err(|_| MlsClientError::InvalidMessage)
+}
+
+fn to_phase(state: Option<mls_core::secret::SecretState>) -> SecretPhase {
+    use mls_core::secret::SecretState::*;
+    match state {
+        Some(Sealed) => SecretPhase::Sealed,
+        Some(Countdown) => SecretPhase::Countdown,
+        Some(Visible) => SecretPhase::Visible,
+        Some(Consumed) => SecretPhase::Consumed,
+        None => SecretPhase::Unknown,
     }
 }
 

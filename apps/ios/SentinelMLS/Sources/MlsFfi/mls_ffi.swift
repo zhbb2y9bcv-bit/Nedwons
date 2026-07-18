@@ -508,6 +508,14 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func addMember(keyPackage: Data) throws  -> AddOutcome
     
     /**
+     * Begin revealing a sealed secret (recipient tapped the placeholder). **Atomic + fail-closed:**
+     * the transition + deadlines are committed before this returns `Ok`. An invalid transition
+     * (double tap, replay, wrong state) or a failed state write returns `Err` and reveals nothing.
+     * `now_ms` is the caller's monotonic clock.
+     */
+    func beginSecretReveal(secretId: Data, nowMs: UInt64) throws 
+    
+    /**
      * Discard the pending staged commit — the server rejected it (stale epoch / governance) or the
      * client is rebasing. State is unchanged.
      */
@@ -525,6 +533,12 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func confirmAcked(ids: [UInt64]) throws 
     
     /**
+     * Force a secret to the terminal tombstone (a screenshot/capture was detected, or the overlay
+     * was closed). Idempotent; scrubs the body; persisted before returning.
+     */
+    func consumeSecret(secretId: Data) throws 
+    
+    /**
      * Encrypt a queued message into a versioned opaque envelope (`app-envelope v1`, R-506).
      * **Idempotent:** a retry returns the same bytes and never advances the ratchet again (no
      * double-spend of a message key) — `wrap` is deterministic over the cached ciphertext.
@@ -535,6 +549,14 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
      * Queue an outbound message (durable draft). Does NOT advance the ratchet. Returns a local id.
      */
     func enqueue(plaintext: Data) throws  -> UInt64
+    
+    /**
+     * Queue a **secret** message. The classification + body are wrapped in the content envelope
+     * that MLS then encrypts, so the relay never learns it is secret. Same bounds as a normal
+     * message. Returns the outbound local id + the 16-byte secret id; `encrypt`/`mark_sent` then
+     * proceed exactly as for a normal message (same authenticated pipeline, same retry safety).
+     */
+    func enqueueSecret(body: Data) throws  -> SecretHandle
     
     /**
      * Current MLS epoch (advances on every membership change).
@@ -596,6 +618,22 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
      * together before returning.
      */
     func processInbound(envelopeId: UInt64, ciphertext: Data) throws  -> InboundResult
+    
+    /**
+     * The current reveal phase of a secret at `now_ms` (advancing + persisting a state change).
+     */
+    func secretPhase(secretId: Data, nowMs: UInt64) throws  -> SecretPhase
+    
+    /**
+     * Remaining countdown / viewing ms for the UI timer + fade (both 0 outside that phase).
+     */
+    func secretRemaining(secretId: Data, nowMs: UInt64) throws  -> SecretRemaining
+    
+    /**
+     * The secret's plaintext **iff it is currently visible** at `now_ms` — the plaintext gate.
+     * `None` while sealed/counting down and forever after expiry (which also scrubs + persists).
+     */
+    func secretVisibleBody(secretId: Data, nowMs: UInt64) throws  -> Data?
     
     /**
      * Stage an add for MLS-commit-authoritative membership (ADR-0010): build commit + welcome
@@ -737,6 +775,20 @@ open func addMember(keyPackage: Data)throws  -> AddOutcome  {
 }
     
     /**
+     * Begin revealing a sealed secret (recipient tapped the placeholder). **Atomic + fail-closed:**
+     * the transition + deadlines are committed before this returns `Ok`. An invalid transition
+     * (double tap, replay, wrong state) or a failed state write returns `Err` and reveals nothing.
+     * `now_ms` is the caller's monotonic clock.
+     */
+open func beginSecretReveal(secretId: Data, nowMs: UInt64)throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_begin_secret_reveal(self.uniffiClonePointer(),
+        FfiConverterData.lower(secretId),
+        FfiConverterUInt64.lower(nowMs),$0
+    )
+}
+}
+    
+    /**
      * Discard the pending staged commit — the server rejected it (stale epoch / governance) or the
      * client is rebasing. State is unchanged.
      */
@@ -767,6 +819,17 @@ open func confirmAcked(ids: [UInt64])throws   {try rustCallWithError(FfiConverte
 }
     
     /**
+     * Force a secret to the terminal tombstone (a screenshot/capture was detected, or the overlay
+     * was closed). Idempotent; scrubs the body; persisted before returning.
+     */
+open func consumeSecret(secretId: Data)throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_consume_secret(self.uniffiClonePointer(),
+        FfiConverterData.lower(secretId),$0
+    )
+}
+}
+    
+    /**
      * Encrypt a queued message into a versioned opaque envelope (`app-envelope v1`, R-506).
      * **Idempotent:** a retry returns the same bytes and never advances the ratchet again (no
      * double-spend of a message key) — `wrap` is deterministic over the cached ciphertext.
@@ -786,6 +849,20 @@ open func enqueue(plaintext: Data)throws  -> UInt64  {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_enqueue(self.uniffiClonePointer(),
         FfiConverterData.lower(plaintext),$0
+    )
+})
+}
+    
+    /**
+     * Queue a **secret** message. The classification + body are wrapped in the content envelope
+     * that MLS then encrypts, so the relay never learns it is secret. Same bounds as a normal
+     * message. Returns the outbound local id + the 16-byte secret id; `encrypt`/`mark_sent` then
+     * proceed exactly as for a normal message (same authenticated pipeline, same retry safety).
+     */
+open func enqueueSecret(body: Data)throws  -> SecretHandle  {
+    return try  FfiConverterTypeSecretHandle_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_enqueue_secret(self.uniffiClonePointer(),
+        FfiConverterData.lower(body),$0
     )
 })
 }
@@ -903,6 +980,43 @@ open func processInbound(envelopeId: UInt64, ciphertext: Data)throws  -> Inbound
     uniffi_mls_ffi_fn_method_mlsclient_process_inbound(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(envelopeId),
         FfiConverterData.lower(ciphertext),$0
+    )
+})
+}
+    
+    /**
+     * The current reveal phase of a secret at `now_ms` (advancing + persisting a state change).
+     */
+open func secretPhase(secretId: Data, nowMs: UInt64)throws  -> SecretPhase  {
+    return try  FfiConverterTypeSecretPhase_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_secret_phase(self.uniffiClonePointer(),
+        FfiConverterData.lower(secretId),
+        FfiConverterUInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * Remaining countdown / viewing ms for the UI timer + fade (both 0 outside that phase).
+     */
+open func secretRemaining(secretId: Data, nowMs: UInt64)throws  -> SecretRemaining  {
+    return try  FfiConverterTypeSecretRemaining_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_secret_remaining(self.uniffiClonePointer(),
+        FfiConverterData.lower(secretId),
+        FfiConverterUInt64.lower(nowMs),$0
+    )
+})
+}
+    
+    /**
+     * The secret's plaintext **iff it is currently visible** at `now_ms` — the plaintext gate.
+     * `None` while sealed/counting down and forever after expiry (which also scrubs + persists).
+     */
+open func secretVisibleBody(secretId: Data, nowMs: UInt64)throws  -> Data?  {
+    return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_secret_visible_body(self.uniffiClonePointer(),
+        FfiConverterData.lower(secretId),
+        FfiConverterUInt64.lower(nowMs),$0
     )
 })
 }
@@ -1212,6 +1326,152 @@ public func FfiConverterTypeCapabilities_lower(_ value: Capabilities) -> RustBuf
 
 
 /**
+ * Result of queuing a secret message: the outbound local id plus its 16-byte secret id.
+ */
+public struct SecretHandle {
+    public var localId: UInt64
+    public var secretId: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(localId: UInt64, secretId: Data) {
+        self.localId = localId
+        self.secretId = secretId
+    }
+}
+
+#if compiler(>=6)
+extension SecretHandle: Sendable {}
+#endif
+
+
+extension SecretHandle: Equatable, Hashable {
+    public static func ==(lhs: SecretHandle, rhs: SecretHandle) -> Bool {
+        if lhs.localId != rhs.localId {
+            return false
+        }
+        if lhs.secretId != rhs.secretId {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(localId)
+        hasher.combine(secretId)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSecretHandle: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SecretHandle {
+        return
+            try SecretHandle(
+                localId: FfiConverterUInt64.read(from: &buf), 
+                secretId: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SecretHandle, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.localId, into: &buf)
+        FfiConverterData.write(value.secretId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSecretHandle_lift(_ buf: RustBuffer) throws -> SecretHandle {
+    return try FfiConverterTypeSecretHandle.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSecretHandle_lower(_ value: SecretHandle) -> RustBuffer {
+    return FfiConverterTypeSecretHandle.lower(value)
+}
+
+
+/**
+ * Remaining countdown / viewing milliseconds for a secret (both 0 outside that phase).
+ */
+public struct SecretRemaining {
+    public var countdownMs: UInt64
+    public var viewMs: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(countdownMs: UInt64, viewMs: UInt64) {
+        self.countdownMs = countdownMs
+        self.viewMs = viewMs
+    }
+}
+
+#if compiler(>=6)
+extension SecretRemaining: Sendable {}
+#endif
+
+
+extension SecretRemaining: Equatable, Hashable {
+    public static func ==(lhs: SecretRemaining, rhs: SecretRemaining) -> Bool {
+        if lhs.countdownMs != rhs.countdownMs {
+            return false
+        }
+        if lhs.viewMs != rhs.viewMs {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(countdownMs)
+        hasher.combine(viewMs)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSecretRemaining: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SecretRemaining {
+        return
+            try SecretRemaining(
+                countdownMs: FfiConverterUInt64.read(from: &buf), 
+                viewMs: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SecretRemaining, into buf: inout [UInt8]) {
+        FfiConverterUInt64.write(value.countdownMs, into: &buf)
+        FfiConverterUInt64.write(value.viewMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSecretRemaining_lift(_ buf: RustBuffer) throws -> SecretRemaining {
+    return try FfiConverterTypeSecretRemaining.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSecretRemaining_lower(_ value: SecretRemaining) -> RustBuffer {
+    return FfiConverterTypeSecretRemaining.lower(value)
+}
+
+
+/**
  * A durably-stored decrypted message (what the UI renders). Not a secret in the key-substitution
  * sense — application plaintext is exactly what the legitimate client is meant to hold.
  */
@@ -1220,14 +1480,24 @@ public struct StoredMessage {
     public var direction: Direction
     public var plaintext: Data
     public var envelopeId: UInt64?
+    /**
+     * `Some` (16 bytes) for a **secret** message. `plaintext` is then empty — render a sealed
+     * placeholder / tombstone driven by [`MlsClient::secret_phase`], never the body.
+     */
+    public var secretId: Data?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(localId: UInt64, direction: Direction, plaintext: Data, envelopeId: UInt64?) {
+    public init(localId: UInt64, direction: Direction, plaintext: Data, envelopeId: UInt64?, 
+        /**
+         * `Some` (16 bytes) for a **secret** message. `plaintext` is then empty — render a sealed
+         * placeholder / tombstone driven by [`MlsClient::secret_phase`], never the body.
+         */secretId: Data?) {
         self.localId = localId
         self.direction = direction
         self.plaintext = plaintext
         self.envelopeId = envelopeId
+        self.secretId = secretId
     }
 }
 
@@ -1250,6 +1520,9 @@ extension StoredMessage: Equatable, Hashable {
         if lhs.envelopeId != rhs.envelopeId {
             return false
         }
+        if lhs.secretId != rhs.secretId {
+            return false
+        }
         return true
     }
 
@@ -1258,6 +1531,7 @@ extension StoredMessage: Equatable, Hashable {
         hasher.combine(direction)
         hasher.combine(plaintext)
         hasher.combine(envelopeId)
+        hasher.combine(secretId)
     }
 }
 
@@ -1273,7 +1547,8 @@ public struct FfiConverterTypeStoredMessage: FfiConverterRustBuffer {
                 localId: FfiConverterUInt64.read(from: &buf), 
                 direction: FfiConverterTypeDirection.read(from: &buf), 
                 plaintext: FfiConverterData.read(from: &buf), 
-                envelopeId: FfiConverterOptionUInt64.read(from: &buf)
+                envelopeId: FfiConverterOptionUInt64.read(from: &buf), 
+                secretId: FfiConverterOptionData.read(from: &buf)
         )
     }
 
@@ -1282,6 +1557,7 @@ public struct FfiConverterTypeStoredMessage: FfiConverterRustBuffer {
         FfiConverterTypeDirection.write(value.direction, into: &buf)
         FfiConverterData.write(value.plaintext, into: &buf)
         FfiConverterOptionUInt64.write(value.envelopeId, into: &buf)
+        FfiConverterOptionData.write(value.secretId, into: &buf)
     }
 }
 
@@ -1391,9 +1667,15 @@ public enum InboundResult {
      */
     case stateAdvanced
     /**
-     * Already processed (at-least-once redelivery) — a durable no-op.
+     * Already processed (at-least-once redelivery, or a replayed secret id) — a durable no-op.
      */
     case duplicate
+    /**
+     * A **secret** (view-once) message arrived and is stored sealed. The body is NOT delivered
+     * here; show a sealed placeholder and reveal it later via [`MlsClient::begin_secret_reveal`].
+     */
+    case secretSealed(secretId: Data
+    )
 }
 
 
@@ -1418,6 +1700,9 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         
         case 3: return .duplicate
         
+        case 4: return .secretSealed(secretId: try FfiConverterData.read(from: &buf)
+        )
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -1438,6 +1723,11 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         case .duplicate:
             writeInt(&buf, Int32(3))
         
+        
+        case let .secretSealed(secretId):
+            writeInt(&buf, Int32(4))
+            FfiConverterData.write(secretId, into: &buf)
+            
         }
     }
 }
@@ -1589,6 +1879,115 @@ extension MlsClientError: Foundation.LocalizedError {
 
 
 
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Reveal phase of a secret message across the FFI (mirrors `mls_core::secret::SecretState`).
+ */
+
+public enum SecretPhase {
+    
+    /**
+     * Received, not tapped; no timer running.
+     */
+    case sealed
+    /**
+     * Reveal begun; 3-second countdown running.
+     */
+    case countdown
+    /**
+     * Body visible; 10-second window running.
+     */
+    case visible
+    /**
+     * Terminal: plaintext gone, tombstone shown, cannot reopen.
+     */
+    case consumed
+    /**
+     * No secret with this id is known to this client.
+     */
+    case unknown
+}
+
+
+#if compiler(>=6)
+extension SecretPhase: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSecretPhase: FfiConverterRustBuffer {
+    typealias SwiftType = SecretPhase
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SecretPhase {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .sealed
+        
+        case 2: return .countdown
+        
+        case 3: return .visible
+        
+        case 4: return .consumed
+        
+        case 5: return .unknown
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SecretPhase, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .sealed:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .countdown:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .visible:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .consumed:
+            writeInt(&buf, Int32(4))
+        
+        
+        case .unknown:
+            writeInt(&buf, Int32(5))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSecretPhase_lift(_ buf: RustBuffer) throws -> SecretPhase {
+    return try FfiConverterTypeSecretPhase.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSecretPhase_lower(_ value: SecretPhase) -> RustBuffer {
+    return FfiConverterTypeSecretPhase.lower(value)
+}
+
+
+extension SecretPhase: Equatable, Hashable {}
+
+
+
+
+
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -1608,6 +2007,30 @@ fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterUInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
+    typealias SwiftType = Data?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterData.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterData.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -1705,6 +2128,16 @@ public func capabilities() -> Capabilities  {
     )
 })
 }
+/**
+ * The exact non-sensitive tombstone text shown for a consumed/sent secret message. Bundled system
+ * text — never an external font/resource that could fail at runtime.
+ */
+public func secretTombstoneText() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+    uniffi_mls_ffi_fn_func_secret_tombstone_text($0
+    )
+})
+}
 
 private enum InitializationResult {
     case ok
@@ -1727,10 +2160,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_func_capabilities() != 52641) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mls_ffi_checksum_func_secret_tombstone_text() != 31838) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mls_ffi_checksum_method_mlsclient_ack_eligible() != 27374) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_add_member() != 6758) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_begin_secret_reveal() != 18181) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_clear_staged() != 582) {
@@ -1742,10 +2181,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_confirm_acked() != 17622) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_consume_secret() != 45075) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mls_ffi_checksum_method_mlsclient_encrypt() != 43898) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue() != 8616) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue_secret() != 25668) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_epoch() != 23643) {
@@ -1776,6 +2221,15 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_process_inbound() != 58528) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_secret_phase() != 29195) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_secret_remaining() != 27661) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_secret_visible_body() != 23074) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_stage_add() != 15693) {

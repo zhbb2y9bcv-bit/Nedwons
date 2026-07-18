@@ -177,3 +177,78 @@ final class MlsFfiBridgeTests: XCTestCase {
         XCTAssertFalse(bindingVersion().isEmpty)
     }
 }
+
+extension MlsFfiBridgeTests {
+    /// The secret-message (view-once) flow across the generated Swift bindings: Alice sends a secret
+    /// through the real MLS path, Bob receives a sealed placeholder, reveals it once (3s countdown +
+    /// 10s window), it expires into the tombstone, and reopen after reveal fails closed. Normal
+    /// messaging keeps working alongside. `nowMs` is supplied deterministically (no real waiting).
+    func testSecretMessageFlowThroughBindings() throws {
+        let (alice, bob) = try twoParty()
+
+        // Send a secret. The relay only ever sees the opaque envelope.
+        let handle = try alice.enqueueSecret(body: Data("eyes only".utf8))
+        let envelope = try alice.encrypt(localId: handle.localId)
+        try alice.markSent(localId: handle.localId)
+        XCTAssertFalse(
+            envelope.range(of: Data("eyes only".utf8)) != nil,
+            "plaintext must not appear in the ciphertext")
+
+        // Bob receives a SEALED placeholder — no body delivered.
+        guard case let .secretSealed(sid) = try bob.processInbound(envelopeId: 1, ciphertext: envelope)
+        else { return XCTFail("expected a sealed secret") }
+        XCTAssertEqual(sid, handle.secretId)
+        XCTAssertEqual(try bob.secretPhase(secretId: sid, nowMs: 0), .sealed)
+        XCTAssertNil(try bob.secretVisibleBody(secretId: sid, nowMs: 0))
+
+        // Reveal: 3s countdown then a 10s window, then tombstone at exactly 13s.
+        try bob.beginSecretReveal(secretId: sid, nowMs: 0)
+        XCTAssertEqual(try bob.secretPhase(secretId: sid, nowMs: 2_999), .countdown)
+        XCTAssertEqual(try bob.secretPhase(secretId: sid, nowMs: 3_000), .visible)
+        XCTAssertEqual(
+            try bob.secretVisibleBody(secretId: sid, nowMs: 3_000).map { String(decoding: $0, as: UTF8.self) },
+            "eyes only")
+        XCTAssertEqual(try bob.secretPhase(secretId: sid, nowMs: 13_000), .consumed)
+        XCTAssertNil(try bob.secretVisibleBody(secretId: sid, nowMs: 13_000))
+        XCTAssertEqual(secretTombstoneText(), "a secret message has been sent")
+
+        // A double reveal is refused; a normal message still flows during the secret's life.
+        XCTAssertThrowsError(try bob.beginSecretReveal(secretId: sid, nowMs: 1_000))
+        let nid = try alice.enqueue(plaintext: Data("normal still works".utf8))
+        let nenv = try alice.encrypt(localId: nid)
+        guard case let .application(pt) = try bob.processInbound(envelopeId: 2, ciphertext: nenv)
+        else { return XCTFail("normal delivery must keep working") }
+        XCTAssertEqual(String(decoding: pt, as: UTF8.self), "normal still works")
+    }
+
+    /// Crash after reveal begins → fail closed on relaunch (the plaintext is never re-viewable).
+    func testSecretFailsClosedAfterReopen() throws {
+        let bPath = tmp("bob")
+        let alice = try MlsClient.createGroup(
+            identity: Data("alice".utf8), dbPath: tmp("alice"), atRestKey: key)
+        let bob = try MlsClient.newJoiner(
+            identity: Data("bob".utf8), dbPath: bPath, atRestKey: key)
+        let add = try alice.addMember(keyPackage: try bob.keyPackage())
+        try bob.joinGroup(welcome: add.welcome)
+
+        let handle = try alice.enqueueSecret(body: Data("burn".utf8))
+        let env = try alice.encrypt(localId: handle.localId)
+        _ = try bob.processInbound(envelopeId: 1, ciphertext: env)
+        try bob.beginSecretReveal(secretId: handle.secretId, nowMs: 0)
+        XCTAssertEqual(try bob.secretPhase(secretId: handle.secretId, nowMs: 3_000), .visible)
+
+        bob.close()  // "crash"
+        let bob2 = try MlsClient.open(dbPath: bPath, atRestKey: key)
+        XCTAssertEqual(try bob2.secretPhase(secretId: handle.secretId, nowMs: 3_500), .consumed)
+        XCTAssertNil(try bob2.secretVisibleBody(secretId: handle.secretId, nowMs: 3_500))
+    }
+
+    /// Hostile secret ids never crash the binding; they surface as typed errors / unknown.
+    func testHostileSecretIdIsTypedError() throws {
+        let (_, bob) = try twoParty()
+        for bad in [Data(), Data(repeating: 0, count: 15), Data(repeating: 0, count: 17)] {
+            XCTAssertThrowsError(try bob.beginSecretReveal(secretId: bad, nowMs: 0))
+        }
+        XCTAssertEqual(try bob.secretPhase(secretId: Data(repeating: 0xAB, count: 16), nowMs: 0), .unknown)
+    }
+}
