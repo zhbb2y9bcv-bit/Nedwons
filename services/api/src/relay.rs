@@ -36,6 +36,25 @@ pub struct SealedEnvelopeOut {
     pub ciphertext: Vec<u8>,
 }
 
+/// A queued **self-group** envelope (ADR-0015 option 3): opaque ciphertext for one of the account's
+/// own devices — an MLS Welcome/commit during device linking, or a `SecretConsumed` control message.
+/// Both endpoints are the same account's authenticated devices, so the sender device is recorded.
+pub struct SelfGroupEnvelopeOut {
+    pub id: i64,
+    pub sender_device: [u8; 16],
+    pub ciphertext: Vec<u8>,
+}
+
+/// Outcome of a self-group delivery (targeted or fan-out).
+#[derive(Debug, PartialEq, Eq)]
+pub enum SelfGroupSendOutcome {
+    /// The recipient device is not a device of the delivering account (targeted delivery only).
+    Forbidden,
+    /// Delivered (or already delivered on an idempotent retry). Carries the recipient devices that
+    /// received a *new* envelope, so only those get woken.
+    Delivered { newly_queued: Vec<[u8; 16]> },
+}
+
 /// Outcome of a sealed delivery.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SealedSendOutcome {
@@ -639,6 +658,252 @@ impl PgRelay {
                 .execute(
                     "DELETE FROM sealed_envelopes WHERE id IN (
                          SELECT id FROM sealed_envelopes
+                         WHERE created_at < now() - make_interval(secs => $1)
+                         ORDER BY created_at
+                         LIMIT $2)",
+                    &[&ttl_secs, &batch_size],
+                )
+                .map_err(db_err)?;
+            total += purged;
+            if purged < batch_size as u64 {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    // ----- Device self-group (ADR-0015 option 3) --------------------------------------------------
+    //
+    // Establishing + using the account's own-devices MLS group over the relay. The relay is MLS-blind
+    // throughout: it never sees the self-group's group id or plaintext, only routes opaque ciphertext
+    // among ONE account's authenticated devices. Every method here is account-scoped by construction.
+
+    /// Record that `device` (of `account`) has joined its account's self-group. Idempotent — a repeat
+    /// is a no-op. The caller authenticates as this device, so no cross-account membership is
+    /// representable.
+    pub fn register_self_group_member(
+        &self,
+        account: &AccountId,
+        device: &DeviceId,
+    ) -> StoreResult<()> {
+        let mut conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO self_group_members (account_id, device_id) VALUES ($1, $2)
+             ON CONFLICT (account_id, device_id) DO NOTHING",
+            &[&account.as_bytes(), &device.as_bytes()],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// True if `device` is a joined member of `account`'s self-group.
+    pub fn is_self_group_member(
+        &self,
+        account: &AccountId,
+        device: &DeviceId,
+    ) -> StoreResult<bool> {
+        let mut conn = self.conn()?;
+        let row = conn
+            .query_opt(
+                "SELECT 1 FROM self_group_members WHERE account_id = $1 AND device_id = $2",
+                &[&account.as_bytes(), &device.as_bytes()],
+            )
+            .map_err(db_err)?;
+        Ok(row.is_some())
+    }
+
+    /// The account's non-revoked devices that are enrolled but NOT yet in its self-group — the
+    /// candidates a linking device claims a key package for and adds. Excludes `caller` itself.
+    pub fn pending_self_group_devices(
+        &self,
+        account: &AccountId,
+        caller: &DeviceId,
+    ) -> StoreResult<Vec<[u8; 16]>> {
+        let mut conn = self.conn()?;
+        let rows = conn
+            .query(
+                "SELECT d.device_id FROM devices d
+                 WHERE d.account_id = $1 AND NOT d.revoked AND d.device_id <> $2
+                   AND NOT EXISTS (
+                       SELECT 1 FROM self_group_members m
+                       WHERE m.account_id = $1 AND m.device_id = d.device_id)
+                 ORDER BY d.device_id",
+                &[&account.as_bytes(), &caller.as_bytes()],
+            )
+            .map_err(db_err)?;
+        rows.into_iter()
+            .map(|r| id16(r.get::<_, &[u8]>(0)))
+            .collect()
+    }
+
+    /// Claim (pop) one non-expired key package for a **specific** device (used to add a named sibling
+    /// device to the self-group). Like [`Self::claim_key_package`] but scoped to one device rather
+    /// than any of the account's devices, so a multi-device link targets each sibling deterministically.
+    pub fn claim_key_package_for_device(
+        &self,
+        device: &DeviceId,
+        ttl_secs: u64,
+    ) -> StoreResult<Option<ClaimedKeyPackage>> {
+        let mut conn = self.conn()?;
+        let row = conn
+            .query_opt(
+                "DELETE FROM key_packages WHERE id = (
+                     SELECT id FROM key_packages
+                     WHERE device_id = $1 AND created_at > now() - make_interval(secs => $2)
+                     ORDER BY id LIMIT 1
+                     FOR UPDATE SKIP LOCKED
+                 ) RETURNING device_id, key_package",
+                &[&device.as_bytes(), &(ttl_secs as f64)],
+            )
+            .map_err(db_err)?;
+        row.map(|r| {
+            Ok(ClaimedKeyPackage {
+                device_id: id16(r.get::<_, &[u8]>(0))?,
+                key_package: r.get::<_, Vec<u8>>(1),
+            })
+        })
+        .transpose()
+    }
+
+    /// Deliver a self-group envelope to ONE specific recipient device of `account` (an MLS Welcome to
+    /// a device being linked, or a commit to an existing member). Refuses if the recipient is not a
+    /// non-revoked device of `account`. Idempotent on `(recipient, sender, idempotency_key)`.
+    pub fn deliver_self_group_targeted(
+        &self,
+        account: &AccountId,
+        sender_device: &DeviceId,
+        recipient_device: &DeviceId,
+        ciphertext: &[u8],
+        idempotency_key: &[u8; 16],
+    ) -> StoreResult<SelfGroupSendOutcome> {
+        let mut conn = self.conn()?;
+        let mut txn = conn.transaction().map_err(db_err)?;
+        // The recipient must be a non-revoked device of the SAME account (authorization boundary).
+        let ok = txn
+            .query_opt(
+                "SELECT 1 FROM devices WHERE device_id = $1 AND account_id = $2 AND NOT revoked",
+                &[&recipient_device.as_bytes(), &account.as_bytes()],
+            )
+            .map_err(db_err)?
+            .is_some();
+        if !ok {
+            return Ok(SelfGroupSendOutcome::Forbidden);
+        }
+        let row = txn
+            .query_opt(
+                "INSERT INTO self_group_envelopes
+                     (recipient_device, sender_device, ciphertext, idempotency_key)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (recipient_device, sender_device, idempotency_key) DO NOTHING
+                 RETURNING recipient_device",
+                &[
+                    &recipient_device.as_bytes(),
+                    &sender_device.as_bytes(),
+                    &ciphertext,
+                    &idempotency_key.as_slice(),
+                ],
+            )
+            .map_err(db_err)?;
+        txn.commit().map_err(db_err)?;
+        let newly_queued = match row {
+            Some(_) => vec![recipient_device.0],
+            None => vec![], // idempotent retry
+        };
+        Ok(SelfGroupSendOutcome::Delivered { newly_queued })
+    }
+
+    /// Fan a self-group envelope out to every OTHER **joined member** of `account`'s self-group (a
+    /// `SecretConsumed` control message, or a commit to the whole self-group). Excludes the sender and
+    /// any revoked device. Idempotent per key. One statement, mirroring [`Self::fanout_message`].
+    pub fn fanout_self_group(
+        &self,
+        account: &AccountId,
+        sender_device: &DeviceId,
+        ciphertext: &[u8],
+        idempotency_key: &[u8; 16],
+    ) -> StoreResult<SelfGroupSendOutcome> {
+        let mut conn = self.conn()?;
+        let rows = conn
+            .query(
+                "INSERT INTO self_group_envelopes
+                     (recipient_device, sender_device, ciphertext, idempotency_key)
+                 SELECT m.device_id, $2, $3, $4
+                 FROM self_group_members m
+                 JOIN devices d ON d.device_id = m.device_id
+                 WHERE m.account_id = $1 AND m.device_id <> $2 AND NOT d.revoked
+                 ON CONFLICT (recipient_device, sender_device, idempotency_key) DO NOTHING
+                 RETURNING recipient_device",
+                &[
+                    &account.as_bytes(),
+                    &sender_device.as_bytes(),
+                    &ciphertext,
+                    &idempotency_key.as_slice(),
+                ],
+            )
+            .map_err(db_err)?;
+        let newly_queued = rows
+            .into_iter()
+            .map(|r| id16(r.get::<_, &[u8]>(0)))
+            .collect::<StoreResult<Vec<_>>>()?;
+        Ok(SelfGroupSendOutcome::Delivered { newly_queued })
+    }
+
+    /// Peek a device's undelivered self-group envelopes (at-least-once, like [`Self::peek_inbox`]).
+    pub fn peek_self_group_inbox(
+        &self,
+        device: &DeviceId,
+        limit: i64,
+    ) -> StoreResult<Vec<SelfGroupEnvelopeOut>> {
+        let mut conn = self.conn()?;
+        let rows = conn
+            .query(
+                "SELECT id, sender_device, ciphertext FROM self_group_envelopes
+                 WHERE recipient_device = $1 AND NOT delivered
+                 ORDER BY id LIMIT $2",
+                &[&device.as_bytes(), &limit],
+            )
+            .map_err(db_err)?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(SelfGroupEnvelopeOut {
+                    id: r.get(0),
+                    sender_device: id16(r.get::<_, &[u8]>(1))?,
+                    ciphertext: r.get::<_, Vec<u8>>(2),
+                })
+            })
+            .collect()
+    }
+
+    /// Acknowledge (delete) self-group envelopes, scoped to the caller's own device.
+    pub fn ack_self_group(&self, device: &DeviceId, ids: &[i64]) -> StoreResult<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut conn = self.conn()?;
+        let acked = conn
+            .execute(
+                "DELETE FROM self_group_envelopes WHERE recipient_device = $1 AND id = ANY($2)",
+                &[&device.as_bytes(), &ids],
+            )
+            .map_err(db_err)?;
+        Ok(acked)
+    }
+
+    /// Retention purge for self-group envelopes (mirrors [`Self::purge_stale_envelopes`]).
+    pub fn purge_stale_self_group(
+        &self,
+        ttl: std::time::Duration,
+        batch_size: i64,
+        max_batches: u32,
+    ) -> StoreResult<u64> {
+        let mut conn = self.conn()?;
+        let ttl_secs = ttl.as_secs_f64();
+        let mut total: u64 = 0;
+        for _ in 0..max_batches {
+            let purged = conn
+                .execute(
+                    "DELETE FROM self_group_envelopes WHERE id IN (
+                         SELECT id FROM self_group_envelopes
                          WHERE created_at < now() - make_interval(secs => $1)
                          ORDER BY created_at
                          LIMIT $2)",

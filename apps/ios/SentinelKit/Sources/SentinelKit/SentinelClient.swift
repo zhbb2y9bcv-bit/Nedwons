@@ -284,10 +284,15 @@ public struct InboxEnvelope: Decodable, Sendable, Identifiable {
     /// True for a sealed envelope. Sealed ids are a SEPARATE id space from identified ones — ack
     /// them via `ackInbox(sealedIds:)`, never via `ids`.
     public let sealed: Bool
+    /// True for a **self-group** envelope (ADR-0015 option 3): a message from one of this account's
+    /// OWN devices (a linking Welcome/commit, or a `SecretConsumed` control message). Route it to the
+    /// MLS core's self-group inbound path (`processSelfInbound`), and ack via `ackInbox(selfGroupIds:)`
+    /// — yet another separate id space. `senderDevice` is a sibling device; `conversationID` is nil.
+    public let selfGroup: Bool
 
     enum CodingKeys: String, CodingKey {
         case id, conversationID = "conversation_id", senderDevice = "sender_device", ciphertext,
-            sealed
+            sealed, selfGroup = "self_group"
     }
 
     public init(from decoder: Decoder) throws {
@@ -297,6 +302,18 @@ public struct InboxEnvelope: Decodable, Sendable, Identifiable {
         senderDevice = try c.decodeIfPresent(String.self, forKey: .senderDevice)
         ciphertext = try c.decode(String.self, forKey: .ciphertext)
         sealed = try c.decodeIfPresent(Bool.self, forKey: .sealed) ?? false
+        selfGroup = try c.decodeIfPresent(Bool.self, forKey: .selfGroup) ?? false
+    }
+}
+
+/// A key package claimed for a specific device (to add it to the self-group). `keyPackage` is the
+/// hex-encoded opaque MLS key package the relay stored verbatim.
+public struct ClaimedKeyPackage: Decodable, Sendable {
+    public let deviceID: String
+    public let keyPackage: String
+
+    enum CodingKeys: String, CodingKey {
+        case deviceID = "device_id", keyPackage = "key_package"
     }
 }
 
@@ -601,15 +618,20 @@ public extension SentinelClient {
     }
 
     /// Ack durably-persisted envelopes. `ids` = identified envelopes; `sealedIds` = sealed-sender
-    /// envelopes (a separate id space, ADR-0014). Existing callers passing only `ids` are unchanged.
-    func ackInbox(accessToken: String, ids: [Int], sealedIds: [Int] = []) async throws {
+    /// envelopes (a separate id space, ADR-0014); `selfGroupIds` = self-group envelopes (another
+    /// separate id space, ADR-0015 option 3). Existing callers passing only `ids` are unchanged.
+    func ackInbox(
+        accessToken: String, ids: [Int], sealedIds: [Int] = [], selfGroupIds: [Int] = []
+    ) async throws {
         struct Body: Encodable {
             let ids: [Int]
             let sealed_ids: [Int]
+            let self_group_ids: [Int]
         }
         var request = authed("POST", "/v1/inbox/ack", accessToken: accessToken)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(Body(ids: ids, sealed_ids: sealedIds))
+        request.httpBody = try JSONEncoder().encode(
+            Body(ids: ids, sealed_ids: sealedIds, self_group_ids: selfGroupIds))
         _ = try await perform(request)
     }
 
@@ -661,6 +683,78 @@ public extension SentinelClient {
                 ciphertext: Hex.encode(ciphertext),
                 idempotency_key: Hex.encode(idempotencyKey)))
         _ = try await perform(request)
+    }
+
+    // ----- Device self-group: linking + consumption fan-out (ADR-0015 option 3) -----
+
+    /// Publish an (opaque) MLS key package for this device so its siblings can add it to the
+    /// self-group (`POST /v1/keypackages`). The relay stores it verbatim and never parses it.
+    public func publishKeyPackage(accessToken: String, keyPackage: Data) async throws {
+        struct Body: Encodable { let key_package: String }
+        var request = authed("POST", "/v1/keypackages", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(Body(key_package: Hex.encode(keyPackage)))
+        _ = try await perform(request)
+    }
+
+    /// Declare this device a member of its account's self-group (`POST /v1/self-group/register`,
+    /// idempotent). The device that creates the self-group calls this; each linked device calls it
+    /// after `joinSelfGroup`. Only then does the relay fan consumption messages out to it.
+    public func registerSelfGroupMember(accessToken: String) async throws {
+        var request = authed("POST", "/v1/self-group/register", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = Data("{}".utf8)
+        _ = try await perform(request)
+    }
+
+    /// This account's devices that are enrolled but NOT yet linked into the self-group — the
+    /// candidates to add (`GET /v1/self-group/pending`). Each returned id can be claimed + added.
+    public func pendingSelfGroupDevices(accessToken: String) async throws -> [String] {
+        struct Res: Decodable { let pending_devices: [String] }
+        let res: Res = try decode(
+            await perform(authed("GET", "/v1/self-group/pending", accessToken: accessToken)))
+        return res.pending_devices
+    }
+
+    /// Claim one key package for a specific sibling device of this account, to add it to the
+    /// self-group (`POST /v1/self-group/keypackage/claim`). Throws `ClientError.http(404, …)` if the
+    /// device is not this account's or has no key package published.
+    public func claimSelfGroupKeyPackage(
+        accessToken: String, deviceID: String
+    ) async throws -> ClaimedKeyPackage {
+        struct Body: Encodable { let device_id: String }
+        var request = authed("POST", "/v1/self-group/keypackage/claim", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(Body(device_id: deviceID))
+        return try decode(await perform(request))
+    }
+
+    /// Deliver an opaque self-group envelope (`POST /v1/self-group/deliver`). Pass `recipientDevice`
+    /// to target one sibling (an MLS Welcome/commit while linking); pass `nil` to **fan out** to every
+    /// OTHER joined member of this account's self-group (a `SecretConsumed` control message). Returns
+    /// the number of devices it was newly delivered to (0 on an idempotent retry). Relay-blind.
+    @discardableResult
+    public func deliverSelfGroup(
+        accessToken: String,
+        recipientDevice: String? = nil,
+        ciphertext: Data,
+        idempotencyKey: Data
+    ) async throws -> Int {
+        struct Body: Encodable {
+            let recipient_device: String?
+            let ciphertext: String
+            let idempotency_key: String
+        }
+        struct Receipt: Decodable { let delivered: Int }
+        var request = authed("POST", "/v1/self-group/deliver", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            Body(
+                recipient_device: recipientDevice,
+                ciphertext: Hex.encode(ciphertext),
+                idempotency_key: Hex.encode(idempotencyKey)))
+        let receipt: Receipt = try decode(await perform(request))
+        return receipt.delivered
     }
 
     // ----- internals -----

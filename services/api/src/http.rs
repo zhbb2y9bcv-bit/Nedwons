@@ -35,7 +35,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use crate::groups::{InviteOutcome, PgGroups};
 use crate::membership::{ApplyOutcome, CommitRequest, PgMembership};
 use crate::notify::DeliveryNotifier;
-use crate::relay::{FanoutOutcome, PgRelay, SendOutcome};
+use crate::relay::{FanoutOutcome, PgRelay, SelfGroupSendOutcome, SendOutcome};
 use crate::social::{FriendRequestOutcome, PgSocial};
 use crate::transparency::PgTransparency;
 
@@ -167,6 +167,14 @@ pub fn build_router_cfg(
         .route("/v1/keypackages", post(publish_key_package))
         .route("/v1/keypackages/claim", post(claim_key_package))
         .route("/v1/keypackages/count", get(key_package_count))
+        // Device self-group (ADR-0015 option 3): establish + use the account's own-devices MLS group.
+        .route("/v1/self-group/register", post(self_group_register))
+        .route("/v1/self-group/pending", get(self_group_pending))
+        .route(
+            "/v1/self-group/keypackage/claim",
+            post(self_group_claim_key_package),
+        )
+        .route("/v1/self-group/deliver", post(self_group_deliver))
         // sealed-sender certificate issuance (ADR-0012, R-204)
         .route("/v1/sender-certificate", get(issue_sender_certificate))
         // sealed-sender delivery access key registration (ADR-0014 Slice 2a, R-204)
@@ -1194,6 +1202,12 @@ struct InboxEnvelopeDto {
     /// so a client acks them via `AckBody.sealed_ids`, not `ids`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     sealed: bool,
+    /// True for a **self-group** envelope (ADR-0015 option 3): a message from one of this account's
+    /// OWN devices (linking Welcome/commit, or a `SecretConsumed`), which the client routes to the
+    /// self-group inbound path. Its own id space — ack via `AckBody.self_group_ids`. `sender_device`
+    /// is present (a sibling device); `conversation_id` is absent (it is not a conversation).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    self_group: bool,
 }
 
 #[derive(Deserialize)]
@@ -1212,6 +1226,10 @@ struct AckBody {
     /// existing clients that only send `ids` are unaffected.
     #[serde(default)]
     sealed_ids: Vec<i64>,
+    /// **Self-group** envelope ids to ack — a separate id space again (ADR-0015 option 3). Optional
+    /// so existing clients are unaffected.
+    #[serde(default)]
+    self_group_ids: Vec<i64>,
 }
 
 /// Publish a key package for the authenticated device.
@@ -1430,6 +1448,136 @@ async fn deliver_sealed_handler(
     // Wake a waiting inbox/long-poll for the recipient.
     state.notifier.wake(&recipient.0);
     Ok(StatusCode::ACCEPTED)
+}
+
+// ----- Device self-group (ADR-0015 option 3) ------------------------------------------
+//
+// Establish + use the account's own-devices MLS group over the relay so a view-once "consumed"
+// control message fans out to the account's OTHER devices — without the conversation's other party
+// ever being in the channel. Every endpoint is authenticated and account-scoped: a device only ever
+// touches its OWN account's self-group (the account boundary IS the authorization; no manifests).
+
+/// Declare the authenticated device a member of its account's self-group (idempotent). Called by the
+/// device that creates the self-group and by each device after it `join_self_group`s.
+async fn self_group_register(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let relay = state.relay.clone();
+    let account = me.account_id;
+    let device = me.device_id;
+    blocking_store(move || relay.register_self_group_member(&account, &device)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct SelfGroupPendingDto {
+    /// Devices of my account that are enrolled but not yet linked into the self-group.
+    pending_devices: Vec<String>,
+}
+
+/// List the account's devices that are enrolled but NOT yet in its self-group — the candidates the
+/// caller links (claim each one's key package, add it, deliver the Welcome).
+async fn self_group_pending(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SelfGroupPendingDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let relay = state.relay.clone();
+    let account = me.account_id;
+    let caller = me.device_id;
+    let devices =
+        blocking_store(move || relay.pending_self_group_devices(&account, &caller)).await?;
+    Ok(Json(SelfGroupPendingDto {
+        pending_devices: devices.iter().map(hex::encode).collect(),
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelfGroupClaimBody {
+    /// A device of the caller's OWN account to claim a key package for (to add it to the self-group).
+    device_id: String,
+}
+
+/// Claim one key package for a specific sibling device of the caller's account (to add it to the
+/// self-group). Refuses if the target device is not a non-revoked device of the caller's account —
+/// this endpoint never claims another account's key package.
+async fn self_group_claim_key_package(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SelfGroupClaimBody>,
+) -> Result<Json<ClaimedKeyPackageDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let target = DeviceId(id16_from_hex(&body.device_id)?);
+    let relay = state.relay.clone();
+    let account = me.account_id;
+    let claimed = blocking_store(move || {
+        // Authorization: the target must be one of the caller's own account's devices.
+        match relay.account_for_device(&target)? {
+            Some(a) if a.0 == account.0 => {}
+            _ => return Ok(None),
+        }
+        relay.claim_key_package_for_device(&target, crate::relay::KEY_PACKAGE_TTL_SECS)
+    })
+    .await?
+    .ok_or(ApiError(StatusCode::NOT_FOUND, "no_key_package"))?;
+    Ok(Json(ClaimedKeyPackageDto {
+        device_id: hex::encode(claimed.device_id),
+        key_package: hex::encode(claimed.key_package),
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SelfGroupDeliverBody {
+    /// Targeted delivery to one of the caller's own devices (an MLS Welcome/commit during linking).
+    /// Omit to **fan out** to every OTHER joined member of the self-group (a `SecretConsumed` control
+    /// message).
+    #[serde(default)]
+    recipient_device: Option<String>,
+    /// Opaque MLS ciphertext (hex) — the relay never decrypts it.
+    ciphertext: String,
+    /// 16-byte client-chosen idempotency key (hex); a retry with the same key is a no-op.
+    idempotency_key: String,
+}
+
+/// Deliver a self-group envelope. With `recipient_device`: targeted to that sibling device (Welcome
+/// or commit). Without: fan out to every OTHER joined member of the caller's self-group (the
+/// consumption control message). Relay-blind: opaque ciphertext, account-scoped routing only.
+async fn self_group_deliver(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SelfGroupDeliverBody>,
+) -> Result<Json<FanoutReceiptDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let ciphertext = decode_ciphertext(&body.ciphertext)?;
+    let idem = id16_from_hex(&body.idempotency_key)?;
+    let recipient = match &body.recipient_device {
+        Some(hex_id) => Some(DeviceId(id16_from_hex(hex_id)?)),
+        None => None,
+    };
+
+    let relay = state.relay.clone();
+    let account = me.account_id;
+    let sender = me.device_id;
+    let outcome = blocking_store(move || match recipient {
+        Some(rec) => relay.deliver_self_group_targeted(&account, &sender, &rec, &ciphertext, &idem),
+        None => relay.fanout_self_group(&account, &sender, &ciphertext, &idem),
+    })
+    .await?;
+
+    let newly_queued = match outcome {
+        SelfGroupSendOutcome::Forbidden => return Err(forbidden()),
+        SelfGroupSendOutcome::Delivered { newly_queued } => newly_queued,
+    };
+    for device in &newly_queued {
+        state.notifier.wake(device);
+    }
+    Ok(Json(FanoutReceiptDto {
+        delivered: newly_queued.len(),
+    }))
 }
 
 #[derive(Serialize)]
@@ -2317,15 +2465,15 @@ async fn fetch_inbox(
 
     // Register interest BEFORE the first read to avoid a lost-wakeup window.
     let notified = state.notifier.handle(&device);
-    let (mut identified, mut sealed) = read_all_inbox(&state, me.device_id).await?;
+    let (mut identified, mut sealed, mut self_group) = read_all_inbox(&state, me.device_id).await?;
 
-    if identified.is_empty() && sealed.is_empty() && query.wait > 0 {
+    if identified.is_empty() && sealed.is_empty() && self_group.is_empty() && query.wait > 0 {
         let wait = std::time::Duration::from_secs(query.wait.min(MAX_INBOX_WAIT_SECS));
         tokio::select! {
             _ = notified.notified() => {}
             _ = tokio::time::sleep(wait) => {}
         }
-        (identified, sealed) = read_all_inbox(&state, me.device_id).await?;
+        (identified, sealed, self_group) = read_all_inbox(&state, me.device_id).await?;
     }
 
     let mut out: Vec<InboxEnvelopeDto> = identified
@@ -2336,6 +2484,7 @@ async fn fetch_inbox(
             sender_device: Some(hex::encode(e.sender_device)),
             ciphertext: hex::encode(e.ciphertext),
             sealed: false,
+            self_group: false,
         })
         .collect();
     out.extend(sealed.into_iter().map(|e| InboxEnvelopeDto {
@@ -2344,6 +2493,15 @@ async fn fetch_inbox(
         sender_device: None,
         ciphertext: hex::encode(e.ciphertext),
         sealed: true,
+        self_group: false,
+    }));
+    out.extend(self_group.into_iter().map(|e| InboxEnvelopeDto {
+        id: e.id,
+        conversation_id: None,
+        sender_device: Some(hex::encode(e.sender_device)),
+        ciphertext: hex::encode(e.ciphertext),
+        sealed: false,
+        self_group: true,
     }));
     Ok(Json(out))
 }
@@ -2356,7 +2514,7 @@ async fn ack_inbox(
     Json(body): Json<AckBody>,
 ) -> Result<StatusCode, ApiError> {
     let me = authed_device(&state, &headers).await?;
-    if body.ids.len() > 1000 || body.sealed_ids.len() > 1000 {
+    if body.ids.len() > 1000 || body.sealed_ids.len() > 1000 || body.self_group_ids.len() > 1000 {
         return Err(bad_request());
     }
     let relay = state.relay.clone();
@@ -2364,6 +2522,7 @@ async fn ack_inbox(
     blocking_store(move || {
         relay.ack_envelopes(&device, &body.ids)?;
         relay.ack_sealed(&device, &body.sealed_ids)?;
+        relay.ack_self_group(&device, &body.self_group_ids)?;
         Ok(())
     })
     .await?;
@@ -2379,8 +2538,9 @@ async fn read_inbox(
     blocking_store(move || relay.peek_inbox(&device_id, 100)).await
 }
 
-/// Peek both identified and sealed envelopes for a device (ADR-0014). Sealed ones live in a separate
-/// table/id space, so they are returned as a separate list the caller tags distinctly.
+/// Peek identified, sealed (ADR-0014), and self-group (ADR-0015 option 3) envelopes for a device.
+/// Each lives in a separate table/id space, so they are returned as separate lists the caller tags
+/// distinctly (`sealed` / `self_group` flags), and the client acks each via its own id list.
 #[allow(clippy::type_complexity)]
 async fn read_all_inbox(
     state: &AppState,
@@ -2389,6 +2549,7 @@ async fn read_all_inbox(
     (
         Vec<crate::relay::EnvelopeOut>,
         Vec<crate::relay::SealedEnvelopeOut>,
+        Vec<crate::relay::SelfGroupEnvelopeOut>,
     ),
     ApiError,
 > {
@@ -2396,7 +2557,8 @@ async fn read_all_inbox(
     blocking_store(move || {
         let identified = relay.peek_inbox(&device_id, 100)?;
         let sealed = relay.peek_sealed_inbox(&device_id, 100)?;
-        Ok((identified, sealed))
+        let self_group = relay.peek_self_group_inbox(&device_id, 100)?;
+        Ok((identified, sealed, self_group))
     })
     .await
 }
@@ -2459,6 +2621,7 @@ async fn stream_socket(
                         sender_device: Some(hex::encode(e.sender_device)),
                         ciphertext: hex::encode(e.ciphertext),
                         sealed: false,
+                        self_group: false,
                     })
                     .collect();
                 if let Some(max_id) = fresh.iter().map(|e| e.id).max() {

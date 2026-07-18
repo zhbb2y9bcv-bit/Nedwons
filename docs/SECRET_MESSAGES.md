@@ -64,6 +64,13 @@ is **not** a read receipt to the sender. (An earlier design routed it through th
 did disclose the open to the sender; the self-group upgrade closes that. A single-device or not-yet-
 linked account falls back to the conversation route until a second device is linked.)
 
+Establishing that self-group across your devices runs over the relay, which stays **MLS-blind** — it
+routes opaque ciphertext among your own authenticated devices only, never seeing the self-group or
+its contents (`services/api`, ADR-0015 "Backend transport"). A device is linked into the self-group
+only through the authenticated trusted-device enrollment ceremony (ADR-0008) followed by the MLS
+add/Welcome handshake; a stranger can neither claim your device's key package nor deliver into your
+self-group.
+
 Two honest caveats, inherent to keeping this relay-blind (not hidden):
 
 - **Concurrency:** if two of your devices open the *same* secret within the brief window before the

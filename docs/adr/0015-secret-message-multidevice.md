@@ -21,6 +21,11 @@
   phone + tablet; phone reveals → tablet consumed; the sender is not in the self-group and **cannot
   decrypt** the signal) + `self_group_persists_across_reopen`; FFI `consumption_over_the_self_group_across_the_ffi`;
   SentinelApp `testRevealFansOutOverTheSelfGroupSenderNeverSeesIt`. Original option-2 tests retained.
+- **Implementation (backend transport / device-linking, 2026-07-18):** the relay path to establish +
+  use the self-group across an account's devices (`services/api` migration `V18`, the
+  `/v1/self-group/*` endpoints, `/v1/inbox` folding, and the Swift `SentinelClient` methods) — see the
+  "Backend transport — device-linking flow" section below. Relay stays MLS-blind; proven by
+  `services/api/tests/self_group.rs`.
 - **Date:** 2026-07-18
 - **Deciders:** crypto integrator, backend lead, security architect
 - **Context:** ADR-0008 (multi-device trust), ADR-0010 (MLS-authoritative membership), ADR-0012/0014
@@ -101,3 +106,31 @@ Adopt **option 2** with a race rule and a fail-closed default:
 
 Until step 2 lands, the Secret Message guarantee remains **single-device**, as stated in
 `docs/SECRET_MESSAGES.md` and RISK_REGISTER.
+
+## Backend transport — device-linking flow (landed 2026-07-18, `services/api`)
+
+The option-3 self-group needs a relay path to establish and use it across the account's devices. The
+relay stays **MLS-blind** — it routes opaque ciphertext by account/device, never sees the self-group
+group id or contents — and every endpoint is authenticated and **account-scoped** (the account
+boundary is the authorization; no membership manifests, unlike a conversation). Migration `V18`:
+
+- `self_group_members(account_id, device_id)` — which of an account's devices have JOINED its
+  self-group. Fan-out targets only joined members, so a device that is enrolled but not yet linked
+  never receives a message it cannot decrypt.
+- `self_group_envelopes` — a dedicated envelope channel (separate table/id space from `envelopes`
+  and `sealed_envelopes`), for linking Welcomes/commits and `SecretConsumed` messages.
+
+Endpoints (all authenticated): `POST /v1/self-group/register` (declare this device a member),
+`GET /v1/self-group/pending` (enrolled-but-not-linked siblings to add), `POST
+/v1/self-group/keypackage/claim` (claim a specific sibling's key package — refuses a device that is
+not the caller's account's), and `POST /v1/self-group/deliver` (targeted Welcome/commit to one
+sibling, or — with no recipient — fan out to every OTHER joined member). Self-group envelopes ride
+the existing `/v1/inbox` long-poll with a `self_group` flag and their own `self_group_ids` ack space,
+mirroring how sealed-sender folds in. Retention purge for the channel matches the envelope TTL.
+
+**Proven:** `services/api/tests/self_group.rs` — two devices enroll, link (pending → claim → Welcome
+→ join/register), and a consumption message fans out to the joined sibling (and not to the sender);
+a stranger can neither claim a sibling's key package (`404`) nor deliver into another account's
+self-group (`403`); idempotent redelivery is a no-op; a lone device's fan-out reaches nobody. The
+Swift `SentinelClient` gained the matching methods (`publishKeyPackage`, `registerSelfGroupMember`,
+`pendingSelfGroupDevices`, `claimSelfGroupKeyPackage`, `deliverSelfGroup`, self-group inbox/ack).
