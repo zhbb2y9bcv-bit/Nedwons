@@ -391,3 +391,122 @@ fn tombstone_text_is_the_exact_string() {
         "a secret message has been sent"
     );
 }
+
+/// ADR-0015 **option 3**: the consumption message travels over the account's device **self-group**
+/// (phone + tablet), which the conversation's other party (alice, the sender) is NOT a member of.
+/// So opening on the phone consumes the tablet's copy — account-wide single-view — while the sender
+/// never receives, and cannot even decrypt, the read signal. This is the improvement over option 2
+/// (where the consumption message rode the conversation group and the sender learned of the open).
+#[test]
+fn consumption_syncs_over_the_self_group_without_the_sender_learning() {
+    // Conversation group: alice (sender) + phone + tablet (Bob's two devices).
+    let alice = Member::new(b"alice-device").unwrap();
+    let phone = Member::new(b"bob-phone").unwrap();
+    let tablet = Member::new(b"bob-tablet").unwrap();
+    let mut ga = alice.create_group().unwrap();
+    let add_phone = ga
+        .add_member(&alice, &phone.key_package_bytes().unwrap())
+        .unwrap();
+    let mut gp = phone.join_from_welcome(&add_phone.welcome).unwrap();
+    let add_tablet = ga
+        .add_member(&alice, &tablet.key_package_bytes().unwrap())
+        .unwrap();
+    gp.process(&phone, &add_tablet.commit).unwrap();
+    let gt = tablet.join_from_welcome(&add_tablet.welcome).unwrap();
+
+    let mut da = DurableSession::adopt(alice, ga, InMemoryJournal::new()).unwrap();
+    let mut dp = DurableSession::adopt(phone, gp, InMemoryJournal::new()).unwrap();
+    let mut dt = DurableSession::adopt(tablet, gt, InMemoryJournal::new()).unwrap();
+
+    // Bob's two devices form their OWN self-group. Alice is not, and cannot be, a member.
+    dp.create_self_group().unwrap();
+    let tablet_kp = dt.key_package().unwrap();
+    let (_commit, welcome) = dp.add_self_device(&tablet_kp).unwrap();
+    dt.join_self_group(&welcome).unwrap();
+    assert!(dp.has_self_group() && dt.has_self_group());
+    assert!(
+        !da.has_self_group(),
+        "the sender has no place in Bob's self-group"
+    );
+
+    // Alice sends a secret; both of Bob's devices receive it sealed (over the conversation).
+    let (env, sid) = send_secret(&mut da, b"the vault code is 7788");
+    assert!(matches!(
+        dp.process_inbound(1, &env).unwrap(),
+        InboundOutcome::SecretSealed { .. }
+    ));
+    assert!(matches!(
+        dt.process_inbound(1, &env).unwrap(),
+        InboundOutcome::SecretSealed { .. }
+    ));
+
+    // The phone reveals it and emits the consumption message — now routed over the SELF-GROUP.
+    dp.begin_secret_reveal(&sid, 0).unwrap();
+    let cid = dp
+        .emit_secret_consumption(&sid)
+        .unwrap()
+        .expect("a consumption message");
+    assert_eq!(
+        dp.emit_secret_consumption(&sid).unwrap(),
+        Some(cid),
+        "idempotent"
+    );
+    let consumption_env = dp.encrypt(cid).unwrap();
+    assert!(
+        !consumption_env.windows(4).any(|w| w == b"7788"),
+        "relay sees only opaque ciphertext"
+    );
+
+    // The tablet applies it over its self-group inbox and consumes its copy — it can never open it.
+    assert!(matches!(
+        dt.process_self_inbound(2, &consumption_env).unwrap(),
+        InboundOutcome::SecretConsumedRemotely { secret_id } if secret_id == sid
+    ));
+    assert_eq!(
+        dt.secret_state(&sid, 0).unwrap(),
+        Some(SecretState::Consumed)
+    );
+    assert!(
+        dt.begin_secret_reveal(&sid, 0).is_err(),
+        "the tablet's reveal is refused after remote consumption"
+    );
+
+    // THE option-3 PROPERTY: the sender is not in the self-group, so the consumption message never
+    // reaches her — and even handed the raw bytes she cannot decrypt them. The read stays private.
+    assert!(
+        da.process_inbound(2, &consumption_env).is_err(),
+        "the sender cannot decrypt a message from a group she is not in"
+    );
+
+    // The phone (first to open) still views it within its own window — first device wins.
+    assert_eq!(
+        dp.secret_state(&sid, 3_000).unwrap(),
+        Some(SecretState::Visible)
+    );
+    assert_eq!(
+        dp.secret_visible_body(&sid, 3_000).unwrap().as_deref(),
+        Some(&b"the vault code is 7788"[..])
+    );
+}
+
+/// The self-group's ratchet state is captured by the same atomic blob as the conversation, so it is
+/// reloaded on reopen (crash recovery) rather than lost.
+#[test]
+fn self_group_persists_across_reopen() {
+    let alice = Member::new(b"solo-device").unwrap();
+    let group = alice.create_group().unwrap();
+    let journal = InMemoryJournal::new();
+    let mut d = DurableSession::adopt(alice, group, journal.clone()).unwrap();
+    assert!(!d.has_self_group());
+    d.create_self_group().unwrap();
+    assert!(d.has_self_group());
+    // A second create is refused rather than orphaning the first group.
+    assert!(d.create_self_group().is_err());
+    drop(d);
+
+    let d2 = DurableSession::open(journal).unwrap();
+    assert!(
+        d2.has_self_group(),
+        "the self-group is reloaded from the persisted blob"
+    );
+}
