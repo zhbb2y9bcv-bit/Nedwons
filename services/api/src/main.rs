@@ -22,6 +22,27 @@ use auth_core::{AuthService, Config};
 use sentinel_api::pgstore::PgStores;
 use sentinel_api::{build_pool, http, run_migrations};
 
+/// A small **bundled** corpus of frequently-breached passwords that satisfy the 12-char length
+/// policy (so the embedded exact-match blocklist would miss them). This is a floor; production
+/// replaces the `RangeProvider` with a large corpus behind the same interface (R-305).
+const BUNDLED_BREACHED_PASSWORDS: &[&str] = &[
+    "password123456",
+    "qwerty123456789",
+    "123456789101112",
+    "iloveyou1234567",
+    "administrator12",
+    "welcome123456789",
+    "passw0rdpassw0rd",
+    "letmein12345678",
+    "monkeymonkey123",
+    "dragondragon123",
+    "football1234567",
+    "baseball1234567",
+    "superman1234567",
+    "trustno1trustno1",
+    "whatever1234567",
+];
+
 fn env_or(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
@@ -67,15 +88,23 @@ fn main() {
     };
     let stores = Arc::new(PgStores::new(pool));
 
-    let service = Arc::new(AuthService::new(
-        stores.clone(),
-        stores.clone(),
-        stores.clone(),
-        stores.clone(),
-        stores.clone(),
-        Arc::new(SystemClock),
-        Config::default(),
-    ));
+    let service = Arc::new(
+        AuthService::new(
+            stores.clone(),
+            stores.clone(),
+            stores.clone(),
+            stores.clone(),
+            stores.clone(),
+            Arc::new(SystemClock),
+            Config::default(),
+        )
+        // Compromised-credential check (R-305): a bundled corpus of common breached passwords that
+        // pass the length policy. Production swaps this `RangeProvider` for a large corpus (an HTTP
+        // k-anonymity range query, e.g. HIBP, or a Bloom filter) — the interface is unchanged.
+        .with_breach_provider(Arc::new(auth_core::breach::StaticCorpus::from_passwords(
+            BUNDLED_BREACHED_PASSWORDS,
+        ))),
+    );
 
     let relay = Arc::new(sentinel_api::relay::PgRelay::new(stores.pool_clone()));
     let social = Arc::new(sentinel_api::social::PgSocial::new(stores.pool_clone()));
