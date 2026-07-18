@@ -92,5 +92,8 @@ remaining Slice 2 work — the **unauthenticated delivery endpoint** that stores
 the recipient-issued **delivery-token** abuse control, and the sealed-payload wire format — is a
 **relay trust/abuse-model change** (the current relay enforces membership + idempotency via the
 *authenticated* sender) and must be decided + reviewed before implementation, not landed
-autonomously. R-204 stays **OPEN/MITIGATING** until it ships and the relay demonstrably stores no
-sender for sealed messages.
+autonomously. **That abuse model is now specified in
+[ADR-0014](0014-sealed-sender-delivery-tokens.md)** — delivery access keys, recipient-side block
+enforcement, per-recipient rate limits, a separate `sealed_envelopes` table, and a 2a→2d rollout;
+Proposed, pending review before code. R-204 stays **OPEN/MITIGATING** until it ships and the relay
+demonstrably stores no sender for sealed messages.
