@@ -511,6 +511,40 @@ fn self_group_persists_across_reopen() {
     );
 }
 
+/// ADR-0014 Slice 2c: an approved contact's sealed-sender delivery key `K_r` is distributed over the
+/// E2EE channel — the relay never sees it — and surfaced to the recipient to store (no message-log
+/// entry, since it is a control message, not user content).
+#[test]
+fn delivery_key_grant_travels_e2ee_and_is_surfaced() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+    let key_r = [0x7cu8; 32];
+
+    let local_id = alice.enqueue_delivery_key_grant(&key_r).unwrap();
+    let env = alice.encrypt(local_id).unwrap();
+    alice.mark_sent(local_id).unwrap();
+
+    // The relay-visible ciphertext does not contain K_r.
+    assert!(
+        !env.windows(32).any(|w| w == key_r),
+        "K_r must not appear in the ciphertext the relay forwards"
+    );
+    // It is NOT a user-visible message on the sender (a control message, no message-log entry).
+    assert!(
+        alice.messages().is_empty(),
+        "the grant creates no message on the sender"
+    );
+
+    match bob.process_inbound(1, &env).unwrap() {
+        InboundOutcome::DeliveryKeyGranted { key_r: got } => assert_eq!(got, key_r),
+        other => panic!("expected DeliveryKeyGranted, got {other:?}"),
+    }
+    // The grant is a control message — it does not appear in Bob's message log.
+    assert!(
+        bob.messages().is_empty(),
+        "a delivery-key grant is not a user-visible message"
+    );
+}
+
 /// ADR-0015 option 3, full lifecycle: a THREE-device self-group (phone + tablet + laptop) where
 /// adding the third device requires a commit to the existing member; a consumption fans out to BOTH
 /// other devices (each consuming its own held copy); and — the security-critical part — when the

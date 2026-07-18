@@ -134,6 +134,10 @@ pub enum InboundResult {
     /// revealed `secret_id`, so this device consumed its copy (account-wide single-view). No
     /// user-visible content; refresh any placeholder for `secret_id` to its tombstone.
     SecretConsumedRemotely { secret_id: Vec<u8> },
+    /// A **delivery-key grant** arrived (ADR-0014 Slice 2c): an approved contact shared their
+    /// sealed-sender delivery access key `K_r` (32 bytes) over the E2EE channel. Store it keyed by
+    /// the sender to later send that contact sealed messages. No user-visible content.
+    DeliveryKeyGranted { key_r: Vec<u8> },
 }
 
 /// Capability/version record so the Swift side can assert it links a compatible core and refuse on
@@ -492,6 +496,24 @@ impl MlsClient {
         })
     }
 
+    /// Queue a **delivery-key grant** (ADR-0014 Slice 2c): share this account's sealed-sender
+    /// delivery access key `K_r` (exactly 32 bytes) with an approved contact over the E2EE channel.
+    /// The relay never sees `K_r`. Returns the outbound local id; `encrypt`/`mark_sent` then proceed
+    /// exactly as for a normal message.
+    pub fn enqueue_delivery_key_grant(&self, key_r: Vec<u8>) -> Result<u64, MlsClientError> {
+        catch(move || {
+            let key: [u8; 32] = key_r
+                .as_slice()
+                .try_into()
+                .map_err(|_| MlsClientError::InvalidMessage)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session
+                .enqueue_delivery_key_grant(&key)
+                .map_err(map_durable)
+        })
+    }
+
     /// Begin revealing a sealed secret (recipient tapped the placeholder). **Atomic + fail-closed:**
     /// the transition + deadlines are committed before this returns `Ok`. An invalid transition
     /// (double tap, replay, wrong state) or a failed state write returns `Err` and reveals nothing.
@@ -633,6 +655,9 @@ impl MlsClient {
                         secret_id: secret_id.to_vec(),
                     }
                 }
+                InboundOutcome::DeliveryKeyGranted { key_r } => InboundResult::DeliveryKeyGranted {
+                    key_r: key_r.to_vec(),
+                },
             })
         })
     }
@@ -669,6 +694,9 @@ impl MlsClient {
                         secret_id: secret_id.to_vec(),
                     }
                 }
+                InboundOutcome::DeliveryKeyGranted { key_r } => InboundResult::DeliveryKeyGranted {
+                    key_r: key_r.to_vec(),
+                },
             })
         })
     }
