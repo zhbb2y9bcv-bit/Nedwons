@@ -56,7 +56,7 @@ later without redesign.
 | Cross-language interop (Swift signs → Rust verifies) | both | ✅ | ✅ `INTEROP_OK` + byte-identical transcript vectors |
 | `infra` (docker-compose) | Docker/Colima (installed) | ✅ `config` validates | ✅ Postgres service verified up; API image build not run |
 | `apps/ios/Sentinel` (`@main` app target) | Xcode 26.6 | requires Xcode app target (see apps/ios/README.md) | ⚠️ not run on a simulator/device (R-101) |
-| `core/mls-core` Rust↔Swift FFI (UniFFI) | Rust 1.97.1 | planned (on-device, Section 3 / R-101) | — |
+| `core/mls-ffi` Rust↔Swift MLS bridge (UniFFI 0.29) | Rust 1.97.1 + Swift 6.3.3 | ✅ implemented + packaged (`scripts/build_mls_ffi.sh` → `MlsFfi.xcframework`, macOS+iOS+sim) | ✅ Swift↔Rust integration test on the host slice **and RUNNING in the iOS simulator** (`scripts/test_mls_sim.sh`); + Rust FFI/adversarial tests + fuzz. Device slice compiles; **on-device *run* still R-101.** |
 
 See each milestone report in the git history for exactly what was run and what was not.
 

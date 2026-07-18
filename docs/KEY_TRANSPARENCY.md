@@ -10,9 +10,22 @@ This document states precisely what Sentinel's KT does and — just as important
 
 ## What is implemented
 
-An **append-only Merkle transparency log** using the **RFC 6962** (Certificate Transparency)
-construction — a mature, precisely specified *standard*, not a bespoke protocol. It is pure, tested
-Rust in `auth_core::transparency`, driven by a Postgres-backed directory in
+An **RFC 6962-compatible append-only Merkle-log primitive used inside an application-specific
+key-transparency design**. Be precise about which part is standard and which is ours:
+
+- The **tree construction** (leaf/node hashing, inclusion proofs, consistency proofs) follows RFC
+  6962 exactly — a mature, precisely specified construction. (Note: **RFC 9162 obsoletes RFC 6962
+  for Certificate Transparency itself**; we use the Merkle-tree construction, which is unchanged in
+  substance, not the CT PKI ecosystem around it.)
+- Everything **around** the tree is application-specific and has NOT been standardized or
+  externally reviewed: the account→device-key **leaf schema**, the enrollment→append coupling, the
+  STH distribution and log-key pinning policy, the per-account audit path, and the client
+  self-monitoring policy. Neither RFC defines those for a messenger key directory. **Do not
+  describe the system as "standardized key transparency"**, and do not call it "not hand-rolled"
+  merely because the tree follows an RFC — the KT *application* is ours and needs specialized
+  review (R-201).
+
+It is pure, tested Rust in `auth_core::transparency`, driven by a Postgres-backed directory in
 `services/api/src/transparency.rs`, and verified on the client in
 `SentinelKit/Transparency.swift`.
 

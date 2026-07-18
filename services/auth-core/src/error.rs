@@ -24,7 +24,7 @@ pub enum AuthError {
     #[error("invalid input")]
     InvalidInput,
 
-    /// Registration only: password fails the NIST SP 800-63B-aligned policy (too short,
+    /// Registration only: password fails the NIST SP 800-63B-4-aligned policy (too short,
     /// too long, or on the common-password blocklist). Client-correctable, and telling the
     /// user why is required UX — this leaks nothing about other accounts.
     #[error("password does not meet requirements")]

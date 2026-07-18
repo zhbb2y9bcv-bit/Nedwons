@@ -1,0 +1,24 @@
+[package]
+name = "mls-ffi-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mls-ffi = { path = ".." }
+mls-core = { path = "../../mls-core" }
+once_cell = "1"
+
+# Its own workspace so it is not built by the parent's `cargo test` (needs nightly + libfuzzer).
+[workspace]
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
