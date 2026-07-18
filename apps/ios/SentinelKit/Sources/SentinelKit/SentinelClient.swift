@@ -672,11 +672,13 @@ public struct MembershipEvent: Decodable, Sendable {
     public let nextEpoch: UInt64
     public let commitHash: String
     public let actorDevice: String
+    /// The actor's account — where its device key is logged in the transparency log.
+    public let actorAccount: String
     public let added: [MembershipEventMember]
     public let removed: [String]
     public let idempotencyKey: String
     public let expiresAt: UInt64
-    /// Canonical manifest bytes (hex) + device signature (hex), for future signature verification.
+    /// Canonical manifest bytes (hex) + the actor's device signature (hex).
     public let manifest: String
     public let signature: String
 
@@ -686,6 +688,7 @@ public struct MembershipEvent: Decodable, Sendable {
         case nextEpoch = "next_epoch"
         case commitHash = "commit_hash"
         case actorDevice = "actor_device"
+        case actorAccount = "actor_account"
         case added, removed
         case idempotencyKey = "idempotency_key"
         case expiresAt = "expires_at"
@@ -696,6 +699,31 @@ public struct MembershipEvent: Decodable, Sendable {
     /// compares the staged commit against.
     public var addedDeviceIDs: [Data] { added.compactMap { Hex.decode($0.deviceID) } }
     public var removedDeviceIDs: [Data] { removed.compactMap { Hex.decode($0) } }
+
+    /// Verify the manifest's ECDSA-P256 device signature over the exact stored manifest bytes,
+    /// under `deviceKeyX963` — which the caller MUST obtain from the transparency log, not from the
+    /// server's assertion for this event (see `verifyIncomingMembershipEvent`).
+    public func verifyManifestSignature(deviceKeyX963: Data) -> Bool {
+        guard let manifestBytes = Hex.decode(manifest),
+            let sigBytes = Hex.decode(signature),
+            let key = try? P256.Signing.PublicKey(x963Representation: deviceKeyX963),
+            let sig = try? P256.Signing.ECDSASignature(rawRepresentation: sigBytes)
+        else { return false }
+        return key.isValidSignature(sig, for: manifestBytes)
+    }
+}
+
+/// Result of fully verifying an incoming membership event (transparency anchor + manifest
+/// signature). Only `.verified` should be fed to `MlsClient.processCommit`.
+public enum MembershipVerifyResult: Sendable, Equatable {
+    /// Fully verified: feed `(added, removed, nextEpoch)` to the correspondence check.
+    case verified(added: [Data], removed: [Data], nextEpoch: UInt64)
+    /// The log advertised a key different from the pinned one (possible key-directory swap).
+    case logKeyChanged
+    /// STH signature, actor-device binding, or its inclusion proof did not verify.
+    case badTransparencyProof
+    /// The manifest signature did not verify under the actor's transparency-logged device key.
+    case badSignature
 }
 
 extension SentinelClient {
@@ -719,6 +747,53 @@ extension SentinelClient {
             "GET", "/v1/conversations/\(conversationID)/membership/\(epoch)",
             accessToken: accessToken)
         return try decode(await perform(request))
+    }
+
+    /// Fully verify an incoming membership event before merging (ADR-0010 + R-201): the actor's
+    /// device key is the one in the **transparency log** (STH signature under the *pinned* log key,
+    /// the actor-device binding included under the signed root — so the server cannot substitute a
+    /// key it never logged), and the manifest signature verifies under **that** key. Returns the
+    /// verified delta for `MlsClient.processCommit`; the app merges only on `.verified`. This is the
+    /// half of membership trust that closes the "valid-member lying manifest" gap for the
+    /// *signature* — the correspondence check (in mls-core) closes the *content* half.
+    public func verifyIncomingMembershipEvent(
+        accessToken: String,
+        conversationID: String,
+        epoch: UInt64,
+        pinnedLogPublicKeyX963: Data
+    ) async throws -> MembershipVerifyResult {
+        let event = try await membershipEvent(
+            accessToken: accessToken, conversationID: conversationID, epoch: epoch)
+
+        // 1. Signed tree head under the PINNED log key (reject a swapped/forged log key).
+        let sth = try await transparencySignedTreeHead(accessToken: accessToken)
+        guard let root = Hex.decode(sth.rootHash), let sthSig = Hex.decode(sth.signature),
+            let advertised = Hex.decode(sth.logPublicKey)
+        else { return .badTransparencyProof }
+        if advertised != pinnedLogPublicKeyX963 { return .logKeyChanged }
+        guard Transparency.verifySTHSignature(
+            treeSize: sth.treeSize, root: root, timestamp: sth.timestamp,
+            signature: sthSig, logPublicKeyX963: pinnedLogPublicKeyX963)
+        else { return .badTransparencyProof }
+
+        // 2. The actor's device binding, included under the signed root.
+        let view = try await transparencyAccount(
+            accessToken: accessToken, accountID: event.actorAccount, treeSize: sth.treeSize)
+        guard let binding = view.bindings.first(where: { $0.deviceID == event.actorDevice }),
+            let entry = Hex.decode(binding.entry), let loggedKey = Hex.decode(binding.publicKey)
+        else { return .badTransparencyProof }
+        let proof = binding.proof.compactMap { Hex.decode($0) }
+        guard proof.count == binding.proof.count,
+            Transparency.verifyInclusion(
+                leaf: Transparency.hashLeaf(entry), index: Int(binding.leafIndex),
+                treeSize: Int(sth.treeSize), proof: proof, root: root)
+        else { return .badTransparencyProof }
+
+        // 3. The manifest signature under the transparency-logged device key.
+        guard event.verifyManifestSignature(deviceKeyX963: loggedKey) else { return .badSignature }
+
+        return .verified(
+            added: event.addedDeviceIDs, removed: event.removedDeviceIDs, nextEpoch: event.nextEpoch)
     }
 
     /// Build + sign the ADR-0010 manifest for `change` with `signer` (the device key — the private

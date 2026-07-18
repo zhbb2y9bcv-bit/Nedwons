@@ -1537,12 +1537,14 @@ struct MembershipEventDto {
     next_epoch: u64,
     commit_hash: String,
     actor_device: String,
+    /// The actor's account — where its device key lives in the transparency log, so the recipient
+    /// can verify the signature against the LOGGED key rather than a server-asserted one.
+    actor_account: String,
     added: Vec<CommitAddDto>,
     removed: Vec<String>,
     idempotency_key: String,
     expires_at: u64,
-    /// Canonical manifest bytes (hex) + the actor's device signature (hex), so the recipient can
-    /// verify the signature once the key directory exposes the actor's device key.
+    /// Canonical manifest bytes (hex) + the actor's device signature (hex).
     manifest: String,
     signature: String,
 }
@@ -1583,6 +1585,7 @@ async fn membership_event(
         next_epoch: m.next_epoch,
         commit_hash: hex::encode(m.commit_hash),
         actor_device: hex::encode(m.actor_device),
+        actor_account: hex::encode(row.actor_account),
         added: m
             .added
             .iter()
