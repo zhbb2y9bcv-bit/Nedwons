@@ -9,6 +9,12 @@ use auth_core::store::{StoreError, StoreResult};
 use crate::pgstore::PgPool;
 use r2d2_postgres::postgres::NoTls;
 
+/// MLS key packages ("prekeys") expire after this (hygiene): a stale prekey must never be used to
+/// add a device. The client replenishes when its available count drops below the low-watermark.
+pub const KEY_PACKAGE_TTL_SECS: u64 = 30 * 24 * 3600;
+/// Suggested client replenishment threshold (surfaced via the count endpoint).
+pub const KEY_PACKAGE_LOW_WATERMARK: u64 = 5;
+
 /// Relay storage over the shared connection pool.
 #[derive(Clone)]
 pub struct PgRelay {
@@ -113,17 +119,25 @@ impl PgRelay {
         Ok(())
     }
 
-    /// Claim (pop) one key package for the given account's device. `DELETE ... RETURNING`
-    /// with a subquery makes claiming atomic — two claimants cannot get the same package.
-    pub fn claim_key_package(&self, account: &AccountId) -> StoreResult<Option<ClaimedKeyPackage>> {
+    /// Claim (pop) one **non-expired** key package for the given account's device. `DELETE ...
+    /// RETURNING` with a subquery makes claiming atomic — two claimants cannot get the same
+    /// package. Key packages older than `ttl_secs` are ignored (a stale prekey must never be used
+    /// to add a device — MLS key-package hygiene); the purge task deletes them.
+    pub fn claim_key_package(
+        &self,
+        account: &AccountId,
+        ttl_secs: u64,
+    ) -> StoreResult<Option<ClaimedKeyPackage>> {
         let mut conn = self.conn()?;
         let row = conn
             .query_opt(
                 "DELETE FROM key_packages WHERE id = (
-                     SELECT id FROM key_packages WHERE account_id = $1 ORDER BY id LIMIT 1
+                     SELECT id FROM key_packages
+                     WHERE account_id = $1 AND created_at > now() - make_interval(secs => $2)
+                     ORDER BY id LIMIT 1
                      FOR UPDATE SKIP LOCKED
                  ) RETURNING device_id, key_package",
-                &[&account.as_bytes()],
+                &[&account.as_bytes(), &(ttl_secs as f64)],
             )
             .map_err(db_err)?;
         row.map(|r| {
@@ -133,6 +147,37 @@ impl PgRelay {
             })
         })
         .transpose()
+    }
+
+    /// How many non-expired key packages a device still has published. The client publishes more
+    /// when this drops below a low-watermark, so the device stays addable offline (replenishment).
+    pub fn count_available_key_packages(
+        &self,
+        device: &DeviceId,
+        ttl_secs: u64,
+    ) -> StoreResult<u64> {
+        let mut conn = self.conn()?;
+        let count: i64 = conn
+            .query_one(
+                "SELECT count(*) FROM key_packages
+                 WHERE device_id = $1 AND created_at > now() - make_interval(secs => $2)",
+                &[&device.as_bytes(), &(ttl_secs as f64)],
+            )
+            .map_err(db_err)?
+            .get(0);
+        Ok(count as u64)
+    }
+
+    /// Delete key packages older than `ttl_secs` (MLS prekey hygiene). Returns rows purged.
+    pub fn purge_expired_key_packages(&self, ttl_secs: u64) -> StoreResult<u64> {
+        let mut conn = self.conn()?;
+        let purged = conn
+            .execute(
+                "DELETE FROM key_packages WHERE created_at <= now() - make_interval(secs => $1)",
+                &[&(ttl_secs as f64)],
+            )
+            .map_err(db_err)?;
+        Ok(purged)
     }
 
     /// Create a conversation and add the creator as its first member (one transaction). When

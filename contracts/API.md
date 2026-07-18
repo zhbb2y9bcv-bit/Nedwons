@@ -113,7 +113,14 @@ implementation. Bodies may be up to 256 KiB (envelopes).
 
 ### `POST /v1/keypackages/claim` → `200` | `404`
 `{ "account_id": "<16B hex>" }` → `{ "device_id": "<16B hex>", "key_package": "<hex>" }`.
-Atomically pops one key package for the target account's device (to add them to a group).
+Atomically pops one **non-expired** key package for the target account's device (to add them to a
+group). Key packages past their TTL (30 days) are never handed out and are purged — a stale prekey
+must never be used to add a device (MLS hygiene).
+
+### `GET /v1/keypackages/count` → `200`
+Authed. `{ available, low_watermark }` — how many non-expired key packages the caller's device still
+has published. The client publishes more when `available ≤ low_watermark`, so the device stays
+addable while offline.
 
 ### `POST /v1/conversations` → `200`
 Optional body `{ mls_authoritative?: bool }` (default false). When `true`, the conversation is

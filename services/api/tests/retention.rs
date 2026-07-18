@@ -250,3 +250,46 @@ fn pool_connections_carry_statement_timeout() {
         .get(0);
     assert_eq!(it, "30s");
 }
+
+/// MLS key-package hygiene: a stale (expired) prekey is never claimed or counted, and is purged.
+#[test]
+fn key_package_hygiene_expires_stale_prekeys() {
+    use auth_core::ids::{AccountId, DeviceId};
+    let relay = shared_relay();
+    let mut client = postgres::Client::connect(&db_url(), postgres::NoTls).expect("db");
+
+    let account = AccountId([0xC1u8; 16]);
+    let device = DeviceId([0xC2u8; 16]);
+    let acct = account.0;
+    let dev = device.0;
+    client
+        .execute(
+            "DELETE FROM key_packages WHERE account_id = $1",
+            &[&acct.as_slice()],
+        )
+        .expect("clean slate");
+
+    // One fresh (via publish) and one 40-day-old (backdated) key package.
+    relay
+        .publish_key_package(account, device, b"fresh-kp")
+        .expect("publish");
+    client
+        .execute(
+            "INSERT INTO key_packages (account_id, device_id, key_package, created_at)
+             VALUES ($1, $2, $3, now() - interval '40 days')",
+            &[&acct.as_slice(), &dev.as_slice(), &b"stale-kp".as_slice()],
+        )
+        .expect("stale insert");
+
+    let ttl = 30 * 24 * 60 * 60;
+    // Only the fresh one counts.
+    assert_eq!(relay.count_available_key_packages(&device, ttl).unwrap(), 1);
+    // Claim returns the fresh one, never the stale.
+    let claimed = relay.claim_key_package(&account, ttl).unwrap().unwrap();
+    assert_eq!(claimed.key_package, b"fresh-kp");
+    // The stale one is not claimable (expired).
+    assert!(relay.claim_key_package(&account, ttl).unwrap().is_none());
+    // Purge removes it; the device now has zero available.
+    assert!(relay.purge_expired_key_packages(ttl).unwrap() >= 1);
+    assert_eq!(relay.count_available_key_packages(&device, ttl).unwrap(), 0);
+}
