@@ -696,6 +696,55 @@ impl PgRelay {
         Ok(())
     }
 
+    // ----- Push notification tokens (#4) ----------------------------------------------------------
+
+    /// Register (or rotate) a device's push token for a platform (`apns`). Upsert — one token per
+    /// (device, platform). The token is opaque to the relay; it addresses a contentless wake push.
+    pub fn register_push_token(
+        &self,
+        device: &DeviceId,
+        platform: &str,
+        token: &str,
+    ) -> StoreResult<()> {
+        let mut conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO device_push_tokens (device_id, platform, token, updated_at)
+             VALUES ($1, $2, $3, now())
+             ON CONFLICT (device_id, platform)
+             DO UPDATE SET token = EXCLUDED.token, updated_at = now()",
+            &[&device.as_bytes(), &platform, &token],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// This device's registered push tokens as `(platform, token)` pairs.
+    pub fn push_tokens_for_device(&self, device: &DeviceId) -> StoreResult<Vec<(String, String)>> {
+        let mut conn = self.conn()?;
+        let rows = conn
+            .query(
+                "SELECT platform, token FROM device_push_tokens WHERE device_id = $1",
+                &[&device.as_bytes()],
+            )
+            .map_err(db_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+            .collect())
+    }
+
+    /// Delete all of a device's push tokens (on revocation). Idempotent; returns rows removed.
+    pub fn delete_push_tokens(&self, device: &DeviceId) -> StoreResult<u64> {
+        let mut conn = self.conn()?;
+        let removed = conn
+            .execute(
+                "DELETE FROM device_push_tokens WHERE device_id = $1",
+                &[&device.as_bytes()],
+            )
+            .map_err(db_err)?;
+        Ok(removed)
+    }
+
     /// Drop a device from its account's self-group membership (housekeeping when the device is
     /// revoked). Idempotent. The *cryptographic* re-key is a client action (an existing device issues
     /// an MLS remove-commit); this just stops the relay routing self-group traffic to it and keeps
