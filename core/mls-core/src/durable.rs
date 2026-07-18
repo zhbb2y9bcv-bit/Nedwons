@@ -28,6 +28,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Conversation, Incoming, Member};
 
+/// On-disk blob schema version. Bumped when the serialized `{store, meta}` layout changes so an
+/// older blob is detectable (and, in future, migratable) rather than silently misread. Surfaced to
+/// the client via the FFI `capabilities()` call.
+pub const BLOB_FORMAT_VERSION: u32 = 1;
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum DurableError {
     #[error("mls error")]
@@ -96,6 +101,9 @@ pub enum InboundOutcome {
 /// Serializable metadata that travels in the committed blob alongside the MLS store snapshot.
 #[derive(Serialize, Deserialize, Clone, Default)]
 struct Meta {
+    /// Blob schema version. `#[serde(default)]` ⇒ blobs written before this field load as 0.
+    #[serde(default)]
+    format_version: u32,
     identity: Vec<u8>,
     public_key: Vec<u8>,
     group_id: Vec<u8>,
@@ -171,6 +179,7 @@ impl<J: Journal> DurableSession<J> {
         let conversation = member.create_group()?;
         let session = Session::wrap(member, conversation);
         let meta = Meta {
+            format_version: BLOB_FORMAT_VERSION,
             identity: identity.to_vec(),
             public_key: session.public_key.clone(),
             group_id: session.group_id.clone(),
@@ -197,6 +206,7 @@ impl<J: Journal> DurableSession<J> {
         let identity = member.identity().to_vec();
         let session = Session::wrap(member, conversation);
         let meta = Meta {
+            format_version: BLOB_FORMAT_VERSION,
             identity,
             public_key: session.public_key.clone(),
             group_id: session.group_id.clone(),
@@ -371,6 +381,11 @@ impl<J: Journal> DurableSession<J> {
         self.session.conversation.epoch()
     }
 
+    /// Schema version of the loaded blob (0 for blobs written before versioning).
+    pub fn format_version(&self) -> u32 {
+        self.meta.format_version
+    }
+
     /// Snapshot the (already-advanced) MLS store together with `meta` and commit atomically, then
     /// adopt `meta` in memory. If the commit fails, `meta` is not adopted; per the recovery
     /// contract the caller must discard this session and `open` again.
@@ -404,6 +419,7 @@ fn commit_blob<J: Journal>(
 struct JournalInner {
     blob: Option<Vec<u8>>,
     fail_next: bool,
+    panic_next: bool,
 }
 
 #[derive(Clone, Default)]
@@ -422,11 +438,23 @@ impl InMemoryJournal {
             g.fail_next = true;
         }
     }
+
+    /// Make the next `commit` **panic** — used to prove the FFI boundary contains panics as typed
+    /// errors (they must never unwind across the C ABI). Test support only.
+    pub fn panic_next_commit(&self) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.panic_next = true;
+        }
+    }
 }
 
 impl Journal for InMemoryJournal {
     fn commit(&mut self, blob: &[u8]) -> Result<(), DurableError> {
         let mut g = self.inner.lock().map_err(|_| DurableError::Journal)?;
+        if g.panic_next {
+            g.panic_next = false;
+            panic!("injected journal panic (test)");
+        }
         if g.fail_next {
             g.fail_next = false;
             return Err(DurableError::Journal);
@@ -521,5 +549,37 @@ impl Journal for FileJournal {
             .decrypt(&nonce.into(), ciphertext)
             .map_err(|_| DurableError::Journal)?; // fails closed on tamper / wrong key
         Ok(Some(plaintext))
+    }
+}
+
+// --------------------------------------------------------------------------------------------
+// Concrete journal selector.
+//
+// A `uniffi::Object` cannot be generic, but `DurableSession<J>` is. So the FFI layer wraps a
+// `DurableSession<JournalKind>` where `JournalKind` picks the real backend at construction:
+// `File` on device / in Swift host tests (device-faithful: real at-rest encryption + atomic
+// rename), `Memory` for Rust crash-injection tests. This keeps ONE persistence authority — every
+// variant is still just the same `Journal` contract — rather than introducing a second store.
+
+pub enum JournalKind {
+    // Boxed: `FileJournal` carries the AES key schedule and is far larger than the `Arc`-sized
+    // `Memory` variant, so box it to keep the enum small (clippy::large_enum_variant).
+    File(Box<FileJournal>),
+    Memory(InMemoryJournal),
+}
+
+impl Journal for JournalKind {
+    fn commit(&mut self, blob: &[u8]) -> Result<(), DurableError> {
+        match self {
+            JournalKind::File(j) => j.commit(blob),
+            JournalKind::Memory(j) => j.commit(blob),
+        }
+    }
+
+    fn load(&self) -> Result<Option<Vec<u8>>, DurableError> {
+        match self {
+            JournalKind::File(j) => j.load(),
+            JournalKind::Memory(j) => j.load(),
+        }
     }
 }
