@@ -1,7 +1,9 @@
 # ADR-0013: Transparency log — device-lifecycle events & kind-tagged leaf schema v2 (R-201)
 
-- **Status:** Proposed (design only — **not yet implemented**). Written to precede the protocol
-  change per the repo rule "write/update an ADR before changing protocol/crypto/storage behavior."
+- **Status:** Accepted — **implemented end-to-end 2026-07-18** (slices 1–3 below). Device removals
+  are now logged as v2 revocation leaves (server) and verified under the pinned log key (client), so
+  the device lifecycle is auditable. Optional follow-up: switching *binding* appends to v2 (pure
+  schema uniformity, no added security — bindings are already logged) is intentionally deferred.
 - **Date:** 2026-07-18
 - **Deciders:** crypto integrator, backend lead, security architect
 - **Sources:** RFC 6962/9162 (Certificate Transparency leaf typing via a leaf-type byte); CONIKS
