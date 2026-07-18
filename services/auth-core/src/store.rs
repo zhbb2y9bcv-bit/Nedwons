@@ -97,6 +97,20 @@ pub trait CredentialStore {
     fn set_recovery_phc(&self, account_id: &AccountId, phc: &str) -> StoreResult<bool>;
     /// The account's recovery-secret hash, if one is set. `None` if unset or unknown account.
     fn recovery_phc(&self, account_id: &AccountId) -> StoreResult<Option<String>>;
+    /// The unix time until which recovery is locked for this account (`None` if not locked or
+    /// unknown). Recovery-attempt throttling, R-304.
+    fn recovery_locked_until(&self, account_id: &AccountId) -> StoreResult<Option<u64>>;
+    /// Record a failed recovery attempt: increment the counter, and if it reaches `max_failures`
+    /// lock recovery until `now + lockout_secs` (resetting the counter). Atomic.
+    fn bump_recovery_failure(
+        &self,
+        account_id: &AccountId,
+        max_failures: i32,
+        lockout_secs: u64,
+        now: u64,
+    ) -> StoreResult<()>;
+    /// Clear the failure counter + lock (on a successful recovery).
+    fn clear_recovery_failures(&self, account_id: &AccountId) -> StoreResult<()>;
 }
 
 pub trait DeviceStore {
