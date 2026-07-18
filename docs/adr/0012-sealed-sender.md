@@ -82,7 +82,15 @@ the returned key, binds the device's own public key, and a tampered key fails. T
 also landed: `SentinelClient.fetchSenderCertificate` decodes the issuance response into an
 `IssuedSenderCertificate` (certificate + signature + echoed cert key) with
 `verify(pinnedCertPublicKeyX963:now:)`, unit-tested via a stub transport (verifies under the pinned
-key, rejects a substituted key, rejects once expired). **Slice 2:** the sealed-sender delivery
-endpoint (NULL sender, recipient-token abuse control) + recipient extraction/verification wired
-through the MLS payload + `PRIVACY.md` updates. R-204 stays **OPEN/MITIGATING** until Slice 2 ships
-and the relay demonstrably stores no sender for sealed messages.
+key, rejects a substituted key, rejects once expired). **Slice 2 (in progress):** the sealed-sender
+delivery endpoint (NULL sender, recipient-token abuse control) + recipient extraction/verification
+wired through the MLS payload + `PRIVACY.md` updates. The recipient **key-match verification** landed
+2026-07-18 — `SenderCertificate.verifySealedSender` requires all three of {signature valid under the
+pinned cert key, not expired, **bound sender key == the key MLS attributes the message to**}, so a
+valid certificate for device A can't be wrapped around device B's message (unit-tested). The
+remaining Slice 2 work — the **unauthenticated delivery endpoint** that stores no `sender_device`,
+the recipient-issued **delivery-token** abuse control, and the sealed-payload wire format — is a
+**relay trust/abuse-model change** (the current relay enforces membership + idempotency via the
+*authenticated* sender) and must be decided + reviewed before implementation, not landed
+autonomously. R-204 stays **OPEN/MITIGATING** until it ships and the relay demonstrably stores no
+sender for sealed messages.

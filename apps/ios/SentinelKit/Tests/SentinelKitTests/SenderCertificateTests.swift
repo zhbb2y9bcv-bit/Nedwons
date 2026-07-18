@@ -36,4 +36,36 @@ final class SenderCertificateTests: XCTestCase {
                 now: 999),
             "a different cert key does not verify")
     }
+
+    /// Sealed-sender receipt (ADR-0012 Slice 2): the cert must verify AND its bound sender key must
+    /// equal the key MLS attributes the message to — otherwise a valid cert for one device could be
+    /// wrapped around another device's message.
+    func testVerifySealedSenderRequiresMlsKeyMatch() throws {
+        let certKey = P256.Signing.PrivateKey()
+        let senderKey = P256.Signing.PrivateKey().publicKey.x963Representation
+        let cert = SenderCertificate(
+            accountID: Data(repeating: 0x01, count: 16),
+            deviceID: Data(repeating: 0x02, count: 16),
+            senderPublicKeyX963: senderKey,
+            expiresAt: 1_000)
+        let signature = try certKey.signature(for: cert.canonicalBytes()).rawRepresentation
+        let certPub = certKey.publicKey.x963Representation
+
+        // Valid cert + the MLS sender key matches the cert's bound key → accepted.
+        XCTAssertTrue(
+            cert.verifySealedSender(
+                signature: signature, pinnedCertPublicKeyX963: certPub,
+                mlsSenderPublicKeyX963: senderKey, now: 999))
+        // Valid cert but MLS says a DIFFERENT sender key → rejected (the key-match check bites).
+        let otherMlsKey = P256.Signing.PrivateKey().publicKey.x963Representation
+        XCTAssertFalse(
+            cert.verifySealedSender(
+                signature: signature, pinnedCertPublicKeyX963: certPub,
+                mlsSenderPublicKeyX963: otherMlsKey, now: 999))
+        // Expired cert → rejected even with a matching MLS key.
+        XCTAssertFalse(
+            cert.verifySealedSender(
+                signature: signature, pinnedCertPublicKeyX963: certPub,
+                mlsSenderPublicKeyX963: senderKey, now: 1_001))
+    }
 }
