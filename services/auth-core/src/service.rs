@@ -70,6 +70,27 @@ pub struct RegisterRequest {
     pub signature: Vec<u8>,
 }
 
+/// Challenge returned by [`AuthService::enroll_device_begin`] — the reserved id + nonce for the
+/// NEW device, which the trusted device signs to authorize (ADR-0008).
+pub struct EnrollChallenge {
+    /// The reserved id for the new device.
+    pub device_id: DeviceId,
+    pub txn_id: TxnId,
+    pub nonce: [u8; 32],
+    pub expires_at: u64,
+}
+
+/// Payload for [`AuthService::enroll_device_finish`]. The signature is by the **trusted**
+/// (already-enrolled) device over the `DeviceEnroll` transcript binding the account + the NEW
+/// device's reserved id + its public key; the new device's private key never appears.
+pub struct EnrollRequest {
+    pub txn_id: TxnId,
+    /// SEC1-encoded P-256 public key of the NEW device.
+    pub device_public_key: Vec<u8>,
+    /// The trusted device's signature over the `DeviceEnroll` transcript.
+    pub signature: Vec<u8>,
+}
+
 /// Challenge returned by [`AuthService::login_begin`]. Always returned (even on bad
 /// credentials, as an unstored decoy) so the begin step does not reveal account existence.
 #[derive(Clone, Debug)]
@@ -210,6 +231,128 @@ impl AuthService {
             account_id: challenge.account_id,
             device_id: challenge.device_id,
         })
+    }
+
+    // ----- Trusted-device enrollment (ADR-0008) -------------------------------------
+
+    /// Maximum non-revoked devices per account. A generous cap that bounds abuse (a compromised
+    /// trusted device cannot enroll unbounded ghost devices) without constraining real use.
+    pub const MAX_ACTIVE_DEVICES: usize = 8;
+
+    /// Stage 1 of trusted-device enrollment: an already-enrolled (trusted) device reserves ids and
+    /// a nonce for a NEW device and issues a single-use `DeviceEnroll` challenge bound to the
+    /// account. Only a non-revoked device may authorize enrollment (never a password-only path).
+    pub fn enroll_device_begin(&self, trusted: &AccountDevice) -> Result<EnrollChallenge> {
+        // The authorizing device must currently be active.
+        self.devices
+            .device(&trusted.device_id)?
+            .filter(|d| !d.revoked && d.account_id == trusted.account_id)
+            .ok_or(AuthError::Denied)?;
+
+        let device_id = DeviceId::random();
+        let txn_id = TxnId::random();
+        let nonce = random_bytes::<32>();
+        let expires_at = self.clock.now_unix() + self.config.challenge_ttl_secs;
+        self.challenges.put(ChallengeRecord {
+            txn_id,
+            account_id: trusted.account_id,
+            device_id,
+            action: Action::DeviceEnroll,
+            nonce,
+            expires_at,
+        })?;
+        Ok(EnrollChallenge {
+            device_id,
+            txn_id,
+            nonce,
+            expires_at,
+        })
+    }
+
+    /// Stage 2 of trusted-device enrollment: verify the **trusted** device signed the
+    /// `DeviceEnroll` transcript authorizing the new device's public key, add the new device
+    /// (subject to [`MAX_ACTIVE_DEVICES`]), and provision it a session. The new device's private
+    /// key is never involved — the trusted device's authorization is the credential (a stolen
+    /// username/password can never enroll a device, R-903).
+    pub fn enroll_device_finish(
+        &self,
+        trusted: &AccountDevice,
+        req: EnrollRequest,
+    ) -> Result<Session> {
+        let challenge = self
+            .challenges
+            .consume(&req.txn_id)?
+            .ok_or(AuthError::Denied)?;
+        self.check_challenge(&challenge, Action::DeviceEnroll)?;
+        // The challenge must belong to the trusted device's own account.
+        if challenge.account_id != trusted.account_id {
+            return Err(AuthError::Denied);
+        }
+
+        // The trusted device signs a transcript binding the account + the NEW device's reserved id
+        // + its presented public key, so the server cannot be tricked into enrolling a different
+        // key than the trusted device approved.
+        let transcript = Transcript {
+            action: Action::DeviceEnroll,
+            account_id: &challenge.account_id,
+            device_id: &challenge.device_id,
+            public_key: &req.device_public_key,
+            challenge: &challenge.nonce,
+            expires_at: challenge.expires_at,
+            txn_id: &req.txn_id,
+        };
+        let trusted_key = self
+            .devices
+            .device(&trusted.device_id)?
+            .filter(|d| !d.revoked && d.account_id == trusted.account_id)
+            .ok_or(AuthError::Denied)?
+            .public_key;
+        if !verify_p256(&trusted_key, &transcript.encode(), &req.signature) {
+            return Err(AuthError::Denied);
+        }
+
+        let added = self.devices.add_active_device(
+            DeviceRecord {
+                device_id: challenge.device_id,
+                account_id: challenge.account_id,
+                public_key: req.device_public_key,
+                revoked: false,
+            },
+            Self::MAX_ACTIVE_DEVICES,
+        )?;
+        if !added {
+            // At the device cap (or an id clash) — a generic denial, no oracle.
+            return Err(AuthError::Denied);
+        }
+
+        // Provision the new device a session (its own refresh family), relayed to it over the
+        // pairing channel. It never needs the password.
+        self.mint_session_new_family(AccountDevice {
+            account_id: challenge.account_id,
+            device_id: challenge.device_id,
+        })
+    }
+
+    /// The account's devices (for the management list). Public keys included; nothing secret.
+    pub fn list_devices(&self, account_id: &AccountId) -> Result<Vec<DeviceRecord>> {
+        Ok(self.devices.list_devices(account_id)?)
+    }
+
+    /// Revoke a device **only if it belongs to `account_id`** (device management, ADR-0008).
+    /// Returns `false` if the device is not the caller's (or does not exist) — one account can
+    /// never revoke another's device. On success the revocation cascades (tokens + families) via
+    /// [`revoke_device`](Self::revoke_device).
+    pub fn revoke_own_device(&self, account_id: &AccountId, device_id: &DeviceId) -> Result<bool> {
+        let owned = self
+            .devices
+            .device(device_id)?
+            .map(|d| d.account_id == *account_id)
+            .unwrap_or(false);
+        if !owned {
+            return Ok(false);
+        }
+        self.revoke_device(device_id)?;
+        Ok(true)
     }
 
     // ----- Login (two-stage) --------------------------------------------------------

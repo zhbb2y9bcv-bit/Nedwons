@@ -207,43 +207,56 @@ fn refresh_rotate_race_at_most_one_winner() {
     }
 }
 
-/// The partial unique index allows only one active device per account (ADR-0002), and
-/// username uniqueness is enforced by the database.
+/// Multi-device (ADR-0008): the DB no longer forbids a second active device — the trusted-device
+/// ceremony plus a per-account cap (`add_active_device`) govern that. Username uniqueness is still
+/// enforced by the database; revoked devices don't count against the cap; `active_device_for_account`
+/// resolves the deterministic primary.
 #[test]
-fn schema_enforces_single_active_device_and_unique_usernames() {
+fn schema_allows_capped_multi_device_and_unique_usernames() {
+    use auth_core::store::DeviceRecord;
+    const MAX: usize = auth_core::AuthService::MAX_ACTIVE_DEVICES;
+    let new_device = |account| DeviceRecord {
+        device_id: DeviceId::random(),
+        account_id: account,
+        public_key: vec![0x04; 65],
+        revoked: false,
+    };
+
     let (stores, service) = setup();
     let username = unique_username("carol");
     let (_device, session) = register(&service, &username);
+    let active_count = || {
+        stores
+            .list_devices(&session.account_id)
+            .expect("list")
+            .iter()
+            .filter(|d| !d.revoked)
+            .count()
+    };
 
-    // A second active device row for the same account violates the partial unique index.
-    let second = auth_core::store::DeviceRecord {
-        device_id: DeviceId::random(),
-        account_id: session.account_id,
-        public_key: vec![0x04; 65],
-        revoked: false,
-    };
-    let another_account = auth_core::store::AccountRecord {
-        account_id: AccountId::random(),
-        username_normalized: unique_username("dave"),
-        password_phc: "x".repeat(32),
-    };
-    // Direct store call: creating an account is fine, but attaching a second active device
-    // to carol's account must fail at the DB level.
-    let err = stores
-        .create_account_with_device(another_account, second)
-        .expect_err("partial unique index must reject a second active device");
+    // A second active device is now ALLOWED (the single-active index is gone).
     assert!(
-        format!("{err}").contains("db"),
-        "should be a database error"
+        stores
+            .add_active_device(new_device(session.account_id), MAX)
+            .expect("add"),
+        "a second active device is allowed under the cap"
+    );
+    assert_eq!(active_count(), 2);
+
+    // The per-account cap IS enforced: fill to MAX, then the next is refused.
+    while active_count() < MAX {
+        assert!(stores
+            .add_active_device(new_device(session.account_id), MAX)
+            .expect("add"));
+    }
+    assert!(
+        !stores
+            .add_active_device(new_device(session.account_id), MAX)
+            .expect("add"),
+        "the cap is enforced at the store"
     );
 
-    // Duplicate username is a clean `false`, not an error.
-    let dup_device = auth_core::store::DeviceRecord {
-        device_id: DeviceId::random(),
-        account_id: AccountId::random(),
-        public_key: vec![0x04; 65],
-        revoked: false,
-    };
+    // Duplicate username is still a clean `false`, not an error.
     let dup = auth_core::store::AccountRecord {
         account_id: AccountId::random(),
         username_normalized: username.clone(),
@@ -251,17 +264,25 @@ fn schema_enforces_single_active_device_and_unique_usernames() {
     };
     assert!(
         !stores
-            .create_account_with_device(dup, dup_device)
+            .create_account_with_device(dup, new_device(AccountId::random()))
             .expect("no error"),
         "duplicate username returns false"
     );
 
-    // Revoked devices don't count against the partial index: revoke then enroll another.
-    stores.revoke_device(&session.device_id).expect("revoke");
-    assert!(stores
+    // Revoked devices don't count against the cap, and primary resolution stays defined.
+    let primary = stores
         .active_device_for_account(&session.account_id)
         .expect("query")
-        .is_none());
+        .expect("a primary exists");
+    stores.revoke_device(&primary.device_id).expect("revoke");
+    assert_eq!(active_count(), MAX - 1);
+    assert!(
+        stores
+            .active_device_for_account(&session.account_id)
+            .expect("query")
+            .is_some(),
+        "primary resolves to the next earliest non-revoked device"
+    );
 }
 
 /// Expired-row purge removes old challenges and access tokens (retention hygiene).

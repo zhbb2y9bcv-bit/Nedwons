@@ -174,6 +174,26 @@ at local epoch N fetches `N+1` to learn the `added`/`removed` device identities 
 commit↔manifest correspondence check (and, once the key directory exposes the actor's device key,
 to verify `signature` over `manifest`).
 
+## Controlled multi-device (ADR-0008)
+
+### `POST /v1/devices/enroll/begin` → `200`
+Authed as an existing (trusted) device. Reserves the new device's id + a nonce:
+`{ device_id, txn_id, nonce, expires_at }`. The trusted device signs the `DeviceEnroll` transcript
+(binding account + the reserved new device id + the new device's public key + nonce).
+
+### `POST /v1/devices/enroll/finish` → `200` | `401`
+Authed as the trusted device. `{ txn_id, device_public_key (65B hex), signature (64B hex) }` — the
+trusted device's signature authorizing the new device. Returns a **session for the new device**
+(relayed to it over the pairing channel). Refused (generic `401`) on a bad signature, an expired
+challenge, or at the per-account device cap. A stolen username/password can never add a device.
+
+### `GET /v1/devices` → `200`
+Authed. The account's devices: `[{ device_id, revoked, current }]`.
+
+### `POST /v1/devices/revoke` → `204` | `403`
+Authed. `{ device_id }` — revoke one of the caller's own devices (cascades access-token + refresh
+family invalidation). `403` if the device is not the caller's.
+
 ## Group governance (ADR-0009): admins, invites, join requests
 
 The group creator is its first **admin**. All of the following except `invites/accept` require the
