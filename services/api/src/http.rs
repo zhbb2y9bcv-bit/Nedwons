@@ -28,6 +28,7 @@ use axum::{Json, Router};
 use governor::clock::DefaultClock;
 use governor::state::keyed::DefaultKeyedStateStore;
 use governor::{Quota, RateLimiter};
+use p256::ecdsa::signature::Signer;
 use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
 
@@ -66,6 +67,25 @@ pub struct AppState {
     /// DPoP-style device proof (ADR-0011, R-308). Off by default during migration.
     require_proof: bool,
     proof_cache: Arc<crate::proof::ProofReplayCache>,
+    /// Sealed-sender **sender-certificate** signing key (ADR-0012, R-204). Loaded from
+    /// `SENTINEL_SENDER_CERT_KEY` (hex) or ephemeral (dev). Distinct from the auth/transparency
+    /// keys. Its public key is returned with issued certificates; production clients pin it.
+    sender_cert_key: Arc<p256::ecdsa::SigningKey>,
+}
+
+/// Load the sender-certificate signing key from `SENTINEL_SENDER_CERT_KEY` (hex), or generate an
+/// ephemeral one (dev — a restart rotates it, invalidating in-flight certs, which is fine as they
+/// are short-lived).
+fn load_or_generate_sender_cert_key() -> p256::ecdsa::SigningKey {
+    if let Ok(hex_key) = std::env::var("SENTINEL_SENDER_CERT_KEY") {
+        if let Ok(bytes) = hex::decode(hex_key.trim()) {
+            if let Ok(key) = p256::ecdsa::SigningKey::from_slice(&bytes) {
+                return key;
+            }
+        }
+        tracing::error!("SENTINEL_SENDER_CERT_KEY is set but invalid; using an ephemeral key");
+    }
+    p256::ecdsa::SigningKey::random(&mut rand_core::OsRng)
 }
 
 /// Build the router with per-IP rate limiting keyed on the **peer** socket IP (correct when the
@@ -131,6 +151,7 @@ pub fn build_router_cfg(
         trusted_ip_header,
         require_proof,
         proof_cache: Arc::new(crate::proof::ProofReplayCache::new()),
+        sender_cert_key: Arc::new(load_or_generate_sender_cert_key()),
     };
 
     // Relay routes accept larger bodies (opaque envelopes) than auth routes.
@@ -138,6 +159,8 @@ pub fn build_router_cfg(
         .route("/v1/keypackages", post(publish_key_package))
         .route("/v1/keypackages/claim", post(claim_key_package))
         .route("/v1/keypackages/count", get(key_package_count))
+        // sealed-sender certificate issuance (ADR-0012, R-204)
+        .route("/v1/sender-certificate", get(issue_sender_certificate))
         .route(
             "/v1/conversations",
             post(create_conversation).get(list_conversations),
@@ -1215,6 +1238,62 @@ async fn key_package_count(
     Ok(Json(KeyPackageCountDto {
         available,
         low_watermark: crate::relay::KEY_PACKAGE_LOW_WATERMARK,
+    }))
+}
+
+/// Sealed-sender certificate lifetime (ADR-0012, R-204). Short so a leaked or rotated
+/// sender-certificate key stops being trusted quickly, yet long enough that a device does not
+/// re-fetch per message.
+const SENDER_CERT_TTL_SECS: u64 = 24 * 60 * 60;
+
+#[derive(Serialize)]
+struct SenderCertDto {
+    account_id: String,
+    device_id: String,
+    /// SEC1 public key of the sending device (what the recipient checks the MLS sender against).
+    sender_public_key: String,
+    expires_at: u64,
+    /// 64-byte r‖s ECDSA-P256 signature over the canonical certificate encoding.
+    signature: String,
+    /// SEC1 public key of the server's sender-certificate signing key. Production clients pin this
+    /// out of band; it is returned here for bootstrap/discovery and tests (ADR-0012).
+    cert_public_key: String,
+}
+
+/// Issue a short-lived sealed-sender **certificate** for the authenticated device (ADR-0012,
+/// R-204). The device embeds the certificate *inside* the E2EE payload of a sealed-sender message,
+/// so the recipient — and only the recipient — verifies who sent it while the relay never learns
+/// the sender. The relay itself stays MLS-blind: this endpoint only signs `{account, device,
+/// device public key, expiry}` bytes.
+async fn issue_sender_certificate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SenderCertDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let service = state.service.clone();
+    let device_id = me.device_id;
+    let sender_public_key = blocking(move || service.device_public_key(&device_id)).await?;
+    let expires_at = now_unix() + SENDER_CERT_TTL_SECS;
+    let cert = auth_core::sender_cert::SenderCert {
+        account_id: &me.account_id,
+        device_id: &me.device_id,
+        sender_public_key: &sender_public_key,
+        expires_at,
+    };
+    let signature: p256::ecdsa::Signature = state.sender_cert_key.sign(&cert.encode());
+    let cert_public_key = state
+        .sender_cert_key
+        .verifying_key()
+        .to_encoded_point(false)
+        .as_bytes()
+        .to_vec();
+    Ok(Json(SenderCertDto {
+        account_id: hex::encode(me.account_id.as_bytes()),
+        device_id: hex::encode(me.device_id.as_bytes()),
+        sender_public_key: hex::encode(&sender_public_key),
+        expires_at,
+        signature: hex::encode(signature.to_bytes()),
+        cert_public_key: hex::encode(cert_public_key),
     }))
 }
 
