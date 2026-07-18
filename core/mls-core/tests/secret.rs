@@ -3,7 +3,7 @@
 //! and body stay inside the ciphertext (relay-blind), the reveal is atomic + fail-closed, expiry
 //! scrubs and tombstones, and a crash after reveal fails closed on relaunch.
 
-use mls_core::durable::{DurableSession, InMemoryJournal, InboundOutcome};
+use mls_core::durable::{Direction, DurableSession, InMemoryJournal, InboundOutcome};
 use mls_core::secret::{SecretState, TOMBSTONE_TEXT};
 use mls_core::Member;
 
@@ -509,6 +509,66 @@ fn self_group_persists_across_reopen() {
         d2.has_self_group(),
         "the self-group is reloaded from the persisted blob"
     );
+}
+
+/// #7: a newly-linked device starts with no conversation history (MLS does not backfill). An
+/// existing device replicates its past messages to it over the self-group (E2EE, relay-blind), and
+/// the new device's message log gains them in order — with secrets excluded (view-once).
+#[test]
+fn history_syncs_to_a_newly_linked_device_over_the_self_group() {
+    let (mut alice, _ja, mut phone, _jp) = pair();
+    // Alice sends two normal messages + one secret; phone receives all three.
+    for (i, body) in [b"hello one".as_slice(), b"hello two".as_slice()]
+        .iter()
+        .enumerate()
+    {
+        let id = alice.enqueue(body).unwrap();
+        let env = alice.encrypt(id).unwrap();
+        assert!(matches!(
+            phone.process_inbound((i + 1) as u64, &env).unwrap(),
+            InboundOutcome::Application(_)
+        ));
+    }
+    let (secret_env, _sid) = send_secret(&mut alice, b"view once only");
+    assert!(matches!(
+        phone.process_inbound(3, &secret_env).unwrap(),
+        InboundOutcome::SecretSealed { .. }
+    ));
+
+    // Link a tablet into phone's self-group (it holds its own durable session so it is Active).
+    let tablet_member = Member::new(b"bob-tablet").unwrap();
+    let tablet_group = tablet_member.create_group().unwrap();
+    let mut tablet =
+        DurableSession::adopt(tablet_member, tablet_group, InMemoryJournal::new()).unwrap();
+    phone.create_self_group().unwrap();
+    let (_c, w) = phone
+        .add_self_device(&tablet.key_package().unwrap())
+        .unwrap();
+    tablet.join_self_group(&w).unwrap();
+    assert!(
+        tablet.messages().is_empty(),
+        "a newly-linked device starts with no history"
+    );
+
+    // Phone replicates its non-secret history to the tablet over the self-group.
+    let entries = phone.history_entries(100);
+    assert_eq!(entries.len(), 2, "the secret is excluded from history");
+    let sync_id = phone.enqueue_history_sync(entries).unwrap();
+    let sync_env = phone.encrypt(sync_id).unwrap();
+    assert!(
+        !sync_env.windows(9).any(|w| w == b"hello one"),
+        "the relay sees only opaque ciphertext"
+    );
+    match tablet.process_self_inbound(50, &sync_env).unwrap() {
+        InboundOutcome::HistorySynced { count } => assert_eq!(count, 2),
+        other => panic!("expected HistorySynced, got {other:?}"),
+    }
+    // The tablet now holds the two messages, in order, with the right direction (received).
+    let msgs = tablet.messages();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(msgs[0].plaintext, b"hello one");
+    assert_eq!(msgs[1].plaintext, b"hello two");
+    assert!(msgs.iter().all(|m| m.direction == Direction::Inbound));
 }
 
 /// ADR-0014 Slice 2c: an approved contact's sealed-sender delivery key `K_r` is distributed over the

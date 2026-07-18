@@ -187,6 +187,41 @@ fn normal_messages_work_before_during_and_after_a_secret() {
 }
 
 #[test]
+fn history_sync_over_the_ffi() {
+    // #7 across the generated surface: phone receives a message, links a tablet into its self-group,
+    // and replicates its history to the tablet, whose message log then holds it.
+    let (alice, phone) = two_party(&tmp("a"), &tmp("p"));
+    let id = alice.enqueue(b"remember me".to_vec()).unwrap();
+    let env = alice.encrypt(id).unwrap();
+    assert!(matches!(
+        phone.process_inbound(1, env).unwrap(),
+        InboundResult::Application { .. }
+    ));
+
+    // Tablet holds its own durable session (so it is Active) and joins phone's self-group.
+    let tablet = MlsClient::create_group(b"tablet".to_vec(), tmp("t"), key()).unwrap();
+    phone.create_self_group().unwrap();
+    let add = phone
+        .add_self_device(tablet.key_package().unwrap())
+        .unwrap();
+    tablet.join_self_group(add.welcome).unwrap();
+    assert!(tablet.messages().unwrap().is_empty());
+
+    // Replicate history over the self-group.
+    let entries = phone.history_entries(100).unwrap();
+    assert_eq!(entries.len(), 1);
+    let sync_id = phone.enqueue_history_sync(entries).unwrap();
+    let sync_env = phone.encrypt(sync_id).unwrap();
+    match tablet.process_self_inbound(9, sync_env).unwrap() {
+        InboundResult::HistorySynced { count } => assert_eq!(count, 1),
+        other => panic!("expected HistorySynced, got {other:?}"),
+    }
+    let msgs = tablet.messages().unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].plaintext, b"remember me");
+}
+
+#[test]
 fn delivery_key_grant_over_the_ffi() {
     // ADR-0014 Slice 2c: alice grants bob her sealed delivery key K_r over the E2EE channel; the
     // relay never sees it, and bob receives it as DeliveryKeyGranted (a control message).

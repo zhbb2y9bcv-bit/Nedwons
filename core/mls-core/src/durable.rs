@@ -26,7 +26,7 @@ use aes_gcm::Aes256Gcm;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
-use crate::content::{Content, ContentError, DELIVERY_KEY_LEN, SECRET_ID_LEN};
+use crate::content::{Content, ContentError, HistoryEntry, DELIVERY_KEY_LEN, SECRET_ID_LEN};
 use crate::secret::{SecretRecord, SecretSide, SecretState};
 use crate::{Conversation, Incoming, Member};
 
@@ -159,6 +159,11 @@ pub enum InboundOutcome {
     /// the sender) to later send that contact sealed-sender messages. Not a user-visible message.
     DeliveryKeyGranted {
         key_r: [u8; DELIVERY_KEY_LEN],
+    },
+    /// A **history-sync** batch arrived (#7): an existing device replicated `count` past messages to
+    /// this newly-linked device. They were appended to the local message log.
+    HistorySynced {
+        count: u64,
     },
 }
 
@@ -681,6 +686,55 @@ impl<J: Journal> DurableSession<J> {
         self.enqueue_content(Content::DeliveryKeyGrant { key_r: *key_r }, None)
     }
 
+    // ----- New-device history sync (#7) -------------------------------------------------------
+
+    /// The most recent (up to `max`) NON-secret messages from the log, as a history batch to
+    /// replicate to a newly-linked device. Secrets are excluded — view-once has no re-showable
+    /// history. Returned oldest-first so replay preserves order.
+    pub fn history_entries(&self, max: usize) -> Vec<HistoryEntry> {
+        let mut recent: Vec<HistoryEntry> = self
+            .meta
+            .messages
+            .iter()
+            .rev()
+            .filter(|m| m.secret_id.is_none())
+            .take(max)
+            .map(|m| HistoryEntry {
+                outbound: m.direction == Direction::Outbound,
+                body: m.plaintext.clone(),
+            })
+            .collect();
+        recent.reverse(); // oldest-first
+        recent
+    }
+
+    /// Queue a **history-sync** batch (#7) to replicate `entries` to the account's newly-linked
+    /// device(s) over the **self-group** (E2EE, relay-blind). Requires an established self-group.
+    /// Returns a local id; `encrypt` + deliver over the self-group as usual.
+    pub fn enqueue_history_sync(
+        &mut self,
+        entries: Vec<HistoryEntry>,
+    ) -> Result<u64, DurableError> {
+        if self.session.self_group.is_none() {
+            return Err(DurableError::SelfGroup);
+        }
+        let mut meta = self.meta.clone();
+        let local_id = meta.take_local_id();
+        meta.outbox.insert(
+            local_id,
+            Outbound {
+                local_id,
+                plaintext: Content::HistorySync { entries }.encode(),
+                status: OutboundStatus::Queued,
+                ciphertext: None,
+                secret_id: None,
+                channel: Channel::SelfGroup,
+            },
+        );
+        self.commit(meta)?;
+        Ok(local_id)
+    }
+
     fn enqueue_content(
         &mut self,
         content: Content,
@@ -767,9 +821,11 @@ impl<J: Journal> DurableSession<J> {
                     secret_id: Some(*secret_id),
                 })
             }
-            // A consumption control message (ADR-0015) / delivery-key grant (ADR-0014 Slice 2c) is
-            // not user-visible — no message log entry.
-            Content::SecretConsumed { .. } | Content::DeliveryKeyGrant { .. } => None,
+            // A consumption control message (ADR-0015) / delivery-key grant (ADR-0014 Slice 2c) /
+            // history-sync batch (#7) is not user-visible on the sender — no message log entry.
+            Content::SecretConsumed { .. }
+            | Content::DeliveryKeyGrant { .. }
+            | Content::HistorySync { .. } => None,
         };
         if let Some(display) = display {
             meta.messages.push(display);
@@ -1040,6 +1096,26 @@ fn apply_incoming(
             // ADR-0014 Slice 2c: an approved contact granted us their sealed delivery key. Surface it
             // to the client to store (keyed by sender); no message-log entry.
             Content::DeliveryKeyGrant { key_r } => InboundOutcome::DeliveryKeyGranted { key_r },
+            // #7: an existing device replicated past messages to this newly-linked device. Append
+            // them to the local message log (each gets a fresh local id).
+            Content::HistorySync { entries } => {
+                let count = entries.len() as u64;
+                for e in entries {
+                    let local_id = meta.take_local_id();
+                    meta.messages.push(Message {
+                        local_id,
+                        direction: if e.outbound {
+                            Direction::Outbound
+                        } else {
+                            Direction::Inbound
+                        },
+                        plaintext: e.body,
+                        envelope_id: None, // synced, not decrypted from a server envelope
+                        secret_id: None,
+                    });
+                }
+                InboundOutcome::HistorySynced { count }
+            }
         },
         Incoming::StateAdvanced => InboundOutcome::StateAdvanced,
     })
