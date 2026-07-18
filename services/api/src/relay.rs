@@ -696,6 +696,84 @@ impl PgRelay {
         Ok(())
     }
 
+    // ----- App Attest (#10) -----------------------------------------------------------------------
+
+    /// Issue (upsert) a short-lived attestation challenge for a device. The client folds it into its
+    /// attestation object; the server later matches it (anti-replay).
+    pub fn issue_attest_challenge(
+        &self,
+        device: &DeviceId,
+        challenge: &[u8; 32],
+        ttl_secs: u64,
+    ) -> StoreResult<()> {
+        let mut conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO app_attest_challenges (device_id, challenge, expires_at)
+             VALUES ($1, $2, now() + make_interval(secs => $3))
+             ON CONFLICT (device_id)
+             DO UPDATE SET challenge = EXCLUDED.challenge, expires_at = EXCLUDED.expires_at",
+            &[
+                &device.as_bytes(),
+                &challenge.as_slice(),
+                &(ttl_secs as f64),
+            ],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Consume a device's challenge iff `presented` matches the stored, non-expired one. Deletes it
+    /// on success (single-use). Returns whether it matched.
+    pub fn consume_attest_challenge(
+        &self,
+        device: &DeviceId,
+        presented: &[u8],
+    ) -> StoreResult<bool> {
+        let mut conn = self.conn()?;
+        let row = conn
+            .query_opt(
+                "DELETE FROM app_attest_challenges
+                 WHERE device_id = $1 AND challenge = $2 AND expires_at > now()
+                 RETURNING 1",
+                &[&device.as_bytes(), &presented],
+            )
+            .map_err(db_err)?;
+        Ok(row.is_some())
+    }
+
+    /// Store a device's submitted App Attest attestation (unverified — the Apple-root verification is
+    /// the hardware-gated step). Upsert.
+    pub fn store_attestation(
+        &self,
+        device: &DeviceId,
+        key_id: &str,
+        attestation: &[u8],
+    ) -> StoreResult<()> {
+        let mut conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO app_attest_keys (device_id, key_id, attestation, verified)
+             VALUES ($1, $2, $3, FALSE)
+             ON CONFLICT (device_id)
+             DO UPDATE SET key_id = EXCLUDED.key_id, attestation = EXCLUDED.attestation,
+                           verified = FALSE, created_at = now()",
+            &[&device.as_bytes(), &key_id, &attestation],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// A device's stored attestation `(key_id, verified)`, if any (for status / the future verifier).
+    pub fn attestation_for_device(&self, device: &DeviceId) -> StoreResult<Option<(String, bool)>> {
+        let mut conn = self.conn()?;
+        let row = conn
+            .query_opt(
+                "SELECT key_id, verified FROM app_attest_keys WHERE device_id = $1",
+                &[&device.as_bytes()],
+            )
+            .map_err(db_err)?;
+        Ok(row.map(|r| (r.get::<_, String>(0), r.get::<_, bool>(1))))
+    }
+
     // ----- Push notification tokens (#4) ----------------------------------------------------------
 
     /// Register (or rotate) a device's push token for a platform (`apns`). Upsert — one token per
