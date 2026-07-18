@@ -812,23 +812,54 @@ async fn list_conversations(
     ))
 }
 
+/// Optional create-conversation body. `mls_authoritative` opts the conversation into
+/// commit-authoritative membership (ADR-0010): afterwards the legacy direct-mutation endpoints
+/// refuse and all membership changes go through `/commit`. Absent/`{}` ⇒ legacy (false).
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct CreateConversationBody {
+    #[serde(default)]
+    mls_authoritative: bool,
+}
+
 /// Create a conversation with the authenticated device as the first member.
 async fn create_conversation(
     State(state): State<AppState>,
     headers: HeaderMap,
+    body: Option<Json<CreateConversationBody>>,
 ) -> Result<Json<ConversationDto>, ApiError> {
     let me = authed_device(&state, &headers).await?;
+    let mls_authoritative = body.map(|b| b.0.mls_authoritative).unwrap_or(false);
     let conversation_id = auth_core::crypto::random_bytes::<16>();
     let relay = state.relay.clone();
     let groups = state.groups.clone();
     blocking_store(move || {
-        relay.create_conversation(conversation_id, me.account_id, me.device_id)?;
+        relay.create_conversation(
+            conversation_id,
+            me.account_id,
+            me.device_id,
+            mls_authoritative,
+        )?;
         groups.bootstrap_admin(&conversation_id, &me.account_id)
     })
     .await?;
     Ok(Json(ConversationDto {
         conversation_id: hex::encode(conversation_id),
     }))
+}
+
+/// Reject a legacy membership mutation on an MLS-authoritative conversation (ADR-0010): such
+/// conversations accept membership changes only through `/commit`. Returns `409 commits_required`.
+async fn reject_if_authoritative(
+    state: &AppState,
+    conversation_id: &[u8; 16],
+) -> Result<(), ApiError> {
+    let relay = state.relay.clone();
+    let cid = *conversation_id;
+    if blocking_store(move || relay.is_authoritative(&cid)).await? {
+        return Err(ApiError(StatusCode::CONFLICT, "commits_required"));
+    }
+    Ok(())
 }
 
 /// Add a target account's active device to a conversation's routing membership. The caller
@@ -842,6 +873,7 @@ async fn add_member(
     let me = authed_device(&state, &headers).await?;
     let conversation_id = id16_from_hex(&conversation_hex)?;
     let target_account = AccountId(id16_from_hex(&body.account_id)?);
+    reject_if_authoritative(&state, &conversation_id).await?;
 
     let relay = state.relay.clone();
     let service = state.service.clone();
@@ -887,6 +919,7 @@ async fn leave_conversation(
 ) -> Result<StatusCode, ApiError> {
     let me = authed_device(&state, &headers).await?;
     let conversation_id = id16_from_hex(&conversation_hex)?;
+    reject_if_authoritative(&state, &conversation_id).await?;
     let groups = state.groups.clone();
     blocking_store(move || groups.leave_conversation(&conversation_id, &me.account_id)).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -959,6 +992,9 @@ async fn create_invite(
 ) -> Result<Json<InviteDto>, ApiError> {
     let me = authed_device(&state, &headers).await?;
     let conversation_id = id16_from_hex(&conversation_hex)?;
+    // Authoritative conversations grow only through /commit, so they mint no invite links: this
+    // closes the invite/join join-path at its source (no invite ⇒ no accept ⇒ no join request).
+    reject_if_authoritative(&state, &conversation_id).await?;
     let expires = body
         .expires_in_secs
         .unwrap_or(INVITE_DEFAULT_EXPIRES_SECS)
@@ -1107,6 +1143,7 @@ async fn approve_join_request(
     let me = authed_device(&state, &headers).await?;
     let conversation_id = id16_from_hex(&conversation_hex)?;
     let target = AccountId(id16_from_hex(&body.account_id)?);
+    reject_if_authoritative(&state, &conversation_id).await?;
     let st = state.clone();
     let approved = blocking_store(move || {
         if !is_conversation_admin(&st, &conversation_id, &me)? {
@@ -1170,6 +1207,7 @@ async fn remove_member(
     if target.0 == me.account_id.0 {
         return Err(bad_request());
     }
+    reject_if_authoritative(&state, &conversation_id).await?;
     let st = state.clone();
     blocking_store(move || {
         if !is_conversation_admin(&st, &conversation_id, &me)? {
@@ -2132,7 +2170,10 @@ async fn create_group(
             return Ok(Err("blocked_member"));
         }
         let conversation_id = auth_core::crypto::random_bytes::<16>();
-        relay.create_conversation(conversation_id, me.account_id, me.device_id)?;
+        // Legacy multi-member group creation stays non-authoritative (it seeds routing directly);
+        // authoritative groups are created empty via POST /v1/conversations {mls_authoritative}
+        // and grow through /commit.
+        relay.create_conversation(conversation_id, me.account_id, me.device_id, false)?;
         groups.bootstrap_admin(&conversation_id, &me.account_id)?;
         for member in &others_for_task {
             // Resolve each member's active device server-side (never client-asserted).

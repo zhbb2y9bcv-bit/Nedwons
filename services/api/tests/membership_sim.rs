@@ -995,3 +995,95 @@ async fn membership_event_signature_verifies_under_actor_key() {
     assert_eq!(decoded.actor_device, alice.device_id);
     assert_eq!(decoded.added, vec![(bob.account, bob.device_id)]);
 }
+
+/// An MLS-authoritative conversation refuses every legacy routing mutation (409
+/// commits_required) and accepts membership changes only through /commit — the migration
+/// enforcement (ADR-0010). A default (non-authoritative) conversation is unaffected.
+#[tokio::test]
+async fn authoritative_conversation_refuses_legacy_mutations() {
+    let app = make_app(100_000).await;
+    let alice = actor(&app, "msimja").await;
+    let bob = actor(&app, "msimjb").await;
+
+    let (_, conv) = post_json_auth(
+        &app,
+        "/v1/conversations",
+        alice.token(),
+        json!({ "mls_authoritative": true }),
+    )
+    .await;
+    let conv_hex = conv["conversation_id"].as_str().unwrap().to_string();
+
+    // Legacy direct add, remove, leave, and invite creation are all refused.
+    for (path, body) in [
+        (
+            format!("/v1/conversations/{conv_hex}/members"),
+            json!({ "account_id": hex::encode(bob.account) }),
+        ),
+        (
+            format!("/v1/conversations/{conv_hex}/members/remove"),
+            json!({ "account_id": hex::encode(bob.account) }),
+        ),
+        (format!("/v1/conversations/{conv_hex}/leave"), json!({})),
+        (format!("/v1/conversations/{conv_hex}/invites"), json!({})),
+    ] {
+        let (status, body) = post_json_auth(&app, &path, alice.token(), body).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{path} should be refused");
+        assert_eq!(body["error"], "commits_required", "{path}");
+    }
+
+    // But /commit works: alice adds bob via the staged flow.
+    let mut group_a = alice.mls.create_group().unwrap();
+    let add_bob = group_a
+        .stage_add_member(&alice.mls, &bob.mls.key_package_bytes().unwrap())
+        .unwrap();
+    let (s, _) = post_commit(
+        &app,
+        &conv_hex,
+        &alice,
+        ControlType::Add,
+        0,
+        &[(AccountId(bob.account), DeviceId(bob.device_id))],
+        &[],
+        [30u8; 16],
+        &add_bob.commit,
+        std::slice::from_ref(&add_bob.welcome),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    group_a.merge_staged(&alice.mls).unwrap();
+    assert_eq!(server_epoch(&app, &conv_hex, alice.token()).await, 1);
+}
+
+/// A default conversation (mls_authoritative omitted) still allows the legacy direct add — the
+/// migration is opt-in and backward-compatible.
+#[tokio::test]
+async fn default_conversation_still_allows_legacy_add() {
+    let app = make_app(100_000).await;
+    let alice = actor(&app, "msimka").await;
+    let bob = actor(&app, "msimkb").await;
+    common::befriend(
+        &app,
+        alice.token(),
+        &hex::encode(alice.account),
+        bob.token(),
+        &hex::encode(bob.account),
+    )
+    .await;
+
+    let (_, conv) = post_json_auth(&app, "/v1/conversations", alice.token(), json!({})).await;
+    let conv_hex = conv["conversation_id"].as_str().unwrap().to_string();
+
+    let (s, _) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conv_hex}/members"),
+        alice.token(),
+        json!({ "account_id": hex::encode(bob.account) }),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::NO_CONTENT,
+        "legacy add works on a default conversation"
+    );
+}
