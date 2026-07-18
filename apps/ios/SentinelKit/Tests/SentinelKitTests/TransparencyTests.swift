@@ -46,4 +46,31 @@ final class TransparencyTests: XCTestCase {
         XCTAssertEqual(a, Transparency.encodeSTH(treeSize: 5, root: root, timestamp: 1_700_000_000))
         XCTAssertNotEqual(a, Transparency.encodeSTH(treeSize: 6, root: root, timestamp: 1_700_000_000))
     }
+
+    /// The account view decodes `revoked_at` (present on revocation leaves, absent on bindings) and
+    /// `revocationLeaves(in:)` extracts exactly the revocations (ADR-0013 Slice 3, R-201).
+    func testRevocationLeafExtraction() throws {
+        let json = """
+        {
+          "tree_size": 3,
+          "bindings": [
+            {"leaf_index": 0, "device_id": "aa", "public_key": "04ab", "entry": "01", "proof": []},
+            {"leaf_index": 1, "device_id": "bb", "public_key": "04cd", "entry": "02", "proof": ["ff"]},
+            {"leaf_index": 2, "device_id": "bb", "public_key": "", "entry": "03", "proof": ["ee"], "revoked_at": 1700000000}
+          ]
+        }
+        """
+        let view = try JSONDecoder().decode(
+            TransparencyAccountView.self, from: Data(json.utf8))
+
+        // Bindings decode with nil revokedAt; the revocation carries its timestamp.
+        XCTAssertNil(view.bindings[0].revokedAt)
+        XCTAssertNil(view.bindings[1].revokedAt)
+        XCTAssertEqual(view.bindings[2].revokedAt, 1_700_000_000)
+
+        let revocations = SentinelClient.revocationLeaves(in: view)
+        XCTAssertEqual(
+            revocations,
+            [LoggedRevocation(deviceID: "bb", revokedAt: 1_700_000_000, leafIndex: 2)])
+    }
 }
