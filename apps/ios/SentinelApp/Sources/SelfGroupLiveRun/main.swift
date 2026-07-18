@@ -42,8 +42,11 @@ struct SelfGroupLiveRun {
         NSTemporaryDirectory() + "live-\(tag)-\(UUID().uuidString)"
     }
 
-    static let key = Data(repeating: 7, count: 32)
     static let password = "battery staple orbit lantern"
+
+    // At-rest keys are HKDF-derived from a Keychain-held root (#5). This CLI harness has no Keychain,
+    // so it uses the in-memory store; a device uses `KeychainStore`. Each store gets an independent key.
+    static let keys = AtRestKeyHierarchy(store: InMemorySecretStore())
 
     static func main() async {
         let urlString = ProcessInfo.processInfo.environment["SENTINEL_URL"] ?? "http://127.0.0.1:8080"
@@ -73,12 +76,15 @@ struct SelfGroupLiveRun {
 
             // --- 2. Real MLS clients ------------------------------------------------------------
             let sMls = try MlsClient.createGroup(
-                identity: Data("s-mls".utf8), dbPath: tmpDB("s"), atRestKey: key)
+                identity: Data("s-mls".utf8), dbPath: tmpDB("s"),
+                atRestKey: try keys.atRestKey(forStore: "s"))
             let phoneMls = try MlsClient.newJoiner(
-                identity: Data("phone-mls".utf8), dbPath: tmpDB("phone"), atRestKey: key)
+                identity: Data("phone-mls".utf8), dbPath: tmpDB("phone"),
+                atRestKey: try keys.atRestKey(forStore: "phone"))
             // The tablet holds its own durable session (so it is Active and can carry a self-group).
             let tabletMls = try MlsClient.createGroup(
-                identity: Data("tablet-mls".utf8), dbPath: tmpDB("tablet"), atRestKey: key)
+                identity: Data("tablet-mls".utf8), dbPath: tmpDB("tablet"),
+                atRestKey: try keys.atRestKey(forStore: "tablet"))
 
             // Phone publishes a key package so S can add it.
             try await client.publishKeyPackage(accessToken: r.accessToken, keyPackage: try phoneMls.keyPackage())
