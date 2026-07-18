@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod breach_http;
 pub mod groups;
 pub mod http;
 pub mod membership;
