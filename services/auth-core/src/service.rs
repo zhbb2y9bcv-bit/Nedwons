@@ -288,6 +288,96 @@ impl AuthService {
         })
     }
 
+    // ----- Password change (device-bound) -------------------------------------------
+
+    /// Stage 1 of a password change: issue a single-use `PasswordChange` challenge bound to the
+    /// authenticated account+device, which the device signs to prove possession of its key.
+    pub fn password_change_begin(&self, account: &AccountDevice) -> Result<RegistrationChallenge> {
+        let txn_id = TxnId::random();
+        let nonce = random_bytes::<32>();
+        let expires_at = self.clock.now_unix() + self.config.challenge_ttl_secs;
+        self.challenges.put(ChallengeRecord {
+            txn_id,
+            account_id: account.account_id,
+            device_id: account.device_id,
+            action: Action::PasswordChange,
+            nonce,
+            expires_at,
+        })?;
+        Ok(RegistrationChallenge {
+            account_id: account.account_id,
+            device_id: account.device_id,
+            txn_id,
+            nonce,
+            expires_at,
+        })
+    }
+
+    /// Stage 2: verify the device signature (proof of possession) AND the current password, then
+    /// validate + hash the new password and replace it. Requires BOTH factors — a stolen access
+    /// token alone (no device key, no current password) cannot change the password. Existing
+    /// device-bound sessions continue (they are not password-derived); the new password only
+    /// governs future logins.
+    pub fn password_change_finish(
+        &self,
+        account: &AccountDevice,
+        txn_id: &TxnId,
+        signature: &[u8],
+        current_password: &str,
+        new_password: &str,
+    ) -> Result<()> {
+        let challenge = self.challenges.consume(txn_id)?.ok_or(AuthError::Denied)?;
+        self.check_challenge(&challenge, Action::PasswordChange)?;
+        if challenge.account_id != account.account_id || challenge.device_id != account.device_id {
+            return Err(AuthError::Denied);
+        }
+        // Device proof of possession over the PasswordChange transcript, under the device's key.
+        let device = self
+            .devices
+            .device(&account.device_id)?
+            .filter(|d| !d.revoked && d.account_id == account.account_id)
+            .ok_or(AuthError::Denied)?;
+        let transcript = Transcript {
+            action: Action::PasswordChange,
+            account_id: &challenge.account_id,
+            device_id: &challenge.device_id,
+            public_key: &device.public_key,
+            challenge: &challenge.nonce,
+            expires_at: challenge.expires_at,
+            txn_id,
+        };
+        if !verify_p256(&device.public_key, &transcript.encode(), signature) {
+            return Err(AuthError::Denied);
+        }
+
+        // Verify the CURRENT password (second factor).
+        let acct = self
+            .creds
+            .find_by_account_id(&account.account_id)?
+            .ok_or(AuthError::Denied)?;
+        if !password::verify_password(&self.argon2, current_password, &acct.password_phc)
+            .unwrap_or(false)
+        {
+            return Err(AuthError::Denied);
+        }
+
+        // Validate + (breach-)check the NEW password, then rehash and store.
+        password::validate_password_policy(new_password)?;
+        if let Some(provider) = &self.breach {
+            if crate::breach::is_compromised(provider.as_ref(), new_password).unwrap_or(false) {
+                return Err(AuthError::WeakPassword);
+            }
+        }
+        let new_phc = password::hash_password(&self.argon2, new_password)?;
+        if !self
+            .creds
+            .update_password_phc(&account.account_id, &new_phc)?
+        {
+            return Err(AuthError::Denied);
+        }
+        Ok(())
+    }
+
     // ----- Trusted-device enrollment (ADR-0008) -------------------------------------
 
     /// Maximum non-revoked devices per account. A generous cap that bounds abuse (a compromised
