@@ -30,6 +30,9 @@ targets:
         product: MlsFfi
       - package: SentinelApp
         product: SentinelAppKit
+      # Embed the Notification Service Extension (#4) so a contentless push can decrypt + rewrite.
+      - target: NotificationService
+        embed: true
     # A real Info.plist (not the auto-generated one) so the app can carry custom build config:
     #   SentinelServerURL          — backend base URL for this build (https on device; empty ⇒ dev)
     #   SentinelTransparencyLogKey — the out-of-band-pinned KT log public key (hex; empty ⇒ dev TOFU)
@@ -58,3 +61,34 @@ targets:
         # Capabilities are declared in the entitlements file; the App ID + provisioning profile that
         # authorize them are configured in the Apple Developer portal (your side).
         CODE_SIGN_ENTITLEMENTS: Sentinel.entitlements
+
+  # Notification Service Extension (#4): decrypts a contentless wake push on device and rewrites the
+  # alert. Links the real MLS core; the decode logic (PushInboxDecoder) is unit-tested in SentinelApp.
+  NotificationService:
+    type: app-extension
+    platform: iOS
+    sources:
+      - NotificationService
+    # Links only extension-SAFE modules: SentinelPush (push decode) → SentinelKit (HTTP) + MlsFfi
+    # (MLS core). It must NOT link SentinelUI (SwiftUI App types are forbidden in app extensions).
+    dependencies:
+      - package: SentinelApp
+        product: SentinelPush
+      - package: SentinelKit
+        product: SentinelKit
+      - package: SentinelMLS
+        product: MlsFfi
+    info:
+      path: NotificationService/Info.plist
+      properties:
+        CFBundleDisplayName: Sentinel Notifications
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.sentinel.demo.NotificationService
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "6.0"
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"

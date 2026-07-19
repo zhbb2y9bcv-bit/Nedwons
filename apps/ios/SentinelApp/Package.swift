@@ -12,15 +12,27 @@ let package = Package(
     platforms: [.iOS(.v17), .macOS(.v14)],
     products: [
         .library(name: "SentinelAppKit", targets: ["SentinelAppKit"]),
+        // Extension-safe: links only SentinelKit (HTTP) + MlsFfi (MLS core), NOT SentinelUI, so the
+        // Notification Service Extension can link it (app extensions forbid app-only API / SwiftUI App).
+        .library(name: "SentinelPush", targets: ["SentinelPush"]),
     ],
     dependencies: [
         .package(path: "../SentinelKit"),
         .package(path: "../SentinelMLS"),
     ],
     targets: [
+        // Extension-safe push decode logic (no SentinelUI): the Notification Service Extension and
+        // the app both use it. Unit-tested against the real MLS core.
+        .target(
+            name: "SentinelPush",
+            dependencies: [
+                .product(name: "SentinelKit", package: "SentinelKit"),
+                .product(name: "MlsFfi", package: "SentinelMLS"),
+            ]),
         .target(
             name: "SentinelAppKit",
             dependencies: [
+                "SentinelPush",
                 .product(name: "SentinelUI", package: "SentinelKit"),
                 .product(name: "SentinelKit", package: "SentinelKit"),
                 .product(name: "MlsFfi", package: "SentinelMLS"),
@@ -35,6 +47,7 @@ let package = Package(
                 .product(name: "SentinelKit", package: "SentinelKit"),
                 .product(name: "MlsFfi", package: "SentinelMLS"),
             ]),
-        .testTarget(name: "SentinelAppKitTests", dependencies: ["SentinelAppKit"]),
+        .testTarget(
+            name: "SentinelAppKitTests", dependencies: ["SentinelAppKit", "SentinelPush"]),
     ]
 )
