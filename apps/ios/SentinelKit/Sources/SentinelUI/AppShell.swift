@@ -133,6 +133,18 @@ public struct DevicesScreen: View {
                     Section("Waiting to link") {
                         Text("\(model.pendingLinkDevices.count) device(s) ready to join your secure device group.")
                             .foregroundStyle(palette.textSecondary)
+                        Button {
+                            Task { await model.linkPendingDevices() }
+                        } label: {
+                            HStack {
+                                Text(model.isLinking ? "Linking…" : "Link \(model.pendingLinkDevices.count) device(s)")
+                                if model.isLinking {
+                                    Spacer()
+                                    ProgressView()
+                                }
+                            }
+                        }
+                        .disabled(model.isLinking)
                     }
                 }
 

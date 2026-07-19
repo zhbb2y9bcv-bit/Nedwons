@@ -162,12 +162,42 @@ public final class AppModel: ObservableObject {
     /// The out-of-band-pinned transparency log key (fetched once at sign-in in this shell).
     private var pinnedLogKey: Data?
 
+    /// True while a link pass is running (drives the Devices button's spinner).
+    @Published public var isLinking = false
+
+    /// Injected by the composition layer that holds the MLS client (`SentinelAppKit`), which
+    /// `SentinelUI` cannot import. Runs the real `SelfGroupLinker` over this device's `MlsClient`
+    /// and returns the sibling ids newly linked. `nil` in the dev shell without an MLS session — the
+    /// Devices button then explains linking isn't available in this build. Not `@Sendable`: it may
+    /// capture the (non-`Sendable`) `MlsClient`, and it is only ever called here on the main actor.
+    public var linkDevicesAction: (() async throws -> [String])?
+
     public func refreshDevices() async {
         await run { [self] in
             guard let token else { return }
             devices = try await client.listDevices(accessToken: token)
             pendingLinkDevices = try await client.pendingSelfGroupDevices(accessToken: token)
         }
+    }
+
+    /// Link every pending sibling into this account's self-group by driving the injected
+    /// `SelfGroupLinker` (the same code proven live by `SelfGroupLiveRun`), then refresh the list.
+    /// Fail-safe: without a wired linker it just reports that this build can't link.
+    public func linkPendingDevices() async {
+        guard let linkDevicesAction else {
+            banner = "Device linking isn't available in this build."
+            return
+        }
+        isLinking = true
+        defer { isLinking = false }
+        await run { [self] in
+            let linked = try await linkDevicesAction()
+            banner =
+                linked.isEmpty
+                ? "No devices were waiting to link."
+                : "Linked \(linked.count) device\(linked.count == 1 ? "" : "s")."
+        }
+        await refreshDevices()
     }
 
     /// The user confirms a device is theirs, adding it to the trusted expected set.
