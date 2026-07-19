@@ -1,5 +1,6 @@
 import Foundation
 import MlsFfi
+import SentinelAppKit
 import SentinelKit
 
 // Live end-to-end run (ADR-0015 option 3): the REAL Swift app stack — `SentinelClient` over real
@@ -139,34 +140,31 @@ struct SelfGroupLiveRun {
             }
             try await client.ackInbox(accessToken: r.accessToken, ids: identified.map { $0.id })
 
-            // --- 4. Self-group establishment over the live relay -------------------------------
-            try phoneMls.createSelfGroup()
-            try await client.registerSelfGroupMember(accessToken: r.accessToken)
+            // --- 4. Self-group establishment over the live relay, via the reusable SelfGroupLinker
+            // This drives the EXACT code the app's Devices screen uses to link a device — the CLI
+            // and the UI share one tested path. The tablet first publishes a key package so the
+            // primary can claim + add it.
             try await client.publishKeyPackage(accessToken: tablet.accessToken, keyPackage: try tabletMls.keyPackage())
+            let linker = SelfGroupLinker(client: client)
 
-            let pending = try await client.pendingSelfGroupDevices(accessToken: r.accessToken)
-            guard pending.contains(tablet.deviceID) else { fail("tablet not listed as a pending sibling") }
-            let sgClaim = try await client.claimSelfGroupKeyPackage(accessToken: r.accessToken, deviceID: tablet.deviceID)
-            guard sgClaim.deviceID == tablet.deviceID, let tabletKP = Hex.decode(sgClaim.keyPackage) else {
-                fail("self-group claim returned the wrong device")
+            // Primary (phone): establish the self-group and link the pending tablet.
+            let link = try await linker.linkPendingSiblings(mls: phoneMls, accessToken: r.accessToken)
+            guard link.createdSelfGroup, link.linked == [tablet.deviceID] else {
+                fail("primary link pass unexpected: \(link)")
             }
-            let addTablet = try phoneMls.addSelfDevice(keyPackage: tabletKP)  // real MLS Welcome
-            let sgDelivered = try await client.deliverSelfGroup(
-                accessToken: r.accessToken, recipientDevice: tablet.deviceID,
-                ciphertext: addTablet.welcome, idempotencyKey: rnd(16))
-            guard sgDelivered == 1 else { fail("self-group welcome delivered to \(sgDelivered)") }
 
-            // Tablet pulls the Welcome from the self-group channel and ACTUALLY joins it.
-            let tabletInbox1 = try await client.fetchInbox(accessToken: tablet.accessToken)
-            let sgWelcomes = tabletInbox1.filter { $0.selfGroup }
-            guard sgWelcomes.count == 1, let sgWelcomeBytes = Hex.decode(sgWelcomes[0].ciphertext) else {
-                fail("tablet did not receive exactly one self-group Welcome")
+            // Joiner (tablet): pull the Welcome from the self-group channel, join it, register.
+            guard try await linker.joinSelfGroupFromInbox(mls: tabletMls, accessToken: tablet.accessToken) else {
+                fail("tablet failed to join the self-group from its inbox")
             }
-            try tabletMls.joinSelfGroup(welcome: sgWelcomeBytes)
-            try await client.registerSelfGroupMember(accessToken: tablet.accessToken)
-            try await client.ackInbox(accessToken: tablet.accessToken, ids: [], selfGroupIds: sgWelcomes.map { $0.id })
             guard try phoneMls.hasSelfGroup(), try tabletMls.hasSelfGroup() else {
                 fail("self-group not established on both devices")
+            }
+
+            // Idempotency: a second primary pass finds nothing pending and is a no-op.
+            let again = try await linker.linkPendingSiblings(mls: phoneMls, accessToken: r.accessToken)
+            guard again.linked.isEmpty, !again.createdSelfGroup else {
+                fail("re-link should be a no-op, got \(again)")
             }
 
             // --- 5. Consumption round trip over the live self-group ----------------------------

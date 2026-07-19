@@ -44,6 +44,7 @@ let package = Package(
         .executableTarget(
             name: "SelfGroupLiveRun",
             dependencies: [
+                "SentinelAppKit",
                 .product(name: "SentinelKit", package: "SentinelKit"),
                 .product(name: "MlsFfi", package: "SentinelMLS"),
             ]),
