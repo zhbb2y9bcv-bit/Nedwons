@@ -1,4 +1,4 @@
-# Sentinel iOS app
+# Nedwons iOS app
 
 Native SwiftUI app for iPhone/iPad. **Requires Xcode 26 + iOS 26 SDK** — Apple's mandated
 minimum for App Store uploads since 2026-04-28 (verified 2026-07-17). This machine has
@@ -8,11 +8,11 @@ Xcode 26.6.
 
 | Part | How it builds/tests | Status |
 |------|---------------------|--------|
-| `SentinelKit/` (crypto/protocol, Keychain, device signer, HTTP client) | `swift build` / `swift test` (macOS) | ✅ builds + 7 tests pass here |
-| `SentinelUI/` (design tokens, components, **wired app screens + AppModel**) | `swift build` (macOS) | ✅ builds here |
+| `NedwonsKit/` (crypto/protocol, Keychain, device signer, HTTP client) | `swift build` / `swift test` (macOS) | ✅ builds + 7 tests pass here |
+| `NedwonsUI/` (design tokens, components, **wired app screens + AppModel**) | `swift build` (macOS) | ✅ builds here |
 | Cross-language transcript vector + signature | `swift test` + Rust pipeline | ✅ INTEROP_OK |
-| **`SentinelClient` ↔ live backend** (register/login/whoami over HTTP) | `scripts/swift_backend_smoke.sh` | ✅ **SMOKE_OK** against the real Rust server + Postgres, incl. INV-2 negative check |
-| `Sentinel/` app target (`@main`, App Attest, APNs, entitlements) | Xcode app target | ⚠️ requires Xcode; not built in this environment (RISK_REGISTER R-101) |
+| **`NedwonsClient` ↔ live backend** (register/login/whoami over HTTP) | `scripts/swift_backend_smoke.sh` | ✅ **SMOKE_OK** against the real Rust server + Postgres, incl. INV-2 negative check |
+| `Nedwons/` app target (`@main`, App Attest, APNs, entitlements) | Xcode app target | ⚠️ requires Xcode; not built in this environment (RISK_REGISTER R-101) |
 | On-device MLS (UniFFI binding of `mls-core`) | Xcode + rust ios targets | ⚠️ planned (ADR-0007, R-101) |
 
 The app target is intentionally **not** shipped as a hand-written `.xcodeproj` (an unverified
@@ -21,22 +21,22 @@ is here.
 
 ## Creating the app target in Xcode
 
-1. **File ▸ New ▸ Project ▸ iOS ▸ App.** Name `Sentinel`, bundle id `app.sentinel.ios`,
+1. **File ▸ New ▸ Project ▸ iOS ▸ App.** Name `Nedwons`, bundle id `app.nedwons.ios`,
    interface **SwiftUI**, language **Swift**. Set the deployment target and build against the
    **iOS 26 SDK**.
-2. Delete the generated `ContentView.swift`/`App.swift`; add `apps/ios/Sentinel/SentinelApp.swift`.
+2. Delete the generated `ContentView.swift`/`App.swift`; add `apps/ios/Nedwons/NedwonsApp.swift`.
 3. **Add the local package:** File ▸ Add Package Dependencies ▸ Add Local ▸ select
-   `apps/ios/SentinelKit`. Link the **SentinelKit** and **SentinelUI** library products to
+   `apps/ios/NedwonsKit`. Link the **NedwonsKit** and **NedwonsUI** library products to
    the app target.
 4. Add `PrivacyInfo.xcprivacy` to the app target (Copy Bundle Resources).
-5. Set the app's **entitlements** file to `Sentinel.entitlements`. Enable the **App Attest**
+5. Set the app's **entitlements** file to `Nedwons.entitlements`. Enable the **App Attest**
    and **Push Notifications** capabilities. Keep App Attest as defense-in-depth only.
 6. Add the permission purpose strings from `Info-additions.plist` to the target's Info.plist.
 7. Build to a simulator/device. Enable the iOS build+test step in `.github/workflows/ci.yml`.
 
 ## Talking to the backend (already wired and verified)
 
-`SentinelClient` (in SentinelKit) performs the full auth flow over HTTP. It is verified
+`NedwonsClient` (in NedwonsKit) performs the full auth flow over HTTP. It is verified
 end-to-end against the real Rust server by `scripts/swift_backend_smoke.sh` (register → whoami
 → login → whoami, plus the INV-2 check that a *different* device cannot log in). On device you
 pass a `SecureEnclaveDeviceSigner` instead of the software signer:
@@ -44,11 +44,11 @@ pass a `SecureEnclaveDeviceSigner` instead of the software signer:
 ```swift
 // First run: enroll this device with a non-exportable Secure Enclave key.
 let signer = try SecureEnclaveDeviceSigner()            // generates the P-256 key in the Enclave
-let client = SentinelClient(baseURL: backendURL)
+let client = NedwonsClient(baseURL: backendURL)
 let session = try await client.register(username: name, password: pass, signer: signer)
 
 // Persist ONLY the encrypted key blob + tokens (never the private key, never the password):
-let keychain = KeychainStore(service: "app.sentinel.ios")
+let keychain = KeychainStore(service: "app.nedwons.ios")
 try keychain.save(signer.dataRepresentation, account: "device-key")   // ThisDeviceOnly
 try keychain.save(Data(session.refreshToken.utf8), account: "refresh-token")
 
@@ -67,7 +67,7 @@ let s = try await client.login(username: name, password: pass, signer: signer2)
 
 ## Functional UI (wired to the backend)
 
-`AppModel` (SentinelUI) wraps `SentinelClient` and backs every button with a real backend
+`AppModel` (NedwonsUI) wraps `NedwonsClient` and backs every button with a real backend
 call — these are functional, not decorative:
 
 - **Sign in / Create account** (`SignInView`) → register/login.

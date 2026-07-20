@@ -12,7 +12,7 @@ use crate::crypto::verify_p256;
 use crate::ids::{AccountId, DeviceId};
 
 /// Versioned domain-separation tag.
-pub const DOMAIN: &[u8] = b"app.sentinel.sender-cert.v1";
+pub const DOMAIN: &[u8] = b"app.nedwons.sender-cert.v1";
 
 /// The fields bound into one sender certificate.
 pub struct SenderCert<'a> {
@@ -78,7 +78,7 @@ mod tests {
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "0000001b6170702e73656e74696e656c2e73656e6465722d636572742e763100000010a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a100000010b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b20000004104000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f000000006553f100"
+            "0000001a6170702e6e6564776f6e732e73656e6465722d636572742e763100000010a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a100000010b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b20000004104000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f000000006553f100"
         );
     }
 

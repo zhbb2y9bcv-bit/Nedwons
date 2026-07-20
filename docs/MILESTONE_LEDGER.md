@@ -22,12 +22,12 @@ results, remaining risks, and the next smallest step.
 - [x] `auth-core`: P-256 device-signature verification; device-bound login.
 - [x] `auth-core`: rotating refresh-token families with reuse detection + family revocation.
 - [x] Security invariant tests (INV-2, INV-4, refresh reuse) pass under `cargo test` (13 tests).
-- [x] iOS `SentinelKit`: Swift transcript encoder, `ClientTranscripts` (register/login/refresh),
+- [x] iOS `NedwonsKit`: Swift transcript encoder, `ClientTranscripts` (register/login/refresh),
       `SecureEnclaveDeviceSigner` + software fallback, `KeychainStore` — builds + 6 `swift test`.
 - [x] Cross-language interoperability proven: Swift and Rust produce **byte-identical**
       canonical transcripts (golden vectors in `contracts/test-vectors/`), and a Swift-signed
       ECDSA-P256 signature verifies in the Rust backend (`INTEROP_OK`).
-- [x] iOS `SentinelUI`: futuristic design tokens + components + app screens (tab shell,
+- [x] iOS `NedwonsUI`: futuristic design tokens + components + app screens (tab shell,
       onboarding with gated enrollment, empty states) — builds with `swift build`.
 - [x] **Postgres implementations of the store traits with concurrency integration tests**
       (`services/api`). DELETE-RETURNING challenge consume, FOR-UPDATE + generation-CAS
@@ -38,14 +38,14 @@ results, remaining risks, and the next smallest step.
       fail-closed errors, CPU work on `spawn_blocking`. End-to-end tests vs real Postgres.
       NIST-aligned password policy (length + blocklist) added. Server boots + serves verified.
 - [x] `infra/docker-compose.yml` (Postgres + API) validated; Postgres service verified healthy.
-- [x] **`SentinelClient` (Swift) verified against the live backend** over real HTTP
+- [x] **`NedwonsClient` (Swift) verified against the live backend** over real HTTP
       (`scripts/swift_backend_smoke.sh` → SMOKE_OK): register → whoami → login → whoami, plus
       the INV-2 negative check (a different device with the same password is denied).
 - [ ] iOS app target (`@main`) built in Xcode; real Secure Enclave enrollment + App Attest
       verified on device; the MLS bridge *run* on hardware. *(R-101 — needs a physical device)*
 - [x] **UniFFI MLS binding (ADR-0007)** implemented + packaged headlessly: `core/mls-ffi`,
       `MlsFfi.xcframework` (macOS+iOS+sim via `scripts/build_mls_ffi.sh`), a Swift↔Rust integration
-      test (`apps/ios/SentinelMLS`), plus adversarial + fuzz. On-device *execution* still R-101.
+      test (`apps/ios/NedwonsMLS`), plus adversarial + fuzz. On-device *execution* still R-101.
 - [ ] Recovery-kit flow. *(R-304)*
 - **Acceptance:** valid credentials from an unregistered device cannot log in — *logic proven
   now in `auth-core`; the client signing path is proven to interoperate with the server
@@ -100,10 +100,10 @@ cd services && cargo fmt --manifest-path auth-core/Cargo.toml -- --check
 cargo clippy --manifest-path auth-core/Cargo.toml --all-targets -- -D warnings
 cargo test --manifest-path auth-core/Cargo.toml
 
-# SentinelKit + SentinelUI (Swift): builds; 6 tests pass
-cd apps/ios/SentinelKit && swift build && swift test
+# NedwonsKit + NedwonsUI (Swift): builds; 6 tests pass
+cd apps/ios/NedwonsKit && swift build && swift test
 
 # Cross-language interop: Swift signs a transcript, Rust verifies -> INTEROP_OK
-swift run --package-path apps/ios/SentinelKit InteropEmit \
+swift run --package-path apps/ios/NedwonsKit InteropEmit \
   | cargo run -q --manifest-path services/auth-core/Cargo.toml --example verify_interop
 ```

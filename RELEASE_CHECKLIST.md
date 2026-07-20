@@ -1,7 +1,7 @@
 # Release Checklist
 
 Nothing here is checked off yet beyond what the working copy proves. This is the gate to
-calling Sentinel production-ready. Cross-references to [RISK_REGISTER.md](RISK_REGISTER.md).
+calling Nedwons production-ready. Cross-references to [RISK_REGISTER.md](RISK_REGISTER.md).
 
 ## Build & toolchain
 

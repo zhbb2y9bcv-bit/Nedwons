@@ -74,7 +74,7 @@ pub struct HttpPushTransport {
 }
 
 /// Default APNs production host. Sandbox is `https://api.sandbox.push.apple.com` (set
-/// `SENTINEL_APNS_URL` to override).
+/// `NEDWONS_APNS_URL` to override).
 pub const APNS_PRODUCTION_URL: &str = "https://api.push.apple.com";
 
 impl HttpPushTransport {
@@ -85,10 +85,10 @@ impl HttpPushTransport {
         }
     }
 
-    /// Base URL from `SENTINEL_APNS_URL`, defaulting to production APNs.
+    /// Base URL from `NEDWONS_APNS_URL`, defaulting to production APNs.
     pub fn from_env() -> Self {
         Self::new(
-            std::env::var("SENTINEL_APNS_URL").unwrap_or_else(|_| APNS_PRODUCTION_URL.to_string()),
+            std::env::var("NEDWONS_APNS_URL").unwrap_or_else(|_| APNS_PRODUCTION_URL.to_string()),
         )
     }
 
@@ -227,16 +227,16 @@ impl PushService {
     /// or malformed. `transport` is the deployment's HTTP/2 adapter ([`HttpPushTransport`] in
     /// production; a recording/[`NullTransport`] in tests).
     ///
-    /// - `SENTINEL_APNS_KEY_ID`, `SENTINEL_APNS_TEAM_ID`, `SENTINEL_APNS_TOPIC` — Apple identifiers.
+    /// - `NEDWONS_APNS_KEY_ID`, `NEDWONS_APNS_TEAM_ID`, `NEDWONS_APNS_TOPIC` — Apple identifiers.
     /// - The provider key, either form:
-    ///   - `SENTINEL_APNS_KEY_P8` — the **contents of the `.p8` file from Apple, verbatim** (PKCS#8
+    ///   - `NEDWONS_APNS_KEY_P8` — the **contents of the `.p8` file from Apple, verbatim** (PKCS#8
     ///     PEM; literal `\n` sequences are accepted for env-file friendliness), or
-    ///   - `SENTINEL_APNS_KEY_HEX` — the raw P-256 scalar in hex.
+    ///   - `NEDWONS_APNS_KEY_HEX` — the raw P-256 scalar in hex.
     pub fn from_env(relay: Arc<PgRelay>, transport: Arc<dyn PushTransport>) -> Self {
         let (Ok(key_id), Ok(team_id), Ok(topic)) = (
-            std::env::var("SENTINEL_APNS_KEY_ID"),
-            std::env::var("SENTINEL_APNS_TEAM_ID"),
-            std::env::var("SENTINEL_APNS_TOPIC"),
+            std::env::var("NEDWONS_APNS_KEY_ID"),
+            std::env::var("NEDWONS_APNS_TEAM_ID"),
+            std::env::var("NEDWONS_APNS_TOPIC"),
         ) else {
             return Self::disabled();
         };
@@ -255,14 +255,14 @@ impl PushService {
         )
     }
 
-    /// The provider signing key from `SENTINEL_APNS_KEY_P8` (preferred — Apple's `.p8` verbatim) or
-    /// `SENTINEL_APNS_KEY_HEX`. `None` if absent or malformed (the service then stays disabled —
+    /// The provider signing key from `NEDWONS_APNS_KEY_P8` (preferred — Apple's `.p8` verbatim) or
+    /// `NEDWONS_APNS_KEY_HEX`. `None` if absent or malformed (the service then stays disabled —
     /// never a half-configured signer).
     fn signing_key_from_env() -> Option<SigningKey> {
-        if let Ok(p8) = std::env::var("SENTINEL_APNS_KEY_P8") {
+        if let Ok(p8) = std::env::var("NEDWONS_APNS_KEY_P8") {
             return signing_key_from_p8(&p8);
         }
-        let key_hex = std::env::var("SENTINEL_APNS_KEY_HEX").ok()?;
+        let key_hex = std::env::var("NEDWONS_APNS_KEY_HEX").ok()?;
         let bytes = hex::decode(key_hex.trim()).ok()?;
         SigningKey::from_slice(&bytes).ok()
     }
@@ -304,7 +304,7 @@ mod tests {
         ApnsConfig {
             key_id: "ABC1234567".to_string(),
             team_id: "TEAM098765".to_string(),
-            topic: "app.sentinel.messenger".to_string(),
+            topic: "app.nedwons.messenger".to_string(),
             signing_key: SigningKey::from_slice(&[7u8; 32]).unwrap(),
         }
     }
@@ -342,7 +342,7 @@ mod tests {
         let req = build_push(&cfg, "deadbeefcafe", 1_700_000_000);
         assert_eq!(req.path, "/3/device/deadbeefcafe");
         assert!(req.authorization.starts_with("bearer "));
-        assert_eq!(req.apns_topic, "app.sentinel.messenger");
+        assert_eq!(req.apns_topic, "app.nedwons.messenger");
         assert_eq!(req.apns_push_type, "alert");
         let body = String::from_utf8(req.body).unwrap();
         // No E2EE content ever appears — only a generic wake alert.

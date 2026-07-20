@@ -12,7 +12,7 @@ use axum::routing::post;
 use axum::Router;
 use p256::ecdsa::SigningKey;
 
-use sentinel_api::push::{
+use nedwons_api::push::{
     build_push, signing_key_from_p8, ApnsConfig, HttpPushTransport, PushTransport,
 };
 
@@ -31,7 +31,7 @@ fn test_cfg() -> ApnsConfig {
     ApnsConfig {
         key_id: "ABC1234567".to_string(),
         team_id: "TEAM098765".to_string(),
-        topic: "app.sentinel.messenger".to_string(),
+        topic: "app.nedwons.messenger".to_string(),
         signing_key: SigningKey::from_slice(&[7u8; 32]).unwrap(),
     }
 }
@@ -89,7 +89,7 @@ async fn http_push_transport_speaks_http2_end_to_end() {
     assert_eq!(seen.version, Version::HTTP_2, "APNs requires HTTP/2");
     assert_eq!(seen.path, "/3/device/deadbeefcafe");
     assert!(seen.authorization.starts_with("bearer "));
-    assert_eq!(seen.topic, "app.sentinel.messenger");
+    assert_eq!(seen.topic, "app.nedwons.messenger");
     assert_eq!(seen.push_type, "alert");
     let body = String::from_utf8(seen.body).unwrap();
     assert!(

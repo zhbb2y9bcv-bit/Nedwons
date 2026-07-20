@@ -55,7 +55,7 @@ encoding is a signature-forgery/confusion risk. The exact format is defined in
 
 ```
 transcript =
-    len32(DOMAIN)      || DOMAIN            // ASCII domain-separation tag, e.g. "app.sentinel.auth.v1"
+    len32(DOMAIN)      || DOMAIN            // ASCII domain-separation tag, e.g. "app.nedwons.auth.v1"
  || u16(PROTOCOL_VER)
  || u8(ACTION)                              // Register=1, Login=2, Refresh=3, PasswordChange=4, DeviceEnroll=5, AccountDelete=6
  || len32(ACCOUNT_ID)  || ACCOUNT_ID        // 16-byte random internal account id
@@ -91,7 +91,7 @@ Rust backend produce byte-identical transcripts.
 - **Key transparency** (append-only log or auditable key directory) is the mechanism that
   makes malicious server key substitution *detectable*. An **RFC 6962-compatible append-only
   Merkle-log primitive is implemented** inside an application-specific KT design (`auth_core::
-  transparency`, `services/api/src/transparency.rs`, `SentinelKit/Transparency.swift`): every
+  transparency`, `services/api/src/transparency.rs`, `NedwonsKit/Transparency.swift`): every
   account→device-key binding is logged (registration, enrollment, recovery), Signed Tree Heads are
   ECDSA-P256-signed, and clients self-monitor (inclusion + consistency under a pinned log key). It
   is **MITIGATING, not complete** (RISK_REGISTER R-201): split-view/gossip, a verifiable map for

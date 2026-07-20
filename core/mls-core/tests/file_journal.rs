@@ -18,7 +18,7 @@ fn temp_path(tag: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    std::env::temp_dir().join(format!("sentinel-fj-{pid}-{nanos}-{n}-{tag}.bin"))
+    std::env::temp_dir().join(format!("nedwons-fj-{pid}-{nanos}-{n}-{tag}.bin"))
 }
 
 fn cleanup(path: &std::path::Path) {

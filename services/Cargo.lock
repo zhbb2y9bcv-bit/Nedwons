@@ -1653,6 +1653,40 @@ dependencies = [
 ]
 
 [[package]]
+name = "nedwons-api"
+version = "0.1.0"
+dependencies = [
+ "auth-core",
+ "axum",
+ "base64",
+ "ciborium",
+ "futures-util",
+ "governor",
+ "hex",
+ "http-body-util",
+ "mls-core",
+ "p256",
+ "p384",
+ "postgres",
+ "r2d2",
+ "r2d2_postgres",
+ "rand_core 0.6.4",
+ "rcgen",
+ "refinery",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "tower",
+ "tower-http 0.7.0",
+ "tracing",
+ "tracing-subscriber",
+ "x509-cert",
+]
+
+[[package]]
 name = "nonzero_ext"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2570,40 +2604,6 @@ name = "semver"
 version = "1.0.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
-
-[[package]]
-name = "sentinel-api"
-version = "0.1.0"
-dependencies = [
- "auth-core",
- "axum",
- "base64",
- "ciborium",
- "futures-util",
- "governor",
- "hex",
- "http-body-util",
- "mls-core",
- "p256",
- "p384",
- "postgres",
- "r2d2",
- "r2d2_postgres",
- "rand_core 0.6.4",
- "rcgen",
- "refinery",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tokio",
- "tokio-tungstenite 0.30.0",
- "tower",
- "tower-http 0.7.0",
- "tracing",
- "tracing-subscriber",
- "x509-cert",
-]
 
 [[package]]
 name = "serde"

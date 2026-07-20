@@ -29,7 +29,7 @@ jobs:
         env:
           POSTGRES_USER: postgres
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: sentinel_test
+          POSTGRES_DB: nedwons_test
         ports:
           - 5432:5432
         options: >-
@@ -38,7 +38,7 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     env:
-      TEST_DATABASE_URL: postgres://postgres:postgres@localhost/sentinel_test
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost/nedwons_test
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust
@@ -161,15 +161,15 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
 
   swift-package:
-    name: SentinelKit (build + test)
+    name: NedwonsKit (build + test)
     runs-on: macos-15   # provides Xcode 26 / Swift 6 toolchain
     steps:
       - uses: actions/checkout@v4
-      - name: Build (SentinelKit + SentinelUI)
-        working-directory: apps/ios/SentinelKit
+      - name: Build (NedwonsKit + NedwonsUI)
+        working-directory: apps/ios/NedwonsKit
         run: swift build
       - name: Test (transcript/interop unit tests)
-        working-directory: apps/ios/SentinelKit
+        working-directory: apps/ios/NedwonsKit
         run: swift test
 
   mls-bridge:
@@ -186,13 +186,13 @@ jobs:
       - name: Fail if committed Swift bindings are stale
         run: scripts/build_mls_ffi.sh --check
       - name: Swift ↔ Rust MLS integration test (host / macOS slice)
-        working-directory: apps/ios/SentinelMLS
+        working-directory: apps/ios/NedwonsMLS
         run: swift test
       - name: RUN bridge tests on the iOS simulator (ios-arm64-simulator slice)
         run: scripts/test_mls_sim.sh
       - name: Compile iOS device slice (compile-only — running needs hardware, R-101)
-        working-directory: apps/ios/SentinelMLS
-        run: xcodebuild build -scheme SentinelMLS -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO
+        working-directory: apps/ios/NedwonsMLS
+        run: xcodebuild build -scheme NedwonsMLS -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO
 
   ios-app:
     name: ios app target (Xcode)
@@ -204,7 +204,7 @@ jobs:
       # The @main Xcode app target + on-device integrations (Secure Enclave, App Attest, Keychain
       # UI, APNs) are not yet committed as an Xcode project (RISK_REGISTER R-101). Once it lands,
       # enable e.g.:
-      # - run: xcodebuild -scheme Sentinel -destination 'platform=iOS Simulator,name=iPhone 16' build test
+      # - run: xcodebuild -scheme Nedwons -destination 'platform=iOS Simulator,name=iPhone 16' build test
       - name: Placeholder
         run: echo "iOS app-target build/test enabled when the Xcode project lands (Gate 1)."
 

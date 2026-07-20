@@ -1,12 +1,12 @@
-//! Sentinel API server binary.
+//! Nedwons API server binary.
 //!
 //! Configuration (environment):
-//! * `DATABASE_URL`  — required, e.g. `postgres://localhost/sentinel_dev`.
-//! * `SENTINEL_BIND` — listen address, default `127.0.0.1:8080`. The dev default binds
+//! * `DATABASE_URL`  — required, e.g. `postgres://localhost/nedwons_dev`.
+//! * `NEDWONS_BIND` — listen address, default `127.0.0.1:8080`. The dev default binds
 //!   loopback only; production terminates TLS 1.3 at the ingress in front of this service
 //!   and must configure trusted-proxy client-IP forwarding for rate limiting.
-//! * `SENTINEL_RATE_PER_MIN` — per-IP requests/minute on `/v1`, default 60.
-//! * `SENTINEL_TRUSTED_IP_HEADER` — optional. When set (e.g. `x-real-client-ip`), the client IP
+//! * `NEDWONS_RATE_PER_MIN` — per-IP requests/minute on `/v1`, default 60.
+//! * `NEDWONS_TRUSTED_IP_HEADER` — optional. When set (e.g. `x-real-client-ip`), the client IP
 //!   for rate limiting is read from that header. **Only** set this behind a trusted reverse proxy
 //!   that overwrites the header on every request; otherwise clients could forge it (R-306). Unset
 //!   ⇒ rate limit by peer socket IP and ignore the header.
@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use auth_core::memstore::SystemClock;
 use auth_core::{AuthService, Config};
-use sentinel_api::pgstore::PgStores;
-use sentinel_api::{build_pool, http, run_migrations};
+use nedwons_api::pgstore::PgStores;
+use nedwons_api::{build_pool, http, run_migrations};
 
 /// A small **bundled** corpus of frequently-breached passwords that satisfy the 12-char length
 /// policy (so the embedded exact-match blocklist would miss them). This is a floor; production
@@ -61,17 +61,17 @@ fn main() {
     let database_url = match std::env::var("DATABASE_URL") {
         Ok(url) => url,
         Err(_) => {
-            eprintln!("DATABASE_URL is required (e.g. postgres://localhost/sentinel_dev)");
+            eprintln!("DATABASE_URL is required (e.g. postgres://localhost/nedwons_dev)");
             std::process::exit(2);
         }
     };
-    let bind: SocketAddr = env_or("SENTINEL_BIND", "127.0.0.1:8080")
+    let bind: SocketAddr = env_or("NEDWONS_BIND", "127.0.0.1:8080")
         .parse()
         .unwrap_or_else(|e| {
-            eprintln!("invalid SENTINEL_BIND: {e}");
+            eprintln!("invalid NEDWONS_BIND: {e}");
             std::process::exit(2);
         });
-    let rate_per_min: u32 = env_or("SENTINEL_RATE_PER_MIN", "60").parse().unwrap_or(60);
+    let rate_per_min: u32 = env_or("NEDWONS_RATE_PER_MIN", "60").parse().unwrap_or(60);
 
     if let Err(e) = run_migrations(&database_url) {
         tracing::error!("migration failure: {e}");
@@ -107,7 +107,7 @@ fn main() {
     // Server-side pepper (R-303): if configured, mix a KMS/HSM secret into all credential hashing.
     // Leaked to 'static because it lives for the whole process. Set it BEFORE any users exist —
     // enabling/rotating it invalidates existing hashes.
-    let service = match std::env::var("SENTINEL_PASSWORD_PEPPER") {
+    let service = match std::env::var("NEDWONS_PASSWORD_PEPPER") {
         Ok(p) if !p.is_empty() => {
             tracing::info!("password pepper ENABLED (server-side Argon2 secret)");
             let pepper: &'static [u8] = Vec::leak(p.into_bytes());
@@ -117,15 +117,15 @@ fn main() {
     };
     let service = Arc::new(service);
 
-    let relay = Arc::new(sentinel_api::relay::PgRelay::new(stores.pool_clone()));
-    let social = Arc::new(sentinel_api::social::PgSocial::new(stores.pool_clone()));
-    let groups = Arc::new(sentinel_api::groups::PgGroups::new(stores.pool_clone()));
+    let relay = Arc::new(nedwons_api::relay::PgRelay::new(stores.pool_clone()));
+    let social = Arc::new(nedwons_api::social::PgSocial::new(stores.pool_clone()));
+    let groups = Arc::new(nedwons_api::groups::PgGroups::new(stores.pool_clone()));
     let log_signing_key = load_or_generate_log_key();
-    let transparency = Arc::new(sentinel_api::transparency::PgTransparency::new(
+    let transparency = Arc::new(nedwons_api::transparency::PgTransparency::new(
         stores.pool_clone(),
         log_signing_key,
     ));
-    let membership = Arc::new(sentinel_api::membership::PgMembership::new(
+    let membership = Arc::new(nedwons_api::membership::PgMembership::new(
         stores.pool_clone(),
     ));
 
@@ -152,11 +152,11 @@ async fn serve(
     rate_per_min: u32,
     stores: Arc<PgStores>,
     service: Arc<AuthService>,
-    relay: Arc<sentinel_api::relay::PgRelay>,
-    social: Arc<sentinel_api::social::PgSocial>,
-    groups: Arc<sentinel_api::groups::PgGroups>,
-    transparency: Arc<sentinel_api::transparency::PgTransparency>,
-    membership: Arc<sentinel_api::membership::PgMembership>,
+    relay: Arc<nedwons_api::relay::PgRelay>,
+    social: Arc<nedwons_api::social::PgSocial>,
+    groups: Arc<nedwons_api::groups::PgGroups>,
+    transparency: Arc<nedwons_api::transparency::PgTransparency>,
+    membership: Arc<nedwons_api::membership::PgMembership>,
 ) {
     // Retention hygiene (DATA_RETENTION.md): every minute purge expired challenges/access
     // tokens AND stale envelopes past the queue TTL. Failure is logged and retried next
@@ -164,7 +164,7 @@ async fn serve(
     // envelope deletion runs in bounded batches so a large backlog can never turn the
     // minutely tick into one long table-locking DELETE (it drains across ticks instead).
     {
-        let ttl_days: u64 = std::env::var("SENTINEL_ENVELOPE_TTL_DAYS")
+        let ttl_days: u64 = std::env::var("NEDWONS_ENVELOPE_TTL_DAYS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(30);
@@ -205,7 +205,7 @@ async fn serve(
                     )?;
                     // MLS prekey hygiene: drop key packages past their TTL.
                     let prekeys = relay
-                        .purge_expired_key_packages(sentinel_api::relay::KEY_PACKAGE_TTL_SECS)?;
+                        .purge_expired_key_packages(nedwons_api::relay::KEY_PACKAGE_TTL_SECS)?;
                     Ok::<u64, auth_core::store::StoreError>(
                         auth + mail + sealed + self_group + prekeys,
                     )
@@ -223,12 +223,12 @@ async fn serve(
 
     // Optional trusted-proxy client-IP header for rate limiting (R-306). Only honored when set;
     // must be overwritten by a trusted proxy on every request or clients could forge it.
-    let trusted_ip_header = std::env::var("SENTINEL_TRUSTED_IP_HEADER")
+    let trusted_ip_header = std::env::var("NEDWONS_TRUSTED_IP_HEADER")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .and_then(|s| axum::http::HeaderName::from_bytes(s.trim().as_bytes()).ok());
     // Sender-constrained access tokens (ADR-0011, R-308): opt-in during migration.
-    let require_proof = std::env::var("SENTINEL_REQUIRE_PROOF")
+    let require_proof = std::env::var("NEDWONS_REQUIRE_PROOF")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     if require_proof {
@@ -252,7 +252,7 @@ async fn serve(
             std::process::exit(1);
         }
     };
-    tracing::info!("sentinel-api listening on {bind}");
+    tracing::info!("nedwons-api listening on {bind}");
     if let Err(e) = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
@@ -268,21 +268,21 @@ async fn serve(
 }
 
 /// The transparency log's ECDSA-P256 signing key. Production loads this from a KMS/HSM via
-/// `SENTINEL_LOG_SIGNING_KEY` (32-byte hex scalar); if unset, an ephemeral key is generated and a
+/// `NEDWONS_LOG_SIGNING_KEY` (32-byte hex scalar); if unset, an ephemeral key is generated and a
 /// warning is logged — clients would then see a changing log public key across restarts, which is
 /// only acceptable in dev.
 fn load_or_generate_log_key() -> p256::ecdsa::SigningKey {
-    if let Ok(hex_key) = std::env::var("SENTINEL_LOG_SIGNING_KEY") {
+    if let Ok(hex_key) = std::env::var("NEDWONS_LOG_SIGNING_KEY") {
         if let Ok(bytes) = hex::decode(hex_key.trim()) {
             if let Ok(key) = p256::ecdsa::SigningKey::from_slice(&bytes) {
                 return key;
             }
         }
-        tracing::error!("SENTINEL_LOG_SIGNING_KEY is set but invalid; refusing to start");
+        tracing::error!("NEDWONS_LOG_SIGNING_KEY is set but invalid; refusing to start");
         std::process::exit(2);
     }
     tracing::warn!(
-        "no SENTINEL_LOG_SIGNING_KEY: generating an EPHEMERAL transparency log key (dev only)"
+        "no NEDWONS_LOG_SIGNING_KEY: generating an EPHEMERAL transparency log key (dev only)"
     );
     p256::ecdsa::SigningKey::random(&mut rand_core::OsRng)
 }

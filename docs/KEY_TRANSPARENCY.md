@@ -5,7 +5,7 @@ out the *right* keys. A malicious or compelled key-directory server could substi
 device key for an attacker's (a MITM on identity). Key transparency (KT) is the defence: make the
 key directory **auditable** so substitution and history-rewriting are detectable.
 
-This document states precisely what Sentinel's KT does and — just as importantly — what it does
+This document states precisely what Nedwons's KT does and — just as importantly — what it does
 **not** yet do. Do not describe protection this system does not provide.
 
 ## What is implemented
@@ -27,7 +27,7 @@ key-transparency design**. Be precise about which part is standard and which is 
 
 It is pure, tested Rust in `auth_core::transparency`, driven by a Postgres-backed directory in
 `services/api/src/transparency.rs`, and verified on the client in
-`SentinelKit/Transparency.swift`.
+`NedwonsKit/Transparency.swift`.
 
 - **Every account→device-key binding is a log leaf.** At device enrollment the server appends
   `account || device || public_key` as an RFC 6962 leaf (gapless index).
@@ -47,7 +47,7 @@ It is pure, tested Rust in `auth_core::transparency`, driven by a Postgres-backe
 **Tested:** `auth-core/tests/transparency.rs` property-tests inclusion + consistency over many tree
 sizes with tamper/rewrite rejection and anchors the hashing against raw SHA-256;
 `services/api/tests/transparency.rs` proves a client verifies a signed STH, that its enrolled key is
-included (no substitution), and append-only growth; `SentinelKitTests/TransparencyTests.swift` unit-
+included (no substitution), and append-only growth; `NedwonsKitTests/TransparencyTests.swift` unit-
 tests the Swift verifier; and the live smoke has the Swift client self-monitor against the real Rust
 server end to end.
 

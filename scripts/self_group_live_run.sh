@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# Live end-to-end run for the device self-group (ADR-0015 option 3): boot the real sentinel-api
+# Live end-to-end run for the device self-group (ADR-0015 option 3): boot the real nedwons-api
 # server against PostgreSQL, then run the Swift SelfGroupLiveRun client — which links BOTH the HTTP
-# client (SentinelKit) AND the real MLS core (MlsFfi) — against it over real HTTP. Proves the whole
+# client (NedwonsKit) AND the real MLS core (MlsFfi) — against it over real HTTP. Proves the whole
 # Swift app stack interoperates with the Rust backend for auth -> secret -> self-group link ->
 # consumption fan-out, with real MLS bytes crossing the real relay.
 #
-# Requires: cargo, swift, a running PostgreSQL. Uses DATABASE_URL (default sentinel_dev).
+# Requires: cargo, swift, a running PostgreSQL. Uses DATABASE_URL (default nedwons_dev).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DATABASE_URL="${DATABASE_URL:-postgres://localhost/sentinel_dev}"
+DATABASE_URL="${DATABASE_URL:-postgres://localhost/nedwons_dev}"
 PORT="${PORT:-8098}"
 BIND="127.0.0.1:${PORT}"
 
-echo "== building sentinel-api =="
-( cd "$ROOT/services" && cargo build -q -p sentinel-api )
+echo "== building nedwons-api =="
+( cd "$ROOT/services" && cargo build -q -p nedwons-api )
 
 echo "== starting server on ${BIND} =="
-DATABASE_URL="$DATABASE_URL" SENTINEL_BIND="$BIND" SENTINEL_RATE_PER_MIN=100000 \
-  "$ROOT/services/target/debug/sentinel-api" &
+DATABASE_URL="$DATABASE_URL" NEDWONS_BIND="$BIND" NEDWONS_RATE_PER_MIN=100000 \
+  "$ROOT/services/target/debug/nedwons-api" &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
 
@@ -30,8 +30,8 @@ done
 curl -fsS "http://${BIND}/healthz" >/dev/null || { echo "server did not become healthy"; exit 1; }
 echo "server healthy"
 
-echo "== running Swift live client (SentinelClient + real MlsClient) =="
-OUT="$(SENTINEL_URL="http://${BIND}" swift run --package-path "$ROOT/apps/ios/SentinelApp" SelfGroupLiveRun 2>&1)"
+echo "== running Swift live client (NedwonsClient + real MlsClient) =="
+OUT="$(NEDWONS_URL="http://${BIND}" swift run --package-path "$ROOT/apps/ios/NedwonsApp" SelfGroupLiveRun 2>&1)"
 echo "$OUT"
 echo "$OUT" | grep -q "LIVE_OK"
 echo "== self_group_live_run: PASS =="

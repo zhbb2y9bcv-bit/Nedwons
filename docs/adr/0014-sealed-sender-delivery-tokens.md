@@ -67,7 +67,7 @@ enforcement all at once. Anonymous write to any inbox = a spam firehose. **The d
 4. **Per-recipient rate limits.** Because the sender is unknown, the relay rate-limits sealed
    deliveries **keyed on `recipient_device`** (GCRA, reusing the R-306 limiter) to bound flooding
    even by a DAK holder or a relay that learned `K_r`.
-5. **Size cap + retention** unchanged (opaque-ciphertext body limit, `SENTINEL_ENVELOPE_TTL_DAYS`).
+5. **Size cap + retention** unchanged (opaque-ciphertext body limit, `NEDWONS_ENVELOPE_TTL_DAYS`).
 
 ## What a sealed envelope stores (metadata minimization)
 
@@ -133,11 +133,11 @@ identified + sealed envelopes; sealed ones carry no sender field.
   and acked; wrong/absent key + unknown device are uniformly refused; a recipient with no verifier
   can't receive sealed. **WebSocket-sealed deferred** (per-source watermark) — sealed rides the
   long-poll inbox for now. Identified delivery + streaming verified untouched (full suite green).
-- **2c — client (transport half landed 2026-07-18).** `SentinelKit.DeliveryAccessKey` (32-byte
+- **2c — client (transport half landed 2026-07-18).** `NedwonsKit.DeliveryAccessKey` (32-byte
   CSPRNG `K_r`, verifier = SHA-256 pinned to the same empty-input golden as
   `auth_core::delivery_key`, truncated material rejected);
-  `SentinelClient.registerDeliveryAccessKey` (only the verifier leaves the device — asserted by
-  test); `SentinelClient.deliverSealed` (**no** `Authorization` header — asserted by test — `K_r`
+  `NedwonsClient.registerDeliveryAccessKey` (only the verifier leaves the device — asserted by
+  test); `NedwonsClient.deliverSealed` (**no** `Authorization` header — asserted by test — `K_r`
   rides `X-Delivery-Key`; per-recipient client-side fan-out; uniform 403 surfaced typed);
   `InboxEnvelope` decodes sealed envelopes (optional sender/conversation + `sealed` flag — fixing
   the previously-required fields that would have failed the whole inbox decode on the first sealed

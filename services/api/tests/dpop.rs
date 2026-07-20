@@ -19,7 +19,7 @@ fn now() -> u64 {
         .as_secs()
 }
 
-/// Build an `X-Sentinel-Proof` header value by signing the canonical request-proof transcript with
+/// Build an `X-Nedwons-Proof` header value by signing the canonical request-proof transcript with
 /// `device`'s key.
 fn make_proof(
     device: &TestDevice,
@@ -49,7 +49,7 @@ fn make_proof(
 async fn get_status(app: &Router, path: &str, token: &str, proof: Option<&str>) -> StatusCode {
     let mut builder = Request::get(path).header(header::AUTHORIZATION, format!("Bearer {token}"));
     if let Some(p) = proof {
-        builder = builder.header("x-sentinel-proof", p);
+        builder = builder.header("x-nedwons-proof", p);
     }
     let resp = app
         .clone()

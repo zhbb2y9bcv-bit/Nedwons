@@ -237,7 +237,7 @@ fn purge_drains_old_envelopes_in_bounded_batches() {
 /// The pool sets fail-fast overload guards on every connection.
 #[test]
 fn pool_connections_carry_statement_timeout() {
-    let pool = sentinel_api::build_pool(&db_url(), 2).expect("pool");
+    let pool = nedwons_api::build_pool(&db_url(), 2).expect("pool");
     let mut conn = pool.get().expect("conn");
     let st: String = conn
         .query_one("SHOW statement_timeout", &[])

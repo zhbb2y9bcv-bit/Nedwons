@@ -36,7 +36,7 @@ pub fn encode_binding(account: &AccountId, device: &DeviceId, public_key: &[u8])
 /// `len32(DOMAIN) || u8(kind) || body`; the kind byte makes leaf types disjoint by construction,
 /// so a revocation leaf can never be confused with a binding leaf. v1 binding leaves (see
 /// [`encode_binding`]) have no header and coexist forever in the append-only log.
-pub const LEAF_DOMAIN_V2: &[u8] = b"app.sentinel.kt-leaf.v2";
+pub const LEAF_DOMAIN_V2: &[u8] = b"app.nedwons.kt-leaf.v2";
 
 /// The kind of a v2 transparency leaf (ADR-0013).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -482,7 +482,7 @@ mod leaf_v2_tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         // Pin the exact bytes so a cross-language (Swift) verifier can reproduce them.
-        assert!(bind_hex.starts_with("00000017")); // len32(23) domain length
+        assert!(bind_hex.starts_with("00000016")); // len32(22) domain length
         assert!(bind_hex.contains(&hex::encode(LEAF_DOMAIN_V2)));
         assert_eq!(
             rev_hex.len(),

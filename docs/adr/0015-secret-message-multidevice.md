@@ -20,10 +20,10 @@
   mls-core `consumption_syncs_over_the_self_group_without_the_sender_learning` (real 4-party: sender +
   phone + tablet; phone reveals → tablet consumed; the sender is not in the self-group and **cannot
   decrypt** the signal) + `self_group_persists_across_reopen`; FFI `consumption_over_the_self_group_across_the_ffi`;
-  SentinelApp `testRevealFansOutOverTheSelfGroupSenderNeverSeesIt`. Original option-2 tests retained.
+  NedwonsApp `testRevealFansOutOverTheSelfGroupSenderNeverSeesIt`. Original option-2 tests retained.
 - **Implementation (backend transport / device-linking, 2026-07-18):** the relay path to establish +
   use the self-group across an account's devices (`services/api` migration `V18`, the
-  `/v1/self-group/*` endpoints, `/v1/inbox` folding, and the Swift `SentinelClient` methods) — see the
+  `/v1/self-group/*` endpoints, `/v1/inbox` folding, and the Swift `NedwonsClient` methods) — see the
   "Backend transport — device-linking flow" section below. Relay stays MLS-blind; proven by
   `services/api/tests/self_group.rs`.
 - **Date:** 2026-07-18
@@ -154,15 +154,15 @@ mirroring how sealed-sender folds in. Retention purge for the channel matches th
 → join/register), and a consumption message fans out to the joined sibling (and not to the sender);
 a stranger can neither claim a sibling's key package (`404`) nor deliver into another account's
 self-group (`403`); idempotent redelivery is a no-op; a lone device's fan-out reaches nobody. The
-Swift `SentinelClient` gained the matching methods (`publishKeyPackage`, `registerSelfGroupMember`,
+Swift `NedwonsClient` gained the matching methods (`publishKeyPackage`, `registerSelfGroupMember`,
 `pendingSelfGroupDevices`, `claimSelfGroupKeyPackage`, `deliverSelfGroup`, self-group inbox/ack).
 
 ### Live end-to-end run (2026-07-18)
 
 A runnable proof that the whole **Swift app stack** interoperates with the real backend:
-`scripts/self_group_live_run.sh` boots the real `sentinel-api` against PostgreSQL and runs the
-`SelfGroupLiveRun` Swift client (`apps/ios/SentinelApp`, the only composition point that links BOTH
-`SentinelClient`/HTTP and `MlsFfi`/`MlsClient`). With **real MLS bytes crossing the real relay** it
+`scripts/self_group_live_run.sh` boots the real `nedwons-api` against PostgreSQL and runs the
+`SelfGroupLiveRun` Swift client (`apps/ios/NedwonsApp`, the only composition point that links BOTH
+`NedwonsClient`/HTTP and `MlsFfi`/`MlsClient`). With **real MLS bytes crossing the real relay** it
 drives: register + trusted-device enroll; a real secret delivered sender → phone through a
 conversation (phone holds it sealed); self-group establishment phone↔tablet where the tablet
 **actually `joinSelfGroup`s** the real `addSelfDevice` Welcome delivered over `/v1/self-group/deliver`;
