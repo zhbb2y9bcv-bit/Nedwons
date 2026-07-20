@@ -5,7 +5,7 @@
 //! Shared helpers for the Postgres-backed integration tests.
 //!
 //! These tests require a running PostgreSQL with a test database:
-//!   `TEST_DATABASE_URL` (default `postgres://localhost/sentinel_test`).
+//!   `TEST_DATABASE_URL` (default `postgres://localhost/nedwons_test`).
 //! They use randomized usernames instead of truncation so parallel tests and repeated
 //! runs never collide, and they run real migrations (idempotent via refinery).
 
@@ -14,16 +14,16 @@ use std::sync::Arc;
 use auth_core::memstore::SystemClock;
 use auth_core::transcript::{Action, Transcript};
 use auth_core::{AuthService, Config, RegisterRequest, Session};
+use nedwons_api::pgstore::PgStores;
+use nedwons_api::relay::PgRelay;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
 use rand_core::{OsRng, RngCore};
-use sentinel_api::pgstore::PgStores;
-use sentinel_api::relay::PgRelay;
 
 pub const PASSWORD: &str = "battery staple orbit lantern";
 
 pub fn db_url() -> String {
     std::env::var("TEST_DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://localhost/sentinel_test".to_string())
+        .unwrap_or_else(|_| "postgres://localhost/nedwons_test".to_string())
 }
 
 /// Parallel tests must not race refinery's schema-history bootstrap: run migrations
@@ -31,8 +31,8 @@ pub fn db_url() -> String {
 pub fn migrate_once(url: &str) {
     static MIGRATE: std::sync::Once = std::sync::Once::new();
     MIGRATE.call_once(|| {
-        sentinel_api::run_migrations(url).expect(
-            "migrations require a running PostgreSQL with the sentinel_test database \
+        nedwons_api::run_migrations(url).expect(
+            "migrations require a running PostgreSQL with the nedwons_test database \
              (TEST_DATABASE_URL)",
         );
     });
@@ -49,7 +49,7 @@ pub fn shared_stores() -> Arc<PgStores> {
             let url = db_url();
             migrate_once(&url);
             Arc::new(PgStores::new(
-                sentinel_api::build_pool(&url, 24).expect("pool"),
+                nedwons_api::build_pool(&url, 24).expect("pool"),
             ))
         })
         .clone()
@@ -80,35 +80,35 @@ pub fn shared_relay() -> Arc<PgRelay> {
 }
 
 /// Social store (profiles/friends/blocks) over the shared pool.
-pub fn shared_social() -> Arc<sentinel_api::social::PgSocial> {
-    Arc::new(sentinel_api::social::PgSocial::new(
+pub fn shared_social() -> Arc<nedwons_api::social::PgSocial> {
+    Arc::new(nedwons_api::social::PgSocial::new(
         shared_stores().pool_clone(),
     ))
 }
 
 /// Group governance store (roles/invites/join requests) over the shared pool.
-pub fn shared_groups() -> Arc<sentinel_api::groups::PgGroups> {
-    Arc::new(sentinel_api::groups::PgGroups::new(
+pub fn shared_groups() -> Arc<nedwons_api::groups::PgGroups> {
+    Arc::new(nedwons_api::groups::PgGroups::new(
         shared_stores().pool_clone(),
     ))
 }
 
 /// Membership-commit store (ADR-0010 epoch CAS + audit log) over the shared pool.
 #[allow(dead_code)]
-pub fn shared_membership() -> Arc<sentinel_api::membership::PgMembership> {
-    Arc::new(sentinel_api::membership::PgMembership::new(
+pub fn shared_membership() -> Arc<nedwons_api::membership::PgMembership> {
+    Arc::new(nedwons_api::membership::PgMembership::new(
         shared_stores().pool_clone(),
     ))
 }
 
 /// Transparency store over the shared pool, with a process-stable log signing key (so STH
 /// signatures verify against a consistent public key across a test's requests).
-pub fn shared_transparency() -> Arc<sentinel_api::transparency::PgTransparency> {
+pub fn shared_transparency() -> Arc<nedwons_api::transparency::PgTransparency> {
     static KEY: std::sync::OnceLock<p256::ecdsa::SigningKey> = std::sync::OnceLock::new();
     let key = KEY
         .get_or_init(|| p256::ecdsa::SigningKey::random(&mut OsRng))
         .clone();
-    Arc::new(sentinel_api::transparency::PgTransparency::new(
+    Arc::new(nedwons_api::transparency::PgTransparency::new(
         shared_stores().pool_clone(),
         key,
     ))
@@ -189,7 +189,7 @@ pub async fn make_app(per_ip_per_minute: u32) -> Router {
     tokio::task::spawn_blocking(move || {
         let stores = shared_stores();
         let service = Arc::new(make_service(&stores));
-        sentinel_api::http::build_router(
+        nedwons_api::http::build_router(
             service,
             shared_relay(),
             shared_social(),
@@ -210,7 +210,7 @@ pub async fn make_app_with_proof(per_ip_per_minute: u32) -> Router {
     tokio::task::spawn_blocking(move || {
         let stores = shared_stores();
         let service = Arc::new(make_service(&stores));
-        sentinel_api::http::build_router_cfg(
+        nedwons_api::http::build_router_cfg(
             service,
             shared_relay(),
             shared_social(),
@@ -232,7 +232,7 @@ pub async fn make_app_with_trusted_ip_header(per_ip_per_minute: u32) -> Router {
     tokio::task::spawn_blocking(move || {
         let stores = shared_stores();
         let service = Arc::new(make_service(&stores));
-        sentinel_api::http::build_router_cfg(
+        nedwons_api::http::build_router_cfg(
             service,
             shared_relay(),
             shared_social(),

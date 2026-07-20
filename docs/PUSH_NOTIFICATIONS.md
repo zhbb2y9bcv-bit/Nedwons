@@ -33,7 +33,7 @@ conversation, or body is ever placed in the push payload (asserted by
 `HttpPushTransport` (`services/api/src/push.rs`) is the production `PushTransport`: HTTP/2 via
 `reqwest` + rustls (no OpenSSL), wired as the default in the router. An `https://` base uses TLS
 with ALPN (Apple negotiates h2); an `http://` base uses HTTP/2 prior knowledge for local/dev
-servers. `SENTINEL_APNS_URL` overrides the host (`https://api.sandbox.push.apple.com` for sandbox);
+servers. `NEDWONS_APNS_URL` overrides the host (`https://api.sandbox.push.apple.com` for sandbox);
 default is production APNs. No socket is ever opened unless credentials are configured.
 
 **Proven** by `services/api/tests/apns_transport.rs`: a local mock APNs asserts the connection
@@ -46,10 +46,10 @@ status surfaces to the caller; and the provider key loads **verbatim from Apple'
 
 Supplied via env (`PushService::from_env`; any missing ⇒ the service is disabled, wake path no-ops):
 
-- `SENTINEL_APNS_KEY_P8` — the contents of the `.p8` from the Apple Developer portal, verbatim
-  (preferred), or `SENTINEL_APNS_KEY_HEX` — the raw P-256 scalar in hex.
-- `SENTINEL_APNS_KEY_ID`, `SENTINEL_APNS_TEAM_ID`, `SENTINEL_APNS_TOPIC` (bundle id).
-- `SENTINEL_APNS_URL` — optional host override (sandbox/dev).
+- `NEDWONS_APNS_KEY_P8` — the contents of the `.p8` from the Apple Developer portal, verbatim
+  (preferred), or `NEDWONS_APNS_KEY_HEX` — the raw P-256 scalar in hex.
+- `NEDWONS_APNS_KEY_ID`, `NEDWONS_APNS_TEAM_ID`, `NEDWONS_APNS_TOPIC` (bundle id).
+- `NEDWONS_APNS_URL` — optional host override (sandbox/dev).
 
 ## What still needs hardware (cannot be closed without it)
 

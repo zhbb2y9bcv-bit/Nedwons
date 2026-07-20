@@ -17,7 +17,7 @@ use crate::ids::{AccountId, DeviceId};
 
 /// ASCII domain-separation tag. Versioned: a future manifest format re-tags (explicit protocol
 /// versioning for membership control messages — the R-506 requirement).
-pub const DOMAIN: &[u8] = b"app.sentinel.membership.v1";
+pub const DOMAIN: &[u8] = b"app.nedwons.membership.v1";
 
 /// What kind of membership change this manifest describes. One kind per commit in v1 (no mixed
 /// add+remove commits — simpler for every verifier and matches the product flows).
@@ -249,7 +249,7 @@ mod tests {
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "0000001a6170702e73656e74696e656c2e6d656d626572736869702e7631010000001007070\
+            "000000196170702e6e6564776f6e732e6d656d626572736869702e7631010000001007070\
              707070707070707070707070707000000000000000400000000000000050000002009090909\
              090909090909090909090909090909090909090909090909090909090000001001010101010\
              1010101010101010101010000000100000010aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa000000\
@@ -316,7 +316,7 @@ mod tests {
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert!(decode(&trailing).is_none()); // trailing bytes
-        assert!(decode(b"app.sentinel.membership.v1 not really").is_none());
+        assert!(decode(b"app.nedwons.membership.v1 not really").is_none());
     }
 
     #[test]

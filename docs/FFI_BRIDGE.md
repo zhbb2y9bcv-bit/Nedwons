@@ -11,7 +11,7 @@ core/mls-core     Rust  #![forbid(unsafe_code)]   OpenMLS integration + crash-sa
 core/mls-ffi      Rust  UniFFI boundary. Thin marshalling shim: MlsClient object + records/enums +
                         redacted errors. The ONLY place the unavoidable FFI `unsafe` lives.
                         `cargo run --bin uniffi-bindgen` generates the Swift.
-apps/ios/SentinelMLS   Swift package: generated bindings (Sources/MlsFfi/mls_ffi.swift, committed)
+apps/ios/NedwonsMLS   Swift package: generated bindings (Sources/MlsFfi/mls_ffi.swift, committed)
                         + MlsFfi.xcframework (built, not committed) + the integration test.
 services/api      Rust  The relay. Depends on NEITHER mls-core NOR mls-ffi — it only ever sees
                         opaque ciphertext (INV-1 / ADR-0001). Verified by `grep`, not just intent.

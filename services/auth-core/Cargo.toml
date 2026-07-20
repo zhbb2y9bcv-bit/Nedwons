@@ -1,7 +1,7 @@
 [package]
 name = "auth-core"
 version = "0.1.0"
-description = "Pure, storage-agnostic device-bound authentication logic for Sentinel."
+description = "Pure, storage-agnostic device-bound authentication logic for Nedwons."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true

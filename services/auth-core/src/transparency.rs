@@ -221,7 +221,7 @@ pub fn verify_consistency(
 /// Canonical, domain-separated, length-prefixed byte encoding of a Signed Tree Head, agreed
 /// between the log server (which signs it) and clients (which verify). Mirrors the auth transcript
 /// style so Swift/Kotlin re-encode identically. The server signs THIS with the log's key.
-pub const STH_DOMAIN: &[u8] = b"sentinel-transparency-sth-v1";
+pub const STH_DOMAIN: &[u8] = b"nedwons-transparency-sth-v1";
 
 pub fn encode_sth(tree_size: u64, root: &Hash, timestamp: u64) -> Vec<u8> {
     let mut out = Vec::with_capacity(STH_DOMAIN.len() + 8 + 8 + 32 + 8);

@@ -7,8 +7,8 @@ screen affordance that drives it.
 
 ## The coordinator: `SelfGroupLinker`
 
-`apps/ios/SentinelApp/Sources/SentinelAppKit/SelfGroupLinker.swift` — a small, stateless value over
-`SentinelClient` (HTTP) + `MlsClient` (the real Rust MLS core). Two roles, one per side of a link:
+`apps/ios/NedwonsApp/Sources/NedwonsAppKit/SelfGroupLinker.swift` — a small, stateless value over
+`NedwonsClient` (HTTP) + `MlsClient` (the real Rust MLS core). Two roles, one per side of a link:
 
 - **Primary** (`linkPendingSiblings`): the device that holds — or here first establishes — the
   self-group. It creates + registers the self-group if absent, then for every device the relay lists
@@ -25,21 +25,21 @@ The relay stays **MLS-blind** throughout — only opaque Welcome/commit bytes cr
 ### It's the *tested* path
 
 `SelfGroupLiveRun` (the live end-to-end harness, `scripts/self_group_live_run.sh`) drives this exact
-type against a booted `sentinel-api` + PostgreSQL: primary establishes the group and links the
+type against a booted `nedwons-api` + PostgreSQL: primary establishes the group and links the
 tablet, the tablet joins from its inbox, both `hasSelfGroup()`, and a second primary pass is a proven
 no-op. So the app's linking code is exercised live with real MLS bytes crossing the real relay
 (`LIVE_OK`), not mocked.
 
 ## The UI: Devices screen
 
-`DevicesScreen` (SentinelUI) shows a **"Waiting to link"** section when the relay reports pending
+`DevicesScreen` (NedwonsUI) shows a **"Waiting to link"** section when the relay reports pending
 siblings, with a **"Link N device(s)"** button (a spinner + disabled state while running, then a
 "Linked N device(s)" / "No devices were waiting to link" banner). The button calls
 `AppModel.linkPendingDevices()`.
 
 ### Layering: why the link action is injected
 
-`SentinelUI` is pure Swift and **cannot import `MlsFfi`** (the MLS core) — that's what keeps it
+`NedwonsUI` is pure Swift and **cannot import `MlsFfi`** (the MLS core) — that's what keeps it
 macOS-buildable and the NSE-safe modules clean. So `AppModel` can't itself run the linker. Instead it
 exposes an injection point:
 
@@ -47,7 +47,7 @@ exposes an injection point:
 public var linkDevicesAction: (() async throws -> [String])?   // set by the composition layer
 ```
 
-`SentinelAppKit` — the one layer that links both `SentinelUI` and `MlsFfi` — is where this gets wired
+`NedwonsAppKit` — the one layer that links both `NedwonsUI` and `MlsFfi` — is where this gets wired
 to a `SelfGroupLinker` over the app's session `MlsClient`. Until it's wired, the hook is `nil` and the
 button honestly reports *"Device linking isn't available in this build."* — fail-safe, never a fake
 success.

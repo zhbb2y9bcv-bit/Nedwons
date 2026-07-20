@@ -4,12 +4,12 @@
 //! holds the device's enrolled private key. The proof is a raw ECDSA-P256 signature over this
 //! canonical, domain-separated transcript — the same vetted signing path as auth/refresh, so a
 //! stolen bearer token is useless without the non-exportable key. RFC 9449 semantics (bind
-//! method + URI + token + time + nonce), expressed in Sentinel's transcript idiom rather than JWS.
+//! method + URI + token + time + nonce), expressed in Nedwons's transcript idiom rather than JWS.
 
 use crate::crypto::verify_p256;
 
 /// Domain-separation tag. Versioned; a new proof format re-tags.
-pub const DOMAIN: &[u8] = b"app.sentinel.dpop.v1";
+pub const DOMAIN: &[u8] = b"app.nedwons.dpop.v1";
 
 /// Protocol version carried in the signed bytes (explicit, non-silent evolution).
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -94,7 +94,7 @@ mod tests {
             .collect();
         assert_eq!(
             hex,
-            "000000146170702e73656e74696e656c2e64706f702e7631000100000004504f53540000001f2f76312f636f6e766572736174696f6e732f616162622f6d65737361676573000000200707070707070707070707070707070707070707070707070707070707070707000000006553f1000000001009090909090909090909090909090909"
+            "000000136170702e6e6564776f6e732e64706f702e7631000100000004504f53540000001f2f76312f636f6e766572736174696f6e732f616162622f6d65737361676573000000200707070707070707070707070707070707070707070707070707070707070707000000006553f1000000001009090909090909090909090909090909"
         );
     }
 

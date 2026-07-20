@@ -1,4 +1,4 @@
-//! `auth-core` — the pure, storage-agnostic security logic behind Sentinel's device-bound
+//! `auth-core` — the pure, storage-agnostic security logic behind Nedwons's device-bound
 //! authentication (ADR-0002, ADR-0006).
 //!
 //! This crate deliberately contains **no** networking, no database, and no framework: only

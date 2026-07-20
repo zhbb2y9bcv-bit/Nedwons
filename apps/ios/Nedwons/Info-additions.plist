@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Permission purpose strings to merge into the app target's Info.plist. Each is requested
+  contextually (at the point of use), never at first launch. Only include the ones the
+  shipped build actually uses.
+-->
+<plist version="1.0">
+<dict>
+    <key>NSFaceIDUsageDescription</key>
+    <string>Unlock Nedwons and authorize use of your device key stored in secure hardware.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Scan a contact's QR code to verify their safety number, and take photos to send in encrypted messages.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Record voice messages and make encrypted calls.</string>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>Attach photos and videos to encrypted messages. Location metadata can be stripped before sending.</string>
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>Save photos and videos you receive to your library.</string>
+</dict>
+</plist>

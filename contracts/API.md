@@ -1,4 +1,4 @@
-# Sentinel Auth API (v1)
+# Nedwons Auth API (v1)
 
 Wire contract for the device-bound authentication endpoints served by `services/api`. All
 binary fields are lowercase hex. All requests are JSON with `Content-Type: application/json`
@@ -126,7 +126,7 @@ addable while offline.
 Authed. Issues a short-lived sealed-sender certificate for the caller's device:
 `{ account_id, device_id, sender_public_key, expires_at, signature, cert_public_key }` (all hex).
 `signature` is a 64-byte r‖s ECDSA-P256 signature, made with the server's dedicated
-sender-certificate key, over the canonical `SenderCert` encoding (`app.sentinel.sender-cert.v1`).
+sender-certificate key, over the canonical `SenderCert` encoding (`app.nedwons.sender-cert.v1`).
 The device embeds the certificate inside the E2EE payload of a sealed-sender message so the
 recipient verifies who sent it while the relay never learns the sender. `cert_public_key` is the
 SEC1 signing-key public key — production clients **pin** it out of band; it is returned for

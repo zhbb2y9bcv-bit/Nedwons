@@ -8,7 +8,7 @@
 
 `core/mls-core` (ADR-0001) is the Rust MLS integration and is fully tested on the host
 (`cargo test`). The iOS app needs to call it on device to encrypt/decrypt messages. The
-canonical transcript layer already crosses to Swift byte-identically (SentinelKit), but MLS
+canonical transcript layer already crosses to Swift byte-identically (NedwonsKit), but MLS
 group state is complex and must not be reimplemented in Swift — that would be a second
 crypto implementation, which the mission forbids.
 
@@ -36,7 +36,7 @@ Required adaptations (small, tracked as work items):
 - Cross-compile the staticlib for `aarch64-apple-ios`, `aarch64-apple-ios-sim`, and (for
   host tests) the Mac arch; assemble an `xcframework` via `xcodebuild -create-xcframework`.
 - Generate Swift bindings with `uniffi-bindgen`; ship as a local SwiftPM target the app links
-  alongside `SentinelKit`.
+  alongside `NedwonsKit`.
 
 ## Consequences
 
@@ -53,8 +53,8 @@ FFI boundary (ADR-0004 consequence); no Swift crypto to review.
 
 ## Status
 
-Planned. The host-side MLS (`mls-core`) and the auth client transport (SentinelKit's
-`SentinelClient`, verified against the live backend) are done; this binding is the remaining
+Planned. The host-side MLS (`mls-core`) and the auth client transport (NedwonsKit's
+`NedwonsClient`, verified against the live backend) are done; this binding is the remaining
 bridge to run E2EE on the device, landed together with the Xcode app target (Section 3 / R-101).
 
 ### Update 2026-07-17 — the narrow Rust-owned API layer now exists (`mls_core::client`)
@@ -97,7 +97,7 @@ ran here — not aspirations.
 | UniFFI version | **`0.29`** (resolved `0.29.5`) | Latest 0.29 line; compiles under Rust 1.97.1; its generated Swift compiles clean under Swift 6.3.3 with `-swift-version 6`. Pin the minor; re-review on bump. |
 | Binding mode | **proc-macro** (`uniffi::setup_scaffolding!()` + `#[uniffi::export]`, `#[derive(uniffi::Object/Record/Enum/Error)]`) | One source of truth in Rust; **no UDL file to drift** out of sync with the code. UDL is rejected precisely because it duplicates the surface. |
 | Bindgen | **library mode** via an in-crate `uniffi-bindgen` bin (`cargo run --bin uniffi-bindgen generate --library <dylib> --language swift`) | The generator introspects the built library, so bindings cannot describe a surface the library does not export. Avoids a separately-versioned external `uniffi-bindgen`. |
-| Min deployment target | **iOS 17 / macOS 14** | Matches `SentinelKit/Package.swift`. |
+| Min deployment target | **iOS 17 / macOS 14** | Matches `NedwonsKit/Package.swift`. |
 | Architectures | host `arm64-apple-macos` (host tests) · `aarch64-apple-ios` (device) · `aarch64-apple-ios-sim` (simulator, Apple Silicon). `x86_64-apple-ios` (Intel sim) is **optional** and off by default. | Apple-Silicon-first; the host slice is what the fast `swift test` integration loop links. |
 | Swift language mode | generated bindings compile under **`-swift-version 6`** | Proven in the spike. UniFFI's own docs call Swift-6 support partial, so this is asserted by a real compile, and warnings are **not** broadly suppressed to hide it. |
 
@@ -163,7 +163,7 @@ FFI constructors build the `File` variant from a caller-supplied path + 32-byte 
   never unwind across the C ABI (UB).
 - **Concurrency/cancellation:** the surface is **synchronous and non-blocking** — CPU-bound MLS work
   plus a bounded local-file commit; no network, no async, no unbounded wait crosses FFI in this
-  slice. (Network I/O stays in Swift's `SentinelClient`.)
+  slice. (Network I/O stays in Swift's `NedwonsClient`.)
 
 ### Version compatibility
 

@@ -4,7 +4,7 @@ Two independent hardware protections, and what is built vs. hardware-gated.
 
 ## Secure Enclave device key — DONE (software + real API)
 
-`SecureEnclaveDeviceSigner` (`apps/ios/SentinelKit/Sources/SentinelKit/DeviceSigner.swift`) generates
+`SecureEnclaveDeviceSigner` (`apps/ios/NedwonsKit/Sources/NedwonsKit/DeviceSigner.swift`) generates
 a **non-exportable** P-256 key inside the Secure Enclave (`SecureEnclave.P256.Signing.PrivateKey`);
 only an encrypted, device-bound blob is persisted (Keychain, `ThisDeviceOnly`). `DeviceIdentity`
 provisions it and **fails closed** — a device without a usable Enclave does not silently downgrade;
@@ -23,7 +23,7 @@ emulators and tampered builds.
 - Client: `AppAttestation` (`AppAttest.swift`) wraps `DCAppAttestService` —
   `isSupported` / `generateKey` / `attestKey(challenge)` / `generateAssertion`. It **fails closed**
   off real hardware (`.unsupported` on Simulator / macOS / a compromised device), asserted by
-  `AppAttestTests`. Client methods `SentinelClient.attestChallenge` / `submitAttestation`.
+  `AppAttestTests`. Client methods `NedwonsClient.attestChallenge` / `submitAttestation`.
 - Server: `GET /v1/attest/challenge` issues a single-use 32-byte challenge (5-min TTL);
   `POST /v1/attest/key` consumes it (anti-replay) and stores the submitted attestation bound to the
   device. Migration `V20`; proven by `services/api/tests/app_attest.rs` (challenge → submit →
@@ -44,10 +44,10 @@ is fully verified server-side per Apple's spec:
 4. **authData** — RP ID hash = `SHA-256(app_id)`, counter `0`, aaguid = `appattest` (production;
    `appattestdevelop` only when explicitly allowed).
 
-Wired into `POST /v1/attest/key`: when `SENTINEL_APP_ATTEST_APP_ID` is set, a failed verification is
+Wired into `POST /v1/attest/key`: when `NEDWONS_APP_ATTEST_APP_ID` is set, a failed verification is
 **rejected** and a passing one stores `verified=true`; unconfigured deployments store `verified=false`
-(bootstrap). Config: `SENTINEL_APP_ATTEST_APP_ID` (`TeamID.bundle-id`), optional
-`SENTINEL_APP_ATTEST_ROOT_PEM` override, `SENTINEL_APP_ATTEST_DEV` to accept development builds.
+(bootstrap). Config: `NEDWONS_APP_ATTEST_APP_ID` (`TeamID.bundle-id`), optional
+`NEDWONS_APP_ATTEST_ROOT_PEM` override, `NEDWONS_APP_ATTEST_DEV` to accept development builds.
 
 **Proven without hardware:** `services/api/tests/attest_verify.rs` mints a synthetic chain (test
 root → intermediate → credential cert with the real Apple nonce-extension shape) via `rcgen` and a

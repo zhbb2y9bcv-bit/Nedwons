@@ -1,23 +1,23 @@
 #!/usr/bin/env bash
-# Live integration proof: boot the real sentinel-api server against PostgreSQL, then run the
-# Swift SentinelSmoke client against it over real HTTP (register -> whoami -> login -> whoami,
+# Live integration proof: boot the real nedwons-api server against PostgreSQL, then run the
+# Swift NedwonsSmoke client against it over real HTTP (register -> whoami -> login -> whoami,
 # plus the INV-2 negative check that a different device cannot log in). Verifies the iOS
 # client interoperates with the Rust backend end to end.
 #
-# Requires: cargo, swift, a running PostgreSQL. Uses DATABASE_URL (default sentinel_dev).
+# Requires: cargo, swift, a running PostgreSQL. Uses DATABASE_URL (default nedwons_dev).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DATABASE_URL="${DATABASE_URL:-postgres://localhost/sentinel_dev}"
+DATABASE_URL="${DATABASE_URL:-postgres://localhost/nedwons_dev}"
 PORT="${PORT:-8097}"
 BIND="127.0.0.1:${PORT}"
 
-echo "== building sentinel-api =="
-( cd "$ROOT/services" && cargo build -q -p sentinel-api )
+echo "== building nedwons-api =="
+( cd "$ROOT/services" && cargo build -q -p nedwons-api )
 
 echo "== starting server on ${BIND} =="
-DATABASE_URL="$DATABASE_URL" SENTINEL_BIND="$BIND" SENTINEL_RATE_PER_MIN=100000 \
-  "$ROOT/services/target/debug/sentinel-api" &
+DATABASE_URL="$DATABASE_URL" NEDWONS_BIND="$BIND" NEDWONS_RATE_PER_MIN=100000 \
+  "$ROOT/services/target/debug/nedwons-api" &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
 
@@ -30,7 +30,7 @@ curl -fsS "http://${BIND}/healthz" >/dev/null || { echo "server did not become h
 echo "server healthy"
 
 echo "== running Swift smoke client =="
-OUT="$(SENTINEL_URL="http://${BIND}" swift run --package-path "$ROOT/apps/ios/SentinelKit" SentinelSmoke 2>&1)"
+OUT="$(NEDWONS_URL="http://${BIND}" swift run --package-path "$ROOT/apps/ios/NedwonsKit" NedwonsSmoke 2>&1)"
 echo "$OUT"
 echo "$OUT" | grep -q "SMOKE_OK"
 echo "== swift_backend_smoke: PASS =="

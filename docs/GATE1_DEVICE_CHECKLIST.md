@@ -6,7 +6,7 @@ proven on hardware. Do not mark Gate 1 passed until every box below has captured
 
 ## What is already done in code (verified headlessly)
 
-- **Signer selection + fail-closed policy** — `SentinelKit/DeviceIdentity.swift`. Prefers the
+- **Signer selection + fail-closed policy** — `NedwonsKit/DeviceIdentity.swift`. Prefers the
   Secure Enclave; `requireHardware` refuses to enroll without it (no silent software key);
   `allowSoftwareFallback` is an explicit, acknowledged lower-assurance path.
 - **Key persistence** — the enrolled key (Enclave `dataRepresentation` or software raw) is stored
@@ -37,10 +37,10 @@ proven on hardware. Do not mark Gate 1 passed until every box below has captured
 ## Build & run (once the Xcode project lands)
 
 ```
-# From repo root, after the app target is committed under apps/ios/Sentinel:
-xcodebuild -scheme Sentinel -destination 'platform=iOS,name=<device>' build
+# From repo root, after the app target is committed under apps/ios/Nedwons:
+xcodebuild -scheme Nedwons -destination 'platform=iOS,name=<device>' build
 # Install on device via Xcode Run; for CI smoke on simulator (no Enclave, expect fail-closed):
-xcodebuild -scheme Sentinel -destination 'platform=iOS Simulator,name=iPhone 16' build test
+xcodebuild -scheme Nedwons -destination 'platform=iOS Simulator,name=iPhone 16' build test
 ```
 
 ## Acceptance assertions (capture evidence, never expose secrets)

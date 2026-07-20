@@ -5,7 +5,7 @@
 //! a newer envelope version **rejects it** instead of feeding unknown bytes to MLS. The MLS-blind
 //! relay forwards these bytes untouched (it never parses them), so this changes nothing about the
 //! server's opacity. Control (membership) messages are versioned separately via the manifest
-//! domain tag (`app.sentinel.membership.v1`).
+//! domain tag (`app.nedwons.membership.v1`).
 
 /// The current application-envelope version. Bumping this is an explicit, non-silent wire change.
 pub const VERSION: u16 = 1;

@@ -12,13 +12,13 @@ services:
   postgres:
     image: postgres:17
     environment:
-      POSTGRES_USER: sentinel
+      POSTGRES_USER: nedwons
       POSTGRES_PASSWORD: devonly_not_a_secret
-      POSTGRES_DB: sentinel_dev
+      POSTGRES_DB: nedwons_dev
     ports:
       - "127.0.0.1:5432:5432" # loopback only
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U sentinel -d sentinel_dev"]
+      test: ["CMD-SHELL", "pg_isready -U nedwons -d nedwons_dev"]
       interval: 3s
       timeout: 3s
       retries: 20
@@ -30,9 +30,9 @@ services:
       context: ../services
       dockerfile: api/Dockerfile
     environment:
-      DATABASE_URL: postgres://sentinel:devonly_not_a_secret@postgres:5432/sentinel_dev
-      SENTINEL_BIND: 0.0.0.0:8080
-      SENTINEL_RATE_PER_MIN: "60"
+      DATABASE_URL: postgres://nedwons:devonly_not_a_secret@postgres:5432/nedwons_dev
+      NEDWONS_BIND: 0.0.0.0:8080
+      NEDWONS_RATE_PER_MIN: "60"
       RUST_LOG: info
     depends_on:
       postgres:
