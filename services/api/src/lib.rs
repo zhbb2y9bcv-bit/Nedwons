@@ -1,4 +1,4 @@
-//! `sentinel-api` — PostgreSQL-backed stores and the HTTP authentication API for Sentinel.
+//! `nedwons-api` — PostgreSQL-backed stores and the HTTP authentication API for Nedwons.
 //! The security decisions live in `auth-core`; this crate supplies storage (with
 //! DB-enforced atomicity, ADR-0006) and transport.
 

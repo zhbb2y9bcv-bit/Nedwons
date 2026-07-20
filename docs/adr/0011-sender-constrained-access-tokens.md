@@ -32,13 +32,13 @@ enrollment and refresh but not the requests in between.
 
 ## Decision
 
-Option 3, expressed in Sentinel's existing idiom rather than JWS: the proof is a **raw ECDSA-P256
+Option 3, expressed in Nedwons's existing idiom rather than JWS: the proof is a **raw ECDSA-P256
 signature over a domain-separated, length-prefixed transcript** (`auth_core::request_proof`), reusing
 the exact vetted signing path as auth/refresh (no new crypto, no JWT dependency, no ad-hoc header
 format). This is RFC 9449's security model — proof-of-possession bound to method+URI+token+time+nonce
 — adapted to our transcript discipline.
 
-### The proof transcript (`app.sentinel.dpop.v1`)
+### The proof transcript (`app.nedwons.dpop.v1`)
 
 ```
 len32(DOMAIN) || DOMAIN
@@ -50,7 +50,7 @@ len32(DOMAIN) || DOMAIN
   || len32(NONCE)   || NONCE            (16 random bytes, unique per request)
 ```
 
-The client sends the proof in an `X-Sentinel-Proof: v1;ts=<u64>;nonce=<16B hex>;sig=<hex>` header
+The client sends the proof in an `X-Nedwons-Proof: v1;ts=<u64>;nonce=<16B hex>;sig=<hex>` header
 alongside `Authorization: Bearer <token>`.
 
 ### Server verification (in `authed_device`, when enforcement is enabled)
@@ -68,7 +68,7 @@ alongside `Authorization: Bearer <token>`.
 
 ### Migration & compatibility
 
-- Enforcement is **opt-in** via `SENTINEL_REQUIRE_PROOF` (wired through `build_router_cfg`), default
+- Enforcement is **opt-in** via `NEDWONS_REQUIRE_PROOF` (wired through `build_router_cfg`), default
   **off**, so existing conversations, clients, and the whole test suite are unaffected while clients
   roll out proof generation. A dedicated test suite exercises the enabled path end to end.
 - WebSocket: the upgrade request (`GET /v1/stream`) carries a proof like any authed request; the

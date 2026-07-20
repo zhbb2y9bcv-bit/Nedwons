@@ -96,7 +96,7 @@ correspondence before merging and refuse mismatches.
 
 | # | Field | Type | Meaning |
 |---|-------|------|---------|
-| 1 | `version` | domain tag | `sentinel-membership-manifest-v1` (domain separation = explicit protocol version; a v2 re-tags). |
+| 1 | `version` | domain tag | `nedwons-membership-manifest-v1` (domain separation = explicit protocol version; a v2 re-tags). |
 | 2 | `group_id` | 16 B | The conversation. |
 | 3 | `prev_epoch` | u64 BE | MLS epoch the commit was built against. |
 | 4 | `next_epoch` | u64 BE | Resulting epoch; MUST equal `prev_epoch + 1`. |
@@ -205,7 +205,7 @@ merging the staged commit**:
   this protocol (the admin's *accept* becomes an add-commit; the token/consent logic of ADR-0009
   is unchanged).
 - **Swift wiring** (follow-up): expose the correspondence check through `mls-ffi`
-  (`process_commit_checked`) and drive the new endpoint from `SentinelKit`; then two-device flows
+  (`process_commit_checked`) and drive the new endpoint from `NedwonsKit`; then two-device flows
   on simulator/hardware (R-101).
 - Envelope-level protocol versioning for *application* messages remains open (tracked in R-506's
   residual); membership control messages are versioned by the manifest domain tag as of v1.

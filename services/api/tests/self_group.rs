@@ -9,7 +9,7 @@
 //!
 //! The MLS correctness of the self-group itself (that the fanned-out message actually consumes the
 //! secret, and the conversation's sender cannot decrypt it) is proven in mls-core / mls-ffi /
-//! SentinelApp. This test proves the *transport*: the relay establishes and routes the channel.
+//! NedwonsApp. This test proves the *transport*: the relay establishes and routes the channel.
 
 mod common;
 

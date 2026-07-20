@@ -71,29 +71,29 @@ pub struct AppState {
     require_proof: bool,
     proof_cache: Arc<crate::proof::ProofReplayCache>,
     /// Sealed-sender **sender-certificate** signing key (ADR-0012, R-204). Loaded from
-    /// `SENTINEL_SENDER_CERT_KEY` (hex) or ephemeral (dev). Distinct from the auth/transparency
+    /// `NEDWONS_SENDER_CERT_KEY` (hex) or ephemeral (dev). Distinct from the auth/transparency
     /// keys. Its public key is returned with issued certificates; production clients pin it.
     sender_cert_key: Arc<p256::ecdsa::SigningKey>,
     /// Per-recipient-device rate limiter for the unauthenticated sealed-delivery endpoint
     /// (ADR-0014). Bounds flooding when the sender is unknown.
     sealed_limiter: Arc<DeviceLimiter>,
-    /// App Attest verification config (#10). `Some` when `SENTINEL_APP_ATTEST_APP_ID` is set: a
+    /// App Attest verification config (#10). `Some` when `NEDWONS_APP_ATTEST_APP_ID` is set: a
     /// submitted attestation is then cryptographically verified against the pinned Apple root and
     /// rejected on failure. `None` ⇒ attestations are stored unverified (bootstrap mode).
     attest_config: Option<Arc<crate::attest::AttestationConfig>>,
 }
 
-/// Load the sender-certificate signing key from `SENTINEL_SENDER_CERT_KEY` (hex), or generate an
+/// Load the sender-certificate signing key from `NEDWONS_SENDER_CERT_KEY` (hex), or generate an
 /// ephemeral one (dev — a restart rotates it, invalidating in-flight certs, which is fine as they
 /// are short-lived).
 fn load_or_generate_sender_cert_key() -> p256::ecdsa::SigningKey {
-    if let Ok(hex_key) = std::env::var("SENTINEL_SENDER_CERT_KEY") {
+    if let Ok(hex_key) = std::env::var("NEDWONS_SENDER_CERT_KEY") {
         if let Ok(bytes) = hex::decode(hex_key.trim()) {
             if let Ok(key) = p256::ecdsa::SigningKey::from_slice(&bytes) {
                 return key;
             }
         }
-        tracing::error!("SENTINEL_SENDER_CERT_KEY is set but invalid; using an ephemeral key");
+        tracing::error!("NEDWONS_SENDER_CERT_KEY is set but invalid; using an ephemeral key");
     }
     p256::ecdsa::SigningKey::random(&mut rand_core::OsRng)
 }
@@ -152,8 +152,8 @@ pub fn build_router_cfg(
     let notifier = DeliveryNotifier::default();
 
     // Push wiring (#4): a device that is not connected is reached by a contentless APNs wake push.
-    // Configured from SENTINEL_APNS_* (disabled otherwise). The transport is the REAL HTTP/2 client
-    // (`SENTINEL_APNS_URL` overrides the host for sandbox/local); it is only contacted when the
+    // Configured from NEDWONS_APNS_* (disabled otherwise). The transport is the REAL HTTP/2 client
+    // (`NEDWONS_APNS_URL` overrides the host for sandbox/local); it is only contacted when the
     // service is enabled, so an unconfigured deployment opens no sockets.
     let push = crate::push::PushService::from_env(
         relay.clone(),
@@ -375,7 +375,7 @@ async fn proof_layer(State(state): State<AppState>, request: Request, next: Next
             .map(str::to_owned);
         let proof_hdr = request
             .headers()
-            .get("x-sentinel-proof")
+            .get("x-nedwons-proof")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         let method = request.method().as_str().as_bytes().to_vec();
@@ -1692,7 +1692,7 @@ struct AttestSubmitBody {
 }
 
 /// Submit an App Attest attestation for the authenticated device (#10). The outstanding challenge is
-/// consumed (anti-replay); then, when `SENTINEL_APP_ATTEST_APP_ID` is configured, the attestation
+/// consumed (anti-replay); then, when `NEDWONS_APP_ATTEST_APP_ID` is configured, the attestation
 /// object is **cryptographically verified** (`crate::attest`: chain to the pinned Apple root, nonce,
 /// key id, authData) and rejected outright on failure — a verified row is stored with
 /// `verified=true`. Unconfigured deployments store unverified (bootstrap mode). **Honest limit:**

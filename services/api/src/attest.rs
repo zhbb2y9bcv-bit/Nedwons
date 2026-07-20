@@ -82,16 +82,16 @@ pub struct AttestationConfig {
 }
 
 impl AttestationConfig {
-    /// From env: `SENTINEL_APP_ATTEST_APP_ID` (required — absent ⇒ verification disabled, `None`),
-    /// `SENTINEL_APP_ATTEST_ROOT_PEM` (optional override; default = the embedded Apple root),
-    /// `SENTINEL_APP_ATTEST_DEV` (accept development-environment attestations).
+    /// From env: `NEDWONS_APP_ATTEST_APP_ID` (required — absent ⇒ verification disabled, `None`),
+    /// `NEDWONS_APP_ATTEST_ROOT_PEM` (optional override; default = the embedded Apple root),
+    /// `NEDWONS_APP_ATTEST_DEV` (accept development-environment attestations).
     pub fn from_env() -> Option<Self> {
-        let app_id = std::env::var("SENTINEL_APP_ATTEST_APP_ID").ok()?;
-        let pem = std::env::var("SENTINEL_APP_ATTEST_ROOT_PEM")
+        let app_id = std::env::var("NEDWONS_APP_ATTEST_APP_ID").ok()?;
+        let pem = std::env::var("NEDWONS_APP_ATTEST_ROOT_PEM")
             .unwrap_or_else(|_| APPLE_APP_ATTEST_ROOT_PEM.to_string());
         let root = Certificate::from_pem(pem.as_bytes()).ok()?;
         let root_der = root.to_der().ok()?;
-        let allow_development = std::env::var("SENTINEL_APP_ATTEST_DEV").is_ok();
+        let allow_development = std::env::var("NEDWONS_APP_ATTEST_DEV").is_ok();
         Some(Self {
             app_id,
             root_der,

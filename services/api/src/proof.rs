@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// A parsed `X-Sentinel-Proof: v1;ts=<u64>;nonce=<32 hex>;sig=<hex>` header.
+/// A parsed `X-Nedwons-Proof: v1;ts=<u64>;nonce=<32 hex>;sig=<hex>` header.
 pub struct ParsedProof {
     pub timestamp: u64,
     pub nonce: [u8; 16],

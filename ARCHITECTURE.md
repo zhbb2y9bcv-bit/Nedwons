@@ -1,6 +1,6 @@
 # Architecture
 
-Working name: **Sentinel**. Platform scope: **Apple only** (iOS/iPadOS), per
+Working name: **Nedwons**. Platform scope: **Apple only** (iOS/iPadOS), per
 [ADR-0005](docs/adr/0005-apple-only-scope.md). Backend: **Rust modular monolith**, per
 [ADR-0004](docs/adr/0004-backend-language.md).
 

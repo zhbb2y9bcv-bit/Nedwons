@@ -15,7 +15,7 @@ use p256::ecdsa::SigningKey;
 use serde_json::json;
 
 use auth_core::ids::DeviceId;
-use sentinel_api::push::{ApnsConfig, ApnsRequest, PushService, PushTransport};
+use nedwons_api::push::{ApnsConfig, ApnsRequest, PushService, PushTransport};
 
 /// A transport that records requests instead of opening a socket to Apple.
 #[derive(Default)]
@@ -33,7 +33,7 @@ fn test_cfg() -> ApnsConfig {
     ApnsConfig {
         key_id: "ABC1234567".to_string(),
         team_id: "TEAM098765".to_string(),
-        topic: "app.sentinel.messenger".to_string(),
+        topic: "app.nedwons.messenger".to_string(),
         signing_key: SigningKey::from_slice(&[7u8; 32]).unwrap(),
     }
 }
@@ -93,7 +93,7 @@ async fn registered_token_gets_a_contentless_wake_push() {
     assert_eq!(sent.len(), 1, "one wake push to the registered token");
     assert_eq!(sent[0].path, "/3/device/abc123devicetoken");
     assert!(sent[0].authorization.starts_with("bearer "));
-    assert_eq!(sent[0].apns_topic, "app.sentinel.messenger");
+    assert_eq!(sent[0].apns_topic, "app.nedwons.messenger");
     let body = String::from_utf8(sent[0].body.clone()).unwrap();
     assert!(
         body.contains("mutable-content") && !body.contains("abc123"),

@@ -1,4 +1,4 @@
-//! `mls-core` — a narrow, memory-safe wrapper over OpenMLS (RFC 9420) for Sentinel's
+//! `mls-core` — a narrow, memory-safe wrapper over OpenMLS (RFC 9420) for Nedwons's
 //! end-to-end encrypted messaging (ADR-0001). No custom cryptography: every primitive comes
 //! from OpenMLS and its RustCrypto provider.
 //!

@@ -25,7 +25,7 @@
 use crate::ids::{AccountId, DeviceId, TxnId};
 
 /// ASCII domain-separation tag. Versioned; a new protocol version changes this string.
-pub const DOMAIN: &[u8] = b"app.sentinel.auth.v1";
+pub const DOMAIN: &[u8] = b"app.nedwons.auth.v1";
 
 /// Protocol version carried in the transcript. Bumping this is an explicit, non-silent
 /// change (INV-9): old and new versions produce different signed bytes.
@@ -94,7 +94,7 @@ mod tests {
     use crate::ids::{AccountId, DeviceId, TxnId};
 
     /// Golden cross-platform vector. The iOS Swift client's transcript encoder MUST produce
-    /// exactly these bytes for this input (see apps/ios/SentinelKit tests and
+    /// exactly these bytes for this input (see apps/ios/NedwonsKit tests and
     /// contracts/test-vectors/auth-transcript-login.hex). Changing this value is a
     /// wire-breaking change and requires a protocol-version bump.
     #[test]
@@ -129,7 +129,7 @@ mod tests {
         let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
         assert_eq!(
             hex,
-            "000000146170702e73656e74696e656c2e617574682e7631000102000000100011223344\
+            "000000136170702e6e6564776f6e732e617574682e7631000102000000100011223344\
              5566778899aabbccddeeff000000100102030405060708090a0b0c0d0e0f100000004104\
              000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20212223\
              2425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f0000002000010203\

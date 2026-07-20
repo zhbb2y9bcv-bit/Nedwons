@@ -13,9 +13,9 @@ use ciborium::value::Value;
 use rcgen::{BasicConstraints, CertificateParams, CustomExtension, IsCa, KeyPair};
 use sha2::{Digest, Sha256};
 
-use sentinel_api::attest::{verify_attestation, AttestError, AttestationConfig};
+use nedwons_api::attest::{verify_attestation, AttestError, AttestationConfig};
 
-const APP_ID: &str = "TEAM123.app.sentinel.demo";
+const APP_ID: &str = "TEAM123.app.nedwons.demo";
 const AAGUID_PROD: [u8; 16] = *b"appattest\0\0\0\0\0\0\0";
 const AAGUID_DEV: [u8; 16] = *b"appattestdevelop";
 

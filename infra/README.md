@@ -15,9 +15,9 @@ curl -s -X POST http://127.0.0.1:8080/v1/register/begin -H 'content-type: applic
 Or run the API against a local Homebrew Postgres without containers:
 
 ```bash
-createdb sentinel_dev
+createdb nedwons_dev
 cd services
-DATABASE_URL=postgres://localhost/sentinel_dev cargo run -p sentinel-api
+DATABASE_URL=postgres://localhost/nedwons_dev cargo run -p nedwons-api
 ```
 
 ## Verified in this environment (2026-07-17)
