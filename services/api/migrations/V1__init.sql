@@ -1,4 +1,4 @@
--- Sentinel auth schema v1. The database is the enforcement point for the atomicity
+-- Nedwons auth schema v1. The database is the enforcement point for the atomicity
 -- contracts documented on auth-core's store traits (ADR-0006):
 --   * single-use challenges  -> DELETE ... RETURNING
 --   * refresh rotation       -> SELECT ... FOR UPDATE + generation compare-and-swap

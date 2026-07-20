@@ -20,11 +20,11 @@ apps/ios/**/.swiftpm/
 *.dSYM
 
 # MLS UniFFI bridge derived artifacts — large/rebuildable via scripts/build_mls_ffi.sh (ADR-0007).
-# The generated Swift (apps/ios/SentinelMLS/Sources/MlsFfi/mls_ffi.swift) IS committed and
+# The generated Swift (apps/ios/NedwonsMLS/Sources/MlsFfi/mls_ffi.swift) IS committed and
 # stale-checked in CI; the XCFramework binary + provenance manifest + scratch generation are not.
 apps/ios/**/*.xcframework
 apps/ios/**/.build-xc/
-apps/ios/SentinelMLS/ARTIFACTS.md
+apps/ios/NedwonsMLS/ARTIFACTS.md
 core/mls-ffi/generated/
 
 # cargo-fuzz: keep the target + a small seed corpus committed; ignore crash artifacts + coverage.
@@ -51,10 +51,10 @@ secrets/
 sbom/
 **/*.cdx.json
 
-# Generated Xcode app project (xcodegen from apps/ios/Sentinel/project.yml — regenerable)
+# Generated Xcode app project (xcodegen from apps/ios/Nedwons/project.yml — regenerable)
 apps/ios/**/*.xcodeproj
 # Auto-grown fuzz corpus (regenerable); the deterministic tests + harness are what matter.
 core/mls-ffi/fuzz/corpus/secret_state/
 
 # Generated Info.plist (xcodegen from project.yml info: block — regenerable)
-apps/ios/Sentinel/Sentinel/
+apps/ios/Nedwons/Nedwons/

@@ -157,8 +157,8 @@ fn sth_encoding_is_canonical() {
     let b = encode_sth(5, &root, 1_700_000_000);
     assert_eq!(a, b, "deterministic");
     // Domain-separated: begins with the length-prefixed domain string.
-    assert_eq!(&a[0..8], &(28u64).to_be_bytes()); // STH_DOMAIN is 28 bytes
-    assert_eq!(&a[8..8 + 28], b"sentinel-transparency-sth-v1");
+    assert_eq!(&a[0..8], &(27u64).to_be_bytes()); // STH_DOMAIN is 27 bytes
+    assert_eq!(&a[8..8 + 27], b"nedwons-transparency-sth-v1");
     // Each field participates: changing any one changes the bytes.
     assert_ne!(a, encode_sth(6, &root, 1_700_000_000), "tree_size matters");
     assert_ne!(

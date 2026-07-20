@@ -6,16 +6,16 @@ that extension.
 
 ## What's built (and how it's tested)
 
-- **`PushInboxDecoder`** (`apps/ios/SentinelApp/Sources/SentinelPush`) — the extension-safe decode
+- **`PushInboxDecoder`** (`apps/ios/NedwonsApp/Sources/NedwonsPush`) — the extension-safe decode
   logic: given a freshly-`open`ed `MlsClient` and the fetched inbox, it processes the new envelopes
   through the **real MLS core** and returns what to show (the newest normal message's body; a
   generic "Secret message" for a view-once, whose plaintext is NEVER put in the notification; control
   / duplicate messages surface nothing). Unit-tested against the real core in
   `PushInboxDecoderTests` (normal body, secret-generic-without-leak, newest-wins, control-only → nil).
-- **`SentinelPush`** is a **leaf module** depending only on `SentinelKit` (HTTP) + `MlsFfi` (MLS) —
-  NOT `SentinelUI` — because app extensions forbid app-only API / SwiftUI `App` types. The app and
+- **`NedwonsPush`** is a **leaf module** depending only on `NedwonsKit` (HTTP) + `MlsFfi` (MLS) —
+  NOT `NedwonsUI` — because app extensions forbid app-only API / SwiftUI `App` types. The app and
   the NSE both link it.
-- **`NotificationService`** (`apps/ios/Sentinel/NotificationService`) — the NSE shell:
+- **`NotificationService`** (`apps/ios/Nedwons/NotificationService`) — the NSE shell:
   synchronously (an NSE may block for its ~30s budget) it fetches the inbox, decodes via
   `PushInboxDecoder`, acks, and rewrites the alert; the two async client calls are bridged to
   blocking, crossing only `Sendable` results, so the non-`Sendable` notification content stays on one
@@ -39,9 +39,9 @@ crashes or blocks the system.
 `SharedNotificationContext.current()` returns `nil` until these exist, so today the NSE safely shows
 the generic wake:
 
-- An **App Group** (`group.app.sentinel...`) shared between the app and the NSE, holding the MLS
+- An **App Group** (`group.app.nedwons...`) shared between the app and the NSE, holding the MLS
   store + the `flock` file (`FileManager.containerURL(forSecurityApplicationGroupIdentifier:)`).
-- A **shared Keychain access group** (stubbed in `Sentinel.entitlements`) so the NSE reads the same
+- A **shared Keychain access group** (stubbed in `Nedwons.entitlements`) so the NSE reads the same
   session token + at-rest root the app enrolled.
 - The push capability + the NSE embedded in the signed app (already wired in `project.yml`).
 

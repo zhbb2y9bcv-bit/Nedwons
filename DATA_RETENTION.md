@@ -7,7 +7,7 @@ unrecoverable.
 
 | Data class | Retention target | Mechanism | Notes |
 |------------|------------------|-----------|-------|
-| Undelivered ciphertext envelope | Until delivered, else **30-day** queue TTL (`SENTINEL_ENVELOPE_TTL_DAYS`, default 30) | Relay queue TTL job (minutely, **bounded batches** so a backlog drains without one long table-locking DELETE) | After TTL, envelope is purged; sender sees "failed". |
+| Undelivered ciphertext envelope | Until delivered, else **30-day** queue TTL (`NEDWONS_ENVELOPE_TTL_DAYS`, default 30) | Relay queue TTL job (minutely, **bounded batches** so a backlog drains without one long table-locking DELETE) | After TTL, envelope is purged; sender sees "failed". |
 | Delivered ciphertext envelope | Purged from server **on delivery ack** | Relay | Server does not retain delivered message ciphertext as a store; the device is the store. |
 | Ciphertext attachment (object store) | **30-day** TTL or on message deletion | Object lifecycle policy | Keys live only in the E2EE envelope; expiring the object is sufficient. |
 | Disappearing-message queue copy | min(disappearing timer, queue TTL) | Relay TTL | Client-enforced too; honest limits (R-901). |

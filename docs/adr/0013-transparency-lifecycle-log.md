@@ -12,7 +12,7 @@
 ## Problem (R-201 residual)
 
 The transparency log (`auth_core::transparency` + `services/api/src/transparency.rs` +
-`SentinelKit/Transparency.swift`) today logs **only device additions** — one leaf per
+`NedwonsKit/Transparency.swift`) today logs **only device additions** — one leaf per
 account→device-key **binding**, appended at registration / enrollment / recovery. A self-monitoring
 client checks that *its own* binding is present under the signed root, so the server cannot
 **silently add** a device-key it never logged.
@@ -40,7 +40,7 @@ only sound fix is an explicit, unambiguous **leaf-type tag on every leaf**.
 ## Decision
 
 Introduce **leaf schema v2**: every leaf gains a leading domain-separated header
-`len32(DOMAIN) || u8(LEAF_KIND)`, with a versioned `DOMAIN = "app.sentinel.kt-leaf.v2"`.
+`len32(DOMAIN) || u8(LEAF_KIND)`, with a versioned `DOMAIN = "app.nedwons.kt-leaf.v2"`.
 
 ```
 leaf_v2 = len32(DOMAIN) || u8(KIND) || body
@@ -89,7 +89,7 @@ The log is append-only; existing v1 binding leaves **cannot be rewritten**. So:
    self-monitor (which reads the earliest leaf) is undisturbed. **Deliberately NOT done in this
    slice:** switching *binding* appends to v2 — the shipped Swift verifier reconstructs v1 binding
    leaves, so that flip must wait until slice 3 teaches the client to parse both.
-3. **SentinelKit (remaining):** parse both schemas; add the "was my device revoked without my
+3. **NedwonsKit (remaining):** parse both schemas; add the "was my device revoked without my
    action?" monitor. Only after that is it safe to flip binding appends to v2.
 
 Each slice is committed and tested on its own. Slices 1–2 have landed; slice 3 (client) remains, so

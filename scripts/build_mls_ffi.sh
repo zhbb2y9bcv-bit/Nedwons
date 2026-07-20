@@ -17,7 +17,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FFI="$ROOT/core/mls-ffi"
-PKG="$ROOT/apps/ios/SentinelMLS"
+PKG="$ROOT/apps/ios/NedwonsMLS"
 BINDINGS_DIR="$PKG/Sources/MlsFfi"
 XCF="$PKG/MlsFfi.xcframework"
 STAGE="$FFI/target/apple-stage"
@@ -27,7 +27,7 @@ IOS="aarch64-apple-ios"
 SIM="aarch64-apple-ios-sim"
 LIB="libmls_ffi"
 
-# Deployment targets match SentinelKit/Package.swift (ADR-0007).
+# Deployment targets match NedwonsKit/Package.swift (ADR-0007).
 export MACOSX_DEPLOYMENT_TARGET="14.0"
 export IPHONEOS_DEPLOYMENT_TARGET="17.0"
 

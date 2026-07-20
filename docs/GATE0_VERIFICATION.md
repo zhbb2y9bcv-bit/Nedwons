@@ -19,8 +19,8 @@ run — not assumed from the status report. Commands and results are recorded ve
 |------|---------|-------|
 | Rust (cargo/rustc) | 1.97.1 | Installed via rustup; **not on default PATH** — must `export PATH="$HOME/.cargo/bin:$PATH"`. |
 | clippy / rustfmt | 0.1.97 / 1.9.0 | |
-| Swift | 6.3.3 (Apple) | Builds SentinelKit + SentinelUI for **macOS host**, not iOS. |
-| PostgreSQL | 17.10 (Homebrew) | Running; `sentinel_test` and `sentinel_dev` DBs present. |
+| Swift | 6.3.3 (Apple) | Builds NedwonsKit + NedwonsUI for **macOS host**, not iOS. |
+| PostgreSQL | 17.10 (Homebrew) | Running; `nedwons_test` and `nedwons_dev` DBs present. |
 | Docker | 29.6.2 | Available (compose not exercised in this pass). |
 | cargo-audit | 0.22.2 | **Was not installed** — installed during this pass to run SCA for the first time. |
 
@@ -39,12 +39,12 @@ Working tree: clean, branch `main`, 10 commits.
 | auth-core fmt | `cargo fmt --manifest-path auth-core/Cargo.toml -- --check` | **clean** |
 | auth-core tests | `cargo test --manifest-path auth-core/Cargo.toml` | **18 passed** (1 unit + 17 invariants) |
 | workspace clippy | `cargo clippy --workspace --all-targets -- -D warnings` | **clean** |
-| api integration | `cargo test -p sentinel-api` (TEST_DATABASE_URL) | **27 passed** (http 6, load 3, pg_invariants 6, relay_e2ee 5, social 5, ws_stream 2) |
+| api integration | `cargo test -p nedwons-api` (TEST_DATABASE_URL) | **27 passed** (http 6, load 3, pg_invariants 6, relay_e2ee 5, social 5, ws_stream 2) |
 | mls-core clippy | `cargo clippy --all-targets -- -D warnings` | **clean** |
 | mls-core tests | `cargo test` | **3 passed** (e2ee) |
 | mls-core fmt | `cargo fmt -- --check` | **DIFF (not clean)** — see R-G0-3 |
-| Swift build | `swift build` | **clean** (compiles SentinelKit + SentinelUI on macOS) |
-| Swift tests | `swift test` | **7 passed** (AuthTranscript 3, ClientTranscripts 3, SentinelClient 1) |
+| Swift build | `swift build` | **clean** (compiles NedwonsKit + NedwonsUI on macOS) |
+| Swift tests | `swift test` | **7 passed** (AuthTranscript 3, ClientTranscripts 3, NedwonsClient 1) |
 | live smoke | `scripts/swift_backend_smoke.sh` | **SMOKE_OK** (real server + real HTTP; register/login/whoami, INV-2 negative, social+group+message, clique gate) |
 | SCA (services) | `cargo audit` | **6 vulnerabilities + 2 warnings** — see R-G0-1 |
 | SCA (mls-core) | `cargo audit` | same 6 + 2 (shared libcrux backend) |
@@ -73,8 +73,8 @@ Status legend: **V** verified · **P** partially verified (real but boundary not
 | 9 | At-least-once, persist-before-ack, idempotent send | `relay.rs peek/ack/fanout`, migration V3 | `peek_is_non_destructive_until_ack`, `concurrent_duplicate_sends_dedup_to_one` | Client-side crash-safety (no client state machine exists) | **V** (server) |
 | 10 | Long-poll + WebSocket delivery | `http.rs /v1/inbox`, `/v1/stream`, `notify.rs` | `inbox_long_poll_wakes_on_delivery`, `websocket_pushes_new_envelopes_instantly`, `websocket_requires_auth`, `idle_waiters_exceed_pool_without_deadlock` | Slow-consumer, revoked-session mid-stream, multi-instance fanout | **V** (single instance) |
 | 11 | Profiles, username search, friends, requests, groups, conversation list | `social.rs`, `http.rs`, migration V4 | `profile_update_get_and_search`, `friend_request_accept_flow`, `mutual_requests_auto_accept`, `group_*`, list-conversations in smoke | IDOR sweep across all object endpoints; homoglyph/normalization abuse | **V** (functional) |
-| 12 | SentinelKit: SE signer, Keychain, transcript, HTTP client | `SentinelKit/*.swift` | Swift 7 tests; `InteropEmit`→`verify_interop` (Swift-signs/Rust-verifies); transcript golden vectors | Keychain never exercised (no device) | **V** (interop) / **U** (Keychain on device) |
-| 13 | SentinelUI wired screens; buttons call backend | `SentinelUI/*.swift`, `AppModel.swift` | compiles on macOS; smoke exercises same client calls | Never run on iOS; SwiftUI runtime unproven | **P** |
+| 12 | NedwonsKit: SE signer, Keychain, transcript, HTTP client | `NedwonsKit/*.swift` | Swift 7 tests; `InteropEmit`→`verify_interop` (Swift-signs/Rust-verifies); transcript golden vectors | Keychain never exercised (no device) | **V** (interop) / **U** (Keychain on device) |
+| 13 | NedwonsUI wired screens; buttons call backend | `NedwonsUI/*.swift`, `AppModel.swift` | compiles on macOS; smoke exercises same client calls | Never run on iOS; SwiftUI runtime unproven | **P** |
 | 14 | 55 tests + live smoke, all green | (all of the above) | reproduced this pass | — | **V** |
 | 15 | No device run, no App Attest, no MLS↔Swift binding, no rendering, no key transparency, no recovery, no audit | — | grep: no `DCAppAttest`/App Attest; **no FFI surface** (`extern`/`uniffi`/`no_mangle` = none); `mls-core` used only by its own tests | — | **V (absent, as stated)** |
 

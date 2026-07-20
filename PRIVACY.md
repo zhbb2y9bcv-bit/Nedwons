@@ -1,6 +1,6 @@
 # Privacy
 
-Privacy is the default. Sentinel collects the minimum data necessary to deliver encrypted
+Privacy is the default. Nedwons collects the minimum data necessary to deliver encrypted
 messages and defend the service from abuse. This document is the source for the eventual
 Apple Privacy "Nutrition Label", the iOS privacy manifest, permission purpose strings, and
 the public privacy policy — all of which must **match actual behavior** (RISK_REGISTER

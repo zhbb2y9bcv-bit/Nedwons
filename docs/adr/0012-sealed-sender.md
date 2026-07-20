@@ -71,15 +71,15 @@ recipient still cryptographically verifies the sender (no spoofing). Content sec
 
 Adopt Signal-style sealed sender. **Slice 1a (this change):** the sender-certificate primitive
 (`auth_core::sender_cert` — canonical encode + verify with expiry) and the client-side verifier
-(`SentinelKit.SenderCertificate`, byte-identical + golden-tested cross-language). **Slice 1b
-(landed 2026-07-18):** a dedicated server sender-certificate key (`SENTINEL_SENDER_CERT_KEY`,
+(`NedwonsKit.SenderCertificate`, byte-identical + golden-tested cross-language). **Slice 1b
+(landed 2026-07-18):** a dedicated server sender-certificate key (`NEDWONS_SENDER_CERT_KEY`,
 ephemeral fallback in dev; distinct from the auth/transparency keys) and `GET
 /v1/sender-certificate`, which issues a short-lived (`SENDER_CERT_TTL_SECS`, 24h) signed certificate
 for the authenticated device. The response includes the cert public key so clients can pin it out of
 band and verify without the relay ever seeing the sender; the relay stays MLS-blind (it only signs
 `{account, device, device pubkey, expiry}` bytes). Integration-tested: the signature verifies under
 the returned key, binds the device's own public key, and a tampered key fails. The **client half**
-also landed: `SentinelClient.fetchSenderCertificate` decodes the issuance response into an
+also landed: `NedwonsClient.fetchSenderCertificate` decodes the issuance response into an
 `IssuedSenderCertificate` (certificate + signature + echoed cert key) with
 `verify(pinnedCertPublicKeyX963:now:)`, unit-tested via a stub transport (verifies under the pinned
 key, rejects a substituted key, rejects once expired). **Slice 2 (in progress):** the sealed-sender

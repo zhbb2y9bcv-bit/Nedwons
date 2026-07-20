@@ -1,7 +1,7 @@
 [package]
-name = "sentinel-api"
+name = "nedwons-api"
 version = "0.1.0"
-description = "Sentinel backend: PostgreSQL-backed stores and the HTTP authentication API."
+description = "Nedwons backend: PostgreSQL-backed stores and the HTTP authentication API."
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
