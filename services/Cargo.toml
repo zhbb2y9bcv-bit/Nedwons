@@ -16,3 +16,10 @@ rust-version = "1.85"
 # Security-relevant hardening for release builds.
 overflow-checks = true
 panic = "abort"
+
+# PQ: the shipped nedwons-api binary is MLS-blind and never links OpenMLS. But `mls-core` is a
+# dev-dependency (the integration tests drive real MLS clients through the relay), and it now uses
+# the hybrid X-Wing ciphersuite — which needs the vendored provider. Patch it here too so the test
+# build resolves the same PQ-enabled, advisory-fixed provider (see core/vendor/openmls_rust_crypto).
+[patch.crates-io]
+openmls_rust_crypto = { path = "../core/vendor/openmls_rust_crypto" }

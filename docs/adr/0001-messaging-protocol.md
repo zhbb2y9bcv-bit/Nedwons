@@ -34,7 +34,8 @@ library integrates cleanly on both client (via FFI) and server.
 
 Adopt **MLS (RFC 9420)** as the messaging protocol, implemented with **OpenMLS 0.8.1
 (MIT)**, used through a narrow adapter in `core/`. Ciphersuite is chosen **explicitly and
-versioned** (default `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`); no silent suite
+versioned** (pinned `MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519` — hybrid post-quantum KEM,
+see ADR-0016; was `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`); no silent suite
 negotiation. Test vectors are shared across iOS and backend.
 
 ## Consequences

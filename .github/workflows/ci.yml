@@ -119,43 +119,26 @@ jobs:
         run: cargo install cargo-audit --locked
       # Ignored advisories are documented per-ID with target-reachability analysis and a removal
       # trigger in docs/SECURITY_AUDIT_EXCEPTIONS.md (tracked as RISK_REGISTER R-505). Any NEW
-      # advisory not on this list fails the build. Both Rust workspaces are scanned (separate
+      # advisory not on this list fails the build. All three Rust workspaces are scanned (separate
       # Cargo.lock files). Keep this list identical to the exceptions doc.
+      # The seven libcrux advisories were RESOLVED by the post-quantum provider upgrade (ADR-0016):
+      # the hpke-rs 0.7 stack moved the whole libcrux chain to advisory-fixed versions
+      # (sha3 0.0.10, secrets 0.0.6) and dropped libcrux-aesgcm entirely. Only the compile-time
+      # proc-macro-error2 advisory remains.
       - name: cargo audit (services workspace)
         working-directory: services
         run: |
           cargo audit \
-            --ignore RUSTSEC-2026-0124 \
-            --ignore RUSTSEC-2026-0207 \
-            --ignore RUSTSEC-2026-0208 \
-            --ignore RUSTSEC-2026-0209 \
-            --ignore RUSTSEC-2026-0210 \
-            --ignore RUSTSEC-2026-0211 \
-            --ignore RUSTSEC-2026-0212 \
             --ignore RUSTSEC-2026-0173
       - name: cargo audit (mls-core)
         working-directory: core/mls-core
         run: |
           cargo audit \
-            --ignore RUSTSEC-2026-0124 \
-            --ignore RUSTSEC-2026-0207 \
-            --ignore RUSTSEC-2026-0208 \
-            --ignore RUSTSEC-2026-0209 \
-            --ignore RUSTSEC-2026-0210 \
-            --ignore RUSTSEC-2026-0211 \
-            --ignore RUSTSEC-2026-0212 \
             --ignore RUSTSEC-2026-0173
       - name: cargo audit (mls-ffi)
         working-directory: core/mls-ffi
         run: |
           cargo audit \
-            --ignore RUSTSEC-2026-0124 \
-            --ignore RUSTSEC-2026-0207 \
-            --ignore RUSTSEC-2026-0208 \
-            --ignore RUSTSEC-2026-0209 \
-            --ignore RUSTSEC-2026-0210 \
-            --ignore RUSTSEC-2026-0211 \
-            --ignore RUSTSEC-2026-0212 \
             --ignore RUSTSEC-2026-0173
       - name: Secret scan
         uses: gitleaks/gitleaks-action@v2

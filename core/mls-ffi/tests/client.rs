@@ -202,7 +202,7 @@ fn capabilities_report_the_pinned_contract() {
     assert_eq!(c.protocol, "MLS 1.0 (RFC 9420)");
     assert_eq!(
         c.ciphersuite,
-        "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519"
+        "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519"
     );
     assert_eq!(c.storage_format_version, 1);
     assert_eq!(c.max_plaintext, 64 * 1024);
