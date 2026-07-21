@@ -25,13 +25,20 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 pub mod durable;
 
 /// The single, explicit ciphersuite for v1 (CRYPTOGRAPHY.md §1). No silent negotiation.
-pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+///
+/// **Hybrid post-quantum** (0x004D): the HPKE KEM is X-Wing = X25519 **and** ML-KEM-768 combined,
+/// so key establishment (key packages, Welcomes, commit path secrets) resists
+/// harvest-now-decrypt-later — while never being weaker than the classical X25519 suite even if
+/// ML-KEM falls. Signatures remain Ed25519 (classical): authentication is verified in real time,
+/// so it carries no HNDL exposure (ADR-0016). Requires the vendored provider
+/// (`core/vendor/openmls_rust_crypto`) that implements the X-Wing KEM arm.
+pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519;
 
 /// This crate's version, surfaced across the FFI so the client can assert compatibility.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Human-readable ciphersuite name (stable string for the FFI `capabilities()` report).
-pub const CIPHERSUITE_NAME: &str = "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519";
+pub const CIPHERSUITE_NAME: &str = "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519";
 
 #[derive(Debug, thiserror::Error)]
 pub enum MlsError {

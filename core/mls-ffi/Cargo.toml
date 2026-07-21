@@ -36,3 +36,8 @@ path = "src/bin/uniffi-bindgen.rs"
 mls-core = { path = "../mls-core" }
 uniffi = { version = "0.29", features = ["cli"] }
 thiserror = "1"
+
+# PQ: same vendored-provider substitution as core/mls-core (this is a separate workspace root,
+# so the patch must be repeated here). See core/vendor/openmls_rust_crypto/README.md.
+[patch.crates-io]
+openmls_rust_crypto = { path = "../vendor/openmls_rust_crypto" }
