@@ -15,7 +15,13 @@ once_cell = "1"
 arbitrary = { version = "1", features = ["derive"] }
 
 # Its own workspace so it is not built by the parent's `cargo test` (needs nightly + libfuzzer).
+# Being a distinct workspace root, it must repeat the PQ vendored-provider patch (see
+# core/vendor/openmls_rust_crypto/README.md) — otherwise it links the un-patched crates.io provider
+# whose X-Wing KEM arm is `unimplemented!()`.
 [workspace]
+
+[patch.crates-io]
+openmls_rust_crypto = { path = "../../vendor/openmls_rust_crypto" }
 
 [[bin]]
 name = "envelope"

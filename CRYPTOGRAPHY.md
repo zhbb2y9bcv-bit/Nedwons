@@ -12,7 +12,7 @@ See [ADR-0001](docs/adr/0001-messaging-protocol.md) for the protocol selection r
 | Purpose | Choice | Source / provenance | Notes |
 |---------|--------|---------------------|-------|
 | Group + 1:1 messaging protocol | **MLS (RFC 9420)** via **OpenMLS 0.8.1** | crates.io, MIT license (verified 2026-07-17) | Integrated in `core/mls-core` behind a narrow API. One protocol for 1:1 and groups; epoch-based membership; forward secrecy + post-compromise security. Tests prove no plaintext in ciphertext and removed-member epoch exclusion. |
-| Message AEAD / KDF | Provided by MLS ciphersuite | RustCrypto within OpenMLS | We do **not** mix suites ad hoc; the ciphersuite is chosen explicitly and versioned. Default: `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519` (classical). |
+| Message AEAD / KDF | Provided by MLS ciphersuite | RustCrypto within OpenMLS | We do **not** mix suites ad hoc; the ciphersuite is chosen explicitly and versioned. Pinned: `MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519` (**hybrid post-quantum KEM**, classical signatures — ADR-0016). |
 | Device proof-of-possession signature | **ECDSA P-256** | `p256` crate (RustCrypto) | Server-side verification; client signer is the Secure Enclave. Deterministic (RFC 6979) on the software test side. |
 | Password hashing | **Argon2id (RFC 9106)** | `argon2` crate (RustCrypto) | Unique per-account salt; params benchmarked per environment (§Argon2 tuning); optional KMS pepper (R-303). |
 | Attachment encryption | Per-object random key, chunked AEAD | RustCrypto AEAD | Fresh key per attachment; keys travel only inside the E2EE envelope. |
@@ -41,9 +41,20 @@ CycloneDX **SBOM** is generated per build (R-501, `scripts/generate_sbom.sh`).
 
 ## 3. Post-quantum
 
-Classical MLS ciphersuite in v1. A hybrid PQ path is a documented direction, gated on
-standardized, reviewed MLS PQ ciphersuites being available in OpenMLS. **We do not
-advertise PQ security today** (RISK_REGISTER R-203).
+**Hybrid post-quantum key establishment (ADR-0016).** The pinned MLS ciphersuite is
+`MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519`: the KEM is **X-Wing** = X25519 **+** ML-KEM-768,
+so MLS key agreement (key packages, Welcomes, commit path secrets) resists
+harvest-now-decrypt-later, while — being hybrid — never being weaker than the classical X25519
+suite even if ML-KEM is later found flawed. This closes the confidentiality side of R-203.
+
+**Signatures remain classical (Ed25519), by design.** Verification happens in real time, so
+signatures carry no harvest-now-decrypt-later exposure; and the Apple Secure Enclave has no PQ
+support, so a PQ-only signature would mean giving up hardware-backed device identity (ADR-0002) —
+a worse trade than the risk it removes. The end state is hybrid dual-signing (Enclave P-256 +
+software ML-DSA), which the versioned transcripts leave room for; tracked as **R-908**.
+
+**Scope discipline:** we advertise **post-quantum confidentiality**, not post-quantum
+authentication. Do not claim "fully post-quantum."
 
 ## 4. The canonical authentication transcript
 

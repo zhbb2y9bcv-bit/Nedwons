@@ -171,7 +171,7 @@ final class MlsFfiBridgeTests: XCTestCase {
     func testCapabilitiesReportPinnedContract() {
         let c = capabilities()
         XCTAssertEqual(c.protocol, "MLS 1.0 (RFC 9420)")
-        XCTAssertEqual(c.ciphersuite, "MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519")
+        XCTAssertEqual(c.ciphersuite, "MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519")
         XCTAssertEqual(c.storageFormatVersion, 1)
         XCTAssertEqual(c.maxPlaintext, 64 * 1024)
         XCTAssertFalse(bindingVersion().isEmpty)
