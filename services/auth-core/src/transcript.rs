@@ -1,7 +1,5 @@
-//! The canonical, domain-separated authentication transcript (CRYPTOGRAPHY.md §4).
-//!
-//! Every device-binding operation signs the byte string produced by [`encode`]. The
-//! encoding is:
+//! The canonical, domain-separated authentication transcript (CRYPTOGRAPHY.md §4). Every
+//! device-binding operation signs these bytes:
 //!
 //! ```text
 //! len32(DOMAIN) || DOMAIN || u16(PROTOCOL) || u8(ACTION)
@@ -13,25 +11,24 @@
 //!   || len32(TXN_ID)     || TXN_ID
 //! ```
 //!
-//! Two properties matter and are tested:
-//!  * **Unambiguous** — every variable field is length-prefixed, so no two distinct field
-//!    vectors serialize to the same bytes (prevents field-splicing/confusion).
-//!  * **Purpose-bound** — `DOMAIN` + `ACTION` bind a signature to one operation, so a
-//!    signature captured for one action cannot be replayed as another.
+//! Two tested properties:
+//!  * **Unambiguous** — every variable field is length-prefixed, so no two distinct field vectors
+//!    serialize alike (prevents field splicing).
+//!  * **Purpose-bound** — `DOMAIN` + `ACTION` bind a signature to one operation, so a signature
+//!    captured for one action cannot be replayed as another.
 //!
-//! This module is deliberately platform-neutral (ADR-0005): the iOS client reproduces this
-//! exact encoding, and shared test vectors keep the two byte-identical.
+//! Platform-neutral (ADR-0005): the iOS client reproduces this encoding, kept byte-identical by
+//! shared test vectors.
 
 use crate::ids::{AccountId, DeviceId, TxnId};
 
-/// ASCII domain-separation tag. Versioned; a new protocol version changes this string.
+/// Versioned; a new protocol version changes this string.
 pub const DOMAIN: &[u8] = b"app.nedwons.auth.v1";
 
-/// Protocol version carried in the transcript. Bumping this is an explicit, non-silent
-/// change (INV-9): old and new versions produce different signed bytes.
+/// Bumping this is an explicit, non-silent change (INV-9): old and new produce different bytes.
 pub const PROTOCOL_VERSION: u16 = 1;
 
-/// The operation a transcript authorizes. The `u8` tag is part of the signed bytes.
+/// The `u8` tag is part of the signed bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Action {
@@ -43,23 +40,21 @@ pub enum Action {
     AccountDelete = 6,
 }
 
-/// The fields bound into a single signed transcript.
 pub struct Transcript<'a> {
     pub action: Action,
     pub account_id: &'a AccountId,
     pub device_id: &'a DeviceId,
     /// SEC1-encoded P-256 public key of the signing device.
     pub public_key: &'a [u8],
-    /// 32-byte server challenge (for refresh, the SHA-256 of the rotating refresh token).
+    /// 32-byte server challenge; for refresh, SHA-256 of the rotating refresh token.
     pub challenge: &'a [u8],
     pub expires_at: u64,
     pub txn_id: &'a TxnId,
 }
 
 impl<'a> Transcript<'a> {
-    /// Produce the canonical byte string to be signed/verified.
+    /// The canonical byte string to sign or verify.
     pub fn encode(&self) -> Vec<u8> {
-        // Pre-size to avoid reallocation churn; exact size is not security-relevant.
         let mut out = Vec::with_capacity(
             4 + DOMAIN.len()
                 + 2
@@ -82,7 +77,7 @@ impl<'a> Transcript<'a> {
     }
 }
 
-/// Append a big-endian u32 length prefix followed by the field bytes.
+/// Big-endian u32 length prefix, then the field bytes.
 fn put_lp(out: &mut Vec<u8>, field: &[u8]) {
     out.extend_from_slice(&(field.len() as u32).to_be_bytes());
     out.extend_from_slice(field);
@@ -93,10 +88,8 @@ mod tests {
     use super::*;
     use crate::ids::{AccountId, DeviceId, TxnId};
 
-    /// Golden cross-platform vector. The iOS Swift client's transcript encoder MUST produce
-    /// exactly these bytes for this input (see apps/ios/NedwonsKit tests and
-    /// contracts/test-vectors/auth-transcript-login.hex). Changing this value is a
-    /// wire-breaking change and requires a protocol-version bump.
+    /// The Swift encoder MUST produce exactly these bytes (contracts/test-vectors/
+    /// auth-transcript-login.hex). Changing this is wire-breaking and needs a version bump.
     #[test]
     fn login_transcript_golden_vector() {
         let account_id = AccountId([

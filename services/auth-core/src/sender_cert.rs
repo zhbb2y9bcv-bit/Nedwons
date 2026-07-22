@@ -1,12 +1,10 @@
 //! Sealed-sender **sender certificate** (ADR-0012, R-204).
 //!
-//! The server issues each device a short-lived certificate binding `{account, device, sender
-//! public key, expires_at}`, signed with a dedicated **sender-certificate key** (ECDSA-P256). A
-//! sender embeds this certificate *inside* the E2EE payload of a sealed-sender message, so the
-//! recipient — and only the recipient — learns and verifies who sent it, while the relay that
-//! delivered the message never saw the sender. The encoding is the same injective, domain-separated
-//! discipline as the auth transcript, so no two distinct certificates collide and a signature over
-//! one cannot be replayed as any other protocol object.
+//! A short-lived server-signed binding of `{account, device, sender public key, expires_at}`. The
+//! sender embeds it INSIDE the E2EE payload, so only the recipient learns and verifies who sent the
+//! message while the delivering relay never saw the sender. Same injective, domain-separated
+//! discipline as the auth transcript, so one certificate's signature cannot be replayed as another
+//! protocol object.
 
 use crate::crypto::verify_p256;
 use crate::ids::{AccountId, DeviceId};
@@ -14,14 +12,12 @@ use crate::ids::{AccountId, DeviceId};
 /// Versioned domain-separation tag.
 pub const DOMAIN: &[u8] = b"app.nedwons.sender-cert.v1";
 
-/// The fields bound into one sender certificate.
 pub struct SenderCert<'a> {
     pub account_id: &'a AccountId,
     pub device_id: &'a DeviceId,
-    /// SEC1-encoded P-256 public key of the sending device (the key the recipient checks the MLS
-    /// sender against).
+    /// SEC1 P-256 key the recipient checks the MLS sender against.
     pub sender_public_key: &'a [u8],
-    /// Unix seconds. Certificates are short-lived so a leaked/rotated key stops being trusted.
+    /// Short-lived, so a leaked or rotated key stops being trusted.
     pub expires_at: u64,
 }
 
@@ -39,8 +35,7 @@ impl<'a> SenderCert<'a> {
         out
     }
 
-    /// Verify `signature` over this certificate against the **pinned** sender-certificate public
-    /// key (SEC1), and that it has not expired at `now`. Fail-closed boolean.
+    /// Against the **pinned** cert key (SEC1), plus expiry at `now`. Fail-closed.
     pub fn verify(&self, cert_public_key_sec1: &[u8], signature: &[u8], now: u64) -> bool {
         if now > self.expires_at {
             return false;

@@ -1,24 +1,17 @@
-//! `mls-ffi` — the UniFFI boundary exposing `mls-core`'s MLS client to Swift (ADR-0007).
-//!
-//! This crate is a **thin marshalling shim**. All MLS/crypto logic lives in `mls-core`
-//! (`#![forbid(unsafe_code)]`); the unavoidable `unsafe extern "C"` scaffolding that any FFI needs
-//! is generated here by UniFFI and confined to this small, fuzzable boundary.
+//! UniFFI boundary exposing `mls-core`'s client to Swift (ADR-0007). A thin marshalling shim: all
+//! MLS/crypto logic stays in `mls-core` (`#![forbid(unsafe_code)]`); the unavoidable `unsafe
+//! extern "C"` scaffolding is generated here, confined to this small, fuzzable boundary.
 //!
 //! ## Contract (frozen in ADR-0007 v2)
-//! - **Object per client, not a handle registry.** Swift holds an `Arc<MlsClient>`; its lifetime is
-//!   ARC-managed. There is no shared `u64` registry, which removes stale-handle / ABA / cross-client
-//!   / registry-exhaustion hazards by construction. `close()` gives explicit invalidation.
-//! - **Single-writer per client.** All state is behind one `Mutex<ClientState>`; a given MLS group
-//!   lives in exactly one client, so concurrent mutation of one group is impossible.
-//! - **One persistence authority.** The only durable store is `mls_core::durable::DurableSession`
-//!   over a `Journal` (an encrypted, atomically-committed blob = MLS store snapshot + message
-//!   state). This crate never introduces a second store.
-//! - **Bytes only across the boundary.** Key packages, welcomes, envelopes, ciphertext, and
-//!   decrypted *application plaintext* cross; **no OpenMLS object, provider/store blob, ratchet
-//!   secret, or signing key ever crosses.** There is deliberately no `export_store` on this surface.
-//! - **Bounded, typed, redacted.** Every byte input is length-checked before parsing; errors are a
-//!   coarse `MlsClientError` with variant-only messages; every entry point is `catch_unwind`-wrapped
-//!   so no panic can unwind across the C ABI.
+//! - **Object per client, not a handle registry.** Swift holds an ARC-managed `Arc<MlsClient>` — no
+//!   shared `u64` registry, so no stale-handle/ABA/cross-client hazards. `close()` invalidates.
+//! - **Single-writer per client.** One `Mutex<ClientState>`; a given MLS group lives in exactly one
+//!   client, so concurrent mutation of one group is impossible.
+//! - **One persistence authority.** Only `DurableSession` over a `Journal`; never a second store.
+//! - **Bytes only cross.** No OpenMLS object, store blob, ratchet secret, or signing key ever
+//!   crosses; there is deliberately no `export_store` on this surface.
+//! - **Bounded, typed, redacted.** Inputs length-checked before parsing; variant-only error
+//!   messages; every entry point `catch_unwind`-wrapped so no panic unwinds across the C ABI.
 
 uniffi::setup_scaffolding!();
 
@@ -35,11 +28,11 @@ use mls_core::durable::{
 };
 use mls_core::{Member, MlsError, CIPHERSUITE_NAME, VERSION as CORE_VERSION};
 
-/// Maximum messages one `messages_page` call returns (bounds per-call FFI marshalling).
+/// Bounds per-call FFI marshalling.
 pub const MAX_PAGE_MESSAGES: u32 = 256;
 
-/// Stable, coarse, **redacted** error surface. Messages are variant-only: no library internals, key
-/// bytes, plaintext, or filesystem paths ever appear (asserted by a redaction test).
+/// Messages are variant-only: no library internals, key bytes, plaintext, or paths ever appear
+/// (asserted by a redaction test).
 #[derive(Debug, PartialEq, Eq, thiserror::Error, uniffi::Error)]
 pub enum MlsClientError {
     #[error("input too large")]
@@ -62,97 +55,94 @@ pub enum MlsClientError {
     Internal,
 }
 
-/// Commit (fan out to existing members) + welcome (deliver to the new member). Both opaque.
+/// Commit fans out to existing members; welcome goes to the new one. Both opaque.
 #[derive(uniffi::Record)]
 pub struct AddOutcome {
     pub commit: Vec<u8>,
     pub welcome: Vec<u8>,
 }
 
-/// Direction of a stored message.
 #[derive(uniffi::Enum)]
 pub enum Direction {
     Inbound,
     Outbound,
 }
 
-/// A durably-stored decrypted message (what the UI renders). Not a secret in the key-substitution
-/// sense — application plaintext is exactly what the legitimate client is meant to hold.
+/// What the UI renders.
 #[derive(uniffi::Record)]
 pub struct StoredMessage {
     pub local_id: u64,
     pub direction: Direction,
     pub plaintext: Vec<u8>,
     pub envelope_id: Option<u64>,
-    /// `Some` (16 bytes) for a **secret** message. `plaintext` is then empty — render a sealed
-    /// placeholder / tombstone driven by [`MlsClient::secret_phase`], never the body.
+    /// `Some` (16 bytes) for a secret; `plaintext` is then empty — render a placeholder/tombstone
+    /// driven by [`MlsClient::secret_phase`], never the body.
     pub secret_id: Option<Vec<u8>>,
 }
 
-/// Reveal phase of a secret message across the FFI (mirrors `mls_core::secret::SecretState`).
+/// Mirrors `mls_core::secret::SecretState`.
 #[derive(Debug, PartialEq, Eq, uniffi::Enum)]
 pub enum SecretPhase {
-    /// Received, not tapped; no timer running.
+    /// Not tapped; no timer running.
     Sealed,
-    /// Reveal begun; 3-second countdown running.
     Countdown,
-    /// Body visible; 10-second window running.
     Visible,
-    /// Terminal: plaintext gone, tombstone shown, cannot reopen.
+    /// Terminal: plaintext gone, cannot reopen.
     Consumed,
-    /// No secret with this id is known to this client.
+    /// No secret with this id is known here.
     Unknown,
 }
 
-/// Result of queuing a secret message: the outbound local id plus its 16-byte secret id.
 #[derive(uniffi::Record)]
 pub struct SecretHandle {
     pub local_id: u64,
     pub secret_id: Vec<u8>,
 }
 
-/// Remaining countdown / viewing milliseconds for a secret (both 0 outside that phase).
+/// Both 0 outside that phase.
 #[derive(uniffi::Record)]
 pub struct SecretRemaining {
     pub countdown_ms: u64,
     pub view_ms: u64,
 }
 
-/// One past message in a history-sync batch (#7): `outbound` = this account sent it; `body` is the
-/// plaintext. Secrets are never included (view-once has no re-showable history).
+/// One past message in a history-sync batch (#7). Secrets are never included.
 #[derive(uniffi::Record)]
 pub struct HistoryEntry {
     pub outbound: bool,
     pub body: Vec<u8>,
 }
 
-/// Result of processing an inbound envelope.
 #[derive(Debug, uniffi::Enum)]
 pub enum InboundResult {
-    /// Decrypted application plaintext.
-    Application { plaintext: Vec<u8> },
-    /// A membership/commit advanced group state (no user-visible content).
+    Application {
+        plaintext: Vec<u8>,
+    },
+    /// A commit advanced group state; no user-visible content.
     StateAdvanced,
-    /// Already processed (at-least-once redelivery, or a replayed secret id) — a durable no-op.
+    /// At-least-once redelivery or a replayed secret id — a durable no-op.
     Duplicate,
-    /// A **secret** (view-once) message arrived and is stored sealed. The body is NOT delivered
-    /// here; show a sealed placeholder and reveal it later via [`MlsClient::begin_secret_reveal`].
-    SecretSealed { secret_id: Vec<u8> },
-    /// A **consumption** control message arrived (ADR-0015): another of this account's devices
-    /// revealed `secret_id`, so this device consumed its copy (account-wide single-view). No
-    /// user-visible content; refresh any placeholder for `secret_id` to its tombstone.
-    SecretConsumedRemotely { secret_id: Vec<u8> },
-    /// A **delivery-key grant** arrived (ADR-0014 Slice 2c): an approved contact shared their
-    /// sealed-sender delivery access key `K_r` (32 bytes) over the E2EE channel. Store it keyed by
-    /// the sender to later send that contact sealed messages. No user-visible content.
-    DeliveryKeyGranted { key_r: Vec<u8> },
-    /// A **history-sync** batch arrived (#7): `count` past messages were appended to this
-    /// newly-linked device's message log.
-    HistorySynced { count: u64 },
+    /// Stored sealed; the body is NOT delivered here. Show a placeholder and reveal later via
+    /// [`MlsClient::begin_secret_reveal`].
+    SecretSealed {
+        secret_id: Vec<u8>,
+    },
+    /// ADR-0015: another device revealed `secret_id`; this copy is consumed. Refresh any
+    /// placeholder to its tombstone.
+    SecretConsumedRemotely {
+        secret_id: Vec<u8>,
+    },
+    /// ADR-0014 Slice 2c: store `K_r` keyed by the sender for future sealed sends.
+    DeliveryKeyGranted {
+        key_r: Vec<u8>,
+    },
+    /// #7: `count` past messages were appended to this device's log.
+    HistorySynced {
+        count: u64,
+    },
 }
 
-/// Capability/version record so the Swift side can assert it links a compatible core and refuse on
-/// mismatch (ADR-0007 version compatibility).
+/// Lets Swift assert it links a compatible core and refuse on mismatch (ADR-0007).
 #[derive(uniffi::Record)]
 pub struct Capabilities {
     pub binding_version: String,
@@ -167,11 +157,11 @@ pub struct Capabilities {
     pub max_plaintext: u64,
 }
 
-/// Client lifecycle. `Pending` = identity exists but no group yet (a joiner that has published a
-/// key package and awaits a Welcome). `Active` = a durable conversation. `Closed` = invalidated.
+/// `Pending` = identity but no group yet (a joiner awaiting a Welcome). `Active` = a durable
+/// conversation. `Closed` = invalidated.
 enum ClientState {
-    // Both non-terminal states carry a heap-heavy MLS payload (provider store / group state); box
-    // them so the enum stays small next to the zero-size `Closed` (clippy::large_enum_variant).
+    // Boxed: both carry heap-heavy MLS payloads next to the zero-size `Closed`
+    // (clippy::large_enum_variant).
     Pending {
         member: Box<Member>,
         journal: JournalKind,
@@ -182,7 +172,7 @@ enum ClientState {
     Closed,
 }
 
-/// One MLS client (one identity + one conversation), owned by Swift as an `Arc<MlsClient>`.
+/// One identity + one conversation, owned by Swift as an `Arc<MlsClient>`.
 #[derive(uniffi::Object)]
 pub struct MlsClient {
     inner: Mutex<ClientState>,
@@ -190,8 +180,7 @@ pub struct MlsClient {
 
 #[uniffi::export]
 impl MlsClient {
-    /// Create a brand-new conversation with this client as the group creator/first member. Persists
-    /// before returning.
+    /// This client becomes the group creator/first member. Persists before returning.
     #[uniffi::constructor]
     pub fn create_group(
         identity: Vec<u8>,
@@ -246,7 +235,7 @@ impl MlsClient {
         })
     }
 
-    /// This client's key package bytes (a one-time prekey) to publish so others can add it.
+    /// A one-time prekey to publish so others can add this client.
     pub fn key_package(&self) -> Result<Vec<u8>, MlsClientError> {
         catch(move || {
             let g = self.lock()?;
@@ -260,8 +249,7 @@ impl MlsClient {
         })
     }
 
-    /// Join the group described by a Welcome (produced by another member's `add_member`). Transitions
-    /// `Pending` → `Active` and persists. On a bad Welcome the client stays `Pending` (retryable).
+    /// `Pending` → `Active`, persisted. On a bad Welcome the client stays `Pending` (retryable).
     pub fn join_group(&self, welcome: Vec<u8>) -> Result<(), MlsClientError> {
         catch(move || {
             bound(welcome.len(), MAX_WELCOME_LEN)?;
@@ -297,8 +285,7 @@ impl MlsClient {
         })
     }
 
-    /// Add a member by their key-package bytes. Returns commit + welcome; the grown group is durable
-    /// before returning.
+    /// The grown group is durable before returning.
     pub fn add_member(&self, key_package: Vec<u8>) -> Result<AddOutcome, MlsClientError> {
         catch(move || {
             bound(key_package.len(), MAX_KEY_PACKAGE_LEN)?;
@@ -313,12 +300,10 @@ impl MlsClient {
 
     // --- Device self-group (ADR-0015 option 3) ---------------------------------------------------
     //
-    // The self-group is a second MLS group of only this account's own devices, used to sync
-    // `SecretConsumed` control messages so the conversation's other party never learns a secret was
-    // opened. It shares this client's provider store with the conversation, so it is persisted by the
-    // same atomic blob. These mirror the conversation membership handshake.
+    // A second MLS group of only this account's devices, syncing `SecretConsumed` so the
+    // conversation's other party never learns of an open. Shares the provider store with the
+    // conversation, so one atomic blob persists both. Mirrors the conversation handshake.
 
-    /// True if this client has an established device self-group.
     pub fn has_self_group(&self) -> Result<bool, MlsClientError> {
         catch(move || {
             let g = self.lock()?;
@@ -330,8 +315,7 @@ impl MlsClient {
         })
     }
 
-    /// Create this account's self-group with this device as its sole member. Persists before
-    /// returning. `WrongState` if one already exists.
+    /// `WrongState` if one already exists.
     pub fn create_self_group(&self) -> Result<(), MlsClientError> {
         catch(move || {
             let mut g = self.lock()?;
@@ -340,11 +324,9 @@ impl MlsClient {
         })
     }
 
-    /// Add another of this account's devices to the self-group by its key-package bytes. Returns a
-    /// **wrapped** `commit` (deliver to the EXISTING self-group members, who apply it via
-    /// [`Self::process_self_inbound`], which unwraps) plus the **raw** `welcome` (deliver to the new
-    /// device, which applies it via [`Self::join_self_group`], which does not unwrap). `WrongState`
-    /// if no self-group exists yet.
+    /// Returns a **wrapped** `commit` (for existing members via [`Self::process_self_inbound`],
+    /// which unwraps) plus the **raw** `welcome` (for the new device via [`Self::join_self_group`],
+    /// which does not).
     pub fn add_self_device(&self, key_package: Vec<u8>) -> Result<AddOutcome, MlsClientError> {
         catch(move || {
             bound(key_package.len(), MAX_KEY_PACKAGE_LEN)?;
@@ -353,8 +335,6 @@ impl MlsClient {
             let (commit, welcome) = session
                 .add_self_device(&key_package)
                 .map_err(map_durable_input)?;
-            // Wrap the commit for the self-group inbound path; the welcome goes to `join_self_group`
-            // (which reads a raw Welcome), so it is left unwrapped.
             Ok(AddOutcome {
                 commit: mls_core::envelope::wrap(&commit),
                 welcome,
@@ -362,8 +342,7 @@ impl MlsClient {
         })
     }
 
-    /// Join this account's self-group from a Welcome produced by another device's `add_self_device`.
-    /// Persists before returning. `WrongState` if a self-group is already established here.
+    /// `WrongState` if a self-group is already established here.
     pub fn join_self_group(&self, welcome: Vec<u8>) -> Result<(), MlsClientError> {
         catch(move || {
             bound(welcome.len(), MAX_WELCOME_LEN)?;
@@ -373,10 +352,8 @@ impl MlsClient {
         })
     }
 
-    /// Remove a device from the self-group by its credential `identity` (used when that device is
-    /// revoked from the account). Returns the MLS remove-commit to fan out to the remaining
-    /// self-group members; applying it advances the epoch so the removed device can no longer decrypt
-    /// self-group traffic. `WrongState` if there is no self-group; `NotFound` if no such member.
+    /// Used when that device is revoked. The returned remove-commit advances the epoch, so the
+    /// removed device can no longer decrypt self-group traffic.
     pub fn remove_self_device(&self, identity: Vec<u8>) -> Result<Vec<u8>, MlsClientError> {
         catch(move || {
             bound(identity.len(), MAX_IDENTITY_LEN)?;
@@ -389,11 +366,10 @@ impl MlsClient {
         })
     }
 
-    /// Stage an add for MLS-commit-authoritative membership (ADR-0010): build commit + welcome
-    /// WITHOUT advancing the group. The caller signs a manifest, POSTs `/commit`, then calls
-    /// [`merge_staged`](Self::merge_staged) on success or [`clear_staged`](Self::clear_staged) on
-    /// rejection. Never merge before the server's epoch CAS confirms — that is how a race loser
-    /// desyncs.
+    /// ADR-0010: builds commit + welcome WITHOUT advancing the group. Sign a manifest, POST
+    /// `/commit`, then [`merge_staged`](Self::merge_staged) on success or
+    /// [`clear_staged`](Self::clear_staged) on rejection. Never merge before the server's epoch CAS
+    /// confirms — that is how a race loser desyncs.
     pub fn stage_add(&self, key_package: Vec<u8>) -> Result<AddOutcome, MlsClientError> {
         catch(move || {
             bound(key_package.len(), MAX_KEY_PACKAGE_LEN)?;
@@ -417,7 +393,7 @@ impl MlsClient {
         })
     }
 
-    /// Merge the pending staged commit — the server accepted it. Advances the epoch and persists.
+    /// Server accepted: advance the epoch and persist.
     pub fn merge_staged(&self) -> Result<(), MlsClientError> {
         catch(move || {
             let mut g = self.lock()?;
@@ -426,8 +402,7 @@ impl MlsClient {
         })
     }
 
-    /// Discard the pending staged commit — the server rejected it (stale epoch / governance) or the
-    /// client is rebasing. State is unchanged.
+    /// Server rejected, or we're rebasing. State unchanged.
     pub fn clear_staged(&self) -> Result<(), MlsClientError> {
         catch(move || {
             let mut g = self.lock()?;
@@ -436,10 +411,9 @@ impl MlsClient {
         })
     }
 
-    /// Recipient path (ADR-0010): process an inbound membership commit, merging ONLY if its actual
-    /// cryptographic effect equals the sender's signed manifest — `next_epoch` and the `added` /
-    /// `removed` credential identities come from that manifest. On mismatch the commit is discarded
-    /// unmerged and `InvalidMessage` is returned; group state is unchanged.
+    /// ADR-0010 recipient path: merges ONLY if the commit's actual effect equals the sender's signed
+    /// manifest (`next_epoch`/`added`/`removed` come from it). On mismatch: discarded unmerged,
+    /// `InvalidMessage`, state unchanged.
     pub fn process_commit(
         &self,
         envelope: Vec<u8>,
@@ -457,7 +431,7 @@ impl MlsClient {
         })
     }
 
-    /// Queue an outbound message (durable draft). Does NOT advance the ratchet. Returns a local id.
+    /// Durable draft; does NOT advance the ratchet.
     pub fn enqueue(&self, plaintext: Vec<u8>) -> Result<u64, MlsClientError> {
         catch(move || {
             bound(plaintext.len(), MAX_PLAINTEXT_LEN)?;
@@ -467,9 +441,8 @@ impl MlsClient {
         })
     }
 
-    /// Encrypt a queued message into a versioned opaque envelope (`app-envelope v1`, R-506).
-    /// **Idempotent:** a retry returns the same bytes and never advances the ratchet again (no
-    /// double-spend of a message key) — `wrap` is deterministic over the cached ciphertext.
+    /// Produces the versioned opaque envelope (`app-envelope v1`). **Idempotent:** a retry returns
+    /// the same bytes and never advances the ratchet again — no double-spend of a message key.
     pub fn encrypt(&self, local_id: u64) -> Result<Vec<u8>, MlsClientError> {
         catch(move || {
             let mut g = self.lock()?;
@@ -479,7 +452,6 @@ impl MlsClient {
         })
     }
 
-    /// Mark a queued message accepted by the server. Persisted before returning.
     pub fn mark_sent(&self, local_id: u64) -> Result<(), MlsClientError> {
         catch(move || {
             let mut g = self.lock()?;
@@ -490,10 +462,8 @@ impl MlsClient {
 
     // --- Secret (view-once) messages -------------------------------------------------------------
 
-    /// Queue a **secret** message. The classification + body are wrapped in the content envelope
-    /// that MLS then encrypts, so the relay never learns it is secret. Same bounds as a normal
-    /// message. Returns the outbound local id + the 16-byte secret id; `encrypt`/`mark_sent` then
-    /// proceed exactly as for a normal message (same authenticated pipeline, same retry safety).
+    /// The classification + body are encrypted inside the content envelope, so the relay never
+    /// learns it is secret. `encrypt`/`mark_sent` then proceed exactly as for a normal message.
     pub fn enqueue_secret(&self, body: Vec<u8>) -> Result<SecretHandle, MlsClientError> {
         catch(move || {
             bound(body.len(), MAX_PLAINTEXT_LEN)?;
@@ -507,10 +477,8 @@ impl MlsClient {
         })
     }
 
-    /// Queue a **delivery-key grant** (ADR-0014 Slice 2c): share this account's sealed-sender
-    /// delivery access key `K_r` (exactly 32 bytes) with an approved contact over the E2EE channel.
-    /// The relay never sees `K_r`. Returns the outbound local id; `encrypt`/`mark_sent` then proceed
-    /// exactly as for a normal message.
+    /// ADR-0014 Slice 2c: share `K_r` (exactly 32 bytes) over the E2EE channel — the relay never
+    /// sees it. `encrypt`/`mark_sent` then proceed as for a normal message.
     pub fn enqueue_delivery_key_grant(&self, key_r: Vec<u8>) -> Result<u64, MlsClientError> {
         catch(move || {
             let key: [u8; 32] = key_r
@@ -525,8 +493,7 @@ impl MlsClient {
         })
     }
 
-    /// The most recent (up to `max`) non-secret messages, as a history batch to replicate to a
-    /// newly-linked device (#7). Secrets are excluded (view-once).
+    /// Up to `max` recent non-secret messages, for replication to a newly-linked device (#7).
     pub fn history_entries(&self, max: u32) -> Result<Vec<HistoryEntry>, MlsClientError> {
         catch(move || {
             let g = self.lock()?;
@@ -545,9 +512,7 @@ impl MlsClient {
         })
     }
 
-    /// Queue a **history-sync** batch (#7) to replicate `entries` to the account's newly-linked
-    /// device(s) over the self-group. `WrongState` if no self-group is established. Returns the
-    /// outbound local id; deliver it over the self-group as usual.
+    /// #7: replicate `entries` over the self-group. `WrongState` if none is established.
     pub fn enqueue_history_sync(&self, entries: Vec<HistoryEntry>) -> Result<u64, MlsClientError> {
         catch(move || {
             let core: Vec<CoreHistoryEntry> = entries
@@ -563,9 +528,8 @@ impl MlsClient {
         })
     }
 
-    /// Begin revealing a sealed secret (recipient tapped the placeholder). **Atomic + fail-closed:**
-    /// the transition + deadlines are committed before this returns `Ok`. An invalid transition
-    /// (double tap, replay, wrong state) or a failed state write returns `Err` and reveals nothing.
+    /// **Atomic + fail-closed:** the transition + deadlines are committed before this returns `Ok`;
+    /// an invalid transition (double tap, replay) or failed write returns `Err` and reveals nothing.
     /// `now_ms` is the caller's monotonic clock.
     pub fn begin_secret_reveal(
         &self,
@@ -582,15 +546,11 @@ impl MlsClient {
         })
     }
 
-    /// Build (once) the **consumption control message** for a secret this device revealed (ADR-0015,
-    /// account-wide single-view). Returns the opaque envelope to deliver to the account's other
-    /// devices, or `None` if the secret is unknown, is the sender's own, or has not been revealed
-    /// here. If this client has a device self-group (option 3) the message is encrypted with it — the
-    /// conversation's other party is not a member and never learns of the open — and the recipient
-    /// devices apply it via [`Self::process_self_inbound`]; otherwise it falls back to the
-    /// conversation channel (option 2) and [`Self::process_inbound`]. Idempotent: repeated calls
-    /// return the same envelope and never double-advance the ratchet. A single-device client simply
-    /// never calls this.
+    /// The consumption control message for a secret this device revealed (ADR-0015). `None` if the
+    /// secret is unknown, the sender's own, or unrevealed here. Encrypted with the self-group when
+    /// one exists (option 3 — the sender never learns of the open; recipients apply via
+    /// [`Self::process_self_inbound`]), else the conversation (option 2). Idempotent: repeated calls
+    /// return the same envelope and never double-advance the ratchet.
     pub fn secret_consumption_envelope(
         &self,
         secret_id: Vec<u8>,
@@ -624,8 +584,8 @@ impl MlsClient {
         })
     }
 
-    /// The secret's plaintext **iff it is currently visible** at `now_ms` — the plaintext gate.
-    /// `None` while sealed/counting down and forever after expiry (which also scrubs + persists).
+    /// The plaintext gate: `None` while sealed/counting down and forever after expiry (which also
+    /// scrubs + persists).
     pub fn secret_visible_body(
         &self,
         secret_id: Vec<u8>,
@@ -641,7 +601,7 @@ impl MlsClient {
         })
     }
 
-    /// Remaining countdown / viewing ms for the UI timer + fade (both 0 outside that phase).
+    /// Both 0 outside that phase. Drives the UI timer + fade.
     pub fn secret_remaining(
         &self,
         secret_id: Vec<u8>,
@@ -661,8 +621,7 @@ impl MlsClient {
         })
     }
 
-    /// Force a secret to the terminal tombstone (a screenshot/capture was detected, or the overlay
-    /// was closed). Idempotent; scrubs the body; persisted before returning.
+    /// Used on a detected screenshot/capture or overlay close. Idempotent; scrubs the body.
     pub fn consume_secret(&self, secret_id: Vec<u8>) -> Result<(), MlsClientError> {
         catch(move || {
             let id = secret_id_arg(&secret_id)?;
@@ -672,8 +631,7 @@ impl MlsClient {
         })
     }
 
-    /// Process an inbound envelope: application plaintext, a state advance, or a dedup no-op. All
-    /// effects (advanced ratchet, stored message, dedup marker, ack-eligibility) are durable
+    /// All effects — advanced ratchet, stored message, dedup marker, ack-eligibility — are durable
     /// together before returning.
     pub fn process_inbound(
         &self,
@@ -682,8 +640,7 @@ impl MlsClient {
     ) -> Result<InboundResult, MlsClientError> {
         catch(move || {
             bound(ciphertext.len(), MAX_ENVELOPE_LEN)?;
-            // Strip + check the app-envelope version before handing bytes to MLS; an unknown
-            // version is rejected (never fed to MLS as-is).
+            // An unknown app-envelope version is rejected, never fed to MLS as-is.
             let payload = mls_core::envelope::unwrap(&ciphertext)
                 .map_err(|_| MlsClientError::InvalidMessage)?
                 .to_vec();
@@ -712,11 +669,9 @@ impl MlsClient {
         })
     }
 
-    /// Process an inbound envelope that arrived on the account's **self-group** channel (ADR-0015
-    /// option 3) — a `SecretConsumed` control message from one of this account's OTHER devices, or a
-    /// self-group membership commit. Decrypts with the self-group (which the conversation's other
-    /// party is not in), so the read signal stays private to the account. Same idempotent dedup + ack
-    /// contract as [`Self::process_inbound`]. `WrongState` if no self-group is established here.
+    /// Self-group channel (ADR-0015 option 3): a `SecretConsumed` from another of this account's
+    /// devices, or a self-group membership commit. Decrypting with the self-group keeps the read
+    /// signal private to the account. Same dedup + ack contract as [`Self::process_inbound`].
     pub fn process_self_inbound(
         &self,
         envelope_id: u64,
@@ -752,7 +707,7 @@ impl MlsClient {
         })
     }
 
-    /// Envelope ids durably processed and safe to acknowledge to the server.
+    /// Durably processed, so safe to acknowledge to the server.
     pub fn ack_eligible(&self) -> Result<Vec<u64>, MlsClientError> {
         catch(move || {
             let g = self.lock()?;
@@ -764,7 +719,6 @@ impl MlsClient {
         })
     }
 
-    /// After the server confirms an ack, stop tracking those ids as ack-eligible.
     pub fn confirm_acked(&self, ids: Vec<u64>) -> Result<(), MlsClientError> {
         catch(move || {
             let mut g = self.lock()?;
@@ -773,8 +727,7 @@ impl MlsClient {
         })
     }
 
-    /// Ordered log of ALL stored messages (inbound decrypted + outbound). Marshals the entire
-    /// history across the boundary — fine for tests and small logs; a UI should render from
+    /// Marshals the ENTIRE history across the boundary — fine for tests; a UI should use
     /// [`Self::messages_page`] + [`Self::message_count`] instead.
     pub fn messages(&self) -> Result<Vec<StoredMessage>, MlsClientError> {
         catch(move || {
@@ -789,7 +742,7 @@ impl MlsClient {
         })
     }
 
-    /// Number of stored messages. Cheap: no payload crosses the boundary.
+    /// Cheap: no payload crosses the boundary.
     pub fn message_count(&self) -> Result<u64, MlsClientError> {
         catch(move || {
             let g = self.lock()?;
@@ -801,10 +754,8 @@ impl MlsClient {
         })
     }
 
-    /// A bounded window of the message log, oldest first: up to `limit` messages starting at
-    /// `offset`. `limit` is clamped to [`MAX_PAGE_MESSAGES`] so a single call can never marshal
-    /// an unbounded payload across the FFI; an offset past the end returns an empty page. This is
-    /// what a chat UI should call (e.g. the newest window = `count - limit .. count`).
+    /// Bounded window, oldest first. `limit` is clamped to [`MAX_PAGE_MESSAGES`] so one call can
+    /// never marshal an unbounded payload; an offset past the end returns an empty page.
     pub fn messages_page(
         &self,
         offset: u64,
@@ -826,7 +777,6 @@ impl MlsClient {
         })
     }
 
-    /// Current MLS epoch (advances on every membership change).
     pub fn epoch(&self) -> Result<u64, MlsClientError> {
         catch(move || {
             let g = self.lock()?;
@@ -838,7 +788,7 @@ impl MlsClient {
         })
     }
 
-    /// Storage schema version of the loaded blob (0 = pre-versioning; a Pending client reports 0).
+    /// 0 = pre-versioning; a Pending client also reports 0.
     pub fn storage_format_version(&self) -> Result<u32, MlsClientError> {
         catch(move || {
             let g = self.lock()?;
@@ -850,8 +800,7 @@ impl MlsClient {
         })
     }
 
-    /// Explicitly invalidate the client and drop its MLS state. Idempotent; subsequent calls return
-    /// `Closed`. Durable state on disk is untouched (reopen with `open`).
+    /// Idempotent. Durable state on disk is untouched — reopen with `open`.
     pub fn close(&self) {
         if let Ok(mut g) = self.inner.lock() {
             *g = ClientState::Closed;
@@ -862,13 +811,12 @@ impl MlsClient {
 // Non-exported helpers.
 impl MlsClient {
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, ClientState>, MlsClientError> {
-        // A poisoned lock (a prior panic) fails safe rather than propagating.
+        // A poisoned lock fails safe rather than propagating the prior panic.
         self.inner.lock().map_err(|_| MlsClientError::Internal)
     }
 
-    /// TEST-ONLY (never `#[uniffi::export]`ed, so it is not in the Swift surface): build an Active
-    /// client over an in-memory journal, so crash/panic injection can be exercised without the
-    /// filesystem. Not part of the FFI contract.
+    /// TEST-ONLY — never `#[uniffi::export]`ed, so not in the Swift surface. An in-memory journal
+    /// lets crash/panic injection run without the filesystem.
     #[doc(hidden)]
     pub fn __test_active_in_memory(
         identity: &[u8],
@@ -884,14 +832,13 @@ impl MlsClient {
     }
 }
 
-/// The exact non-sensitive tombstone text shown for a consumed/sent secret message. Bundled system
-/// text — never an external font/resource that could fail at runtime.
+/// Bundled system text — never an external resource that could fail at runtime.
 #[uniffi::export]
 pub fn secret_tombstone_text() -> String {
     DurableSession::<InMemoryJournal>::secret_tombstone_text().to_string()
 }
 
-/// Rust core version + UniFFI contract tag, for a quick human/log check.
+/// For a quick human/log check.
 #[uniffi::export]
 pub fn binding_version() -> String {
     format!(
@@ -901,7 +848,7 @@ pub fn binding_version() -> String {
     )
 }
 
-/// Machine-checkable capability record (ADR-0007 version compatibility).
+/// Machine-checkable (ADR-0007 version compatibility).
 #[uniffi::export]
 pub fn capabilities() -> Capabilities {
     Capabilities {
@@ -958,7 +905,7 @@ fn to_stored(m: &CoreMessage) -> StoredMessage {
     }
 }
 
-/// Parse a 16-byte secret id from the FFI (bounded, fail-closed on any other length).
+/// Fail-closed on any length other than 16.
 fn secret_id_arg(bytes: &[u8]) -> Result<[u8; SECRET_ID_LEN], MlsClientError> {
     bytes.try_into().map_err(|_| MlsClientError::InvalidMessage)
 }
@@ -974,27 +921,25 @@ fn to_phase(state: Option<mls_core::secret::SecretState>) -> SecretPhase {
     }
 }
 
-/// Panic → typed `Internal`. Panics must never unwind across the C ABI (UB); every entry point is
-/// wrapped (defense in depth atop UniFFI's own catch).
+/// Panics must never unwind across the C ABI (UB); defense in depth atop UniFFI's own catch.
 fn catch<T>(
     f: impl FnOnce() -> Result<T, MlsClientError> + std::panic::UnwindSafe,
 ) -> Result<T, MlsClientError> {
     catch_unwind(f).unwrap_or(Err(MlsClientError::Internal))
 }
 
-/// Durable errors on **local** paths (encrypt/enqueue/mark_sent/open/create): a fault here is ours.
+/// Local paths: a fault here is ours.
 fn map_durable(e: DurableError) -> MlsClientError {
     match e {
         DurableError::NoSession => MlsClientError::NoSession,
         DurableError::UnknownLocal => MlsClientError::NotFound,
         DurableError::Journal => MlsClientError::Journal,
-        // A self-group precondition (absent when required / already present) is a state misuse.
         DurableError::SelfGroup => MlsClientError::WrongState,
         DurableError::Mls | DurableError::Codec => MlsClientError::Internal,
     }
 }
 
-/// Durable errors on **inbound** paths (process/add_member/join): bad bytes are caller-supplied.
+/// Inbound paths: bad bytes are caller-supplied.
 fn map_durable_input(e: DurableError) -> MlsClientError {
     match e {
         DurableError::NoSession => MlsClientError::NoSession,

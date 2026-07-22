@@ -1,9 +1,7 @@
 #!/usr/bin/env bash
-# Run the Swift↔Rust MLS bridge tests ON the iOS simulator (ADR-0007).
-#
-# This executes apps/ios/NedwonsMLS's MlsFfiBridgeTests against the ios-arm64-simulator slice of
-# MlsFfi.xcframework — converting that slice from "compiles/links" to "runs". xcodebuild hosts the
-# XCTest bundle in the simulator directly from the Swift package; no Xcode project is needed.
+# Run the Swift↔Rust MLS bridge tests ON the iOS simulator (ADR-0007), against the
+# ios-arm64-simulator xcframework slice — converting it from "compiles/links" to "runs".
+# xcodebuild hosts the XCTest bundle straight from the Swift package; no Xcode project needed.
 #
 # GOTCHA (the reason for the custom derived-data path): build products must NOT live under a
 # TCC-protected folder (Desktop/Documents/Downloads) and should avoid spaces — the simulator's

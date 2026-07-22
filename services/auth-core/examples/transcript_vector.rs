@@ -1,6 +1,5 @@
-//! Prints the canonical auth-transcript for a fixed input as hex. This is the shared
-//! cross-platform test vector: the iOS Swift client must produce byte-identical output.
-//! Regenerate with: `cargo run -p auth-core --example transcript_vector`.
+//! The shared cross-platform test vector: the Swift client must produce byte-identical output.
+//! Regenerate with `cargo run -p auth-core --example transcript_vector`.
 
 use auth_core::ids::{AccountId, DeviceId, TxnId};
 use auth_core::transcript::{Action, Transcript};

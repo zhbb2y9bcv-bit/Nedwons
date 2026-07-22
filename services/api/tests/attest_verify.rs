@@ -1,9 +1,8 @@
-//! App Attest verifier (#10 gap closure), proven end to end WITHOUT Apple hardware: a synthetic
-//! certificate chain (test root CA → intermediate → credential cert carrying Apple's nonce
-//! extension) + a well-formed CBOR attestation object exercise every verification step, and each
-//! tamper — wrong nonce, wrong key id, wrong app id, non-zero counter, wrong environment, a chain
-//! to a different root, garbage CBOR — is rejected with the right typed error. Against real Apple
-//! hardware the same code runs with the embedded Apple root (pin sanity is unit-tested in-module).
+//! App Attest verifier proven end to end WITHOUT Apple hardware: a synthetic chain (test root →
+//! intermediate → credential cert with Apple's nonce extension) plus a well-formed CBOR object
+//! exercise every step, and each tamper — wrong nonce, key id, app id, counter, environment, root,
+//! or garbage CBOR — is rejected with the right typed error. On real hardware the same code runs
+//! against the embedded Apple root (pin sanity is unit-tested in-module).
 
 mod common;
 

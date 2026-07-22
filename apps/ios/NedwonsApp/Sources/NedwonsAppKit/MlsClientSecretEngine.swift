@@ -2,13 +2,10 @@ import Foundation
 import MlsFfi
 import NedwonsUI
 
-/// The **real** `SecretEngine`: a thin adapter that forwards every call to the generated `MlsClient`
-/// (the Rust MLS core over UniFFI). Because every method is a 1:1 forward, all the security
-/// enforcement — atomic + fail-closed reveal, the monotonic guard, the 3s/10s deadlines, expiry
-/// scrub, replay rejection, crash recovery — happens in Rust, exactly as the mls-core / mls-ffi
-/// tests prove. This is the adapter the report described as "belonging in the app target"; it lives
-/// here in the composition package (the only place that links both NedwonsUI and MlsFfi) and is
-/// exercised against the real core by `SecretMessageViewModelRealCoreTests`.
+/// The **real** `SecretEngine`: every method is a 1:1 forward to the Rust core, so all security
+/// enforcement — atomic fail-closed reveal, the monotonic guard, deadlines, expiry scrub, replay
+/// rejection, crash recovery — happens there, not here. Lives in the composition package because
+/// it is the only place linking both NedwonsUI and MlsFfi.
 public final class MlsClientSecretEngine: SecretEngine {
     private let client: MlsClient
     /// ADR-0015: given the opaque consumption envelope produced when a reveal begins, deliver it to

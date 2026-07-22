@@ -1,20 +1,16 @@
 //! Crash-safe client state machine (Gate 2).
 //!
-//! MLS ratchet state and visible message state must advance **together**. If a crash could advance
-//! the ratchet without capturing the decrypted plaintext, the message key is gone and the message
-//! is lost forever; if it could mark an envelope acknowledged without durably processing it, the
-//! server drops it and it is lost. So this layer persists everything as **one atomically committed
-//! blob** = `{ MLS-store snapshot, message/queue metadata }`. Because they are one write, they can
-//! never be torn apart by a crash.
+//! Ratchet state and visible message state must advance **together**: advancing the ratchet without
+//! capturing the plaintext loses the message key forever, and acking an envelope without durably
+//! processing it makes the server drop it. So everything persists as **one atomically committed
+//! blob** = `{ MLS-store snapshot, message/queue metadata }`, which a crash cannot tear apart.
 //!
-//! Recovery contract: any operation that returns `Err` may have advanced the in-memory MLS state
-//! without committing. The caller MUST discard the [`DurableSession`] and call [`DurableSession::open`]
-//! again, which reloads the last durably committed state. Tests exercise exactly this.
+//! Recovery contract: an operation returning `Err` may have advanced in-memory MLS state without
+//! committing. The caller MUST discard the [`DurableSession`] and [`DurableSession::open`] again.
 //!
-//! What this slice covers: inbound dedup (at-least-once redelivery is idempotent), no-ack-until-
-//! durable, no partial advance on a failed commit, and retry-without-re-encrypt on the outbound
-//! path. Out-of-order/epoch-fork resolution and the encrypted on-device DB are the remaining Gate 2
-//! body (the store blob is where on-device encryption + the OpenMLS fork/discard strategy attach).
+//! Covers inbound dedup (at-least-once redelivery is idempotent), no-ack-until-durable, no partial
+//! advance on a failed commit, and retry-without-re-encrypt outbound. Out-of-order/epoch-fork
+//! resolution and the encrypted on-device DB remain outstanding.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -30,17 +26,14 @@ use crate::content::{Content, ContentError, HistoryEntry, DELIVERY_KEY_LEN, SECR
 use crate::secret::{SecretRecord, SecretSide, SecretState};
 use crate::{Conversation, Incoming, Member};
 
-/// On-disk blob schema version. Bumped when the serialized `{store, meta}` layout changes so an
-/// older blob is detectable (and, in future, migratable) rather than silently misread. Surfaced to
-/// the client via the FFI `capabilities()` call.
+/// Bumped when the serialized `{store, meta}` layout changes, so an older blob is detected rather
+/// than silently misread. Surfaced via the FFI `capabilities()` call.
 pub const BLOB_FORMAT_VERSION: u32 = 1;
 
-/// Upper bound on the out-of-order dedup tail retained above [`Meta::dedup_watermark`] (R-105).
-/// The whole blob is rewritten on every commit, so an unbounded `seen_inbound` set would make each
-/// write grow without limit. Near-in-order at-least-once delivery keeps the tail tiny; this cap only
-/// bites under a pathological permanent gap, where the watermark is force-advanced (see
-/// [`compact_dedup`]). Blob-level dedup is a fast path — OpenMLS's ratchet rejects a genuinely
-/// replayed ciphertext regardless — so bounding it never weakens replay protection.
+/// Caps the out-of-order dedup tail above [`Meta::dedup_watermark`] (R-105): the whole blob is
+/// rewritten each commit, so an unbounded seen-set would grow every write. Only bites under a
+/// pathological permanent gap, where the watermark is force-advanced (see [`compact_dedup`]).
+/// Bounding is safe — blob dedup is a fast path; OpenMLS's ratchet rejects real replays regardless.
 const MAX_SEEN_ABOVE_WATERMARK: usize = 4096;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -55,9 +48,8 @@ pub enum DurableError {
     NoSession,
     #[error("unknown local message")]
     UnknownLocal,
-    /// A self-group precondition was violated: an operation needing the account's device self-group
-    /// (ADR-0015 option 3) was called with none established, or `create_self_group` was called when
-    /// one already exists. Redacted; carries no state.
+    /// An operation needed the self-group (ADR-0015) with none established, or `create_self_group`
+    /// found one already existing. Redacted; carries no state.
     #[error("self-group precondition violated")]
     SelfGroup,
 }
@@ -68,19 +60,18 @@ impl From<crate::MlsError> for DurableError {
     }
 }
 
-/// Map a redacted content-decode failure to a redacted durable error (no payload bytes leak).
+/// Both sides stay redacted — no payload bytes leak.
 fn map_content(_: ContentError) -> DurableError {
     DurableError::Codec
 }
 
-/// Direction of a stored message.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub enum Direction {
     Inbound,
     Outbound,
 }
 
-/// A durably stored message (decrypted content lives here; the blob is encrypted at rest on device).
+/// Decrypted content lives here; the containing blob is encrypted at rest on device.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub struct Message {
     pub local_id: u64,
@@ -88,19 +79,16 @@ pub struct Message {
     pub plaintext: Vec<u8>,
     /// Inbound only: the server envelope id this was decrypted from.
     pub envelope_id: Option<u64>,
-    /// `Some` if this message is a **secret** (view-once) message. The `plaintext` field is then
-    /// EMPTY — the body lives (transiently) in [`Meta::secrets`] and is never returned in the message
-    /// log. The UI renders a sealed placeholder / tombstone from the secret's state instead.
-    /// `#[serde(default)]` ⇒ blobs written before secret messages load as `None`.
+    /// `Some` for a view-once secret, whose `plaintext` is then EMPTY — the body lives transiently
+    /// in [`Meta::secrets`] and never enters the message log; the UI renders from the secret's
+    /// state. `#[serde(default)]` ⇒ older blobs load as `None`.
     #[serde(default)]
     pub secret_id: Option<[u8; SECRET_ID_LEN]>,
 }
 
-/// Which MLS group an outbound message is encrypted with. Normal messages and secrets go through
-/// the **conversation** (with the peer/sender). A `SecretConsumed` control message (ADR-0015
-/// option 3) goes through the account's **self-group** — only this account's own devices — so the
-/// conversation's other party never receives the read signal. `#[serde(default)]` ⇒ blobs written
-/// before this field load as `Conversation`.
+/// Which MLS group encrypts an outbound message. Normal messages and secrets use the conversation;
+/// `SecretConsumed` uses the account's self-group (ADR-0015 option 3), so the conversation's other
+/// party never receives the read signal. `#[serde(default)]` ⇒ older blobs load as `Conversation`.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Channel {
     #[default]
@@ -122,8 +110,8 @@ pub enum OutboundStatus {
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 struct Outbound {
     local_id: u64,
-    /// The **encoded [`Content`] envelope** to encrypt (not the raw body) — so the classification
-    /// travels inside the MLS ciphertext. Scrubbed to empty once a secret message is sent.
+    /// The encoded [`Content`] envelope, not the raw body, so the classification travels inside the
+    /// MLS ciphertext. Scrubbed to empty once a secret is sent.
     plaintext: Vec<u8>,
     status: OutboundStatus,
     ciphertext: Option<Vec<u8>>,
@@ -135,76 +123,67 @@ struct Outbound {
     channel: Channel,
 }
 
-/// What processing an inbound envelope yielded.
 #[derive(Debug, PartialEq, Eq)]
 pub enum InboundOutcome {
     Application(Vec<u8>),
     StateAdvanced,
-    /// Already processed (at-least-once redelivery, OR a replayed secret id). A durable no-op.
+    /// At-least-once redelivery OR a replayed secret id. A durable no-op.
     Duplicate,
-    /// A **secret** message arrived and is stored as a sealed placeholder. Carries its id so the
-    /// UI can show a sealed placeholder; the body is NOT returned here (it is revealed once, later,
-    /// via the reveal state machine).
+    /// Stored as a sealed placeholder; the body is NOT returned here — it is revealed later, once,
+    /// via the reveal state machine.
     SecretSealed {
         secret_id: [u8; SECRET_ID_LEN],
     },
-    /// A **consumption** control message arrived (ADR-0015): another of this account's devices
-    /// revealed `secret_id`, so this device consumed its copy too (account-wide single-view). If
-    /// this device held that secret it is now `Consumed`; otherwise this is a harmless no-op.
+    /// ADR-0015: another of this account's devices revealed `secret_id`, so this device consumed its
+    /// copy too. A harmless no-op if this device never held it.
     SecretConsumedRemotely {
         secret_id: [u8; SECRET_ID_LEN],
     },
-    /// A **delivery-key grant** arrived (ADR-0014 Slice 2c): an approved contact shared their
-    /// sealed-sender delivery access key `K_r` over the E2EE channel. The client stores it (keyed by
-    /// the sender) to later send that contact sealed-sender messages. Not a user-visible message.
+    /// ADR-0014 Slice 2c: an approved contact shared their `K_r`. The client stores it keyed by
+    /// sender. Not user-visible.
     DeliveryKeyGranted {
         key_r: [u8; DELIVERY_KEY_LEN],
     },
-    /// A **history-sync** batch arrived (#7): an existing device replicated `count` past messages to
-    /// this newly-linked device. They were appended to the local message log.
+    /// #7: `count` past messages were replicated here and appended to the local log.
     HistorySynced {
         count: u64,
     },
 }
 
-/// Serializable metadata that travels in the committed blob alongside the MLS store snapshot.
+/// Travels in the committed blob alongside the MLS store snapshot.
 #[derive(Serialize, Deserialize, Clone, Default)]
 struct Meta {
-    /// Blob schema version. `#[serde(default)]` ⇒ blobs written before this field load as 0.
+    /// `#[serde(default)]` ⇒ blobs written before this field load as 0.
     #[serde(default)]
     format_version: u32,
     identity: Vec<u8>,
     public_key: Vec<u8>,
     group_id: Vec<u8>,
-    /// Every envelope id `<= dedup_watermark` is considered already processed. The contiguous
-    /// low prefix of seen ids is collapsed into this watermark so it need not be stored id-by-id
-    /// (R-105 bounded dedup). `#[serde(default)]` ⇒ pre-watermark blobs load as 0 and self-heal on
-    /// the next commit.
+    /// Every envelope id `<= dedup_watermark` counts as processed: the contiguous low prefix of seen
+    /// ids is collapsed here rather than stored id-by-id (R-105). `#[serde(default)]` ⇒ pre-watermark
+    /// blobs load as 0 and self-heal on the next commit.
     #[serde(default)]
     dedup_watermark: u64,
-    /// Processed envelope ids **above** `dedup_watermark` — the out-of-order tail only, bounded by
-    /// [`MAX_SEEN_ABOVE_WATERMARK`]. Combined with the watermark this is the full dedup set.
+    /// The out-of-order tail above `dedup_watermark`, bounded by [`MAX_SEEN_ABOVE_WATERMARK`].
+    /// With the watermark, this is the full dedup set.
     seen_inbound: BTreeSet<u64>,
-    /// Envelope ids durably processed and therefore safe to acknowledge to the server.
+    /// Durably processed, so safe to acknowledge to the server.
     ack_eligible: BTreeSet<u64>,
     next_local_id: u64,
     messages: Vec<Message>,
     outbox: BTreeMap<u64, Outbound>,
-    /// Reveal state for each secret message, keyed by its **hex** id (JSON maps need string keys).
-    /// Crash-safe: every transition is committed here before it becomes observable.
-    /// `#[serde(default)]` ⇒ older blobs load empty.
+    /// Keyed by hex id (JSON maps need string keys). Every transition is committed here before it
+    /// becomes observable. `#[serde(default)]` ⇒ older blobs load empty.
     #[serde(default)]
     secrets: BTreeMap<String, SecretRecord>,
-    /// The MLS group id of this account's **self-group** (ADR-0015 option 3), if one is established —
-    /// the group of only this account's own devices, over which `SecretConsumed` control messages are
-    /// synced without the conversation's other party learning anything. Its ratchet state lives in the
-    /// same provider store as the conversation, so the one `export_store` snapshot persists both.
+    /// This account's self-group (ADR-0015 option 3), if established. Its ratchet state lives in the
+    /// same provider store as the conversation, so one `export_store` snapshot persists both.
     /// `#[serde(default)]` ⇒ older blobs load with no self-group.
     #[serde(default)]
     self_group_id: Option<Vec<u8>>,
 }
 
-/// Hex key for a secret id (JSON object keys must be strings, so the raw `[u8; 16]` can't be a key).
+/// JSON object keys must be strings, so the raw `[u8; 16]` can't be one.
 fn sid_key(id: &[u8; SECRET_ID_LEN]) -> String {
     let mut s = String::with_capacity(SECRET_ID_LEN * 2);
     for b in id {
@@ -234,11 +213,10 @@ impl Meta {
         self.compact_dedup();
     }
 
-    /// Collapse the contiguous low prefix of `seen_inbound` into `dedup_watermark`, then, if the
-    /// non-contiguous tail still exceeds the cap, force the watermark up to absorb the lowest ids.
-    /// Forcing only ever marks *older* ids as seen (never un-sees a newer one), so a not-yet-seen
-    /// low id could at worst be treated as a duplicate later — bounded, and the ratchet is the real
-    /// replay guard (see [`MAX_SEEN_ABOVE_WATERMARK`]).
+    /// Collapse the contiguous low prefix into `dedup_watermark`; if the tail still exceeds the cap,
+    /// force the watermark up to absorb the lowest ids. Forcing only marks *older* ids seen, never
+    /// un-sees a newer one, so at worst an unseen low id is later treated as a duplicate — bounded,
+    /// and the ratchet is the real replay guard (see [`MAX_SEEN_ABOVE_WATERMARK`]).
     fn compact_dedup(&mut self) {
         // Drop anything already covered by the watermark, and advance over the contiguous prefix.
         while let Some(&lowest) = self.seen_inbound.iter().next() {
@@ -273,8 +251,8 @@ struct Blob {
 struct Session {
     member: Member,
     conversation: Conversation,
-    /// The account's device self-group (ADR-0015 option 3), if established. Shares `member`'s
-    /// provider with `conversation`, so both groups are captured by one `export_store` snapshot.
+    /// ADR-0015 option 3. Shares `member`'s provider with `conversation`, so one `export_store`
+    /// snapshot captures both groups.
     self_group: Option<Conversation>,
     public_key: Vec<u8>,
     group_id: Vec<u8>,
@@ -305,8 +283,8 @@ impl Session {
     }
 }
 
-/// Durable append-only store for the single session blob. `commit` must be atomic (all-or-nothing).
-/// On device this is a small encrypted file/row written via a temp-file+rename or a DB transaction.
+/// Store for the single session blob. `commit` MUST be atomic (all-or-nothing) — on device, a
+/// temp-file+rename or a DB transaction.
 pub trait Journal {
     fn commit(&mut self, blob: &[u8]) -> Result<(), DurableError>;
     fn load(&self) -> Result<Option<Vec<u8>>, DurableError>;
@@ -320,7 +298,7 @@ pub struct DurableSession<J: Journal> {
 }
 
 impl<J: Journal> DurableSession<J> {
-    /// Create a brand-new conversation owned by `identity`, persisting it before returning.
+    /// Persists before returning.
     pub fn create(identity: &[u8], mut journal: J) -> Result<Self, DurableError> {
         let member = Member::new(identity)?;
         let conversation = member.create_group()?;
@@ -340,11 +318,9 @@ impl<J: Journal> DurableSession<J> {
         })
     }
 
-    /// Adopt an existing member + conversation into a durable session, persisting it before
-    /// returning. This is the general seam: the async add/join key-package↔welcome exchange is done
-    /// with the lower-level `Member`/`Conversation` (or `ClientApi`) — which must share one provider
-    /// across key-package generation and `join_from_welcome` — and the result is adopted here for
-    /// crash-safe persistence. (`create` is the convenience for the group creator.)
+    /// Adopt an existing member + conversation, persisting before returning. The async key-package↔
+    /// welcome exchange happens on the lower-level `Member`/`Conversation` — which must share ONE
+    /// provider across key-package generation and `join_from_welcome` — then lands here.
     pub fn adopt(
         member: Member,
         conversation: Conversation,
@@ -369,10 +345,9 @@ impl<J: Journal> DurableSession<J> {
 
     /// Reopen the last durably committed session (crash recovery).
     ///
-    /// **Fail closed for secrets:** any secret whose reveal had begun (recipient side, `Countdown`
-    /// or `Visible`) but was not cleanly consumed is forced to `Consumed` here — a crash or
-    /// termination after reveal begins must never grant another viewing opportunity on relaunch. The
-    /// forced consumption is committed before the session is returned.
+    /// **Fail closed for secrets:** a reveal that began but never cleanly consumed is forced to
+    /// `Consumed` here, so a crash after reveal can never grant another viewing opportunity on
+    /// relaunch. Committed before the session is returned.
     pub fn open(journal: J) -> Result<Self, DurableError> {
         let bytes = journal.load()?.ok_or(DurableError::NoSession)?;
         let blob: Blob = serde_json::from_slice(&bytes).map_err(|_| DurableError::Codec)?;
@@ -396,12 +371,11 @@ impl<J: Journal> DurableSession<J> {
         Ok(this)
     }
 
-    /// Publish this member's key package (for others to add them).
     pub fn key_package(&self) -> Result<Vec<u8>, DurableError> {
         Ok(self.session.member.key_package_bytes()?)
     }
 
-    /// Add a member; returns (commit, welcome). The grown group is persisted before returning.
+    /// Returns (commit, welcome); the grown group is persisted before returning.
     pub fn add_member(&mut self, key_package: &[u8]) -> Result<(Vec<u8>, Vec<u8>), DurableError> {
         let added = {
             let Session {
@@ -429,8 +403,7 @@ impl<J: Journal> DurableSession<J> {
         self.session.self_group.is_some()
     }
 
-    /// Create this account's self-group with this device as its sole initial member, persisting it.
-    /// Errors with [`DurableError::SelfGroup`] if one already exists (never silently orphan a group).
+    /// Errors if one already exists — never silently orphan a group.
     pub fn create_self_group(&mut self) -> Result<(), DurableError> {
         if self.session.self_group.is_some() {
             return Err(DurableError::SelfGroup);
@@ -443,10 +416,7 @@ impl<J: Journal> DurableSession<J> {
         self.commit(meta)
     }
 
-    /// Add another of this account's devices to the self-group by its key package. Returns
-    /// (commit, welcome) to deliver to the existing devices / the new device. The advanced self-group
-    /// state is persisted before returning. Errors with [`DurableError::SelfGroup`] if there is no
-    /// self-group on this device yet.
+    /// Returns (commit, welcome) for the existing devices / the new one. Persists before returning.
     pub fn add_self_device(
         &mut self,
         key_package: &[u8],
@@ -463,9 +433,8 @@ impl<J: Journal> DurableSession<J> {
         Ok((added.commit, added.welcome))
     }
 
-    /// Join this account's self-group from a Welcome produced by another of its devices'
-    /// [`add_self_device`](Self::add_self_device). Adopts it as this device's self-group and persists.
-    /// Errors with [`DurableError::SelfGroup`] if a self-group is already established here.
+    /// From a Welcome produced by another device's [`add_self_device`](Self::add_self_device).
+    /// Errors if a self-group is already established here.
     pub fn join_self_group(&mut self, welcome: &[u8]) -> Result<(), DurableError> {
         if self.session.self_group.is_some() {
             return Err(DurableError::SelfGroup);
@@ -478,13 +447,9 @@ impl<J: Journal> DurableSession<J> {
         self.commit(meta)
     }
 
-    /// Remove a device from the self-group by its credential `identity` (e.g. when that device is
-    /// **revoked** from the account). Returns the MLS remove-commit to fan out to the remaining
-    /// self-group members; applying it advances the epoch so the removed device — even if it still
-    /// holds old ratchet state or is handed later ciphertext — can no longer decrypt self-group
-    /// traffic (cryptographic forward secrecy, not merely relay-side exclusion). The advanced state
-    /// is persisted before returning. Errors with [`DurableError::SelfGroup`] if there is no
-    /// self-group here, or [`DurableError::Mls`] if no such member exists.
+    /// Used when a device is revoked. Returns the remove-commit to fan out; applying it advances the
+    /// epoch, so the removed device cannot decrypt later self-group traffic even if it kept old
+    /// ratchet state — cryptographic forward secrecy, not merely relay-side exclusion.
     pub fn remove_self_device(&mut self, identity: &[u8]) -> Result<Vec<u8>, DurableError> {
         let commit = {
             let Session {
@@ -500,11 +465,11 @@ impl<J: Journal> DurableSession<J> {
 
     // ----- Staged commits for MLS-commit-authoritative membership (ADR-0010) ------------------
     //
-    // Staging is deliberately NOT persisted: an in-flight commit awaiting the server's epoch CAS
-    // is discardable, and on a crash the client reopens the last committed (pre-stage) state and
-    // rebuilds. Only `merge_staged` / `process_commit_checked` (state the server accepted) persist.
+    // Staging is deliberately NOT persisted: a commit awaiting the server's epoch CAS is
+    // discardable, and a crash reopens the last committed (pre-stage) state. Only `merge_staged` /
+    // `process_commit_checked` — state the server accepted — persist.
 
-    /// Stage an add: build commit + welcome without advancing the epoch or persisting.
+    /// Builds commit + welcome without advancing the epoch or persisting.
     pub fn stage_add_member(
         &mut self,
         key_package: &[u8],
@@ -518,7 +483,6 @@ impl<J: Journal> DurableSession<J> {
         Ok((added.commit, added.welcome))
     }
 
-    /// Stage a remove: build the commit without advancing the epoch or persisting.
     pub fn stage_remove_member(&mut self, identity: &[u8]) -> Result<Vec<u8>, DurableError> {
         let Session {
             member,
@@ -542,7 +506,7 @@ impl<J: Journal> DurableSession<J> {
         self.commit(meta)
     }
 
-    /// Discard the pending staged commit (server rejected / rebase). Nothing durable changes.
+    /// Server rejected, or we're rebasing. Nothing durable changes.
     pub fn clear_staged(&mut self) -> Result<(), DurableError> {
         let Session {
             member,
@@ -552,8 +516,8 @@ impl<J: Journal> DurableSession<J> {
         Ok(conversation.clear_staged(member)?)
     }
 
-    /// Recipient path: process an inbound commit with the ADR-0010 correspondence check, then
-    /// persist the advanced state. On mismatch nothing advances and nothing is persisted.
+    /// Recipient path with the ADR-0010 correspondence check. On mismatch nothing advances and
+    /// nothing is persisted.
     pub fn process_commit_checked(
         &mut self,
         envelope: &[u8],
@@ -573,9 +537,8 @@ impl<J: Journal> DurableSession<J> {
         self.commit(meta)
     }
 
-    /// Process an inbound envelope. Idempotent per `envelope_id` (at-least-once redelivery is a
-    /// no-op). On success the advanced MLS state, the decrypted message, dedup marker, and
-    /// ack-eligibility are all durable **together** before this returns.
+    /// Idempotent per `envelope_id`, so at-least-once redelivery is a no-op. On success the advanced
+    /// MLS state, decrypted message, dedup marker and ack-eligibility are durable **together**.
     pub fn process_inbound(
         &mut self,
         envelope_id: u64,
@@ -600,13 +563,10 @@ impl<J: Journal> DurableSession<J> {
         Ok(outcome)
     }
 
-    /// Process an inbound envelope that arrived on the account's **self-group** channel (ADR-0015
-    /// option 3): a `SecretConsumed` control message from one of this account's OTHER devices, or a
-    /// self-group membership commit (a device was linked/unlinked). Decrypts with the self-group —
-    /// which the conversation's other party is not a member of — so the read signal never reaches
-    /// them. Shares the same idempotent dedup + ack machinery as [`process_inbound`]; the caller
-    /// routes an envelope here iff the relay tagged it for the self-group. Returns
-    /// [`DurableError::SelfGroup`] if no self-group is established on this device.
+    /// Self-group channel (ADR-0015 option 3): a `SecretConsumed` from another of this account's
+    /// devices, or a self-group membership commit. Decrypting with the self-group — which the
+    /// conversation's other party does not belong to — keeps the read signal away from them. Same
+    /// dedup + ack machinery as [`process_inbound`]; the caller routes here iff the relay tagged it.
     pub fn process_self_inbound(
         &mut self,
         envelope_id: u64,
@@ -630,13 +590,11 @@ impl<J: Journal> DurableSession<J> {
         Ok(outcome)
     }
 
-    /// Envelope ids that are durably processed and safe to acknowledge to the server.
     pub fn ack_eligible(&self) -> Vec<u64> {
         self.meta.ack_eligible.iter().copied().collect()
     }
 
-    /// After the server confirms an ack, stop tracking those ids as ack-eligible (dedup history in
-    /// `seen_inbound` is retained). Persisted before returning.
+    /// Stop tracking these as ack-eligible; `seen_inbound` dedup history is retained.
     pub fn confirm_acked(&mut self, ids: &[u64]) -> Result<(), DurableError> {
         let mut meta = self.meta.clone();
         for id in ids {
@@ -645,9 +603,7 @@ impl<J: Journal> DurableSession<J> {
         self.commit(meta)
     }
 
-    /// Queue an outbound **normal** message (durable draft). Does NOT advance the ratchet. The body
-    /// is wrapped in a [`Content::Normal`] envelope so every message shares one typed, versioned
-    /// application format. Returns a local id.
+    /// Durable draft; does NOT advance the ratchet.
     pub fn enqueue(&mut self, body: &[u8]) -> Result<u64, DurableError> {
         self.enqueue_content(
             Content::Normal {
@@ -657,9 +613,8 @@ impl<J: Journal> DurableSession<J> {
         )
     }
 
-    /// Queue an outbound **secret** (view-once) message. A random secret id is generated; the body
-    /// is wrapped in a [`Content::Secret`] envelope so the classification is encrypted end-to-end
-    /// (the relay never learns a message is secret). Returns `(local_id, secret_id)`.
+    /// Wrapping the body in a [`Content::Secret`] envelope encrypts the classification end-to-end,
+    /// so the relay never learns a message is secret.
     pub fn enqueue_secret(
         &mut self,
         body: &[u8],
@@ -676,9 +631,8 @@ impl<J: Journal> DurableSession<J> {
         Ok((local_id, secret_id))
     }
 
-    /// Queue a **delivery-key grant** (ADR-0014 Slice 2c): share this account's sealed-sender
-    /// delivery access key `K_r` with an approved contact over the E2EE channel. It rides the same
-    /// authenticated MLS pipeline as any message; the relay never sees `K_r`. Returns a local id.
+    /// ADR-0014 Slice 2c. Rides the same authenticated MLS pipeline as any message, so the relay
+    /// never sees `K_r`.
     pub fn enqueue_delivery_key_grant(
         &mut self,
         key_r: &[u8; DELIVERY_KEY_LEN],
@@ -688,9 +642,8 @@ impl<J: Journal> DurableSession<J> {
 
     // ----- New-device history sync (#7) -------------------------------------------------------
 
-    /// The most recent (up to `max`) NON-secret messages from the log, as a history batch to
-    /// replicate to a newly-linked device. Secrets are excluded — view-once has no re-showable
-    /// history. Returned oldest-first so replay preserves order.
+    /// Up to `max` recent messages for a newly-linked device, oldest-first so replay preserves
+    /// order. Secrets are excluded — view-once has no re-showable history.
     pub fn history_entries(&self, max: usize) -> Vec<HistoryEntry> {
         let mut recent: Vec<HistoryEntry> = self
             .meta
@@ -708,9 +661,7 @@ impl<J: Journal> DurableSession<J> {
         recent
     }
 
-    /// Queue a **history-sync** batch (#7) to replicate `entries` to the account's newly-linked
-    /// device(s) over the **self-group** (E2EE, relay-blind). Requires an established self-group.
-    /// Returns a local id; `encrypt` + deliver over the self-group as usual.
+    /// Replicates `entries` over the self-group, so it requires one to be established.
     pub fn enqueue_history_sync(
         &mut self,
         entries: Vec<HistoryEntry>,
@@ -757,9 +708,8 @@ impl<J: Journal> DurableSession<J> {
         Ok(local_id)
     }
 
-    /// Encrypt a queued message and return its envelope. **Idempotent:** if already encrypted, the
-    /// cached ciphertext is returned and the ratchet is NOT advanced again (a retry can never
-    /// double-encrypt or double-spend a message key).
+    /// **Idempotent:** an already-encrypted message returns its cached ciphertext without advancing
+    /// the ratchet again, so a retry can never double-spend a message key.
     pub fn encrypt(&mut self, local_id: u64) -> Result<Vec<u8>, DurableError> {
         let existing = self
             .meta
@@ -780,19 +730,16 @@ impl<J: Journal> DurableSession<J> {
             } = &mut self.session;
             match channel {
                 Channel::Conversation => conversation.encrypt(member, &plaintext)?,
-                // A `SecretConsumed` control message (ADR-0015 option 3) is encrypted with the
-                // self-group so the conversation's other party never receives it. If the outbound
-                // was tagged for the self-group but none exists, that is a self-group precondition
-                // violation — fail closed rather than silently leaking it to the conversation.
+                // Tagged for the self-group but none exists: fail closed rather than silently
+                // leaking the message into the conversation.
                 Channel::SelfGroup => self_group
                     .as_mut()
                     .ok_or(DurableError::SelfGroup)?
                     .encrypt(member, &plaintext)?,
             }
         };
-        // `plaintext` is the encoded Content envelope; decode it to build the DISPLAY message
-        // (never the encoded bytes). A secret becomes an empty-plaintext placeholder + a sender-side
-        // tombstone, so the sender never retains a reopenable copy.
+        // Decode so the DISPLAY message holds the body, never the encoded bytes. A secret becomes an
+        // empty placeholder + sender-side tombstone, so the sender keeps no reopenable copy.
         let content = Content::decode(&plaintext).map_err(map_content)?;
         let mut meta = self.meta.clone();
         let local_id_for_msg = meta.take_local_id();
@@ -821,8 +768,7 @@ impl<J: Journal> DurableSession<J> {
                     secret_id: Some(*secret_id),
                 })
             }
-            // A consumption control message (ADR-0015) / delivery-key grant (ADR-0014 Slice 2c) /
-            // history-sync batch (#7) is not user-visible on the sender — no message log entry.
+            // Control messages are not user-visible on the sender — no message-log entry.
             Content::SecretConsumed { .. }
             | Content::DeliveryKeyGrant { .. }
             | Content::HistorySync { .. } => None,
@@ -834,10 +780,8 @@ impl<J: Journal> DurableSession<J> {
         Ok(ciphertext)
     }
 
-    /// Mark a message accepted by the server. Persisted before returning. For a **secret** message,
-    /// the sender's encoded body is scrubbed from the outbox now that the server has it — the cached
-    /// ciphertext remains for any late retry, but the plaintext body is not retained (the sender
-    /// keeps no reopenable copy).
+    /// A secret's body is scrubbed from the outbox here, now that the server has it; the cached
+    /// ciphertext stays for a late retry, but the sender keeps no reopenable plaintext.
     pub fn mark_sent(&mut self, local_id: u64) -> Result<(), DurableError> {
         let mut meta = self.meta.clone();
         if let Some(entry) = meta.outbox.get_mut(&local_id) {
@@ -856,11 +800,9 @@ impl<J: Journal> DurableSession<J> {
 
     // --- Secret-message reveal API (view-once ephemeral messages) ---------------------------------
 
-    /// Begin revealing a sealed secret (the recipient tapped its placeholder). **Atomic + fail
-    /// closed:** the transition to `Countdown` (with its deadlines) is committed to durable storage
-    /// BEFORE this returns `Ok`. If the state write fails, or the transition is invalid (not sealed,
-    /// wrong side, already revealed/consumed — a double tap or replay), this returns `Err` and the
-    /// caller MUST NOT show anything. `now_ms` is the caller's monotonic clock.
+    /// **Atomic + fail closed:** the transition to `Countdown` is durably committed BEFORE this
+    /// returns `Ok`. On `Err` — failed write, or an invalid transition such as a double tap or
+    /// replay — the caller MUST NOT show anything. `now_ms` is the caller's monotonic clock.
     pub fn begin_secret_reveal(
         &mut self,
         secret_id: &[u8; SECRET_ID_LEN],
@@ -875,13 +817,10 @@ impl<J: Journal> DurableSession<J> {
         self.commit(meta)
     }
 
-    /// Build (once) the **consumption control message** for a secret whose reveal has begun on THIS
-    /// recipient device (ADR-0015, account-wide single-view). Returns the outbound `local_id` to
-    /// `encrypt` + broadcast to the account's other devices (through the same MLS group — opaque to
-    /// the relay), or `None` if the secret is unknown, is the sender's own copy, or has not been
-    /// revealed here. **Idempotent:** repeated calls return the same `local_id`, so the message is
-    /// built + ratchet-advanced at most once. A caller that does not broadcast (single device) simply
-    /// never calls this — no message is enqueued.
+    /// The consumption control message for a secret revealed on THIS device (ADR-0015, account-wide
+    /// single-view). Returns the outbound `local_id` to encrypt + broadcast, or `None` if the secret
+    /// is unknown, is the sender's own copy, or was not revealed here. **Idempotent:** repeated
+    /// calls return the same id, so it is built and ratchet-advanced at most once.
     pub fn emit_secret_consumption(
         &mut self,
         secret_id: &[u8; SECRET_ID_LEN],
@@ -896,10 +835,9 @@ impl<J: Journal> DurableSession<J> {
         if let Some(existing) = rec.consumption_local_id {
             return Ok(Some(existing));
         }
-        // Route through the self-group (ADR-0015 option 3) when this account has one established, so
-        // the conversation's other party never learns the secret was opened. If no self-group exists
-        // (a single-device account, or one not yet linked), fall back to the conversation channel
-        // (option 2 semantics) — a graceful degradation, documented in SECRET_MESSAGES.md.
+        // The self-group keeps the conversation's other party from learning the secret was opened.
+        // Without one (single device, or not yet linked) fall back to the conversation — option 2
+        // semantics, a documented degradation (SECRET_MESSAGES.md).
         let channel = if self.session.self_group.is_some() {
             Channel::SelfGroup
         } else {
@@ -928,8 +866,7 @@ impl<J: Journal> DurableSession<J> {
         Ok(Some(local_id))
     }
 
-    /// The current reveal state of a secret (advancing it for `now_ms`). Persists the advance when it
-    /// changes state (so a consumption survives a crash). `None` if the id is unknown.
+    /// Advances for `now_ms`, persisting on a state change so a consumption survives a crash.
     pub fn secret_state(
         &mut self,
         secret_id: &[u8; SECRET_ID_LEN],
@@ -951,9 +888,8 @@ impl<J: Journal> DurableSession<J> {
         Ok(Some(after))
     }
 
-    /// The secret's plaintext **iff it is currently visible** at `now_ms` — the plaintext gate.
-    /// `None` while sealed/counting down and forever after expiry. Persists a state advance (incl.
-    /// expiry-driven consumption + scrub) when it occurs.
+    /// The plaintext gate: `None` while sealed or counting down, and forever after expiry. Persists
+    /// any state advance, including expiry-driven consumption + scrub.
     pub fn secret_visible_body(
         &mut self,
         secret_id: &[u8; SECRET_ID_LEN],
@@ -975,7 +911,7 @@ impl<J: Journal> DurableSession<J> {
         Ok(body)
     }
 
-    /// Remaining countdown / viewing time in ms (0 when not in that phase) — for the UI timer/fade.
+    /// 0 when not in that phase. Drives the UI timer/fade.
     pub fn secret_remaining_ms(
         &mut self,
         secret_id: &[u8; SECRET_ID_LEN],
@@ -997,8 +933,7 @@ impl<J: Journal> DurableSession<J> {
         Ok((countdown, view))
     }
 
-    /// Force a secret to the terminal tombstone (screenshot/capture detected, or an explicit close).
-    /// Idempotent; scrubs the body. Persisted before returning.
+    /// Used on a detected screenshot/capture or an explicit close. Idempotent; scrubs the body.
     pub fn consume_secret(&mut self, secret_id: &[u8; SECRET_ID_LEN]) -> Result<(), DurableError> {
         let mut meta = self.meta.clone();
         if let Some(rec) = meta.secrets.get_mut(&sid_key(secret_id)) {
@@ -1008,29 +943,26 @@ impl<J: Journal> DurableSession<J> {
         Ok(())
     }
 
-    /// The exact non-sensitive tombstone text shown for a consumed/sent secret.
     pub fn secret_tombstone_text() -> &'static str {
         crate::secret::TOMBSTONE_TEXT
     }
 
-    /// Ordered log of stored messages (inbound decrypted + outbound).
+    /// Inbound decrypted + outbound, in order.
     pub fn messages(&self) -> &[Message] {
         &self.meta.messages
     }
 
-    /// Current MLS epoch.
     pub fn epoch(&self) -> u64 {
         self.session.conversation.epoch()
     }
 
-    /// Schema version of the loaded blob (0 for blobs written before versioning).
+    /// 0 for blobs written before versioning.
     pub fn format_version(&self) -> u32 {
         self.meta.format_version
     }
 
-    /// Snapshot the (already-advanced) MLS store together with `meta` and commit atomically, then
-    /// adopt `meta` in memory. If the commit fails, `meta` is not adopted; per the recovery
-    /// contract the caller must discard this session and `open` again.
+    /// Snapshots the MLS store together with `meta` in one atomic commit, adopting `meta` only on
+    /// success. Per the recovery contract, a failure means the caller must discard and `open` again.
     fn commit(&mut self, meta: Meta) -> Result<(), DurableError> {
         commit_blob(&mut self.journal, &self.session, &meta)?;
         self.meta = meta;
@@ -1038,13 +970,9 @@ impl<J: Journal> DurableSession<J> {
     }
 }
 
-/// Apply a decrypted inbound message to `meta`, returning what it yielded. Shared by both the
-/// conversation channel ([`DurableSession::process_inbound`]) and the self-group channel
-/// ([`DurableSession::process_self_inbound`]) so the content-envelope handling — normal message,
-/// sealed secret, or `SecretConsumed` control message — is defined in exactly ONE place regardless
-/// of which group decrypted it. The MLS plaintext is a [`Content`] envelope; a decode failure (an
-/// authenticated member sent malformed content) is a typed, redacted error and the caller does NOT
-/// commit the ratchet advance, matching the existing process-error contract.
+/// Shared by the conversation and self-group channels so content handling is defined in exactly ONE
+/// place regardless of which group decrypted it. A decode failure — an authenticated member sent
+/// malformed content — is redacted, and the caller does NOT commit the ratchet advance.
 fn apply_incoming(
     meta: &mut Meta,
     incoming: Incoming,
@@ -1065,8 +993,8 @@ fn apply_incoming(
             }
             Content::Secret { secret_id, body } => {
                 if meta.secrets.contains_key(&sid_key(&secret_id)) {
-                    // Replayed secret id (a distinct envelope carrying an already-seen secret).
-                    // Never grant a second sealed placeholder / viewing opportunity.
+                    // A distinct envelope replaying a seen secret id: never grant a second
+                    // placeholder or viewing opportunity.
                     InboundOutcome::Duplicate
                 } else {
                     let local_id = meta.take_local_id();
@@ -1084,20 +1012,17 @@ fn apply_incoming(
                     InboundOutcome::SecretSealed { secret_id }
                 }
             }
-            // ADR-0015: another of this account's devices revealed this secret. Force-consume our
-            // copy (idempotent) so it can never be opened here — account-wide single-view. No
-            // user-visible message; a device that never held this secret simply no-ops.
+            // ADR-0015: another device revealed this secret; force-consume our copy so it can never
+            // be opened here. A device that never held it no-ops.
             Content::SecretConsumed { secret_id } => {
                 if let Some(rec) = meta.secrets.get_mut(&sid_key(&secret_id)) {
                     rec.consume();
                 }
                 InboundOutcome::SecretConsumedRemotely { secret_id }
             }
-            // ADR-0014 Slice 2c: an approved contact granted us their sealed delivery key. Surface it
-            // to the client to store (keyed by sender); no message-log entry.
+            // ADR-0014 Slice 2c: surfaced for the client to store keyed by sender; no log entry.
             Content::DeliveryKeyGrant { key_r } => InboundOutcome::DeliveryKeyGranted { key_r },
-            // #7: an existing device replicated past messages to this newly-linked device. Append
-            // them to the local message log (each gets a fresh local id).
+            // #7: append replicated history to the local log, each with a fresh local id.
             Content::HistorySync { entries } => {
                 let count = entries.len() as u64;
                 for e in entries {
@@ -1136,9 +1061,8 @@ fn commit_blob<J: Journal>(
 }
 
 // --------------------------------------------------------------------------------------------
-// Reference / test journal: an in-memory, shareable store with an injectable commit failure so a
-// crash *before* a commit lands can be simulated. On device, replace with an encrypted-file or DB
-// journal that does an atomic temp-file+rename / transactional write.
+// Test journal: in-memory, shareable, with an injectable commit failure to simulate a crash
+// before a commit lands.
 
 #[derive(Default)]
 struct JournalInner {
@@ -1157,15 +1081,15 @@ impl InMemoryJournal {
         Self::default()
     }
 
-    /// Make the next `commit` fail without storing — simulates a crash before the write lands.
+    /// Simulates a crash before the write lands.
     pub fn fail_next_commit(&self) {
         if let Ok(mut g) = self.inner.lock() {
             g.fail_next = true;
         }
     }
 
-    /// Make the next `commit` **panic** — used to prove the FFI boundary contains panics as typed
-    /// errors (they must never unwind across the C ABI). Test support only.
+    /// Proves the FFI boundary contains panics as typed errors — they must never unwind across the
+    /// C ABI. Test support only.
     pub fn panic_next_commit(&self) {
         if let Ok(mut g) = self.inner.lock() {
             g.panic_next = true;
@@ -1197,16 +1121,14 @@ impl Journal for InMemoryJournal {
 // --------------------------------------------------------------------------------------------
 // Production journal: an encrypted, atomically-written file.
 //
-// - **At rest encryption:** the blob (which contains ratchet secrets + decrypted messages) is
-//   sealed with AES-256-GCM (vetted RustCrypto — no custom crypto). The key is supplied by the
-//   caller; on device it comes from the Keychain-wrapped local key hierarchy (CRYPTOGRAPHY.md §5),
-//   never hard-coded and never in the file.
-// - **Atomicity:** each commit writes a temp file (fsync'd) then `rename`s it over the target, so a
-//   crash mid-write can never leave a torn/partial blob — you either see the old blob or the new.
-// - **Tamper-evidence:** GCM authentication fails closed on any modification of the ciphertext.
+// - At rest: the blob (ratchet secrets + decrypted messages) is sealed with AES-256-GCM (RustCrypto,
+//   no custom crypto). The key comes from the caller — on device, the Keychain-wrapped hierarchy
+//   (CRYPTOGRAPHY.md §5) — never hard-coded, never in the file.
+// - Atomicity: temp file (fsync'd) then `rename`, so a crash mid-write can never leave a torn blob.
+// - Tamper-evidence: GCM authentication fails closed on any modification.
 //
-// File layout: `nonce (12 bytes) || AES-256-GCM ciphertext`. A fresh random nonce per write keeps
-// the (key, nonce) pair unique, which AES-GCM requires.
+// Layout: `nonce (12 bytes) || AES-256-GCM ciphertext`. A fresh random nonce per write keeps the
+// (key, nonce) pair unique, which AES-GCM requires.
 
 pub struct FileJournal {
     path: PathBuf,
@@ -1214,10 +1136,10 @@ pub struct FileJournal {
 }
 
 impl FileJournal {
-    /// `key` is a 32-byte AES-256 key (on device: from the local at-rest key hierarchy). The same
-    /// path + key reopen the persisted session after a relaunch.
+    /// The same path + key reopen the persisted session after a relaunch. On device the key comes
+    /// from the at-rest key hierarchy.
     pub fn new(path: impl Into<PathBuf>, key: &[u8; 32]) -> Self {
-        // 32 bytes is always a valid AES-256 key length, so this cannot fail.
+        // 32 bytes is always a valid AES-256 key length.
         let cipher = Aes256Gcm::new_from_slice(key).expect("AES-256 key is 32 bytes");
         Self {
             path: path.into(),
@@ -1277,18 +1199,12 @@ impl Journal for FileJournal {
     }
 }
 
-// --------------------------------------------------------------------------------------------
-// Concrete journal selector.
-//
-// A `uniffi::Object` cannot be generic, but `DurableSession<J>` is. So the FFI layer wraps a
-// `DurableSession<JournalKind>` where `JournalKind` picks the real backend at construction:
-// `File` on device / in Swift host tests (device-faithful: real at-rest encryption + atomic
-// rename), `Memory` for Rust crash-injection tests. This keeps ONE persistence authority — every
-// variant is still just the same `Journal` contract — rather than introducing a second store.
-
+// A `uniffi::Object` cannot be generic, but `DurableSession<J>` is — so the FFI wraps
+// `DurableSession<JournalKind>`, which picks the backend at construction: `File` on device/Swift
+// tests, `Memory` for Rust crash-injection tests. One persistence authority, not a second store.
 pub enum JournalKind {
-    // Boxed: `FileJournal` carries the AES key schedule and is far larger than the `Arc`-sized
-    // `Memory` variant, so box it to keep the enum small (clippy::large_enum_variant).
+    // Boxed: `FileJournal` carries the AES key schedule, far larger than the `Memory` variant
+    // (clippy::large_enum_variant).
     File(Box<FileJournal>),
     Memory(InMemoryJournal),
 }

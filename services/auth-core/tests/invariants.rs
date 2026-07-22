@@ -1,6 +1,6 @@
-//! Security regression tests. Each maps to an invariant in THREAT_MODEL.md. These prove
-//! the *logic*; the PostgreSQL implementations of the store traits must preserve the same
-//! atomicity (ADR-0006) and get their own concurrency tests later.
+//! Security regression tests, each mapping to a THREAT_MODEL.md invariant. These prove the
+//! *logic*; the PostgreSQL stores must preserve the same atomicity (ADR-0006) and have their own
+//! concurrency tests.
 
 use std::sync::Arc;
 

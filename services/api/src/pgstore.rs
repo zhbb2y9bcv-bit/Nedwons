@@ -1,13 +1,10 @@
-//! PostgreSQL implementations of auth-core's storage seam (ADR-0006). Every atomicity
-//! contract documented on the traits is enforced here by the database:
+//! PostgreSQL implementations of auth-core's storage seam (ADR-0006). The database enforces every
+//! atomicity contract documented on the traits:
 //!
-//! * `ChallengeStore::consume` — `DELETE ... RETURNING`: exactly one caller can ever get
-//!   the row, even under concurrent access.
-//! * `RefreshStore::rotate` — `SELECT ... FOR UPDATE` on the family row serializes racers;
-//!   a generation mismatch (reuse of a retired token) revokes the family in the same
-//!   transaction.
-//! * `CredentialStore::create_account_with_device` — one transaction; the partial unique
-//!   index `devices_one_active_per_account` and the username unique constraint make
+//! * `ChallengeStore::consume` — `DELETE ... RETURNING`: exactly one caller can get the row.
+//! * `RefreshStore::rotate` — `SELECT ... FOR UPDATE` serializes racers; a generation mismatch
+//!   (reuse of a retired token) revokes the family in the same transaction.
+//! * `CredentialStore::create_account_with_device` — one transaction; unique constraints make
 //!   conflicting states unrepresentable.
 //!
 //! Errors are wrapped into `StoreError` with internal-only messages; the service maps them
@@ -46,8 +43,7 @@ impl PgStores {
             .map_err(|e| StoreError(format!("pool: {e}")))
     }
 
-    /// Purge expired challenges and access tokens (retention hygiene, DATA_RETENTION.md).
-    /// Called periodically by the server binary.
+    /// Retention hygiene (DATA_RETENTION.md); called periodically by the server binary.
     pub fn purge_expired(&self, now_unix: u64) -> StoreResult<u64> {
         let mut conn = self.conn()?;
         let now = to_i64(now_unix)?;
@@ -226,8 +222,7 @@ impl CredentialStore for PgStores {
         lockout_secs: u64,
         now: u64,
     ) -> StoreResult<()> {
-        // One statement: increment, and when the (incremented) count reaches the max, lock until
-        // `now + lockout` and reset the counter; otherwise just keep counting.
+        // One statement: increment, and at the max lock until `now + lockout` and reset.
         let mut conn = self.conn()?;
         conn.execute(
             "UPDATE accounts SET
@@ -264,8 +259,8 @@ impl DeviceStore for PgStores {
         account_id: &AccountId,
     ) -> StoreResult<Option<DeviceRecord>> {
         let mut conn = self.conn()?;
-        // Deterministic primary: earliest non-revoked device (ADR-0008). With a single device this
-        // returns it unchanged; with several it is the stable login/bootstrap target.
+        // Deterministic primary (ADR-0008): the earliest non-revoked device, a stable
+        // login/bootstrap target when several exist.
         let row = conn
             .query_opt(
                 "SELECT device_id, account_id, public_key, revoked
@@ -280,10 +275,9 @@ impl DeviceStore for PgStores {
     fn add_active_device(&self, device: DeviceRecord, max_active: usize) -> StoreResult<bool> {
         let mut conn = self.conn()?;
         let mut txn = conn.transaction().map_err(db_err)?;
-        // Count + insert in one transaction so a race cannot exceed the cap. FOR UPDATE would lock
-        // rows; here the isolation of the count-then-insert under one txn plus the retry-safe
-        // caller is sufficient for the cap (an over-limit race would need concurrent enrollments
-        // from the same account, which the client serializes).
+        // Count + insert in one transaction so a race cannot exceed the cap. No FOR UPDATE: an
+        // over-limit race needs concurrent enrollments from one account, which the client
+        // serializes.
         let active: i64 = txn
             .query_one(
                 "SELECT count(*) FROM devices WHERE account_id = $1 AND NOT revoked",

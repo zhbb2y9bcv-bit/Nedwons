@@ -1,10 +1,9 @@
-//! Push notifications (APNs) so a backgrounded/killed iOS app is woken to fetch its inbox — the
-//! in-process [`crate::notify::DeliveryNotifier`] only reaches a connected client.
+//! APNs push, so a backgrounded/killed app is woken to fetch its inbox — the in-process
+//! [`crate::notify::DeliveryNotifier`] only reaches a connected client.
 //!
-//! **Content never leaves the relay (THREAT_MODEL.md INV-1).** The relay is E2EE-blind, so a push
-//! carries NO message content — it is a contentless "you have mail" signal. The app (a Notification
-//! Service Extension) fetches the ciphertext, decrypts it locally, and renders the notification. The
-//! backend only ever sends `{"aps":{"alert":"New message","mutable-content":1,...}}`.
+//! **Content never leaves the relay (INV-1).** A push carries NO message content, only a
+//! contentless "you have mail" signal (`{"aps":{"alert":"New message","mutable-content":1,…}}`);
+//! the Notification Service Extension fetches and decrypts locally.
 //!
 //! **Injected transport (mirrors the HIBP breach provider).** The APNs protocol logic — the ES256
 //! provider JWT, the `/3/device/<token>` request, the headers — is built and unit-tested here against
@@ -46,8 +45,8 @@ pub struct ApnsRequest {
     pub body: Vec<u8>,
 }
 
-/// The socket to Apple, injected so the protocol logic is testable without a network. Returns the
-/// APNs HTTP status (200 = accepted). Blocking; called off the async path.
+/// Injected so the protocol logic is testable without a network. Blocking; called off the async
+/// path. Returns the APNs HTTP status (200 = accepted).
 pub trait PushTransport: Send + Sync {
     fn post(&self, request: &ApnsRequest) -> Result<u16, String>;
 }
@@ -60,14 +59,11 @@ impl PushTransport for NullTransport {
     }
 }
 
-/// The **real** APNs transport: HTTP/2 to `api.push.apple.com` (rustls, no OpenSSL). APNs requires
-/// HTTP/2, so:
-/// - an `https://` base URL uses TLS with ALPN (Apple negotiates h2);
-/// - an `http://` base URL uses HTTP/2 prior knowledge (h2c) — for local integration tests and dev
-///   loopback servers only.
+/// The **real** transport (rustls, no OpenSSL). APNs requires HTTP/2, so `https://` uses TLS ALPN
+/// and `http://` uses prior knowledge (h2c) for local tests only.
 ///
-/// The client is built lazily on first use **inside** `post` (which always runs on a blocking
-/// thread), because constructing a `reqwest::blocking::Client` inside an async context panics.
+/// The client is built lazily **inside** `post`, which always runs on a blocking thread, because
+/// constructing a `reqwest::blocking::Client` in an async context panics.
 pub struct HttpPushTransport {
     base_url: String,
     client: std::sync::OnceLock<Result<reqwest::blocking::Client, String>>,

@@ -1,8 +1,7 @@
-//! Load/soak-shaped tests (bounded so they run in CI). They validate the messaging-
-//! efficiency claims from PERFORMANCE.md under concurrency: server-side fan-out to many
-//! members, idempotent dedup under a concurrent duplicate storm, and — the important one —
-//! that idle long-poll waiters hold NO database connection (more waiters than the pool size
-//! still deliver, which would deadlock if parking held a connection).
+//! Load-shaped tests, bounded for CI, validating PERFORMANCE.md under concurrency: server-side
+//! fan-out, idempotent dedup under a duplicate storm, and — the important one — that idle
+//! long-poll waiters hold NO database connection, since more waiters than pool slots still
+//! deliver where parking-with-a-connection would deadlock.
 
 mod common;
 

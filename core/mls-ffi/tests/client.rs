@@ -1,7 +1,5 @@
-//! Integration tests for the FFI-facing `MlsClient` object (ADR-0007). These drive the exact Rust
-//! surface UniFFI exports, so they prove the object semantics (two-party MLS, durable persistence,
-//! retry-idempotence, state machine, bounds) independently of the generated Swift — the Swift host
-//! test then proves the binding marshals to this same surface.
+//! Drives the exact Rust surface UniFFI exports, proving the object semantics independently of the
+//! generated Swift; the Swift host test then proves the binding marshals to this same surface.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};

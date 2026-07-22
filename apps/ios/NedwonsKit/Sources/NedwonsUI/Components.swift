@@ -1,7 +1,6 @@
 import SwiftUI
 
-/// A calm, legible encryption/verification indicator. Trust state is shown quietly — never
-/// as a fear-based warning for normal operation. Uses the verified (green) color and always
+/// Trust state is shown quietly, never as a fear-based warning for normal operation. Always
 /// carries a non-color cue (icon + label) for accessibility.
 public struct SecurityBadge: View {
     public enum State: Sendable {

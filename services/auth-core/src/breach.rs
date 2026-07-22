@@ -1,12 +1,9 @@
 //! Compromised-credential check via a **k-anonymity range query** (R-305, NIST SP 800-63B-4).
 //!
-//! NIST requires that chosen passwords be checked against a corpus of previously-breached
-//! credentials. The privacy-preserving method (popularised by Have I Been Pwned) never sends the
-//! password or its full hash anywhere: the client/server computes `SHA-1(password)` and reveals
-//! only the **first 5 hex characters** of that hash to the corpus provider, which returns every
-//! breached suffix sharing that prefix; membership is decided locally. This module is the pure,
-//! tested protocol; the corpus provider (a bundled list, a Bloom filter, or an HTTP range API) is
-//! injected via [`RangeProvider`].
+//! Neither the password nor its full hash ever leaves: only the first 5 hex characters of
+//! `SHA-1(password)` go to the corpus provider, which returns every breached suffix sharing that
+//! prefix, and membership is decided locally. The provider (bundled list, Bloom filter, or HTTP
+//! range API) is injected via [`RangeProvider`].
 
 use sha1::{Digest, Sha1};
 
@@ -15,11 +12,10 @@ use sha1::{Digest, Sha1};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BreachUnavailable;
 
-/// Supplies the breached SHA-1 **suffixes** (uppercase hex, 35 chars) present in the corpus for a
-/// given 5-hex-char prefix. The full hash never leaves the caller — only the prefix is revealed.
+/// Supplies breached SHA-1 **suffixes** (uppercase hex, 35 chars) for a 5-hex-char prefix. The
+/// full hash never leaves the caller.
 pub trait RangeProvider {
-    /// Return the suffixes for `prefix`, or `Err(BreachUnavailable)` if the corpus is unavailable (the caller
-    /// decides fail-open vs fail-closed).
+    /// `Err(BreachUnavailable)` if the corpus cannot be consulted.
     fn suffixes(&self, prefix: &str) -> Result<Vec<String>, BreachUnavailable>;
 }
 
@@ -34,15 +30,15 @@ pub fn sha1_hex(password: &str) -> String {
     s
 }
 
-/// Split a 40-char SHA-1 hex into its `(prefix, suffix)` = (first 5 chars, remaining 35).
+/// `(first 5 chars, remaining 35)`.
 pub fn split(hash_hex: &str) -> (String, String) {
     let prefix: String = hash_hex.chars().take(5).collect();
     let suffix: String = hash_hex.chars().skip(5).collect();
     (prefix, suffix)
 }
 
-/// True iff `password`'s SHA-1 appears in the corpus. Only the 5-char prefix is sent to `provider`
-/// (k-anonymity); the suffix comparison is case-insensitive.
+/// Only the 5-char prefix is sent to `provider` (k-anonymity); suffix comparison is
+/// case-insensitive.
 pub fn is_compromised(
     provider: &dyn RangeProvider,
     password: &str,
@@ -53,9 +49,8 @@ pub fn is_compromised(
     Ok(suffixes.iter().any(|s| s.eq_ignore_ascii_case(&suffix)))
 }
 
-/// A corpus backed by an in-memory set of full SHA-1 hex hashes (uppercase). Suitable for a small
-/// **bundled** corpus of the most common breached passwords, and for tests. Production layers a
-/// large external corpus behind the same [`RangeProvider`] trait (e.g. an HTTP range query).
+/// In-memory full SHA-1 hex hashes: a small bundled corpus and tests. Production layers a large
+/// external corpus behind the same [`RangeProvider`].
 pub struct StaticCorpus {
     hashes: std::collections::HashSet<String>,
 }

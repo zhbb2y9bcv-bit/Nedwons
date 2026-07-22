@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
-# Live end-to-end run for the device self-group (ADR-0015 option 3): boot the real nedwons-api
-# server against PostgreSQL, then run the Swift SelfGroupLiveRun client — which links BOTH the HTTP
-# client (NedwonsKit) AND the real MLS core (MlsFfi) — against it over real HTTP. Proves the whole
-# Swift app stack interoperates with the Rust backend for auth -> secret -> self-group link ->
-# consumption fan-out, with real MLS bytes crossing the real relay.
+# Live end-to-end run for the device self-group (ADR-0015 option 3). Boots nedwons-api against
+# PostgreSQL and drives it with SelfGroupLiveRun, which links BOTH the HTTP client (NedwonsKit) and
+# the real MLS core (MlsFfi) — so auth -> secret -> self-group link -> consumption fan-out is proven
+# with real MLS bytes crossing the real relay.
 #
 # Requires: cargo, swift, a running PostgreSQL. Uses DATABASE_URL (default nedwons_dev).
 set -euo pipefail

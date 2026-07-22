@@ -2,10 +2,9 @@ import XCTest
 
 @testable import MlsFfi
 
-/// Proves the *generated Swift bindings* drive the *real Rust MLS core* across the UniFFI boundary
-/// (ADR-0007). On the host these link the macOS slice of MlsFfi.xcframework; the same source runs
-/// against the simulator/device slices in an Xcode test host. No MLS logic lives in Swift — every
-/// call marshals into `mls-core`.
+/// Proves the *generated bindings* drive the *real Rust MLS core* across the UniFFI boundary
+/// (ADR-0007). The host links the macOS xcframework slice; the same source runs against the
+/// simulator/device slices in an Xcode test host. No MLS logic lives in Swift.
 final class MlsFfiBridgeTests: XCTestCase {
     let key = Data(repeating: 7, count: 32)
 

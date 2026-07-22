@@ -1,9 +1,6 @@
-//! Gate 2: crash-safe client state machine. Proves the coupling that makes E2EE messaging safe on
-//! a phone that can be killed at any instant: MLS ratchet state and the decrypted/queued message
-//! state advance together, at-least-once redelivery is idempotent, a failed commit leaves NO
-//! partial advance, and an outbound retry never re-encrypts (never double-spends a message key).
-//! MLS state also survives serialize→restore (a real relaunch), proven by exchanging a message
-//! *after* both sides are reopened from their journals.
+//! Gate 2 crash-safety: ratchet and message state advance together, redelivery is idempotent, a
+//! failed commit leaves NO partial advance, a retry never re-encrypts, and MLS state survives
+//! relaunch — proven by exchanging a message *after* both sides reopen from their journals.
 
 use mls_core::durable::{Direction, DurableError, DurableSession, InMemoryJournal, InboundOutcome};
 use mls_core::Member;
@@ -15,7 +12,7 @@ fn pair() -> (
     DurableSession<InMemoryJournal>,
     InMemoryJournal,
 ) {
-    // Async add at the low level (Bob's key package + join share one provider), then adopt both.
+    // Bob's key package + join must share one provider, so add at the low level and adopt both.
     let alice = Member::new(b"alice-device").expect("alice");
     let bob = Member::new(b"bob-device").expect("bob");
     let bob_kp = bob.key_package_bytes().expect("bob kp");

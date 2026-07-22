@@ -1,9 +1,8 @@
 import CryptoKit
 import Foundation
 
-/// Client-side key-transparency verification (R-201). The whole point of transparency is that the
-/// client does **not** trust the server to report keys honestly — it verifies. This mirrors
-/// `auth_core::transparency` (RFC 6962) byte for byte, so the Swift client and Rust server agree.
+/// Client-side key-transparency verification (R-201): the client does **not** trust the server to
+/// report keys honestly, it verifies. Mirrors `auth_core::transparency` (RFC 6962) byte for byte.
 ///
 /// A client self-monitors its own account: it verifies the Signed Tree Head's signature under the
 /// **pinned** log public key, that its enrolled device key is the one logged (no substitution),

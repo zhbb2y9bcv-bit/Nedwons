@@ -1,6 +1,5 @@
-//! End-to-end HTTP tests for the auth API: a simulated client drives the real axum router
-//! backed by real PostgreSQL stores. In-process via `oneshot`, no network socket. Shared
-//! client helpers live in `common`.
+//! A simulated client drives the real axum router over real PostgreSQL stores, in-process via
+//! `oneshot` with no network socket.
 
 mod common;
 

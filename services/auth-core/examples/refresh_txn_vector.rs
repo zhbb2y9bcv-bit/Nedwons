@@ -1,5 +1,4 @@
-//! Prints the deterministic refresh transaction id for a fixed token, so the iOS client's
-//! `ClientTranscripts.refreshTxnID` can be pinned to the same value.
+//! Pins the iOS `ClientTranscripts.refreshTxnID` to the same deterministic value.
 //! Run: `cargo run -p auth-core --example refresh_txn_vector`.
 
 use auth_core::crypto::sha256;

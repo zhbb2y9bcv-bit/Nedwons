@@ -1,23 +1,16 @@
-//! Versioned, typed **application-content envelope** — the plaintext that MLS encrypts.
+//! Typed application-content envelope — the plaintext MLS encrypts.
 //!
-//! Every application message a client sends is first encoded as one of these and *then* handed to
-//! the MLS ciphersuite. So the classification (normal vs **secret**) and the body live **inside** the
-//! MLS ciphertext: the relay — which only ever forwards opaque MLS bytes — cannot see whether a
-//! message is secret, nor its contents (INV: relay MLS-blindness is preserved by construction; this
-//! adds no plaintext server route). This is distinct from [`crate::envelope`], the *outer*
-//! transport wrapper `u16(version) || mls_ciphertext`; that versions the wire framing, this versions
-//! the decrypted application content.
+//! Because the kind (normal vs **secret**) and body are encoded here and *then* encrypted, they live
+//! INSIDE the MLS ciphertext: the relay cannot see that a message is secret, preserving blindness by
+//! construction. Distinct from [`crate::envelope`], which versions the outer wire framing.
 //!
-//! The encoding is length-prefixed and strictly bounded so a hostile or corrupt payload is rejected
-//! with a typed, redacted error rather than mis-parsed or panicking (the bytes may be attacker-chosen
-//! ciphertext that happened to decrypt, so decode is treated as untrusted input).
+//! Decode treats its input as untrusted — the bytes may be attacker-chosen ciphertext that happened
+//! to decrypt — so it is length-prefixed, strictly bounded, and fails with a redacted error.
 
-/// Current content-envelope version. A bump is an explicit, non-silent wire change; an older client
-/// rejects a newer version rather than guessing.
+/// A bump is an explicit, non-silent wire change; older clients reject rather than guess.
 pub const CONTENT_VERSION: u16 = 1;
 
-/// Upper bound on a decoded body. Kept at/under the FFI `MAX_PLAINTEXT_LEN` so a body that fits the
-/// envelope also fits the transport. Secret text is short by nature; this is generous headroom.
+/// At/under the FFI `MAX_PLAINTEXT_LEN`, so a body that fits the envelope also fits the transport.
 pub const MAX_CONTENT_BODY: usize = 16 * 1024;
 
 const KIND_NORMAL: u8 = 0;
@@ -26,65 +19,61 @@ const KIND_SECRET_CONSUMED: u8 = 2;
 const KIND_DELIVERY_KEY_GRANT: u8 = 3;
 const KIND_HISTORY_SYNC: u8 = 4;
 
-/// Length of a secret-message id (a sender-chosen random, used for placeholder tracking + replay
-/// rejection on the recipient).
+/// Sender-chosen random, used for placeholder tracking + recipient-side replay rejection.
 pub const SECRET_ID_LEN: usize = 16;
 
-/// Length of a sealed-sender **delivery access key** `K_r` (ADR-0014). Distributing it to an
-/// approved contact lets them send you sealed-sender messages; it is granted over the E2EE channel.
+/// Sealed-sender delivery access key `K_r` (ADR-0014), granted over the E2EE channel.
 pub const DELIVERY_KEY_LEN: usize = 32;
 
-/// Upper bound on entries in a single history-sync batch (#7). Bounds a hostile/oversized payload;
-/// a longer history is synced across several batches.
+/// Bounds a hostile payload; longer histories sync across several batches.
 pub const MAX_HISTORY_ENTRIES: usize = 500;
 
-/// One past message replicated to a newly-linked device (#7): the direction (was it sent by this
-/// account) plus the plaintext body. Secrets are NOT included (view-once has no re-showable history).
+/// One past message replicated to a newly-linked device (#7). Secrets are NOT included — view-once
+/// has no re-showable history.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryEntry {
-    /// True if this account originally SENT the message (outbound); false if received (inbound).
+    /// True if this account SENT it; false if received.
     pub outbound: bool,
     pub body: Vec<u8>,
 }
 
-/// A decoded application-content envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Content {
-    /// An ordinary message; `body` is the UTF-8 (or opaque) message bytes.
-    Normal { body: Vec<u8> },
-    /// A **secret** ("view-once") message, identified by `secret_id`.
+    Normal {
+        body: Vec<u8>,
+    },
+    /// A view-once message.
     Secret {
         secret_id: [u8; SECRET_ID_LEN],
         body: Vec<u8>,
     },
-    /// A **consumption** control message (ADR-0015): the account's device that revealed `secret_id`
-    /// tells its OTHER devices to consume that secret too (account-wide single-view). Carries no
-    /// body — only the id. E2EE + relay-blind like any other content.
-    SecretConsumed { secret_id: [u8; SECRET_ID_LEN] },
-    /// A **delivery-key grant** (ADR-0014 Slice 2c): shares this account's sealed-sender delivery
-    /// access key `K_r` with an approved contact over the E2EE channel, so they can send sealed
-    /// messages. The relay never sees `K_r` (it travels inside the MLS ciphertext).
-    DeliveryKeyGrant { key_r: [u8; DELIVERY_KEY_LEN] },
-    /// A **history-sync** batch (#7): an existing device replicates past messages to a newly-linked
-    /// device over the account's self-group. E2EE + relay-blind. Bounded to [`MAX_HISTORY_ENTRIES`].
-    HistorySync { entries: Vec<HistoryEntry> },
+    /// ADR-0015: the device that revealed `secret_id` tells the account's OTHER devices to consume
+    /// it too (account-wide single-view). No body.
+    SecretConsumed {
+        secret_id: [u8; SECRET_ID_LEN],
+    },
+    /// ADR-0014 Slice 2c: shares `K_r` with an approved contact. The relay never sees it — the grant
+    /// travels inside the MLS ciphertext.
+    DeliveryKeyGrant {
+        key_r: [u8; DELIVERY_KEY_LEN],
+    },
+    /// #7: replicates past messages to a newly-linked device over the account's self-group.
+    HistorySync {
+        entries: Vec<HistoryEntry>,
+    },
 }
 
-/// Typed, **redacted** decode failure — carries no payload bytes, so logging one leaks nothing.
+/// Carries no payload bytes, so logging one leaks nothing.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum ContentError {
-    /// Truncated / structurally invalid.
     Malformed,
-    /// A content version this build does not understand.
     UnsupportedVersion(u16),
-    /// An unknown message-kind discriminant.
     UnknownKind(u8),
-    /// The declared or actual body exceeds [`MAX_CONTENT_BODY`].
     TooLarge,
 }
 
 impl Content {
-    /// The body regardless of kind (empty for a `SecretConsumed` control message).
+    /// Empty for control kinds.
     pub fn body(&self) -> &[u8] {
         match self {
             Content::Normal { body } | Content::Secret { body, .. } => body,
@@ -179,7 +168,6 @@ impl Content {
     }
 }
 
-/// Split a leading 16-byte secret id, returning it and the remaining bytes.
 fn split_secret_id(rest: &[u8]) -> Result<([u8; SECRET_ID_LEN], &[u8]), ContentError> {
     if rest.len() < SECRET_ID_LEN {
         return Err(ContentError::Malformed);
@@ -190,8 +178,7 @@ fn split_secret_id(rest: &[u8]) -> Result<([u8; SECRET_ID_LEN], &[u8]), ContentE
     Ok((arr, rest))
 }
 
-/// Decode a history-sync batch: `u32(count) || [u8(outbound) || u32(len) || body]*`, strict (exact
-/// consumption, no trailer) and bounded (`MAX_HISTORY_ENTRIES`, each body `MAX_CONTENT_BODY`).
+/// `u32(count) || [u8(outbound) || u32(len) || body]*` — exact consumption, no trailer, bounded.
 fn decode_history(mut rest: &[u8]) -> Result<Vec<HistoryEntry>, ContentError> {
     if rest.len() < 4 {
         return Err(ContentError::Malformed);
@@ -203,7 +190,6 @@ fn decode_history(mut rest: &[u8]) -> Result<Vec<HistoryEntry>, ContentError> {
     rest = &rest[4..];
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
-        // Each entry: flag(1) + len(4) + body(len).
         if rest.len() < 5 {
             return Err(ContentError::Malformed);
         }
@@ -233,7 +219,7 @@ fn decode_history(mut rest: &[u8]) -> Result<Vec<HistoryEntry>, ContentError> {
     Ok(entries)
 }
 
-/// Decode a `u32(len) || body` trailer, exact (no trailing/truncation) and bounded.
+/// `u32(len) || body` — exact (no trailer or truncation) and bounded.
 fn decode_lp_body(rest: &[u8]) -> Result<Vec<u8>, ContentError> {
     if rest.len() < 4 {
         return Err(ContentError::Malformed);
@@ -284,11 +270,9 @@ mod tests {
         let decoded = Content::decode(&c.encode()).unwrap();
         assert_eq!(decoded, c);
         assert!(decoded.body().is_empty());
-        // A trailing byte after the id is rejected (control message has no body).
         let mut over = c.encode();
         over.push(0);
         assert_eq!(Content::decode(&over), Err(ContentError::Malformed));
-        // A truncated id is rejected.
         let short = &c.encode()[..c.encode().len() - 1];
         assert_eq!(Content::decode(short), Err(ContentError::Malformed));
     }
@@ -301,11 +285,9 @@ mod tests {
         let decoded = Content::decode(&c.encode()).unwrap();
         assert_eq!(decoded, c);
         assert!(decoded.body().is_empty());
-        // A trailing byte after the 32-byte key is rejected.
         let mut over = c.encode();
         over.push(0);
         assert_eq!(Content::decode(&over), Err(ContentError::Malformed));
-        // A short key is rejected.
         let short = &c.encode()[..c.encode().len() - 1];
         assert_eq!(Content::decode(short), Err(ContentError::Malformed));
     }
@@ -331,11 +313,10 @@ mod tests {
         assert_eq!(Content::decode(&c.encode()).unwrap(), c);
         assert!(c.body().is_empty());
 
-        // An empty batch is valid.
         let empty = Content::HistorySync { entries: vec![] };
         assert_eq!(Content::decode(&empty.encode()).unwrap(), empty);
 
-        // A declared count over the cap is rejected on the length field alone (no huge allocation).
+        // Rejected on the length field alone — no huge allocation.
         let mut bytes = CONTENT_VERSION.to_be_bytes().to_vec();
         bytes.push(KIND_HISTORY_SYNC);
         bytes.extend_from_slice(&((MAX_HISTORY_ENTRIES as u32) + 1).to_be_bytes());

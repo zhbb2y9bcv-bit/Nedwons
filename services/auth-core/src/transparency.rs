@@ -1,33 +1,27 @@
 //! Append-only Merkle transparency log — the auditable substrate for key transparency (R-201).
 //!
-//! This is the **RFC 6962** (Certificate Transparency) Merkle tree, a mature, precisely specified
-//! *standard* construction — not a novel protocol. It is deliberately NOT a from-scratch design:
-//! the hashing and proof algorithms below follow RFC 6962 §2.1 verbatim.
+//! The **RFC 6962** Merkle tree, followed verbatim (§2.1) rather than designed from scratch:
 //!
 //! - Leaf hash:     `H(0x00 || entry)`
 //! - Interior hash: `H(0x01 || left || right)`
 //! - Split point:   the largest power of two strictly less than the subtree size.
 //!
-//! It provides two proofs a client verifies:
-//! - **Inclusion**: a specific binding (account → device key) is present in the log at a given
-//!   tree size — so the server cannot serve a key it never logged.
-//! - **Consistency**: the tree at size *n* is an append-only extension of the tree at size *m<n*
-//!   — so the server cannot rewrite history (retroactively swap a logged key).
+//! Two client-verified proofs: **inclusion** (a binding is in the log at a given tree size, so the
+//! server cannot serve a key it never logged) and **consistency** (size *n* extends size *m<n*, so
+//! history cannot be rewritten).
 //!
-//! What this does **not** provide on its own (documented honestly in `docs/KEY_TRANSPARENCY.md`,
-//! RISK_REGISTER R-201): protection from a server that shows *different* consistent logs to
-//! different clients (split-view / equivocation — needs gossip / third-party witnesses), and
-//! efficient verifiable *non-inclusion* / "this is the latest key" proofs (needs a verifiable map,
-//! e.g. CONIKS/Parakeet). This module + client self-monitoring detects logged-key substitution and
-//! history rewriting; it is **not** a complete anti-equivocation KT system and has not had a
-//! specialised third-party audit. Manual safety-number verification remains the belt-and-suspenders.
+//! **Not provided on its own** (docs/KEY_TRANSPARENCY.md, R-201): protection from a server showing
+//! *different* consistent logs to different clients (split-view — needs gossip/witnesses), and
+//! efficient verifiable non-inclusion / "latest key" proofs (needs a verifiable map). This is an
+//! RFC 6962-compatible Merkle primitive inside an application-specific KT design, NOT a complete
+//! anti-equivocation KT system, and it has had no specialised third-party audit. Manual
+//! safety-number verification remains the backstop.
 
 use crate::crypto::sha256;
 
-/// A 32-byte SHA-256 tree hash.
 pub type Hash = [u8; 32];
 
-/// Leaf hash of a log entry: `H(0x00 || entry)` (RFC 6962 §2.1).
+/// `H(0x00 || entry)` (RFC 6962 §2.1).
 pub fn hash_leaf(entry: &[u8]) -> Hash {
     let mut buf = Vec::with_capacity(1 + entry.len());
     buf.push(0x00);
@@ -35,7 +29,7 @@ pub fn hash_leaf(entry: &[u8]) -> Hash {
     sha256(&buf)
 }
 
-/// Interior node hash: `H(0x01 || left || right)` (RFC 6962 §2.1).
+/// `H(0x01 || left || right)` (RFC 6962 §2.1).
 fn hash_node(left: &Hash, right: &Hash) -> Hash {
     let mut buf = Vec::with_capacity(1 + 64);
     buf.push(0x01);
@@ -54,8 +48,7 @@ fn split(n: usize) -> usize {
     k
 }
 
-/// Merkle Tree Hash (root) over the given **leaf hashes** (each already `hash_leaf(entry)`).
-/// The empty tree hashes to `H("")`, per RFC 6962.
+/// Over **leaf hashes** (each already `hash_leaf(entry)`). The empty tree is `H("")`, per RFC 6962.
 pub fn merkle_root(leaves: &[Hash]) -> Hash {
     match leaves.len() {
         0 => sha256(&[]),

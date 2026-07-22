@@ -2,12 +2,10 @@ import Foundation
 import NedwonsKit
 import SwiftUI
 
-/// Observable app state that backs the UI. Every button calls one of these async methods,
-/// which call `NedwonsClient` against the backend — so the controls are functionally wired,
-/// not decorative. The device proof-of-possession key is provisioned and reloaded through
-/// `DeviceIdentity`: registration enrolls the Secure Enclave key when the hardware exists (else
-/// an explicit, acknowledged software fallback), and sign-in reloads that *same* enrolled key —
-/// so device binding (INV-2) actually holds instead of signing a fresh key each launch.
+/// Observable app state backing the UI. Every button calls one of these async methods against the
+/// backend, so the controls are functionally wired, not decorative. Keys go through
+/// `DeviceIdentity`, so sign-in reloads the *same* enrolled key rather than signing a fresh one
+/// each launch — which is what makes device binding (INV-2) actually hold.
 @MainActor
 public final class AppModel: ObservableObject {
     @Published public var session: NedwonsClient.Session?

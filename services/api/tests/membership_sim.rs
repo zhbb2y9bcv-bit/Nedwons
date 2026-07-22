@@ -1,9 +1,9 @@
 //! ADR-0010 headless multi-client reference simulation (R-506).
 //!
-//! REAL MLS clients (`mls-core`, dev-dependency — the server binary still never links it) drive
-//! membership through the REAL relay: device-signed manifests, the per-group epoch CAS, atomic
-//! routing + commit/welcome fan-out + removed-device cutoff, and — the part only clients can do —
-//! the correspondence check that catches a lying manifest.
+//! REAL MLS clients (a dev-dependency; the server binary still never links `mls-core`) drive
+//! membership through the REAL relay: signed manifests, the epoch CAS, atomic routing +
+//! commit/welcome fan-out + removed-device cutoff, and the correspondence check — the part only
+//! clients can do — that catches a lying manifest.
 //!
 //! MLS credential identity = the 16-byte device id, so manifests and credentials name the same
 //! things and recipients can compare them.

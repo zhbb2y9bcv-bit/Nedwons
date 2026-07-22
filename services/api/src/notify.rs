@@ -1,13 +1,10 @@
-//! In-process delivery notifications for long-polling. When an envelope is queued for a
-//! device, waiters on that device's inbox wake immediately instead of polling — dropping
-//! idle delivery latency to near-zero while a waiting client costs **zero** database
-//! queries (unlike a server-side poll loop).
+//! In-process delivery notifications for long-polling: a queued envelope wakes that device's
+//! waiters immediately, so a waiting client costs **zero** database queries.
 //!
-//! This is single-instance. Across multiple API instances a client's waiter and its
-//! sender may live on different processes, so production adds a cross-instance signal
-//! (PostgreSQL `LISTEN/NOTIFY` or a lightweight bus). The database remains the source of
-//! truth and every wait is bounded by a timeout, so a missed cross-instance notification
-//! only delays delivery by the poll timeout — it never loses a message.
+//! Single-instance. Across processes a waiter and its sender may differ, so production adds a
+//! cross-instance signal (`LISTEN/NOTIFY` or a bus). The database stays the source of truth and
+//! every wait is timeout-bounded, so a missed signal only delays delivery — it never loses a
+//! message.
 //!
 //! A device that is NOT connected (backgrounded/killed) is reached instead by push (#4): an
 //! optional wake hook fires on every `wake`, dispatching a contentless APNs push (see

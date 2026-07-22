@@ -1,8 +1,7 @@
 import Foundation
 import NedwonsKit
 
-/// Build-time configuration the shipped app reads from its `Info.plist` (set per build
-/// configuration in the Xcode project), so nothing security-relevant is hardcoded:
+/// Read from `Info.plist` per build configuration, so nothing security-relevant is hardcoded:
 ///
 /// - `NedwonsServerURL` — the backend base URL (must be **https** for a device build; iOS ATS
 ///   blocks plaintext). Falls back to the loopback dev server so the simulator "just works".

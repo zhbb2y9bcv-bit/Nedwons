@@ -2,10 +2,9 @@ import Foundation
 import MlsFfi
 import NedwonsKit
 
-/// Reusable orchestration of the ADR-0015 (option 3) self-group device link, over the real
-/// `NedwonsClient` (HTTP) + `MlsClient` (MLS core). This is the app-facing extraction of the
-/// linking phase proven end-to-end, live, by `SelfGroupLiveRun` — both the CLI harness and the app's
-/// Devices screen drive the exact same code so the UI path is the tested path.
+/// Orchestrates the ADR-0015 self-group device link over `NedwonsClient` + `MlsClient`. The CLI
+/// harness (`SelfGroupLiveRun`, which proves it live) and the Devices screen drive this same code,
+/// so the UI path is the tested path.
 ///
 /// Two roles, matching the two sides of a link:
 ///   • **Primary** (a device that already holds the account's self-group, or is establishing it):

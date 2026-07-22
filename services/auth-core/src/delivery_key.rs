@@ -1,30 +1,24 @@
 //! Sealed-sender **delivery access key** (DAK) primitive (ADR-0014, R-204).
 //!
-//! Sealed delivery removes the authenticated sender, so the relay needs another gate against
-//! anonymous spam. A **recipient** holds a 32-byte random `K_r` and registers only its **verifier**
-//! `V_r = SHA-256(K_r)` with the relay; it distributes `K_r` to approved senders *inside the E2EE
-//! channel* (the relay never sees `K_r` in transit). To deliver a sealed message a sender presents
-//! `K_r`; the relay accepts iff `SHA-256(presented) == V_r`.
+//! Sealed delivery removes the authenticated sender, so the relay needs another anti-spam gate. The
+//! recipient holds a 32-byte `K_r`, registers only `V_r = SHA-256(K_r)`, and distributes `K_r`
+//! inside the E2EE channel; a sender presents `K_r` and the relay accepts iff the hash matches.
 //!
-//! This module is only that pure check. It is deliberately **honest about its limits** (ADR-0014):
-//! on first presentation the relay learns `K_r`, so the DAK gates spam *volume*, not sender
-//! *authenticity* — authenticity is backstopped by the sender certificate the recipient verifies
-//! ([`crate::sender_cert`]). Storing `V_r` (a hash) rather than `K_r` keeps a DB dump from directly
-//! yielding usable delivery keys.
+//! **Honest limit** (ADR-0014): on first presentation the relay learns `K_r`, so this gates spam
+//! *volume*, not sender *authenticity* — authenticity comes from [`crate::sender_cert`]. Storing
+//! the hash keeps a DB dump from directly yielding usable delivery keys.
 //!
-//! Generation of `K_r` happens on the recipient's device (client-side CSPRNG); the server only ever
-//! computes/compares verifiers, which is why this module has no RNG.
+//! `K_r` is generated on the recipient's device, which is why this module needs no RNG.
 
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-/// Length of a delivery access key in bytes.
 pub const DAK_LEN: usize = 32;
 
-/// Length of a verifier (`SHA-256` output) in bytes.
+/// `SHA-256` output width.
 pub const VERIFIER_LEN: usize = 32;
 
-/// The verifier `V_r = SHA-256(K_r)` the recipient registers with the relay.
+/// `V_r = SHA-256(K_r)`, what the recipient registers with the relay.
 pub fn verifier(dak: &[u8]) -> [u8; VERIFIER_LEN] {
     let digest = Sha256::digest(dak);
     let mut out = [0u8; VERIFIER_LEN];
@@ -32,8 +26,8 @@ pub fn verifier(dak: &[u8]) -> [u8; VERIFIER_LEN] {
     out
 }
 
-/// Constant-time check that `presented` is the delivery access key behind `expected_verifier`.
-/// Fail-closed: a wrong-length verifier (never a valid `SHA-256`) can never match.
+/// Constant-time, to avoid delivery-key timing leaks. Fail-closed: a wrong-length verifier can
+/// never match.
 pub fn verify(presented_dak: &[u8], expected_verifier: &[u8]) -> bool {
     if expected_verifier.len() != VERIFIER_LEN {
         return false;
@@ -41,8 +35,7 @@ pub fn verify(presented_dak: &[u8], expected_verifier: &[u8]) -> bool {
     verifier(presented_dak).ct_eq(expected_verifier).into()
 }
 
-/// True if `bytes` is a structurally valid verifier to register (exactly `SHA-256` wide). The relay
-/// stores whatever verifier the recipient registers; this only rejects malformed input.
+/// Rejects malformed input only; the relay stores whatever verifier the recipient registers.
 pub fn is_valid_verifier(bytes: &[u8]) -> bool {
     bytes.len() == VERIFIER_LEN
 }
@@ -74,10 +67,9 @@ mod tests {
 
     #[test]
     fn verifier_is_stable_and_is_plain_sha256() {
-        // Pin the exact bytes so the Swift client (which computes V_r = SHA-256(K_r)) agrees.
+        // Pinned so the Swift client's V_r computation agrees. This is SHA-256("").
         let v = verifier(b"");
         let hex: String = v.iter().map(|b| format!("{b:02x}")).collect();
-        // SHA-256("") — the well-known empty-string digest.
         assert_eq!(
             hex,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"

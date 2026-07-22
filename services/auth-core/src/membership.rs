@@ -1,35 +1,30 @@
 //! The canonical, domain-separated **membership manifest** (ADR-0010, R-506).
 //!
 //! A membership change reaches the relay as `(manifest, signature, opaque commit[, welcomes])`.
-//! The relay is MLS-blind: it cannot parse the commit, so the manifest is the *routing claim*,
-//! signed by the committing device's enrolled auth key. The server verifies signature +
-//! authorization + epoch ordering + `commit_hash` binding; recipient clients verify that the
-//! commit's actual cryptographic effect matches this manifest before merging (the correspondence
-//! check the server cannot perform).
+//! Because the relay is MLS-blind it cannot parse the commit, so the manifest is the *routing
+//! claim*: the server verifies signature + authorization + epoch ordering + `commit_hash` binding,
+//! and recipients verify the commit's actual effect matches it before merging — the correspondence
+//! check the server cannot perform.
 //!
-//! Encoding follows the same injective transcript discipline as [`crate::transcript`]: a
-//! versioned domain tag, then every variable-length field length-prefixed (u32 BE), lists
-//! count-prefixed — no two distinct field vectors serialize identically, and a signature over a
-//! v1 manifest can never be replayed as any other protocol object.
+//! Same injective discipline as [`crate::transcript`] (versioned domain tag, length-prefixed
+//! fields, count-prefixed lists), so a v1 manifest signature can never be replayed as another
+//! protocol object.
 
 use crate::crypto::{sha256, verify_p256};
 use crate::ids::{AccountId, DeviceId};
 
-/// ASCII domain-separation tag. Versioned: a future manifest format re-tags (explicit protocol
-/// versioning for membership control messages — the R-506 requirement).
+/// Versioned: a future manifest format re-tags (explicit protocol versioning, R-506).
 pub const DOMAIN: &[u8] = b"app.nedwons.membership.v1";
 
-/// What kind of membership change this manifest describes. One kind per commit in v1 (no mixed
-/// add+remove commits — simpler for every verifier and matches the product flows).
+/// One kind per commit in v1 — no mixed add+remove, which keeps every verifier simple.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ControlType {
-    /// `added` lists the joining (account, device) pairs; a Welcome per added device travels
-    /// with the commit.
+    /// A Welcome per added device travels with the commit.
     Add = 1,
-    /// `removed` lists the removed devices (admin action).
+    /// Admin action.
     Remove = 2,
-    /// `removed` lists the actor's own devices (consent withdrawal, ADR-0009).
+    /// `removed` lists the actor's OWN devices (consent withdrawal, ADR-0009).
     Leave = 3,
 }
 
@@ -44,11 +39,9 @@ impl ControlType {
     }
 }
 
-/// The fields bound into one signed membership manifest.
-///
-/// `added` MUST be sorted by (account, device) and `removed` sorted, both duplicate-free — the
-/// canonical encoding is otherwise ambiguous between semantically-equal manifests. The server
-/// rejects unsorted input; [`encode`](Manifest::encode) encodes exactly what it is given.
+/// `added` and `removed` MUST be sorted and duplicate-free, or the canonical encoding is ambiguous
+/// between semantically-equal manifests. The server rejects unsorted input;
+/// [`encode`](Manifest::encode) encodes exactly what it is given.
 pub struct Manifest<'a> {
     pub control: ControlType,
     pub group_id: &'a [u8; 16],
@@ -64,13 +57,12 @@ pub struct Manifest<'a> {
     pub removed: &'a [DeviceId],
     /// Same precise scope as message sends: names ONE logical commit upload.
     pub idempotency_key: &'a [u8; 16],
-    /// Unix seconds; the server rejects expired manifests (bounds the in-transit replay window —
-    /// the epoch CAS is the real anti-replay).
+    /// Bounds the in-transit replay window; the epoch CAS is the real anti-replay.
     pub expires_at: u64,
 }
 
 impl<'a> Manifest<'a> {
-    /// Produce the canonical byte string that is signed and hashed.
+    /// The canonical byte string that is signed and hashed.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(
             4 + DOMAIN.len()
@@ -108,14 +100,12 @@ impl<'a> Manifest<'a> {
         out
     }
 
-    /// SHA-256 of the canonical encoding — the manifest's identity in the audit log and the
-    /// idempotency comparison.
+    /// The manifest's identity in the audit log and the idempotency comparison.
     pub fn hash(&self) -> [u8; 32] {
         sha256(&self.encode())
     }
 
-    /// Verify `signature` (ECDSA-P256) over this manifest against the actor's enrolled device
-    /// public key (SEC1). Fail-closed boolean.
+    /// ECDSA-P256 against the actor's enrolled device key (SEC1). Fail-closed.
     pub fn verify(&self, actor_public_key_sec1: &[u8], signature: &[u8]) -> bool {
         verify_p256(actor_public_key_sec1, &self.encode(), signature)
     }

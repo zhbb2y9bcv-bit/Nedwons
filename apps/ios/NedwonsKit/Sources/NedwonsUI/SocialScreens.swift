@@ -1,8 +1,7 @@
 import NedwonsKit
 import SwiftUI
 
-/// Top-level view: shows sign-in until there's a session, then the tabbed app. The `@main`
-/// app constructs an `AppModel` (with the backend URL) and hands it to this view.
+/// Sign-in until there is a session, then the tabbed app. `@main` constructs the `AppModel`.
 public struct AppRootView: View {
     @ObservedObject private var model: AppModel
 

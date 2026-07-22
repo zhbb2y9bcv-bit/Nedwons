@@ -1,90 +1,74 @@
-//! Secret-message reveal **state machine** (view-once ephemeral messages).
-//!
-//! A secret message the recipient holds moves through an explicit, one-way lifecycle:
+//! View-once reveal state machine.
 //!
 //! ```text
 //!   Sealed ──begin_reveal──▶ Countdown ──(+3s)──▶ Visible ──(+10s)──▶ Consumed
 //! ```
 //!
-//! `Consumed` is terminal and equivalent to the *tombstone* display state: the plaintext is gone and
-//! the message can never be reopened through the app. The **sender**'s copy is `Consumed` from the
-//! moment it is sent (the sender never retains a reopenable copy).
+//! `Consumed` is terminal (the tombstone display state); the sender's copy starts there.
+//! Persisting these transitions is [`crate::durable`]'s job — it commits atomically before any
+//! change is observable. Properties enforced here:
 //!
-//! Security properties this type enforces (the *persistence* of these transitions is the durable
-//! layer's job — [`crate::durable`] commits every change atomically before it is observable):
+//! * **One viewing opportunity.** `begin_reveal` fires only from `Sealed`, so a double-tap, replayed
+//!   delivery, or concurrent window cannot restart the clock.
+//! * **No clock rewind.** `now_ms` below the last observed value is clamped forward, so a changed
+//!   system clock, backgrounding, or hostile caller cannot buy extra time.
+//! * **Fail-closed by deadline.** Deadlines are absolute and set once, at reveal; time accrues while
+//!   backgrounded, so returning past the deadline finds the message `Consumed`.
+//! * **No plaintext outside `Visible`.** [`SecretRecord::visible_body`] returns `None` before reveal
+//!   and forever after expiry.
 //!
-//! * **One viewing opportunity.** `begin_reveal` only fires from `Sealed`; a second tap, a replayed
-//!   delivery, or a concurrent window cannot re-enter `Sealed` or restart the clock.
-//! * **The clock cannot be rewound.** Every poll carries a monotonic `now_ms`; a value below the
-//!   last observed one is clamped forward, so changing the system clock, backgrounding, or a
-//!   hostile caller cannot buy extra time.
-//! * **Fail-closed by deadline.** Deadlines are absolute in the caller's monotonic timebase and set
-//!   once, at reveal. Elapsed time keeps accruing across backgrounding; passing the deadline while
-//!   away marks the message `Consumed`.
-//! * **No plaintext outside `Visible`.** [`SecretRecord::visible_body`] returns the body only while
-//!   `Visible`; before reveal and after expiry it returns `None`.
-//!
-//! The times below are *elapsed* durations, not wall-clock — the caller supplies a monotonic source.
+//! Times are elapsed durations — the caller supplies a monotonic source.
 
 use crate::content::SECRET_ID_LEN;
 use serde::{Deserialize, Serialize};
 
-/// Countdown before the message becomes visible (the "3, 2, 1").
 pub const COUNTDOWN_MS: u64 = 3_000;
-/// Viewing window once visible.
 pub const VIEW_MS: u64 = 10_000;
-/// The exact, non-sensitive tombstone text shown in place of a consumed/sent secret message.
+/// Exact tombstone text shown in place of a consumed or sent secret.
 pub const TOMBSTONE_TEXT: &str = "a secret message has been sent";
 
-/// Whether this device is the secret's sender or its recipient.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SecretSide {
-    /// This device sent it; it is tombstoned immediately and never revealable here.
+    /// Tombstoned immediately; never revealable here.
     Sender,
-    /// This device received it; it may be revealed exactly once.
+    /// Revealable exactly once.
     Recipient,
 }
 
-/// The reveal lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SecretState {
-    /// Received, not yet tapped. The countdown has NOT started.
+    /// Not yet tapped; the countdown has NOT started.
     Sealed,
-    /// Reveal begun; the 3-second countdown is running.
     Countdown,
-    /// The body is visible; the 10-second window is running.
     Visible,
-    /// Terminal: plaintext destroyed, tombstone shown, cannot be reopened.
+    /// Terminal: plaintext destroyed, cannot be reopened.
     Consumed,
 }
 
-/// Per-secret durable record. Held inside the atomically-committed durable blob.
+/// Held inside the atomically-committed durable blob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretRecord {
     pub secret_id: [u8; SECRET_ID_LEN],
     pub side: SecretSide,
     pub state: SecretState,
-    /// The decrypted secret body. `None` once consumed/scrubbed, or on the sender side.
+    /// `None` once consumed/scrubbed, or on the sender side.
     pub body: Option<Vec<u8>>,
-    /// Absolute monotonic time (ms) the countdown ends and the body becomes visible. 0 until reveal.
+    /// Absolute monotonic ms; 0 until reveal.
     pub countdown_deadline_ms: u64,
-    /// Absolute monotonic time (ms) the viewing window ends. 0 until reveal.
+    /// Absolute monotonic ms; 0 until reveal.
     pub view_deadline_ms: u64,
-    /// Highest `now_ms` observed — the monotonic guard against clock rewind.
+    /// Highest `now_ms` observed — the guard against clock rewind.
     pub last_now_ms: u64,
-    /// Recipient side, ADR-0015: the outbound local id of the `SecretConsumed` control message this
-    /// device emitted to its OTHER devices when the reveal began, so it is built + encrypted at most
-    /// once (idempotent). `None` until emitted (or on the sender side, which never emits).
+    /// ADR-0015: local id of the `SecretConsumed` message emitted to this account's other devices at
+    /// reveal, so it is built at most once. `None` until emitted; the sender side never emits.
     #[serde(default)]
     pub consumption_local_id: Option<u64>,
 }
 
-/// Attempted an invalid or backward state transition.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub struct InvalidTransition;
 
 impl SecretRecord {
-    /// A freshly received sealed secret (recipient side).
     pub fn sealed_recipient(secret_id: [u8; SECRET_ID_LEN], body: Vec<u8>) -> Self {
         Self {
             secret_id,
@@ -98,7 +82,7 @@ impl SecretRecord {
         }
     }
 
-    /// A sender-side record: tombstoned from creation, never revealable, no body retained.
+    /// Tombstoned from creation; no body retained.
     pub fn tombstone_sender(secret_id: [u8; SECRET_ID_LEN]) -> Self {
         Self {
             secret_id,
@@ -112,34 +96,30 @@ impl SecretRecord {
         }
     }
 
-    /// Monotonic clamp: time never moves backward from this record's perspective.
+    /// Time never moves backward from this record's perspective.
     fn clamp(&mut self, now_ms: u64) -> u64 {
         let now = now_ms.max(self.last_now_ms);
         self.last_now_ms = now;
         now
     }
 
-    /// Begin the reveal (recipient taps the sealed placeholder). Only valid from `Sealed` on the
-    /// recipient side; sets both deadlines from `now_ms`. Returns `Err` for any other state so a
-    /// double-tap / replay / concurrent window cannot grant a second opportunity — the caller MUST
-    /// treat `Err` as "no reveal" and MUST persist the resulting state before showing anything.
+    /// Valid only from `Sealed` on the recipient side, so a double-tap, replay or concurrent window
+    /// cannot grant a second opportunity. The caller MUST treat `Err` as "no reveal" and MUST
+    /// persist the resulting state before showing anything.
     pub fn begin_reveal(&mut self, now_ms: u64) -> Result<(), InvalidTransition> {
         if self.side != SecretSide::Recipient || self.state != SecretState::Sealed {
             return Err(InvalidTransition);
         }
         let now = self.clamp(now_ms);
         self.state = SecretState::Countdown;
-        // Saturating so a pathological/hostile `now_ms` near u64::MAX can never overflow-panic; a
-        // saturated deadline is already past, so the reveal simply expires — fail closed, never a
-        // crash (found by the `secret_state` transition fuzzer).
+        // Saturating so a hostile `now_ms` near u64::MAX cannot overflow-panic; a saturated deadline
+        // is already past, so the reveal expires — fail closed (found by the `secret_state` fuzzer).
         self.countdown_deadline_ms = now.saturating_add(COUNTDOWN_MS);
         self.view_deadline_ms = now.saturating_add(COUNTDOWN_MS).saturating_add(VIEW_MS);
         Ok(())
     }
 
-    /// Advance the state for the current `now_ms` (idempotent; call freely). Countdown→Visible at
-    /// `countdown_deadline_ms`, Visible→Consumed at `view_deadline_ms`, and a long jump straight to
-    /// Consumed. On reaching `Consumed` the body is scrubbed. Returns the (possibly advanced) state.
+    /// Idempotent; call freely. A long jump goes straight to `Consumed`, scrubbing the body.
     pub fn poll(&mut self, now_ms: u64) -> SecretState {
         let now = self.clamp(now_ms);
         match self.state {
@@ -156,8 +136,7 @@ impl SecretRecord {
         self.state
     }
 
-    /// The body iff the message is currently `Visible` at `now_ms` (advances state first). `None`
-    /// while sealed/counting down and forever after expiry — the plaintext gate.
+    /// The plaintext gate: `None` while sealed or counting down, and forever after expiry.
     pub fn visible_body(&mut self, now_ms: u64) -> Option<&[u8]> {
         if self.poll(now_ms) == SecretState::Visible {
             self.body.as_deref()
@@ -166,7 +145,7 @@ impl SecretRecord {
         }
     }
 
-    /// Milliseconds of viewing time left (0 once not visible / consumed). For the UI's fade + timer.
+    /// 0 once not visible. Drives the UI fade + timer.
     pub fn remaining_view_ms(&mut self, now_ms: u64) -> u64 {
         match self.poll(now_ms) {
             SecretState::Visible => self.view_deadline_ms.saturating_sub(self.last_now_ms),
@@ -174,7 +153,7 @@ impl SecretRecord {
         }
     }
 
-    /// Milliseconds of countdown left (0 once past the countdown). For the "3, 2, 1".
+    /// 0 once past the countdown. Drives the "3, 2, 1".
     pub fn remaining_countdown_ms(&mut self, now_ms: u64) -> u64 {
         match self.poll(now_ms) {
             SecretState::Countdown => self.countdown_deadline_ms.saturating_sub(self.last_now_ms),
@@ -182,11 +161,10 @@ impl SecretRecord {
         }
     }
 
-    /// Force to the terminal tombstone state and scrub the body (best-effort zeroize). Idempotent.
-    /// Used on expiry, on a screenshot/capture event, and on the fail-closed relaunch path.
+    /// Idempotent. Used on expiry, on a screenshot/capture event, and on fail-closed relaunch.
     pub fn consume(&mut self) {
         if let Some(mut body) = self.body.take() {
-            // Best-effort scrub of the plaintext buffer before it is dropped.
+            // Best-effort scrub before the buffer is dropped.
             for b in body.iter_mut() {
                 *b = 0;
             }
@@ -194,7 +172,6 @@ impl SecretRecord {
         self.state = SecretState::Consumed;
     }
 
-    /// True once terminal (tombstone shown; reopening impossible).
     pub fn is_tombstone(&self) -> bool {
         self.state == SecretState::Consumed
     }
@@ -274,7 +251,7 @@ mod tests {
         let mut r = rec();
         r.begin_reveal(0).unwrap();
         assert_eq!(r.poll(3_000), SecretState::Visible);
-        // App backgrounded; returns after the deadline → consumed, never re-shown.
+        // Returns after the deadline → consumed, never re-shown.
         assert_eq!(r.poll(20_000), SecretState::Consumed);
         assert!(r.visible_body(20_000).is_none());
     }
@@ -283,8 +260,8 @@ mod tests {
     fn clock_rewind_cannot_buy_time() {
         let mut r = rec();
         r.begin_reveal(0).unwrap();
-        r.poll(13_000); // consumed
-                        // A caller trying to rewind to mid-window gets clamped forward — stays consumed.
+        r.poll(13_000);
+        // Rewinding to mid-window is clamped forward — stays consumed.
         assert_eq!(r.poll(5_000), SecretState::Consumed);
         assert!(r.visible_body(5_000).is_none());
     }
@@ -308,8 +285,7 @@ mod tests {
 
     #[test]
     fn extreme_now_does_not_overflow_and_fails_closed() {
-        // A pathological clock near u64::MAX must not panic; the saturated deadline is already past,
-        // so the reveal expires immediately rather than crashing (regression for a fuzz finding).
+        // Regression for a fuzz finding: a clock near u64::MAX must expire, not panic.
         let mut r = rec();
         r.begin_reveal(u64::MAX).unwrap();
         assert_eq!(r.poll(u64::MAX), SecretState::Consumed);

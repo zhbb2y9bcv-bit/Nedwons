@@ -1,10 +1,8 @@
-//! Argon2id password hashing (RFC 9106) via the RustCrypto `argon2` crate.
+//! Argon2id password hashing (RFC 9106) via RustCrypto `argon2`.
 //!
-//! Parameters here are a **conservative starting point**, not a production benchmark
-//! (RISK_REGISTER R-302): they must be tuned on production hardware and the chosen
-//! algorithm/version/parameters recorded (the PHC string stores them, enabling future
-//! rehashing). A server-side pepper, if used, must live in a KMS/HSM and never in the DB
-//! or repo (R-303) — it is intentionally not wired into this pure slice.
+//! Parameters are a conservative starting point, NOT a production benchmark (R-302): tune on
+//! production hardware; the PHC string records them, enabling future rehashing. A pepper, if used,
+//! lives in a KMS/HSM — never the DB or repo (R-303).
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
@@ -12,33 +10,26 @@ use argon2::{Algorithm, Argon2, Params, Version};
 use crate::crypto::random_bytes;
 use crate::error::AuthError;
 
-/// OWASP-aligned starting parameters: 19 MiB memory, 2 iterations, 1 lane. These are a conservative
-/// *floor*; the operator MUST benchmark on production hardware and raise them so one hash costs the
-/// target time (~0.25–0.5 s), then record the chosen values + a version (R-302, CRYPTOGRAPHY.md).
-/// Run `cargo run --release -p auth-core --example argon2_bench` on the target host to measure.
+/// OWASP-aligned floor (19 MiB, 2 iterations, 1 lane). The operator MUST benchmark on production
+/// hardware and raise these so one hash costs ~0.25–0.5 s (R-302, CRYPTOGRAPHY.md); measure with
+/// `cargo run --release -p auth-core --example argon2_bench`.
 pub const MEMORY_KIB: u32 = 19_456;
 pub const ITERATIONS: u32 = 2;
 pub const PARALLELISM: u32 = 1;
 
-/// The configured Argon2id parameters, exposed so a benchmark/operator can measure the exact cost
-/// the service uses.
+/// Exposed so a benchmark can measure the exact cost the service uses.
 pub fn argon2_params() -> Params {
     Params::new(MEMORY_KIB, ITERATIONS, PARALLELISM, None)
         .expect("static Argon2 parameters are valid")
 }
 
-/// Password policy per **NIST SP 800-63B-4** (the current revision; earlier revisions are
-/// superseded): prioritize length, no composition puzzles, no periodic rotation. 800-63B-4
-/// verifiers SHALL require ≥ 8 characters and SHOULD require ≥ 15; the product policy here is
-/// a 12-character minimum (exceeds the SHALL; blocklist + length carry the strength). The
-/// generous maximum supports long passphrases and password managers (Argon2 cost is
-/// length-independent after hashing input).
+/// NIST SP 800-63B-4 policy: length over composition puzzles, no rotation. The 12-char minimum
+/// exceeds the SHALL (≥8); blocklist + length carry the strength. The generous maximum supports
+/// passphrases and managers.
 pub const MIN_PASSWORD_CHARS: usize = 12;
 pub const MAX_PASSWORD_BYTES: usize = 1024;
 
-/// A small embedded blocklist of the most common passwords/patterns that satisfy the
-/// length rule. This is a floor, not the ceiling: production must layer a real compromised-
-/// credential list (e.g. a k-anonymity range query) — tracked in RISK_REGISTER R-305.
+/// A floor, not the ceiling: production layers a real compromised-credential corpus (R-305).
 const COMMON_PASSWORDS: &[&str] = &[
     "password1234",
     "password12345",
@@ -54,7 +45,7 @@ const COMMON_PASSWORDS: &[&str] = &[
     "trustno1trustno1",
 ];
 
-/// Validate a candidate password against the policy. Case-insensitive blocklist match.
+/// Case-insensitive blocklist match.
 pub fn validate_password_policy(password: &str) -> Result<(), AuthError> {
     if password.chars().count() < MIN_PASSWORD_CHARS || password.len() > MAX_PASSWORD_BYTES {
         return Err(AuthError::WeakPassword);
@@ -66,20 +57,15 @@ pub fn validate_password_policy(password: &str) -> Result<(), AuthError> {
     Ok(())
 }
 
-/// Build the Argon2id hasher with our fixed, recorded parameters.
 pub(crate) fn hasher() -> Argon2<'static> {
-    // `Params::new` only fails on out-of-range constants; ours are valid, so a failure is a
-    // programming error, not a runtime condition.
     let params = Params::new(MEMORY_KIB, ITERATIONS, PARALLELISM, None)
         .expect("static Argon2 parameters are valid");
     Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
 }
 
-/// Build the Argon2id hasher with a **server-side pepper** (Argon2's keyed "secret"), R-303. The
-/// pepper is a deployment secret sourced from a KMS/HSM — never stored in the database — so a
-/// database-only compromise cannot offline-crack passwords/recovery secrets. The SAME pepper must
-/// be used to hash and to verify; changing it invalidates all existing hashes (enable it before
-/// any users exist, or run a rehash-on-next-login migration).
+/// R-303: Argon2's keyed "secret" as a server-side pepper (KMS/HSM, never the DB), so a
+/// database-only compromise cannot offline-crack credentials. The SAME pepper must hash and
+/// verify; changing it invalidates all existing hashes.
 pub(crate) fn hasher_with_pepper(pepper: &'static [u8]) -> Argon2<'static> {
     let params = Params::new(MEMORY_KIB, ITERATIONS, PARALLELISM, None)
         .expect("static Argon2 parameters are valid");
@@ -87,10 +73,9 @@ pub(crate) fn hasher_with_pepper(pepper: &'static [u8]) -> Argon2<'static> {
         .expect("pepper length is within Argon2 limits")
 }
 
-/// Hash a password, returning a PHC string (contains algorithm, version, params, salt).
+/// Returns a PHC string (algorithm, version, params, salt).
 pub(crate) fn hash_password(argon2: &Argon2<'_>, password: &str) -> Result<String, AuthError> {
-    // Generate the salt from the OS CSPRNG rather than relying on a specific rand feature
-    // wiring, then encode it in PHC base64.
+    // Salt straight from the OS CSPRNG rather than relying on a specific rand feature wiring.
     let salt_bytes = random_bytes::<16>();
     let salt = SaltString::encode_b64(&salt_bytes).map_err(|_| AuthError::Internal)?;
     let hash = argon2
@@ -99,8 +84,7 @@ pub(crate) fn hash_password(argon2: &Argon2<'_>, password: &str) -> Result<Strin
     Ok(hash.to_string())
 }
 
-/// Verify `password` against a stored PHC hash. Returns `Ok(true)`/`Ok(false)`; a malformed
-/// stored hash is an internal fault (it should never happen for data we wrote).
+/// A malformed stored hash is an internal fault — it should never happen for data we wrote.
 pub(crate) fn verify_password(
     argon2: &Argon2<'_>,
     password: &str,
@@ -110,10 +94,8 @@ pub(crate) fn verify_password(
     Ok(argon2.verify_password(password.as_bytes(), &parsed).is_ok())
 }
 
-/// A valid PHC hash of a random throwaway password, used to equalize timing on the
-/// account-not-found path (enumeration resistance, ABUSE_MODEL.md). We verify the supplied
-/// password against this dummy so the not-found branch does the same Argon2 work as the
-/// found branch before returning a generic failure.
+/// Valid hash of a random throwaway password: the not-found branch verifies against it so it does
+/// the same Argon2 work as the found branch (enumeration resistance, ABUSE_MODEL.md).
 pub(crate) fn make_dummy_hash(argon2: &Argon2<'_>) -> String {
     let throwaway = random_bytes::<32>();
     let salt_bytes = random_bytes::<16>();

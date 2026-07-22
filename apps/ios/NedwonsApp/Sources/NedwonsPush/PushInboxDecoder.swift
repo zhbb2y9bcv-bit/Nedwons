@@ -2,8 +2,7 @@ import Foundation
 import MlsFfi
 import NedwonsKit
 
-/// One inbox envelope reduced to what the push path needs (decoupled from `NedwonsKit.InboxEnvelope`
-/// so the decode logic is directly testable).
+/// Decoupled from `NedwonsKit.InboxEnvelope` so the decode logic is directly testable.
 public struct PushEnvelope: Sendable {
     public let id: Int
     public let ciphertext: Data
