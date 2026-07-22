@@ -516,207 +516,172 @@ fileprivate struct FfiConverterData: FfiConverterRustBuffer {
 
 
 /**
- * One MLS client (one identity + one conversation), owned by Swift as an `Arc<MlsClient>`.
+ * One identity + one conversation, owned by Swift as an `Arc<MlsClient>`.
  */
 public protocol MlsClientProtocol: AnyObject, Sendable {
     
     /**
-     * Envelope ids durably processed and safe to acknowledge to the server.
+     * Durably processed, so safe to acknowledge to the server.
      */
     func ackEligible() throws  -> [UInt64]
     
     /**
-     * Add a member by their key-package bytes. Returns commit + welcome; the grown group is durable
-     * before returning.
+     * The grown group is durable before returning.
      */
     func addMember(keyPackage: Data) throws  -> AddOutcome
     
     /**
-     * Add another of this account's devices to the self-group by its key-package bytes. Returns a
-     * **wrapped** `commit` (deliver to the EXISTING self-group members, who apply it via
-     * [`Self::process_self_inbound`], which unwraps) plus the **raw** `welcome` (deliver to the new
-     * device, which applies it via [`Self::join_self_group`], which does not unwrap). `WrongState`
-     * if no self-group exists yet.
+     * Returns a **wrapped** `commit` (for existing members via [`Self::process_self_inbound`],
+     * which unwraps) plus the **raw** `welcome` (for the new device via [`Self::join_self_group`],
+     * which does not).
      */
     func addSelfDevice(keyPackage: Data) throws  -> AddOutcome
     
     /**
-     * Begin revealing a sealed secret (recipient tapped the placeholder). **Atomic + fail-closed:**
-     * the transition + deadlines are committed before this returns `Ok`. An invalid transition
-     * (double tap, replay, wrong state) or a failed state write returns `Err` and reveals nothing.
+     * **Atomic + fail-closed:** the transition + deadlines are committed before this returns `Ok`;
+     * an invalid transition (double tap, replay) or failed write returns `Err` and reveals nothing.
      * `now_ms` is the caller's monotonic clock.
      */
     func beginSecretReveal(secretId: Data, nowMs: UInt64) throws 
     
     /**
-     * Discard the pending staged commit — the server rejected it (stale epoch / governance) or the
-     * client is rebasing. State is unchanged.
+     * Server rejected, or we're rebasing. State unchanged.
      */
     func clearStaged() throws 
     
     /**
-     * Explicitly invalidate the client and drop its MLS state. Idempotent; subsequent calls return
-     * `Closed`. Durable state on disk is untouched (reopen with `open`).
+     * Erase this device's visible message log when the user deletes the conversation. Protocol
+     * state (ratchet, replay watermark, outbox, secret records) is retained, so later messages
+     * still decrypt and a replayed secret still cannot be re-revealed. Local only — nothing is
+     * sent, and the peer's copy is untouched.
+     */
+    func clearVisibleHistory() throws 
+    
+    /**
+     * Idempotent. Durable state on disk is untouched — reopen with `open`.
      */
     func close() 
     
-    /**
-     * After the server confirms an ack, stop tracking those ids as ack-eligible.
-     */
     func confirmAcked(ids: [UInt64]) throws 
     
     /**
-     * Force a secret to the terminal tombstone (a screenshot/capture was detected, or the overlay
-     * was closed). Idempotent; scrubs the body; persisted before returning.
+     * Used on a detected screenshot/capture or overlay close. Idempotent; scrubs the body.
      */
     func consumeSecret(secretId: Data) throws 
     
     /**
-     * Create this account's self-group with this device as its sole member. Persists before
-     * returning. `WrongState` if one already exists.
+     * `WrongState` if one already exists.
      */
     func createSelfGroup() throws 
     
     /**
-     * Encrypt a queued message into a versioned opaque envelope (`app-envelope v1`, R-506).
-     * **Idempotent:** a retry returns the same bytes and never advances the ratchet again (no
-     * double-spend of a message key) — `wrap` is deterministic over the cached ciphertext.
+     * Produces the versioned opaque envelope (`app-envelope v1`). **Idempotent:** a retry returns
+     * the same bytes and never advances the ratchet again — no double-spend of a message key.
      */
     func encrypt(localId: UInt64) throws  -> Data
     
     /**
-     * Queue an outbound message (durable draft). Does NOT advance the ratchet. Returns a local id.
+     * Durable draft; does NOT advance the ratchet.
      */
     func enqueue(plaintext: Data) throws  -> UInt64
     
     /**
-     * Queue a **delivery-key grant** (ADR-0014 Slice 2c): share this account's sealed-sender
-     * delivery access key `K_r` (exactly 32 bytes) with an approved contact over the E2EE channel.
-     * The relay never sees `K_r`. Returns the outbound local id; `encrypt`/`mark_sent` then proceed
-     * exactly as for a normal message.
+     * ADR-0014 Slice 2c: share `K_r` (exactly 32 bytes) over the E2EE channel — the relay never
+     * sees it. `encrypt`/`mark_sent` then proceed as for a normal message.
      */
     func enqueueDeliveryKeyGrant(keyR: Data) throws  -> UInt64
     
     /**
-     * Queue a **history-sync** batch (#7) to replicate `entries` to the account's newly-linked
-     * device(s) over the self-group. `WrongState` if no self-group is established. Returns the
-     * outbound local id; deliver it over the self-group as usual.
+     * #7: replicate `entries` over the self-group. `WrongState` if none is established.
      */
     func enqueueHistorySync(entries: [HistoryEntry]) throws  -> UInt64
     
     /**
-     * Queue a **secret** message. The classification + body are wrapped in the content envelope
-     * that MLS then encrypts, so the relay never learns it is secret. Same bounds as a normal
-     * message. Returns the outbound local id + the 16-byte secret id; `encrypt`/`mark_sent` then
-     * proceed exactly as for a normal message (same authenticated pipeline, same retry safety).
+     * The classification + body are encrypted inside the content envelope, so the relay never
+     * learns it is secret. `encrypt`/`mark_sent` then proceed exactly as for a normal message.
      */
     func enqueueSecret(body: Data) throws  -> SecretHandle
     
-    /**
-     * Current MLS epoch (advances on every membership change).
-     */
     func epoch() throws  -> UInt64
     
-    /**
-     * True if this client has an established device self-group.
-     */
     func hasSelfGroup() throws  -> Bool
     
     /**
-     * The most recent (up to `max`) non-secret messages, as a history batch to replicate to a
-     * newly-linked device (#7). Secrets are excluded (view-once).
+     * Up to `max` recent non-secret messages, for replication to a newly-linked device (#7).
      */
     func historyEntries(max: UInt32) throws  -> [HistoryEntry]
     
     /**
-     * Join the group described by a Welcome (produced by another member's `add_member`). Transitions
-     * `Pending` → `Active` and persists. On a bad Welcome the client stays `Pending` (retryable).
+     * `Pending` → `Active`, persisted. On a bad Welcome the client stays `Pending` (retryable).
      */
     func joinGroup(welcome: Data) throws 
     
     /**
-     * Join this account's self-group from a Welcome produced by another device's `add_self_device`.
-     * Persists before returning. `WrongState` if a self-group is already established here.
+     * `WrongState` if a self-group is already established here.
      */
     func joinSelfGroup(welcome: Data) throws 
     
     /**
-     * This client's key package bytes (a one-time prekey) to publish so others can add it.
+     * A one-time prekey to publish so others can add this client.
      */
     func keyPackage() throws  -> Data
     
-    /**
-     * Mark a queued message accepted by the server. Persisted before returning.
-     */
     func markSent(localId: UInt64) throws 
     
     /**
-     * Merge the pending staged commit — the server accepted it. Advances the epoch and persists.
+     * Server accepted: advance the epoch and persist.
      */
     func mergeStaged() throws 
     
     /**
-     * Number of stored messages. Cheap: no payload crosses the boundary.
+     * Cheap: no payload crosses the boundary.
      */
     func messageCount() throws  -> UInt64
     
     /**
-     * Ordered log of ALL stored messages (inbound decrypted + outbound). Marshals the entire
-     * history across the boundary — fine for tests and small logs; a UI should render from
+     * Marshals the ENTIRE history across the boundary — fine for tests; a UI should use
      * [`Self::messages_page`] + [`Self::message_count`] instead.
      */
     func messages() throws  -> [StoredMessage]
     
     /**
-     * A bounded window of the message log, oldest first: up to `limit` messages starting at
-     * `offset`. `limit` is clamped to [`MAX_PAGE_MESSAGES`] so a single call can never marshal
-     * an unbounded payload across the FFI; an offset past the end returns an empty page. This is
-     * what a chat UI should call (e.g. the newest window = `count - limit .. count`).
+     * Bounded window, oldest first. `limit` is clamped to [`MAX_PAGE_MESSAGES`] so one call can
+     * never marshal an unbounded payload; an offset past the end returns an empty page.
      */
     func messagesPage(offset: UInt64, limit: UInt32) throws  -> [StoredMessage]
     
     /**
-     * Recipient path (ADR-0010): process an inbound membership commit, merging ONLY if its actual
-     * cryptographic effect equals the sender's signed manifest — `next_epoch` and the `added` /
-     * `removed` credential identities come from that manifest. On mismatch the commit is discarded
-     * unmerged and `InvalidMessage` is returned; group state is unchanged.
+     * ADR-0010 recipient path: merges ONLY if the commit's actual effect equals the sender's signed
+     * manifest (`next_epoch`/`added`/`removed` come from it). On mismatch: discarded unmerged,
+     * `InvalidMessage`, state unchanged.
      */
     func processCommit(envelope: Data, nextEpoch: UInt64, added: [Data], removed: [Data]) throws 
     
     /**
-     * Process an inbound envelope: application plaintext, a state advance, or a dedup no-op. All
-     * effects (advanced ratchet, stored message, dedup marker, ack-eligibility) are durable
+     * All effects — advanced ratchet, stored message, dedup marker, ack-eligibility — are durable
      * together before returning.
      */
     func processInbound(envelopeId: UInt64, ciphertext: Data) throws  -> InboundResult
     
     /**
-     * Process an inbound envelope that arrived on the account's **self-group** channel (ADR-0015
-     * option 3) — a `SecretConsumed` control message from one of this account's OTHER devices, or a
-     * self-group membership commit. Decrypts with the self-group (which the conversation's other
-     * party is not in), so the read signal stays private to the account. Same idempotent dedup + ack
-     * contract as [`Self::process_inbound`]. `WrongState` if no self-group is established here.
+     * Self-group channel (ADR-0015 option 3): a `SecretConsumed` from another of this account's
+     * devices, or a self-group membership commit. Decrypting with the self-group keeps the read
+     * signal private to the account. Same dedup + ack contract as [`Self::process_inbound`].
      */
     func processSelfInbound(envelopeId: UInt64, ciphertext: Data) throws  -> InboundResult
     
     /**
-     * Remove a device from the self-group by its credential `identity` (used when that device is
-     * revoked from the account). Returns the MLS remove-commit to fan out to the remaining
-     * self-group members; applying it advances the epoch so the removed device can no longer decrypt
-     * self-group traffic. `WrongState` if there is no self-group; `NotFound` if no such member.
+     * Used when that device is revoked. The returned remove-commit advances the epoch, so the
+     * removed device can no longer decrypt self-group traffic.
      */
     func removeSelfDevice(identity: Data) throws  -> Data
     
     /**
-     * Build (once) the **consumption control message** for a secret this device revealed (ADR-0015,
-     * account-wide single-view). Returns the opaque envelope to deliver to the account's other
-     * devices, or `None` if the secret is unknown, is the sender's own, or has not been revealed
-     * here. If this client has a device self-group (option 3) the message is encrypted with it — the
-     * conversation's other party is not a member and never learns of the open — and the recipient
-     * devices apply it via [`Self::process_self_inbound`]; otherwise it falls back to the
-     * conversation channel (option 2) and [`Self::process_inbound`]. Idempotent: repeated calls
-     * return the same envelope and never double-advance the ratchet. A single-device client simply
-     * never calls this.
+     * The consumption control message for a secret this device revealed (ADR-0015). `None` if the
+     * secret is unknown, the sender's own, or unrevealed here. Encrypted with the self-group when
+     * one exists (option 3 — the sender never learns of the open; recipients apply via
+     * [`Self::process_self_inbound`]), else the conversation (option 2). Idempotent: repeated calls
+     * return the same envelope and never double-advance the ratchet.
      */
     func secretConsumptionEnvelope(secretId: Data) throws  -> Data?
     
@@ -726,22 +691,21 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func secretPhase(secretId: Data, nowMs: UInt64) throws  -> SecretPhase
     
     /**
-     * Remaining countdown / viewing ms for the UI timer + fade (both 0 outside that phase).
+     * Both 0 outside that phase. Drives the UI timer + fade.
      */
     func secretRemaining(secretId: Data, nowMs: UInt64) throws  -> SecretRemaining
     
     /**
-     * The secret's plaintext **iff it is currently visible** at `now_ms` — the plaintext gate.
-     * `None` while sealed/counting down and forever after expiry (which also scrubs + persists).
+     * The plaintext gate: `None` while sealed/counting down and forever after expiry (which also
+     * scrubs + persists).
      */
     func secretVisibleBody(secretId: Data, nowMs: UInt64) throws  -> Data?
     
     /**
-     * Stage an add for MLS-commit-authoritative membership (ADR-0010): build commit + welcome
-     * WITHOUT advancing the group. The caller signs a manifest, POSTs `/commit`, then calls
-     * [`merge_staged`](Self::merge_staged) on success or [`clear_staged`](Self::clear_staged) on
-     * rejection. Never merge before the server's epoch CAS confirms — that is how a race loser
-     * desyncs.
+     * ADR-0010: builds commit + welcome WITHOUT advancing the group. Sign a manifest, POST
+     * `/commit`, then [`merge_staged`](Self::merge_staged) on success or
+     * [`clear_staged`](Self::clear_staged) on rejection. Never merge before the server's epoch CAS
+     * confirms — that is how a race loser desyncs.
      */
     func stageAdd(keyPackage: Data) throws  -> AddOutcome
     
@@ -752,13 +716,13 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func stageRemove(identity: Data) throws  -> Data
     
     /**
-     * Storage schema version of the loaded blob (0 = pre-versioning; a Pending client reports 0).
+     * 0 = pre-versioning; a Pending client also reports 0.
      */
     func storageFormatVersion() throws  -> UInt32
     
 }
 /**
- * One MLS client (one identity + one conversation), owned by Swift as an `Arc<MlsClient>`.
+ * One identity + one conversation, owned by Swift as an `Arc<MlsClient>`.
  */
 open class MlsClient: MlsClientProtocol, @unchecked Sendable {
     fileprivate let pointer: UnsafeMutableRawPointer!
@@ -811,8 +775,7 @@ open class MlsClient: MlsClientProtocol, @unchecked Sendable {
 
     
     /**
-     * Create a brand-new conversation with this client as the group creator/first member. Persists
-     * before returning.
+     * This client becomes the group creator/first member. Persists before returning.
      */
 public static func createGroup(identity: Data, dbPath: String, atRestKey: Data)throws  -> MlsClient  {
     return try  FfiConverterTypeMlsClient_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -854,7 +817,7 @@ public static func `open`(dbPath: String, atRestKey: Data)throws  -> MlsClient  
 
     
     /**
-     * Envelope ids durably processed and safe to acknowledge to the server.
+     * Durably processed, so safe to acknowledge to the server.
      */
 open func ackEligible()throws  -> [UInt64]  {
     return try  FfiConverterSequenceUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -864,8 +827,7 @@ open func ackEligible()throws  -> [UInt64]  {
 }
     
     /**
-     * Add a member by their key-package bytes. Returns commit + welcome; the grown group is durable
-     * before returning.
+     * The grown group is durable before returning.
      */
 open func addMember(keyPackage: Data)throws  -> AddOutcome  {
     return try  FfiConverterTypeAddOutcome_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -876,11 +838,9 @@ open func addMember(keyPackage: Data)throws  -> AddOutcome  {
 }
     
     /**
-     * Add another of this account's devices to the self-group by its key-package bytes. Returns a
-     * **wrapped** `commit` (deliver to the EXISTING self-group members, who apply it via
-     * [`Self::process_self_inbound`], which unwraps) plus the **raw** `welcome` (deliver to the new
-     * device, which applies it via [`Self::join_self_group`], which does not unwrap). `WrongState`
-     * if no self-group exists yet.
+     * Returns a **wrapped** `commit` (for existing members via [`Self::process_self_inbound`],
+     * which unwraps) plus the **raw** `welcome` (for the new device via [`Self::join_self_group`],
+     * which does not).
      */
 open func addSelfDevice(keyPackage: Data)throws  -> AddOutcome  {
     return try  FfiConverterTypeAddOutcome_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -891,9 +851,8 @@ open func addSelfDevice(keyPackage: Data)throws  -> AddOutcome  {
 }
     
     /**
-     * Begin revealing a sealed secret (recipient tapped the placeholder). **Atomic + fail-closed:**
-     * the transition + deadlines are committed before this returns `Ok`. An invalid transition
-     * (double tap, replay, wrong state) or a failed state write returns `Err` and reveals nothing.
+     * **Atomic + fail-closed:** the transition + deadlines are committed before this returns `Ok`;
+     * an invalid transition (double tap, replay) or failed write returns `Err` and reveals nothing.
      * `now_ms` is the caller's monotonic clock.
      */
 open func beginSecretReveal(secretId: Data, nowMs: UInt64)throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -905,8 +864,7 @@ open func beginSecretReveal(secretId: Data, nowMs: UInt64)throws   {try rustCall
 }
     
     /**
-     * Discard the pending staged commit — the server rejected it (stale epoch / governance) or the
-     * client is rebasing. State is unchanged.
+     * Server rejected, or we're rebasing. State unchanged.
      */
 open func clearStaged()throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_clear_staged(self.uniffiClonePointer(),$0
@@ -915,8 +873,19 @@ open func clearStaged()throws   {try rustCallWithError(FfiConverterTypeMlsClient
 }
     
     /**
-     * Explicitly invalidate the client and drop its MLS state. Idempotent; subsequent calls return
-     * `Closed`. Durable state on disk is untouched (reopen with `open`).
+     * Erase this device's visible message log when the user deletes the conversation. Protocol
+     * state (ratchet, replay watermark, outbox, secret records) is retained, so later messages
+     * still decrypt and a replayed secret still cannot be re-revealed. Local only — nothing is
+     * sent, and the peer's copy is untouched.
+     */
+open func clearVisibleHistory()throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_clear_visible_history(self.uniffiClonePointer(),$0
+    )
+}
+}
+    
+    /**
+     * Idempotent. Durable state on disk is untouched — reopen with `open`.
      */
 open func close()  {try! rustCall() {
     uniffi_mls_ffi_fn_method_mlsclient_close(self.uniffiClonePointer(),$0
@@ -924,9 +893,6 @@ open func close()  {try! rustCall() {
 }
 }
     
-    /**
-     * After the server confirms an ack, stop tracking those ids as ack-eligible.
-     */
 open func confirmAcked(ids: [UInt64])throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_confirm_acked(self.uniffiClonePointer(),
         FfiConverterSequenceUInt64.lower(ids),$0
@@ -935,8 +901,7 @@ open func confirmAcked(ids: [UInt64])throws   {try rustCallWithError(FfiConverte
 }
     
     /**
-     * Force a secret to the terminal tombstone (a screenshot/capture was detected, or the overlay
-     * was closed). Idempotent; scrubs the body; persisted before returning.
+     * Used on a detected screenshot/capture or overlay close. Idempotent; scrubs the body.
      */
 open func consumeSecret(secretId: Data)throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_consume_secret(self.uniffiClonePointer(),
@@ -946,8 +911,7 @@ open func consumeSecret(secretId: Data)throws   {try rustCallWithError(FfiConver
 }
     
     /**
-     * Create this account's self-group with this device as its sole member. Persists before
-     * returning. `WrongState` if one already exists.
+     * `WrongState` if one already exists.
      */
 open func createSelfGroup()throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_create_self_group(self.uniffiClonePointer(),$0
@@ -956,9 +920,8 @@ open func createSelfGroup()throws   {try rustCallWithError(FfiConverterTypeMlsCl
 }
     
     /**
-     * Encrypt a queued message into a versioned opaque envelope (`app-envelope v1`, R-506).
-     * **Idempotent:** a retry returns the same bytes and never advances the ratchet again (no
-     * double-spend of a message key) — `wrap` is deterministic over the cached ciphertext.
+     * Produces the versioned opaque envelope (`app-envelope v1`). **Idempotent:** a retry returns
+     * the same bytes and never advances the ratchet again — no double-spend of a message key.
      */
 open func encrypt(localId: UInt64)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -969,7 +932,7 @@ open func encrypt(localId: UInt64)throws  -> Data  {
 }
     
     /**
-     * Queue an outbound message (durable draft). Does NOT advance the ratchet. Returns a local id.
+     * Durable draft; does NOT advance the ratchet.
      */
 open func enqueue(plaintext: Data)throws  -> UInt64  {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -980,10 +943,8 @@ open func enqueue(plaintext: Data)throws  -> UInt64  {
 }
     
     /**
-     * Queue a **delivery-key grant** (ADR-0014 Slice 2c): share this account's sealed-sender
-     * delivery access key `K_r` (exactly 32 bytes) with an approved contact over the E2EE channel.
-     * The relay never sees `K_r`. Returns the outbound local id; `encrypt`/`mark_sent` then proceed
-     * exactly as for a normal message.
+     * ADR-0014 Slice 2c: share `K_r` (exactly 32 bytes) over the E2EE channel — the relay never
+     * sees it. `encrypt`/`mark_sent` then proceed as for a normal message.
      */
 open func enqueueDeliveryKeyGrant(keyR: Data)throws  -> UInt64  {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -994,9 +955,7 @@ open func enqueueDeliveryKeyGrant(keyR: Data)throws  -> UInt64  {
 }
     
     /**
-     * Queue a **history-sync** batch (#7) to replicate `entries` to the account's newly-linked
-     * device(s) over the self-group. `WrongState` if no self-group is established. Returns the
-     * outbound local id; deliver it over the self-group as usual.
+     * #7: replicate `entries` over the self-group. `WrongState` if none is established.
      */
 open func enqueueHistorySync(entries: [HistoryEntry])throws  -> UInt64  {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -1007,10 +966,8 @@ open func enqueueHistorySync(entries: [HistoryEntry])throws  -> UInt64  {
 }
     
     /**
-     * Queue a **secret** message. The classification + body are wrapped in the content envelope
-     * that MLS then encrypts, so the relay never learns it is secret. Same bounds as a normal
-     * message. Returns the outbound local id + the 16-byte secret id; `encrypt`/`mark_sent` then
-     * proceed exactly as for a normal message (same authenticated pipeline, same retry safety).
+     * The classification + body are encrypted inside the content envelope, so the relay never
+     * learns it is secret. `encrypt`/`mark_sent` then proceed exactly as for a normal message.
      */
 open func enqueueSecret(body: Data)throws  -> SecretHandle  {
     return try  FfiConverterTypeSecretHandle_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -1020,9 +977,6 @@ open func enqueueSecret(body: Data)throws  -> SecretHandle  {
 })
 }
     
-    /**
-     * Current MLS epoch (advances on every membership change).
-     */
 open func epoch()throws  -> UInt64  {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_epoch(self.uniffiClonePointer(),$0
@@ -1030,9 +984,6 @@ open func epoch()throws  -> UInt64  {
 })
 }
     
-    /**
-     * True if this client has an established device self-group.
-     */
 open func hasSelfGroup()throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_has_self_group(self.uniffiClonePointer(),$0
@@ -1041,8 +992,7 @@ open func hasSelfGroup()throws  -> Bool  {
 }
     
     /**
-     * The most recent (up to `max`) non-secret messages, as a history batch to replicate to a
-     * newly-linked device (#7). Secrets are excluded (view-once).
+     * Up to `max` recent non-secret messages, for replication to a newly-linked device (#7).
      */
 open func historyEntries(max: UInt32)throws  -> [HistoryEntry]  {
     return try  FfiConverterSequenceTypeHistoryEntry.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -1053,8 +1003,7 @@ open func historyEntries(max: UInt32)throws  -> [HistoryEntry]  {
 }
     
     /**
-     * Join the group described by a Welcome (produced by another member's `add_member`). Transitions
-     * `Pending` → `Active` and persists. On a bad Welcome the client stays `Pending` (retryable).
+     * `Pending` → `Active`, persisted. On a bad Welcome the client stays `Pending` (retryable).
      */
 open func joinGroup(welcome: Data)throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_join_group(self.uniffiClonePointer(),
@@ -1064,8 +1013,7 @@ open func joinGroup(welcome: Data)throws   {try rustCallWithError(FfiConverterTy
 }
     
     /**
-     * Join this account's self-group from a Welcome produced by another device's `add_self_device`.
-     * Persists before returning. `WrongState` if a self-group is already established here.
+     * `WrongState` if a self-group is already established here.
      */
 open func joinSelfGroup(welcome: Data)throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_join_self_group(self.uniffiClonePointer(),
@@ -1075,7 +1023,7 @@ open func joinSelfGroup(welcome: Data)throws   {try rustCallWithError(FfiConvert
 }
     
     /**
-     * This client's key package bytes (a one-time prekey) to publish so others can add it.
+     * A one-time prekey to publish so others can add this client.
      */
 open func keyPackage()throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -1084,9 +1032,6 @@ open func keyPackage()throws  -> Data  {
 })
 }
     
-    /**
-     * Mark a queued message accepted by the server. Persisted before returning.
-     */
 open func markSent(localId: UInt64)throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_mark_sent(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(localId),$0
@@ -1095,7 +1040,7 @@ open func markSent(localId: UInt64)throws   {try rustCallWithError(FfiConverterT
 }
     
     /**
-     * Merge the pending staged commit — the server accepted it. Advances the epoch and persists.
+     * Server accepted: advance the epoch and persist.
      */
 open func mergeStaged()throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_merge_staged(self.uniffiClonePointer(),$0
@@ -1104,7 +1049,7 @@ open func mergeStaged()throws   {try rustCallWithError(FfiConverterTypeMlsClient
 }
     
     /**
-     * Number of stored messages. Cheap: no payload crosses the boundary.
+     * Cheap: no payload crosses the boundary.
      */
 open func messageCount()throws  -> UInt64  {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -1114,8 +1059,7 @@ open func messageCount()throws  -> UInt64  {
 }
     
     /**
-     * Ordered log of ALL stored messages (inbound decrypted + outbound). Marshals the entire
-     * history across the boundary — fine for tests and small logs; a UI should render from
+     * Marshals the ENTIRE history across the boundary — fine for tests; a UI should use
      * [`Self::messages_page`] + [`Self::message_count`] instead.
      */
 open func messages()throws  -> [StoredMessage]  {
@@ -1126,10 +1070,8 @@ open func messages()throws  -> [StoredMessage]  {
 }
     
     /**
-     * A bounded window of the message log, oldest first: up to `limit` messages starting at
-     * `offset`. `limit` is clamped to [`MAX_PAGE_MESSAGES`] so a single call can never marshal
-     * an unbounded payload across the FFI; an offset past the end returns an empty page. This is
-     * what a chat UI should call (e.g. the newest window = `count - limit .. count`).
+     * Bounded window, oldest first. `limit` is clamped to [`MAX_PAGE_MESSAGES`] so one call can
+     * never marshal an unbounded payload; an offset past the end returns an empty page.
      */
 open func messagesPage(offset: UInt64, limit: UInt32)throws  -> [StoredMessage]  {
     return try  FfiConverterSequenceTypeStoredMessage.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -1141,10 +1083,9 @@ open func messagesPage(offset: UInt64, limit: UInt32)throws  -> [StoredMessage] 
 }
     
     /**
-     * Recipient path (ADR-0010): process an inbound membership commit, merging ONLY if its actual
-     * cryptographic effect equals the sender's signed manifest — `next_epoch` and the `added` /
-     * `removed` credential identities come from that manifest. On mismatch the commit is discarded
-     * unmerged and `InvalidMessage` is returned; group state is unchanged.
+     * ADR-0010 recipient path: merges ONLY if the commit's actual effect equals the sender's signed
+     * manifest (`next_epoch`/`added`/`removed` come from it). On mismatch: discarded unmerged,
+     * `InvalidMessage`, state unchanged.
      */
 open func processCommit(envelope: Data, nextEpoch: UInt64, added: [Data], removed: [Data])throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_process_commit(self.uniffiClonePointer(),
@@ -1157,8 +1098,7 @@ open func processCommit(envelope: Data, nextEpoch: UInt64, added: [Data], remove
 }
     
     /**
-     * Process an inbound envelope: application plaintext, a state advance, or a dedup no-op. All
-     * effects (advanced ratchet, stored message, dedup marker, ack-eligibility) are durable
+     * All effects — advanced ratchet, stored message, dedup marker, ack-eligibility — are durable
      * together before returning.
      */
 open func processInbound(envelopeId: UInt64, ciphertext: Data)throws  -> InboundResult  {
@@ -1171,11 +1111,9 @@ open func processInbound(envelopeId: UInt64, ciphertext: Data)throws  -> Inbound
 }
     
     /**
-     * Process an inbound envelope that arrived on the account's **self-group** channel (ADR-0015
-     * option 3) — a `SecretConsumed` control message from one of this account's OTHER devices, or a
-     * self-group membership commit. Decrypts with the self-group (which the conversation's other
-     * party is not in), so the read signal stays private to the account. Same idempotent dedup + ack
-     * contract as [`Self::process_inbound`]. `WrongState` if no self-group is established here.
+     * Self-group channel (ADR-0015 option 3): a `SecretConsumed` from another of this account's
+     * devices, or a self-group membership commit. Decrypting with the self-group keeps the read
+     * signal private to the account. Same dedup + ack contract as [`Self::process_inbound`].
      */
 open func processSelfInbound(envelopeId: UInt64, ciphertext: Data)throws  -> InboundResult  {
     return try  FfiConverterTypeInboundResult_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -1187,10 +1125,8 @@ open func processSelfInbound(envelopeId: UInt64, ciphertext: Data)throws  -> Inb
 }
     
     /**
-     * Remove a device from the self-group by its credential `identity` (used when that device is
-     * revoked from the account). Returns the MLS remove-commit to fan out to the remaining
-     * self-group members; applying it advances the epoch so the removed device can no longer decrypt
-     * self-group traffic. `WrongState` if there is no self-group; `NotFound` if no such member.
+     * Used when that device is revoked. The returned remove-commit advances the epoch, so the
+     * removed device can no longer decrypt self-group traffic.
      */
 open func removeSelfDevice(identity: Data)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -1201,15 +1137,11 @@ open func removeSelfDevice(identity: Data)throws  -> Data  {
 }
     
     /**
-     * Build (once) the **consumption control message** for a secret this device revealed (ADR-0015,
-     * account-wide single-view). Returns the opaque envelope to deliver to the account's other
-     * devices, or `None` if the secret is unknown, is the sender's own, or has not been revealed
-     * here. If this client has a device self-group (option 3) the message is encrypted with it — the
-     * conversation's other party is not a member and never learns of the open — and the recipient
-     * devices apply it via [`Self::process_self_inbound`]; otherwise it falls back to the
-     * conversation channel (option 2) and [`Self::process_inbound`]. Idempotent: repeated calls
-     * return the same envelope and never double-advance the ratchet. A single-device client simply
-     * never calls this.
+     * The consumption control message for a secret this device revealed (ADR-0015). `None` if the
+     * secret is unknown, the sender's own, or unrevealed here. Encrypted with the self-group when
+     * one exists (option 3 — the sender never learns of the open; recipients apply via
+     * [`Self::process_self_inbound`]), else the conversation (option 2). Idempotent: repeated calls
+     * return the same envelope and never double-advance the ratchet.
      */
 open func secretConsumptionEnvelope(secretId: Data)throws  -> Data?  {
     return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -1232,7 +1164,7 @@ open func secretPhase(secretId: Data, nowMs: UInt64)throws  -> SecretPhase  {
 }
     
     /**
-     * Remaining countdown / viewing ms for the UI timer + fade (both 0 outside that phase).
+     * Both 0 outside that phase. Drives the UI timer + fade.
      */
 open func secretRemaining(secretId: Data, nowMs: UInt64)throws  -> SecretRemaining  {
     return try  FfiConverterTypeSecretRemaining_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -1244,8 +1176,8 @@ open func secretRemaining(secretId: Data, nowMs: UInt64)throws  -> SecretRemaini
 }
     
     /**
-     * The secret's plaintext **iff it is currently visible** at `now_ms` — the plaintext gate.
-     * `None` while sealed/counting down and forever after expiry (which also scrubs + persists).
+     * The plaintext gate: `None` while sealed/counting down and forever after expiry (which also
+     * scrubs + persists).
      */
 open func secretVisibleBody(secretId: Data, nowMs: UInt64)throws  -> Data?  {
     return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -1257,11 +1189,10 @@ open func secretVisibleBody(secretId: Data, nowMs: UInt64)throws  -> Data?  {
 }
     
     /**
-     * Stage an add for MLS-commit-authoritative membership (ADR-0010): build commit + welcome
-     * WITHOUT advancing the group. The caller signs a manifest, POSTs `/commit`, then calls
-     * [`merge_staged`](Self::merge_staged) on success or [`clear_staged`](Self::clear_staged) on
-     * rejection. Never merge before the server's epoch CAS confirms — that is how a race loser
-     * desyncs.
+     * ADR-0010: builds commit + welcome WITHOUT advancing the group. Sign a manifest, POST
+     * `/commit`, then [`merge_staged`](Self::merge_staged) on success or
+     * [`clear_staged`](Self::clear_staged) on rejection. Never merge before the server's epoch CAS
+     * confirms — that is how a race loser desyncs.
      */
 open func stageAdd(keyPackage: Data)throws  -> AddOutcome  {
     return try  FfiConverterTypeAddOutcome_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -1284,7 +1215,7 @@ open func stageRemove(identity: Data)throws  -> Data  {
 }
     
     /**
-     * Storage schema version of the loaded blob (0 = pre-versioning; a Pending client reports 0).
+     * 0 = pre-versioning; a Pending client also reports 0.
      */
 open func storageFormatVersion()throws  -> UInt32  {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -1350,7 +1281,7 @@ public func FfiConverterTypeMlsClient_lower(_ value: MlsClient) -> UnsafeMutable
 
 
 /**
- * Commit (fan out to existing members) + welcome (deliver to the new member). Both opaque.
+ * Commit fans out to existing members; welcome goes to the new one. Both opaque.
  */
 public struct AddOutcome {
     public var commit: Data
@@ -1423,8 +1354,7 @@ public func FfiConverterTypeAddOutcome_lower(_ value: AddOutcome) -> RustBuffer 
 
 
 /**
- * Capability/version record so the Swift side can assert it links a compatible core and refuse on
- * mismatch (ADR-0007 version compatibility).
+ * Lets Swift assert it links a compatible core and refuse on mismatch (ADR-0007).
  */
 public struct Capabilities {
     public var bindingVersion: String
@@ -1561,8 +1491,7 @@ public func FfiConverterTypeCapabilities_lower(_ value: Capabilities) -> RustBuf
 
 
 /**
- * One past message in a history-sync batch (#7): `outbound` = this account sent it; `body` is the
- * plaintext. Secrets are never included (view-once has no re-showable history).
+ * One past message in a history-sync batch (#7). Secrets are never included.
  */
 public struct HistoryEntry {
     public var outbound: Bool
@@ -1634,9 +1563,6 @@ public func FfiConverterTypeHistoryEntry_lower(_ value: HistoryEntry) -> RustBuf
 }
 
 
-/**
- * Result of queuing a secret message: the outbound local id plus its 16-byte secret id.
- */
 public struct SecretHandle {
     public var localId: UInt64
     public var secretId: Data
@@ -1708,7 +1634,7 @@ public func FfiConverterTypeSecretHandle_lower(_ value: SecretHandle) -> RustBuf
 
 
 /**
- * Remaining countdown / viewing milliseconds for a secret (both 0 outside that phase).
+ * Both 0 outside that phase.
  */
 public struct SecretRemaining {
     public var countdownMs: UInt64
@@ -1781,8 +1707,7 @@ public func FfiConverterTypeSecretRemaining_lower(_ value: SecretRemaining) -> R
 
 
 /**
- * A durably-stored decrypted message (what the UI renders). Not a secret in the key-substitution
- * sense — application plaintext is exactly what the legitimate client is meant to hold.
+ * What the UI renders.
  */
 public struct StoredMessage {
     public var localId: UInt64
@@ -1790,8 +1715,8 @@ public struct StoredMessage {
     public var plaintext: Data
     public var envelopeId: UInt64?
     /**
-     * `Some` (16 bytes) for a **secret** message. `plaintext` is then empty — render a sealed
-     * placeholder / tombstone driven by [`MlsClient::secret_phase`], never the body.
+     * `Some` (16 bytes) for a secret; `plaintext` is then empty — render a placeholder/tombstone
+     * driven by [`MlsClient::secret_phase`], never the body.
      */
     public var secretId: Data?
 
@@ -1799,8 +1724,8 @@ public struct StoredMessage {
     // declare one manually.
     public init(localId: UInt64, direction: Direction, plaintext: Data, envelopeId: UInt64?, 
         /**
-         * `Some` (16 bytes) for a **secret** message. `plaintext` is then empty — render a sealed
-         * placeholder / tombstone driven by [`MlsClient::secret_phase`], never the body.
+         * `Some` (16 bytes) for a secret; `plaintext` is then empty — render a placeholder/tombstone
+         * driven by [`MlsClient::secret_phase`], never the body.
          */secretId: Data?) {
         self.localId = localId
         self.direction = direction
@@ -1887,9 +1812,6 @@ public func FfiConverterTypeStoredMessage_lower(_ value: StoredMessage) -> RustB
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-/**
- * Direction of a stored message.
- */
 
 public enum Direction {
     
@@ -1960,48 +1882,38 @@ extension Direction: Equatable, Hashable {}
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
-/**
- * Result of processing an inbound envelope.
- */
 
 public enum InboundResult {
     
-    /**
-     * Decrypted application plaintext.
-     */
     case application(plaintext: Data
     )
     /**
-     * A membership/commit advanced group state (no user-visible content).
+     * A commit advanced group state; no user-visible content.
      */
     case stateAdvanced
     /**
-     * Already processed (at-least-once redelivery, or a replayed secret id) — a durable no-op.
+     * At-least-once redelivery or a replayed secret id — a durable no-op.
      */
     case duplicate
     /**
-     * A **secret** (view-once) message arrived and is stored sealed. The body is NOT delivered
-     * here; show a sealed placeholder and reveal it later via [`MlsClient::begin_secret_reveal`].
+     * Stored sealed; the body is NOT delivered here. Show a placeholder and reveal later via
+     * [`MlsClient::begin_secret_reveal`].
      */
     case secretSealed(secretId: Data
     )
     /**
-     * A **consumption** control message arrived (ADR-0015): another of this account's devices
-     * revealed `secret_id`, so this device consumed its copy (account-wide single-view). No
-     * user-visible content; refresh any placeholder for `secret_id` to its tombstone.
+     * ADR-0015: another device revealed `secret_id`; this copy is consumed. Refresh any
+     * placeholder to its tombstone.
      */
     case secretConsumedRemotely(secretId: Data
     )
     /**
-     * A **delivery-key grant** arrived (ADR-0014 Slice 2c): an approved contact shared their
-     * sealed-sender delivery access key `K_r` (32 bytes) over the E2EE channel. Store it keyed by
-     * the sender to later send that contact sealed messages. No user-visible content.
+     * ADR-0014 Slice 2c: store `K_r` keyed by the sender for future sealed sends.
      */
     case deliveryKeyGranted(keyR: Data
     )
     /**
-     * A **history-sync** batch arrived (#7): `count` past messages were appended to this
-     * newly-linked device's message log.
+     * #7: `count` past messages were appended to this device's log.
      */
     case historySynced(count: UInt64
     )
@@ -2110,8 +2022,8 @@ extension InboundResult: Equatable, Hashable {}
 
 
 /**
- * Stable, coarse, **redacted** error surface. Messages are variant-only: no library internals, key
- * bytes, plaintext, or filesystem paths ever appear (asserted by a redaction test).
+ * Messages are variant-only: no library internals, key bytes, plaintext, or paths ever appear
+ * (asserted by a redaction test).
  */
 public enum MlsClientError: Swift.Error {
 
@@ -2235,29 +2147,23 @@ extension MlsClientError: Foundation.LocalizedError {
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
 /**
- * Reveal phase of a secret message across the FFI (mirrors `mls_core::secret::SecretState`).
+ * Mirrors `mls_core::secret::SecretState`.
  */
 
 public enum SecretPhase {
     
     /**
-     * Received, not tapped; no timer running.
+     * Not tapped; no timer running.
      */
     case sealed
-    /**
-     * Reveal begun; 3-second countdown running.
-     */
     case countdown
-    /**
-     * Body visible; 10-second window running.
-     */
     case visible
     /**
-     * Terminal: plaintext gone, tombstone shown, cannot reopen.
+     * Terminal: plaintext gone, cannot reopen.
      */
     case consumed
     /**
-     * No secret with this id is known to this client.
+     * No secret with this id is known here.
      */
     case unknown
 }
@@ -2489,7 +2395,7 @@ fileprivate struct FfiConverterSequenceTypeStoredMessage: FfiConverterRustBuffer
     }
 }
 /**
- * Rust core version + UniFFI contract tag, for a quick human/log check.
+ * For a quick human/log check.
  */
 public func bindingVersion() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -2498,7 +2404,7 @@ public func bindingVersion() -> String  {
 })
 }
 /**
- * Machine-checkable capability record (ADR-0007 version compatibility).
+ * Machine-checkable (ADR-0007 version compatibility).
  */
 public func capabilities() -> Capabilities  {
     return try!  FfiConverterTypeCapabilities_lift(try! rustCall() {
@@ -2507,8 +2413,7 @@ public func capabilities() -> Capabilities  {
 })
 }
 /**
- * The exact non-sensitive tombstone text shown for a consumed/sent secret message. Bundled system
- * text — never an external font/resource that could fail at runtime.
+ * Bundled system text — never an external resource that could fail at runtime.
  */
 public func secretTombstoneText() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
@@ -2532,124 +2437,127 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_mls_ffi_checksum_func_binding_version() != 2960) {
+    if (uniffi_mls_ffi_checksum_func_binding_version() != 64513) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_func_capabilities() != 52641) {
+    if (uniffi_mls_ffi_checksum_func_capabilities() != 19744) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_func_secret_tombstone_text() != 31838) {
+    if (uniffi_mls_ffi_checksum_func_secret_tombstone_text() != 3901) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_ack_eligible() != 27374) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_ack_eligible() != 21709) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_add_member() != 6758) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_add_member() != 27587) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_add_self_device() != 53993) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_add_self_device() != 1966) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_begin_secret_reveal() != 18181) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_begin_secret_reveal() != 13740) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_clear_staged() != 582) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_clear_staged() != 11061) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_close() != 59860) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_clear_visible_history() != 41729) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_confirm_acked() != 17622) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_close() != 6369) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_consume_secret() != 45075) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_confirm_acked() != 51522) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_create_self_group() != 55270) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_consume_secret() != 62728) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_encrypt() != 43898) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_create_self_group() != 24532) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue() != 8616) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_encrypt() != 56956) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue_delivery_key_grant() != 37119) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue() != 21140) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue_history_sync() != 45500) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue_delivery_key_grant() != 56582) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue_secret() != 25668) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue_history_sync() != 59844) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_epoch() != 23643) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue_secret() != 19913) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_has_self_group() != 40073) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_epoch() != 12252) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_history_entries() != 63056) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_has_self_group() != 39595) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_join_group() != 28817) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_history_entries() != 5238) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_join_self_group() != 60768) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_join_group() != 20582) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_key_package() != 28909) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_join_self_group() != 51420) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_mark_sent() != 51681) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_key_package() != 41222) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_merge_staged() != 57352) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_mark_sent() != 42917) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_message_count() != 45788) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_merge_staged() != 17494) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_messages() != 32749) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_message_count() != 39791) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_messages_page() != 2744) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_messages() != 9968) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_process_commit() != 58491) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_messages_page() != 36640) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_process_inbound() != 58528) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_process_commit() != 4908) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_process_self_inbound() != 48161) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_process_inbound() != 65073) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_remove_self_device() != 26301) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_process_self_inbound() != 28883) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_secret_consumption_envelope() != 12709) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_remove_self_device() != 4041) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_secret_consumption_envelope() != 27555) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_secret_phase() != 29195) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_secret_remaining() != 27661) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_secret_remaining() != 64082) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_secret_visible_body() != 23074) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_secret_visible_body() != 8801) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_stage_add() != 15693) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_stage_add() != 49236) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_stage_remove() != 13093) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_storage_format_version() != 23944) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_storage_format_version() != 65410) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_constructor_mlsclient_create_group() != 35239) {
+    if (uniffi_mls_ffi_checksum_constructor_mlsclient_create_group() != 42599) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_constructor_mlsclient_new_joiner() != 33443) {

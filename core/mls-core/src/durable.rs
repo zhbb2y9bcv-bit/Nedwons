@@ -952,6 +952,16 @@ impl<J: Journal> DurableSession<J> {
         &self.meta.messages
     }
 
+    /// Drop the user-visible message log ONLY. Every protocol input a future message depends on is
+    /// deliberately retained: the MLS store/ratchet, `dedup_watermark` + `seen_inbound` (replay
+    /// protection), `ack_eligible`, the pending `outbox`, and `secrets`. Keeping `secrets` is
+    /// load-bearing — dropping it would let a replayed secret id earn a second viewing.
+    pub fn clear_visible_history(&mut self) -> Result<(), DurableError> {
+        let mut meta = self.meta.clone();
+        meta.messages.clear();
+        self.commit(meta)
+    }
+
     pub fn epoch(&self) -> u64 {
         self.session.conversation.epoch()
     }

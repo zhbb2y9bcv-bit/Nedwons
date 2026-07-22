@@ -10,8 +10,8 @@ use auth_core::transcript::{Action, Transcript};
 use axum::http::StatusCode;
 use common::{
     get_auth, http_register, id16_from_hex, make_app, make_app_with_trusted_ip_header, post_json,
-    post_json_with_client_ip, response_headers, sign_challenge, unique_username, TestDevice,
-    PASSWORD,
+    post_json_with_client_ip, put_json_auth, response_headers, sign_challenge, unique_username,
+    TestDevice, PASSWORD,
 };
 use serde_json::json;
 
@@ -350,4 +350,163 @@ async fn sender_certificate_issued_and_verifies() {
     // Unauthenticated request is rejected.
     let (status, _) = get_auth(&app, "/v1/sender-certificate", "zz").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// The registered username is the account's permanent public handle. Nothing in the API may change
+/// it: the sole profile-mutation route carries only display name and bio, and its strict schema
+/// (`deny_unknown_fields`) refuses a smuggled `username` outright rather than silently ignoring it.
+/// Proven against the real router + database.
+#[tokio::test]
+async fn username_is_immutable_through_the_api() {
+    let app = make_app(100_000).await;
+    let username = unique_username("perm");
+    let (_device, session) = http_register(&app, &username).await;
+    let token = session["access_token"].as_str().unwrap();
+
+    // A request that tries to set a username is rejected by the schema, not partially applied.
+    let (status, _) = put_json_auth(
+        &app,
+        "/v1/profile",
+        token,
+        json!({ "display_name": "Display", "bio": "b", "username": "attacker_chosen" }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a username field must be refused by the profile schema"
+    );
+
+    // The legitimate update succeeds and leaves the username untouched.
+    let (status, _) = put_json_auth(
+        &app,
+        "/v1/profile",
+        token,
+        json!({ "display_name": "Display", "bio": "b" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, profile) = get_auth(&app, "/v1/profile", token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(profile["username"], username, "username must be unchanged");
+    assert_eq!(
+        profile["display_name"], "Display",
+        "the allowed fields did change"
+    );
+
+    // The original username still authenticates — it was not re-pointed.
+    let (status, challenge) = post_json(
+        &app,
+        "/v1/login/begin",
+        json!({ "username": username, "password": PASSWORD }),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "original username must still log in: {challenge}"
+    );
+
+    // Searching the attacker-chosen handle finds nothing: it was never created as an alias for
+    // this account. (`/v1/login/begin` deliberately answers uniformly for unknown usernames — see
+    // `http_login_begin_is_enumeration_resistant` — so discovery is the honest probe here.)
+    let (status, results) = get_auth(&app, "/v1/profiles/search?q=attacker_chosen", token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(results.as_array().map(|a| a.len()), Some(0));
+}
+
+/// Discovery must stay deliberate and injection-proof: too-short and oversized queries are
+/// refused, and LIKE/SQL metacharacters are treated as literal data, never as wildcards.
+#[tokio::test]
+async fn profile_search_rejects_abuse_and_treats_input_as_data() {
+    let app = make_app(100_000).await;
+    let username = unique_username("srch");
+    let (_device, session) = http_register(&app, &username).await;
+    let token = session["access_token"].as_str().unwrap();
+
+    // Empty and 1-char queries are refused outright (no bulk directory scan).
+    for q in ["", "a"] {
+        let (status, _) = get_auth(&app, &format!("/v1/profiles/search?q={q}"), token).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "query {q:?} must be refused"
+        );
+    }
+
+    // Oversized query is refused rather than run.
+    let long = "a".repeat(200);
+    let (status, _) = get_auth(&app, &format!("/v1/profiles/search?q={long}"), token).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // A bare wildcard must not match everything — it is escaped and matched literally.
+    let (status, results) = get_auth(&app, "/v1/profiles/search?q=%25%25", token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        results.as_array().map(|a| a.len()),
+        Some(0),
+        "'%%' must be a literal prefix, not a wildcard that lists the directory"
+    );
+
+    // Classic injection payload stays data: it matches nothing and the server keeps working.
+    let (status, results) = get_auth(
+        &app,
+        "/v1/profiles/search?q=x%27%20OR%20%271%27%3D%271",
+        token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(results.as_array().map(|a| a.len()), Some(0));
+
+    // The real prefix still resolves, so the escaping did not break legitimate search.
+    let prefix = &username[..6];
+    let (status, results) = get_auth(&app, &format!("/v1/profiles/search?q={prefix}"), token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        results
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["username"] == username),
+        "legitimate prefix search must still find the account"
+    );
+}
+
+/// A search result is a discovery card, not an account dump: it must never carry private or
+/// security-relevant fields.
+#[tokio::test]
+async fn profile_search_never_returns_private_fields() {
+    let app = make_app(100_000).await;
+    let username = unique_username("priv");
+    let (_device, session) = http_register(&app, &username).await;
+    let token = session["access_token"].as_str().unwrap();
+
+    let prefix = &username[..6];
+    let (status, results) = get_auth(&app, &format!("/v1/profiles/search?q={prefix}"), token).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let hit = results
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["username"] == username)
+        .expect("own account should be findable by its prefix");
+
+    for leaked in [
+        "password_phc",
+        "recovery_phc",
+        "email",
+        "device_id",
+        "devices",
+        "device_public_key",
+        "ip",
+        "last_login",
+        "refresh_token",
+    ] {
+        assert!(
+            hit.get(leaked).is_none(),
+            "search result must not expose {leaked}"
+        );
+    }
 }

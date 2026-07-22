@@ -1,8 +1,9 @@
 import NedwonsKit
 import SwiftUI
 
-/// The app shell: a navigable root that gates on auth and then presents Chats, Devices (linking +
-/// key-transparency audit), and Settings, backed by the live `AppModel`.
+/// The single app root. It renders exactly one `AppPhase`, so protected content is unreachable
+/// until a session is validated. This is the ONLY root view: an earlier build shipped a second,
+/// unwired shell that showed a dead onboarding scaffold instead of an auth form.
 public struct NedwonsAppRoot: View {
     @ObservedObject private var model: AppModel
 
@@ -11,15 +12,46 @@ public struct NedwonsAppRoot: View {
     }
 
     public var body: some View {
-        if model.isLoggedIn {
-            MainAppView(model: model)
-        } else {
-            OnboardingView()
+        Group {
+            switch model.phase {
+            case .booting:
+                BootingView()
+            case .unauthenticated, .authenticating:
+                WelcomeView(model: model)
+            case .authenticated:
+                MainAppView(model: model)
+            case .sessionExpired:
+                SessionExpiredView(model: model)
+            case .fatalRecoveryRequired(let reason):
+                RecoveryRequiredView(reason: reason, model: model)
+            }
+        }
+        .overlay(alignment: .bottom) { bannerOverlay }
+        .task { await model.restoreSession() }
+    }
+
+    @ViewBuilder
+    private var bannerOverlay: some View {
+        if let banner = model.banner {
+            Text(banner)
+                .font(Nedwons.TypeScale.caption)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, Nedwons.Spacing.md)
+                .padding(.vertical, Nedwons.Spacing.sm)
+                .background(.thinMaterial, in: Capsule())
+                .padding(.horizontal, Nedwons.Spacing.lg)
+                .padding(.bottom, Nedwons.Spacing.xl)
+                .onTapGesture { model.banner = nil }
+                .task {
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    model.banner = nil
+                }
         }
     }
 }
 
-/// The signed-in tab shell, wired to `AppModel` (unlike the presentation-only `RootView` scaffold).
+/// The signed-in tab shell. Each tab owns an independent `NavigationStack`, so switching tabs
+/// preserves each stack's position and no screen can trap the root.
 public struct MainAppView: View {
     @ObservedObject private var model: AppModel
     @Environment(\.colorScheme) private var scheme
@@ -32,13 +64,13 @@ public struct MainAppView: View {
 
     public var body: some View {
         TabView {
-            ConversationsScreen(palette: palette)
+            ChatsListView(model: model)
                 .tabItem { Label("Chats", systemImage: "bubble.left.and.bubble.right.fill") }
 
-            DevicesScreen(model: model, palette: palette)
-                .tabItem { Label("Devices", systemImage: "laptopcomputer.and.iphone") }
+            PeopleView(model: model)
+                .tabItem { Label("People", systemImage: "person.2.fill") }
 
-            SettingsScreen(flags: FeatureFlags(backendConfigured: true), palette: palette)
+            SettingsRootView(model: model)
                 .tabItem { Label("Settings", systemImage: "gearshape.fill") }
         }
     }
