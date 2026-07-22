@@ -1,35 +1,30 @@
 //! DPoP-style per-request proof-of-possession (ADR-0011, R-308).
 //!
-//! A sender-constrained access token: each authenticated request carries a proof that the caller
-//! holds the device's enrolled private key. The proof is a raw ECDSA-P256 signature over this
-//! canonical, domain-separated transcript — the same vetted signing path as auth/refresh, so a
-//! stolen bearer token is useless without the non-exportable key. RFC 9449 semantics (bind
-//! method + URI + token + time + nonce), expressed in Nedwons's transcript idiom rather than JWS.
+//! Sender-constrains the access token: each request proves the caller holds the device's enrolled
+//! private key, so a stolen bearer token is useless without the non-exportable key. RFC 9449
+//! semantics (bind method + URI + token + time + nonce) in the transcript idiom rather than JWS.
 
 use crate::crypto::verify_p256;
 
-/// Domain-separation tag. Versioned; a new proof format re-tags.
+/// Versioned; a new proof format re-tags.
 pub const DOMAIN: &[u8] = b"app.nedwons.dpop.v1";
 
-/// Protocol version carried in the signed bytes (explicit, non-silent evolution).
+/// Carried in the signed bytes, so evolution is explicit.
 pub const PROTOCOL_VERSION: u16 = 1;
 
-/// Maximum accepted clock skew (seconds) between the proof timestamp and server time. Bounds the
-/// replay window; the nonce cache makes each proof single-use within it.
+/// Bounds the replay window; the nonce cache makes each proof single-use within it.
 pub const MAX_SKEW_SECS: u64 = 60;
 
-/// The fields bound into one request proof.
 pub struct RequestProof<'a> {
     /// HTTP method, uppercase ASCII (e.g. `GET`, `POST`).
     pub method: &'a [u8],
     /// Request path, no query string (e.g. `/v1/inbox`).
     pub path: &'a [u8],
-    /// SHA-256 of the presented access token — recomputed server-side, so the client cannot lie
-    /// about which token the proof covers.
+    /// Recomputed server-side, so the client cannot lie about which token the proof covers.
     pub access_token_hash: &'a [u8; 32],
     /// Client clock, unix seconds.
     pub timestamp: u64,
-    /// 16 random bytes, unique per request (single-use within the skew window).
+    /// Unique per request; single-use within the skew window.
     pub nonce: &'a [u8; 16],
 }
 

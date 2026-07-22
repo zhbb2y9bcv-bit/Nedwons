@@ -1,13 +1,11 @@
-//! The device-bound authentication service (ADR-0002). Orchestrates registration, the
-//! two-stage login, device-signed refresh, access-token validation, logout, and revocation
-//! over the storage seam.
+//! Device-bound authentication (ADR-0002): registration, two-stage login, device-signed refresh,
+//! access validation, logout, revocation — over the storage seam.
 //!
 //! Security posture, enforced below and by tests:
 //!  * Username + password alone never create a session (INV-2).
 //!  * Every challenge is single-use, expiring, and account/device/action-bound (INV-4).
 //!  * All security failures return the generic [`AuthError::Denied`] (fail closed).
-//!  * Storage failures never become implicit successes: `StoreError` maps to
-//!    [`AuthError::Internal`] (or `Denied` where the safe direction is denial).
+//!  * Storage failures never become implicit successes.
 
 use std::sync::Arc;
 
@@ -30,7 +28,7 @@ impl From<StoreError> for AuthError {
     }
 }
 
-/// Tunable lifetimes. Defaults are conservative starting values.
+/// Defaults are conservative starting values.
 #[derive(Clone, Copy, Debug)]
 pub struct Config {
     pub challenge_ttl_secs: u64,
@@ -48,8 +46,7 @@ impl Default for Config {
     }
 }
 
-/// Challenge returned by [`AuthService::register_begin`]. The client signs a `Register`
-/// transcript built from these fields plus its new device public key.
+/// The client signs a `Register` transcript over these fields plus its new device public key.
 #[derive(Clone, Debug)]
 pub struct RegistrationChallenge {
     pub account_id: AccountId,
@@ -59,7 +56,6 @@ pub struct RegistrationChallenge {
     pub expires_at: u64,
 }
 
-/// Enrollment payload for [`AuthService::register_finish`].
 pub struct RegisterRequest {
     pub username: String,
     pub password: String,
@@ -70,8 +66,7 @@ pub struct RegisterRequest {
     pub signature: Vec<u8>,
 }
 
-/// Challenge returned by [`AuthService::recover_begin`] — enumeration-resistant (always returned).
-/// Carries the reserved NEW device id the recovering device will self-sign for.
+/// Always returned (enumeration-resistant). Carries the reserved NEW device id to self-sign for.
 pub struct RecoveryChallenge {
     pub account_id: AccountId,
     pub device_id: DeviceId,
@@ -80,8 +75,8 @@ pub struct RecoveryChallenge {
     pub expires_at: u64,
 }
 
-/// Payload for [`AuthService::recover_finish`]. The `recovery_secret` authorizes (something you
-/// know); the `new_device_signature` proves possession of the new device key (self-signed).
+/// `recovery_secret` authorizes (something you know); `new_device_signature` proves possession of
+/// the new device key.
 pub struct RecoveryRequest {
     pub username: String,
     pub recovery_secret: String,
@@ -92,19 +87,17 @@ pub struct RecoveryRequest {
     pub new_device_signature: Vec<u8>,
 }
 
-/// Challenge returned by [`AuthService::enroll_device_begin`] — the reserved id + nonce for the
-/// NEW device, which the trusted device signs to authorize (ADR-0008).
+/// The reserved id + nonce for the NEW device, which the trusted device signs to authorize
+/// (ADR-0008).
 pub struct EnrollChallenge {
-    /// The reserved id for the new device.
     pub device_id: DeviceId,
     pub txn_id: TxnId,
     pub nonce: [u8; 32],
     pub expires_at: u64,
 }
 
-/// Payload for [`AuthService::enroll_device_finish`]. The signature is by the **trusted**
-/// (already-enrolled) device over the `DeviceEnroll` transcript binding the account + the NEW
-/// device's reserved id + its public key; the new device's private key never appears.
+/// Signed by the **trusted** device over the `DeviceEnroll` transcript binding the account + the
+/// NEW device's reserved id + its public key; the new device's private key never appears.
 pub struct EnrollRequest {
     pub txn_id: TxnId,
     /// SEC1-encoded P-256 public key of the NEW device.
@@ -113,8 +106,8 @@ pub struct EnrollRequest {
     pub signature: Vec<u8>,
 }
 
-/// Challenge returned by [`AuthService::login_begin`]. Always returned (even on bad
-/// credentials, as an unstored decoy) so the begin step does not reveal account existence.
+/// Always returned — an unstored decoy on bad credentials — so the begin step does not reveal
+/// account existence.
 #[derive(Clone, Debug)]
 pub struct LoginChallenge {
     pub account_id: AccountId,
@@ -124,9 +117,8 @@ pub struct LoginChallenge {
     pub expires_at: u64,
 }
 
-/// A proof-of-possession session. Tokens are raw bytes here; transport encoding (base64,
-/// headers) is an API-layer concern. No `Debug` is derived — tokens must not land in logs
-/// (INV-8).
+/// Tokens are raw bytes; transport encoding is an API-layer concern. No `Debug` — tokens must not
+/// land in logs (INV-8).
 pub struct Session {
     pub account_id: AccountId,
     pub device_id: DeviceId,
@@ -136,7 +128,6 @@ pub struct Session {
     pub refresh_expires_at: u64,
 }
 
-/// Shared, thread-safe handles to the storage seam.
 pub struct AuthService {
     creds: Arc<dyn CredentialStore + Send + Sync>,
     devices: Arc<dyn DeviceStore + Send + Sync>,
@@ -146,11 +137,10 @@ pub struct AuthService {
     clock: Arc<dyn Clock + Send + Sync>,
     config: Config,
     argon2: Argon2<'static>,
-    /// Valid Argon2 hash of a throwaway secret, verified against on the account-not-found
-    /// path to equalize timing (enumeration resistance).
+    /// Verified against on the account-not-found path to equalize timing (enumeration resistance).
     dummy_hash: String,
-    /// Optional compromised-credential corpus (R-305). When set, a breached password is rejected
-    /// at registration. `None` (default) keeps only the length + embedded-blocklist policy.
+    /// Compromised-credential corpus (R-305); when set, breached passwords are rejected at
+    /// registration.
     breach: Option<Arc<dyn crate::breach::RangeProvider + Send + Sync>>,
 }
 
@@ -180,8 +170,7 @@ impl AuthService {
         }
     }
 
-    /// Attach a compromised-credential corpus (R-305). Registration will reject a password whose
-    /// SHA-1 is in the corpus. Builder-style so existing construction is unchanged.
+    /// R-305: registration rejects a password whose SHA-1 is in the corpus.
     pub fn with_breach_provider(
         mut self,
         provider: Arc<dyn crate::breach::RangeProvider + Send + Sync>,
@@ -190,12 +179,10 @@ impl AuthService {
         self
     }
 
-    /// Mix a server-side **pepper** into all password + recovery-secret hashing (R-303). The
-    /// pepper is a KMS/HSM deployment secret held only in process memory (`'static`), so a
-    /// database-only compromise cannot offline-crack credentials. Rebuilds the timing-dummy hash
-    /// under the same pepper so enumeration resistance is preserved. Builder-style; existing
-    /// construction (no pepper) is unchanged. NOTE: enabling/changing the pepper invalidates all
-    /// prior hashes — set it before any users exist.
+    /// R-303: mixes a KMS/HSM pepper (process memory only) into all password + recovery hashing, so
+    /// a database-only compromise cannot offline-crack credentials. Rebuilds the timing-dummy hash
+    /// under the same pepper to preserve enumeration resistance. NOTE: enabling/changing the pepper
+    /// invalidates all prior hashes — set it before any users exist.
     pub fn with_pepper(mut self, pepper: &'static [u8]) -> Self {
         self.argon2 = password::hasher_with_pepper(pepper);
         self.dummy_hash = password::make_dummy_hash(&self.argon2);
@@ -228,8 +215,7 @@ impl AuthService {
         })
     }
 
-    /// Stage 2 of enrollment: verify the device holds the private key for its asserted
-    /// public key (proof of possession), then create the account and device atomically.
+    /// Stage 2: verify proof of possession, then create the account and device atomically.
     pub fn register_finish(&self, req: RegisterRequest) -> Result<Session> {
         let challenge = self
             .challenges
@@ -237,8 +223,7 @@ impl AuthService {
             .ok_or(AuthError::Denied)?;
         self.check_challenge(&challenge, Action::Register)?;
 
-        // The signature must cover the reserved ids AND the presented public key, so the
-        // key cannot be swapped after the fact.
+        // Covers the reserved ids AND the presented key, so the key cannot be swapped after.
         let transcript = Transcript {
             action: Action::Register,
             account_id: &challenge.account_id,
@@ -252,12 +237,10 @@ impl AuthService {
             return Err(AuthError::Denied);
         }
 
-        // Username/password validation are client-correctable request errors, distinct
-        // from Denied.
+        // Client-correctable request errors, distinct from Denied.
         let username = normalize_username(&req.username)?;
         password::validate_password_policy(&req.password)?;
-        // Compromised-credential check (R-305). Fail OPEN on a provider error (an outage must not
-        // block registration); reject only on a confirmed corpus hit.
+        // R-305: fail OPEN on a provider error (an outage must not block registration).
         if let Some(provider) = &self.breach {
             if crate::breach::is_compromised(provider.as_ref(), &req.password).unwrap_or(false) {
                 return Err(AuthError::WeakPassword);
@@ -290,8 +273,7 @@ impl AuthService {
 
     // ----- Password change (device-bound) -------------------------------------------
 
-    /// Stage 1 of a password change: issue a single-use `PasswordChange` challenge bound to the
-    /// authenticated account+device, which the device signs to prove possession of its key.
+    /// Stage 1: a single-use `PasswordChange` challenge bound to the authenticated account+device.
     pub fn password_change_begin(&self, account: &AccountDevice) -> Result<RegistrationChallenge> {
         let txn_id = TxnId::random();
         let nonce = random_bytes::<32>();
@@ -313,11 +295,9 @@ impl AuthService {
         })
     }
 
-    /// Stage 2: verify the device signature (proof of possession) AND the current password, then
-    /// validate + hash the new password and replace it. Requires BOTH factors — a stolen access
-    /// token alone (no device key, no current password) cannot change the password. Existing
-    /// device-bound sessions continue (they are not password-derived); the new password only
-    /// governs future logins.
+    /// Stage 2: requires BOTH the device signature and the current password, so a stolen access
+    /// token alone cannot change the password. Existing device-bound sessions continue (not
+    /// password-derived); the new password governs future logins only.
     pub fn password_change_finish(
         &self,
         account: &AccountDevice,
@@ -380,13 +360,11 @@ impl AuthService {
 
     // ----- Trusted-device enrollment (ADR-0008) -------------------------------------
 
-    /// Maximum non-revoked devices per account. A generous cap that bounds abuse (a compromised
-    /// trusted device cannot enroll unbounded ghost devices) without constraining real use.
+    /// Bounds abuse — a compromised trusted device cannot enroll unbounded ghost devices.
     pub const MAX_ACTIVE_DEVICES: usize = 8;
 
-    /// Stage 1 of trusted-device enrollment: an already-enrolled (trusted) device reserves ids and
-    /// a nonce for a NEW device and issues a single-use `DeviceEnroll` challenge bound to the
-    /// account. Only a non-revoked device may authorize enrollment (never a password-only path).
+    /// Stage 1: a trusted device reserves ids for a NEW device. Only a non-revoked device may
+    /// authorize enrollment — never a password-only path.
     pub fn enroll_device_begin(&self, trusted: &AccountDevice) -> Result<EnrollChallenge> {
         // The authorizing device must currently be active.
         self.devices
@@ -414,11 +392,9 @@ impl AuthService {
         })
     }
 
-    /// Stage 2 of trusted-device enrollment: verify the **trusted** device signed the
-    /// `DeviceEnroll` transcript authorizing the new device's public key, add the new device
-    /// (subject to [`MAX_ACTIVE_DEVICES`]), and provision it a session. The new device's private
-    /// key is never involved — the trusted device's authorization is the credential (a stolen
-    /// username/password can never enroll a device, R-903).
+    /// Stage 2: the **trusted** device's signature over the `DeviceEnroll` transcript is the
+    /// credential — a stolen username/password can never enroll a device (R-903). Adds the device
+    /// (subject to [`MAX_ACTIVE_DEVICES`]) and provisions it a session.
     pub fn enroll_device_finish(
         &self,
         trusted: &AccountDevice,
@@ -434,9 +410,8 @@ impl AuthService {
             return Err(AuthError::Denied);
         }
 
-        // The trusted device signs a transcript binding the account + the NEW device's reserved id
-        // + its presented public key, so the server cannot be tricked into enrolling a different
-        // key than the trusted device approved.
+        // The transcript binds account + reserved id + presented key, so the server cannot be
+        // tricked into enrolling a different key than the trusted device approved.
         let transcript = Transcript {
             action: Action::DeviceEnroll,
             account_id: &challenge.account_id,
@@ -478,15 +453,14 @@ impl AuthService {
         })
     }
 
-    /// The account's devices (for the management list). Public keys included; nothing secret.
+    /// Public keys included; nothing secret.
     pub fn list_devices(&self, account_id: &AccountId) -> Result<Vec<DeviceRecord>> {
         Ok(self.devices.list_devices(account_id)?)
     }
 
     // ----- Account recovery (ADR-0003, R-304) ---------------------------------------
 
-    /// Minimum length of a recovery secret. Recovery secrets are **generated** high-entropy codes
-    /// (not user-chosen), so this is a sanity floor, not a strength policy.
+    /// Recovery secrets are generated high-entropy codes, so this is a sanity floor, not policy.
     pub const MIN_RECOVERY_SECRET_CHARS: usize = 20;
 
     /// Failed recovery attempts before recovery is locked (R-304 throttling).
@@ -494,9 +468,8 @@ impl AuthService {
     /// How long recovery stays locked after hitting the failure ceiling.
     pub const RECOVERY_LOCKOUT_SECS: u64 = 15 * 60;
 
-    /// Set (or replace) the account's recovery secret, stored only as an Argon2id hash. Called by
-    /// an authenticated device (the caller must already hold an active device — recovery is set up
-    /// while you still have access). A too-short secret is a client-correctable `WeakPassword`.
+    /// Stored only as an Argon2id hash. Requires an active device — recovery is set up while you
+    /// still have access.
     pub fn set_recovery_secret(&self, account: &AccountDevice, secret: &str) -> Result<()> {
         // The caller's device must be active (defense in depth; the API also authenticates it).
         self.devices
@@ -513,9 +486,8 @@ impl AuthService {
         Ok(())
     }
 
-    /// Stage 1 of recovery: reserve a NEW device id + nonce for the recovering device to self-sign.
-    /// Enumeration-resistant — a real (stored) challenge only when the username exists; otherwise
-    /// an unstored decoy with random ids, so the response does not reveal account existence.
+    /// Stage 1: reserve a NEW device id + nonce to self-sign. Enumeration-resistant — an unstored
+    /// decoy when the username does not exist.
     pub fn recover_begin(&self, username: &str) -> RecoveryChallenge {
         let account = normalize_username(username)
             .ok()
@@ -555,10 +527,9 @@ impl AuthService {
         }
     }
 
-    /// Stage 2 of recovery: verify the recovery secret AND the new device's proof-of-possession,
-    /// then enroll the new device and provision it a session. Recovery restores **account access**,
-    /// not E2EE message history: the new device has a fresh MLS identity and is re-added to
-    /// conversations by other members via MLS commits (ADR-0009); no history is silently restored.
+    /// Stage 2: verify the recovery secret AND the new device's proof-of-possession, then enroll
+    /// it. Restores **account access**, not E2EE history — the new device has a fresh MLS identity
+    /// and is re-added to conversations via MLS commits (ADR-0009).
     pub fn recover_finish(&self, req: RecoveryRequest) -> Result<Session> {
         // Burn the single-use challenge regardless of outcome.
         let challenge = self.challenges.consume(&req.txn_id)?;
@@ -566,8 +537,8 @@ impl AuthService {
             .ok()
             .and_then(|u| self.creds.find_by_username(&u).ok().flatten());
 
-        // Always run exactly one Argon2 verification (real or dummy) so timing does not reveal
-        // whether the account exists or has a recovery secret.
+        // Exactly one Argon2 verification (real or dummy), so timing does not reveal whether the
+        // account exists or has a recovery secret.
         let phc = account
             .as_ref()
             .and_then(|a| self.creds.recovery_phc(&a.account_id).ok().flatten());
@@ -582,9 +553,8 @@ impl AuthService {
             }
         };
 
-        // Recovery-attempt throttling (R-304): if the account is currently locked out, refuse —
-        // and if the secret was wrong, record the failure (locking after too many). A locked
-        // account cannot be probed even with the right secret until the cooldown elapses.
+        // R-304 throttling: a locked account cannot be probed even with the right secret until the
+        // cooldown elapses; wrong secrets record failures toward the lock.
         if let Some(acct) = &account {
             let locked = self
                 .creds
@@ -647,10 +617,8 @@ impl AuthService {
         })
     }
 
-    /// Revoke a device **only if it belongs to `account_id`** (device management, ADR-0008).
-    /// Returns `false` if the device is not the caller's (or does not exist) — one account can
-    /// never revoke another's device. On success the revocation cascades (tokens + families) via
-    /// [`revoke_device`](Self::revoke_device).
+    /// Only if the device belongs to `account_id` — one account can never revoke another's device.
+    /// On success the revocation cascades (tokens + families) via [`revoke_device`](Self::revoke_device).
     pub fn revoke_own_device(&self, account_id: &AccountId, device_id: &DeviceId) -> Result<bool> {
         let owned = self
             .devices
@@ -666,18 +634,15 @@ impl AuthService {
 
     // ----- Login (two-stage) --------------------------------------------------------
 
-    /// Stage 1 of login. Verifies credentials with enumeration-resistant timing and always
-    /// returns a challenge. A real (stored) challenge is issued only when the credentials
-    /// are valid AND the account has an active device; otherwise an unstored decoy of
-    /// identical shape is returned so the response reveals nothing. Storage errors surface
-    /// as a decoy too — the caller cannot distinguish an outage from a bad credential.
+    /// Stage 1: always returns a challenge — real only when credentials are valid AND an active
+    /// device exists, otherwise an identical-shape unstored decoy (storage errors decoy too), so
+    /// the response reveals nothing.
     pub fn login_begin(&self, username: &str, password: &str) -> LoginChallenge {
         let account = normalize_username(username)
             .ok()
             .and_then(|u| self.creds.find_by_username(&u).ok().flatten());
 
-        // Always run one Argon2 verification (real hash if found, dummy if not) so timing
-        // does not distinguish existence.
+        // One Argon2 verification either way, so timing does not distinguish existence.
         let credentials_ok = match &account {
             Some(acct) => password::verify_password(&self.argon2, password, &acct.password_phc)
                 .unwrap_or(false),
@@ -716,9 +681,8 @@ impl AuthService {
         self.decoy_login_challenge()
     }
 
-    /// Stage 2 of login. Succeeds only if the presented signature verifies against the
-    /// enrolled device's public key over the bound challenge. A decoy `txn_id` (or any
-    /// replay/expiry/mismatch) consumes to nothing and fails closed.
+    /// Stage 2: the signature must verify against the enrolled device's key over the bound
+    /// challenge. A decoy `txn_id`, replay, expiry, or mismatch consumes to nothing — fail closed.
     pub fn login_finish(&self, txn_id: &TxnId, signature: &[u8]) -> Result<Session> {
         let challenge = self.challenges.consume(txn_id)?.ok_or(AuthError::Denied)?;
         self.check_challenge(&challenge, Action::Login)?;
@@ -750,10 +714,9 @@ impl AuthService {
 
     // ----- Sessions: refresh / validate / logout / revocation ------------------------
 
-    /// Rotate a refresh token. Requires BOTH the (unpredictable, rotating) refresh token
-    /// and a device-key signature over a `Refresh` transcript, so a copied bearer token is
-    /// insufficient (INV-2 for refresh). Verification happens before rotation so a
-    /// signature-less thief cannot trigger a family revocation (DoS) against the victim.
+    /// Requires BOTH the rotating refresh token and a device-key signature, so a copied bearer
+    /// token is insufficient (INV-2). Verification precedes rotation so a signature-less thief
+    /// cannot trigger a family revocation (DoS) against the victim.
     pub fn refresh(&self, refresh_token: &[u8], signature: &[u8]) -> Result<Session> {
         let now = self.clock.now_unix();
         let old_hash = sha256(refresh_token);
@@ -802,7 +765,7 @@ impl AuthService {
         }
     }
 
-    /// Validate an access token: known hash, not expired, and its device still active.
+    /// Known hash, not expired, and its device still active.
     pub fn validate_access(&self, access_token: &[u8]) -> Result<AccountDevice> {
         let (account, expires_at) = self
             .sessions
@@ -822,9 +785,8 @@ impl AuthService {
         Ok(account)
     }
 
-    /// The enrolled (unrevoked) device's SEC1 public key — used to verify device-signed
-    /// artifacts beyond login, e.g. membership manifests (ADR-0010). Fails closed on
-    /// unknown/revoked devices.
+    /// For verifying device-signed artifacts beyond login, e.g. membership manifests (ADR-0010).
+    /// Fails closed on unknown/revoked devices.
     pub fn device_public_key(&self, device_id: &DeviceId) -> Result<Vec<u8>> {
         let device = self
             .devices
@@ -834,8 +796,7 @@ impl AuthService {
         Ok(device.public_key)
     }
 
-    /// Revoke the family owning this refresh token and the device's access tokens
-    /// (logout on one device). Idempotent; unknown tokens are a no-op.
+    /// Logout on one device. Idempotent; unknown tokens are a no-op.
     pub fn logout(&self, refresh_token: &[u8]) -> Result<()> {
         let hash = sha256(refresh_token);
         if let Some(owner) = self.refresh.owner_of(&hash)? {
@@ -845,9 +806,7 @@ impl AuthService {
         Ok(())
     }
 
-    /// Look up the active device id for an account (server-side authority for routing;
-    /// never a client-asserted value, INV-6). Returns `Ok(None)` if the account has no
-    /// active device.
+    /// Server-side authority for routing — never a client-asserted value (INV-6).
     pub fn active_device(&self, account_id: &AccountId) -> Result<Option<DeviceId>> {
         Ok(self
             .devices
@@ -855,8 +814,8 @@ impl AuthService {
             .map(|d| d.device_id))
     }
 
-    /// Revoke a device: mark it revoked and burn all its refresh families and access
-    /// tokens (INV-10). Future logins, refreshes, and API calls from it fail closed.
+    /// Marks revoked and burns all its refresh families + access tokens (INV-10); everything from
+    /// it then fails closed.
     pub fn revoke_device(&self, device_id: &DeviceId) -> Result<()> {
         self.devices.revoke_device(device_id)?;
         self.refresh.revoke_all_for_device(device_id)?;
@@ -866,8 +825,8 @@ impl AuthService {
 
     // ----- internals ----------------------------------------------------------------
 
-    /// Shared challenge validation: correct action and not expired. Binding to account and
-    /// device is enforced by the caller rebuilding the transcript from the stored record.
+    /// Correct action and not expired; account/device binding is enforced by the caller rebuilding
+    /// the transcript from the stored record.
     fn check_challenge(&self, challenge: &ChallengeRecord, expected: Action) -> Result<()> {
         if challenge.action != expected {
             return Err(AuthError::Denied);
@@ -911,9 +870,8 @@ impl AuthService {
     }
 }
 
-/// Deterministic transaction id for a refresh, derived from the token hash so client and
-/// server agree without an extra round-trip. Public because the client reproduces it when
-/// building the `Refresh` transcript to sign.
+/// Derived from the token hash so client and server agree without an extra round-trip; the client
+/// reproduces it when building the `Refresh` transcript.
 pub fn refresh_txn_id(old_hash: &[u8; 32]) -> TxnId {
     let mut buf = Vec::with_capacity(35);
     buf.extend_from_slice(old_hash);
@@ -924,10 +882,9 @@ pub fn refresh_txn_id(old_hash: &[u8; 32]) -> TxnId {
     TxnId(id)
 }
 
-/// Conservative ASCII username normalization (ABUSE_MODEL.md): lowercase, 3–32 chars, must
-/// start with a letter, allowed set `[a-z0-9_.]`, no `..` and no trailing `.`. Rejecting
-/// everything outside the allowlist blocks invisible/zero-width and homoglyph characters
-/// and prevents casing/normalization collisions.
+/// Conservative ASCII allowlist (ABUSE_MODEL.md): lowercase, 3–32 chars, starts with a letter,
+/// `[a-z0-9_.]`, no `..`, no trailing `.`. Blocks invisible/homoglyph characters and
+/// casing/normalization collisions.
 pub fn normalize_username(input: &str) -> Result<String> {
     let s = input.trim().to_ascii_lowercase();
     let bytes = s.as_bytes();

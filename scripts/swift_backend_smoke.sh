@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Live integration proof: boot the real nedwons-api server against PostgreSQL, then run the
-# Swift NedwonsSmoke client against it over real HTTP (register -> whoami -> login -> whoami,
-# plus the INV-2 negative check that a different device cannot log in). Verifies the iOS
-# client interoperates with the Rust backend end to end.
+# Live integration proof: boots nedwons-api against PostgreSQL and runs NedwonsSmoke over real HTTP
+# (register -> whoami -> login -> whoami, plus the INV-2 negative check that a different device
+# cannot log in).
 #
 # Requires: cargo, swift, a running PostgreSQL. Uses DATABASE_URL (default nedwons_dev).
 set -euo pipefail

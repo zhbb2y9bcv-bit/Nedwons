@@ -1,20 +1,19 @@
 import CryptoKit
 import Foundation
 
-/// HTTP client for the Nedwons auth API (contracts/API.md). This is the exact flow the iOS
-/// app performs: it builds and signs the canonical transcripts with a `DeviceSigner` (the
-/// Secure Enclave on device) and never sends the private key anywhere. Binary fields are hex,
-/// matching the wire contract.
+/// HTTP client for the auth API (contracts/API.md). Signs the canonical transcripts with a
+/// `DeviceSigner` — the Secure Enclave on device — and never sends the private key anywhere.
+/// Binary fields are hex, matching the wire contract.
 ///
-/// Networking uses `URLSession` async/await so it runs headlessly (the `NedwonsSmoke`
-/// executable drives it against a live server) and unchanged inside the app.
+/// `URLSession` async/await, so it runs headlessly (`NedwonsSmoke` drives it against a live
+/// server) and unchanged inside the app.
 public struct NedwonsClient: Sendable {
     public enum ClientError: Error {
         case http(status: Int, body: String)
         case decoding
         case transport(String)
-        /// A cryptographic check failed (e.g. a transparency STH signature, a pinned log-key
-        /// mismatch, or an inclusion proof) — fail closed, never treat as "nothing found".
+        /// A cryptographic check failed (STH signature, pinned log key, inclusion proof).
+        /// Fail closed — never treat as "nothing found".
         case verificationFailed
     }
 
@@ -212,9 +211,8 @@ public struct SignedTreeHead: Decodable, Sendable {
     }
 }
 
-/// One logged transparency leaf with its inclusion proof. Usually an account→device-key **binding**;
-/// since ADR-0013 it may instead be a **revocation** of `deviceID` (`revokedAt != nil`), so the full
-/// device lifecycle — additions and removals — is auditable under the signed root.
+/// A binding, or since ADR-0013 a **revocation** (`revokedAt != nil`), so the full device
+/// lifecycle is auditable under the signed root.
 public struct TransparencyBinding: Decodable, Sendable {
     public let leafIndex: UInt64
     public let deviceID: String
@@ -274,20 +272,18 @@ public struct Conversation: Decodable, Sendable, Identifiable {
 
 public struct InboxEnvelope: Decodable, Sendable, Identifiable {
     public let id: Int
-    /// Absent for a **sealed-sender** envelope (ADR-0014) — the relay never learned the
-    /// conversation; the client recovers it from the decrypted payload.
+    /// Absent when sealed (ADR-0014): the relay never learned it; the client recovers it from the
+    /// decrypted payload.
     public let conversationID: String?
-    /// Absent for a **sealed-sender** envelope — the relay never learned the sender; the recipient
-    /// authenticates it via the sender certificate inside the E2EE payload.
+    /// Absent when sealed: the recipient authenticates the sender via the certificate inside the
+    /// E2EE payload instead.
     public let senderDevice: String?
     public let ciphertext: String
-    /// True for a sealed envelope. Sealed ids are a SEPARATE id space from identified ones — ack
-    /// them via `ackInbox(sealedIds:)`, never via `ids`.
+    /// A SEPARATE id space: ack via `ackInbox(sealedIds:)`, never `ids`.
     public let sealed: Bool
-    /// True for a **self-group** envelope (ADR-0015 option 3): a message from one of this account's
-    /// OWN devices (a linking Welcome/commit, or a `SecretConsumed` control message). Route it to the
-    /// MLS core's self-group inbound path (`processSelfInbound`), and ack via `ackInbox(selfGroupIds:)`
-    /// — yet another separate id space. `senderDevice` is a sibling device; `conversationID` is nil.
+    /// A message from one of this account's OWN devices (ADR-0015): route to `processSelfInbound`
+    /// and ack via `ackInbox(selfGroupIds:)`, a third separate id space. `senderDevice` is the
+    /// sibling; `conversationID` is nil.
     public let selfGroup: Bool
 
     enum CodingKeys: String, CodingKey {
@@ -306,8 +302,7 @@ public struct InboxEnvelope: Decodable, Sendable, Identifiable {
     }
 }
 
-/// A key package claimed for a specific device (to add it to the self-group). `keyPackage` is the
-/// hex-encoded opaque MLS key package the relay stored verbatim.
+/// `keyPackage` is the hex-encoded opaque MLS key package the relay stored verbatim.
 public struct ClaimedKeyPackage: Decodable, Sendable {
     public let deviceID: String
     public let keyPackage: String
@@ -374,7 +369,7 @@ public extension NedwonsClient {
 
     // ----- blocking & reporting -----
 
-    /// Block an account: severs any friendship and refuses future requests (server enforces).
+    /// Severs any friendship and refuses future requests; the server enforces this.
     func blockUser(accessToken: String, accountID: String) async throws {
         try await postAccountRefVoid("/v1/blocks", accessToken, accountID)
     }
@@ -389,8 +384,7 @@ public extension NedwonsClient {
         try decode(await perform(authed("GET", "/v1/blocks", accessToken: accessToken)))
     }
 
-    /// File an abuse report. `evidence` is only what the user chooses to include — the server
-    /// cannot read E2EE content. Returns the server-assigned report id.
+    /// `evidence` is only what the user chooses to include — the server cannot read E2EE content.
     @discardableResult
     func reportUser(
         accessToken: String,
@@ -420,7 +414,7 @@ public extension NedwonsClient {
         try decode(await perform(authed("GET", "/v1/conversations", accessToken: accessToken)))
     }
 
-    /// Create a group; the server rejects with 403 unless all members are mutual friends.
+    /// The server rejects with 403 unless the creator is friends with each listed member.
     func createGroup(accessToken: String, memberAccountIDs: [String]) async throws -> GroupCreated {
         struct Body: Encodable { let member_account_ids: [String] }
         var request = authed("POST", "/v1/groups", accessToken: accessToken)
@@ -429,8 +423,8 @@ public extension NedwonsClient {
         return try decode(await perform(request))
     }
 
-    /// Leave a conversation (consent withdrawal, ADR-0009). Removes all of this account's devices
-    /// from routing and purges queued undelivered envelopes for it. Idempotent on the server.
+    /// Consent withdrawal (ADR-0009): removes all this account's devices from routing and purges
+    /// its queued envelopes. Idempotent.
     func leaveConversation(accessToken: String, conversationID: String) async throws {
         let request = authed(
             "POST", "/v1/conversations/\(conversationID)/leave", accessToken: accessToken
@@ -445,8 +439,7 @@ public extension NedwonsClient {
         try decode(await perform(authed("GET", "/v1/transparency/sth", accessToken: accessToken)))
     }
 
-    /// This account's logged bindings + inclusion proofs, pinned to `treeSize` so they verify
-    /// against the signed root at that size.
+    /// Pinned to `treeSize` so the proofs verify against the signed root at that size.
     func transparencyAccount(
         accessToken: String,
         accountID: String,
@@ -462,9 +455,9 @@ public extension NedwonsClient {
         return try decode(await perform(request))
     }
 
-    /// Self-monitor key transparency: verify the STH signature under the **pinned** log public key,
-    /// that this device's enrolled key is the one logged (no substitution), and that it is included
-    /// under the signed root. The client trusts nothing the server says here — it checks.
+    /// Verifies the STH under the **pinned** log key, that this device's enrolled key is the one
+    /// logged (no substitution), and its inclusion under the signed root. The client checks rather
+    /// than trusting the server.
     func selfMonitorKeyTransparency(
         accessToken: String,
         accountID: String,

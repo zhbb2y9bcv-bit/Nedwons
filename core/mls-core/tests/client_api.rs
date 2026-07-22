@@ -1,14 +1,12 @@
-//! Gate 2 first slice: the narrow, FFI-ready `ClientApi` must (1) carry a real two-party message
-//! end to end through opaque handles, (2) reject oversized input before parsing, and (3) never
-//! panic on malformed/hostile input — it returns a typed error instead. These run headlessly
-//! (`cargo test`); the actual UniFFI packaging + on-device run is ADR-0007 / R-101.
+//! The FFI-ready `ClientApi` must (1) carry a real two-party message through opaque handles,
+//! (2) reject oversized input before parsing, and (3) return typed errors on hostile input,
+//! never panicking.
 
 use mls_core::client::{
     ClientApi, ClientError, Received, MAX_ENVELOPE_LEN, MAX_IDENTITY_LEN, MAX_PLAINTEXT_LEN,
 };
 
-/// Deterministic round trip: Alice creates a group, adds Bob via his key package, sends an
-/// application message, and Bob decrypts exactly it — all through handles, no MLS objects crossing.
+/// All through handles — no MLS objects cross.
 #[test]
 fn two_party_round_trip_through_handles() {
     let api = ClientApi::new();
@@ -24,11 +22,10 @@ fn two_party_round_trip_through_handles() {
         .join_from_welcome(bob, &added.welcome)
         .expect("bob joins from welcome");
 
-    // Deterministic: whatever the (random) ciphertext bytes, the decrypted plaintext is exact.
     let plaintext = b"deterministic-hello";
     let envelope = api.encrypt(group, alice, plaintext).expect("encrypt");
 
-    // The envelope is opaque: it does not contain the plaintext (INV-1, at the client layer too).
+    // INV-1 at the client layer too.
     assert!(
         !contains(&envelope, plaintext),
         "ciphertext must not contain the plaintext"
@@ -42,11 +39,9 @@ fn two_party_round_trip_through_handles() {
         Received::StateAdvanced => panic!("expected application message, got a control message"),
     }
 
-    // Adding a member advanced the epoch past genesis.
     assert!(api.epoch(group).expect("epoch") >= 1);
 }
 
-/// Oversized inputs are rejected up front, before any parsing/allocation.
 #[test]
 fn oversized_inputs_are_rejected() {
     let api = ClientApi::new();
@@ -67,7 +62,6 @@ fn oversized_inputs_are_rejected() {
     );
 }
 
-/// Unknown handles fail closed with a typed error, never a panic.
 #[test]
 fn unknown_handles_are_not_found() {
     let api = ClientApi::new();
@@ -77,9 +71,7 @@ fn unknown_handles_are_not_found() {
     assert_eq!(api.encrypt(999, 999, b"x"), Err(ClientError::NotFound));
 }
 
-/// Malformed/hostile bytes must yield `InvalidMessage`, never crash the client. This is the
-/// property a fuzzer will harden further (ADR-0007); here we assert it over a deterministic
-/// corpus of garbage and near-miss buffers.
+/// Deterministic sibling of the fuzz target: garbage and near-miss buffers yield typed errors.
 #[test]
 fn malformed_input_never_panics() {
     let api = ClientApi::new();
@@ -87,11 +79,10 @@ fn malformed_input_never_panics() {
     let bob = api.create_identity(b"bob").expect("bob");
     let group = api.create_group(alice).expect("group");
 
-    // A pseudo-random but reproducible corpus (no rng dependency): byte patterns + a truncated,
-    // otherwise-valid welcome/envelope.
+    // Reproducible corpus (no rng dependency).
     let mut corpus: Vec<Vec<u8>> = Vec::new();
-    corpus.push(Vec::new()); // empty
-    corpus.push(vec![0x00]); // single byte
+    corpus.push(Vec::new());
+    corpus.push(vec![0x00]);
     corpus.push(vec![0xff; 32]);
     for seed in 0u16..64 {
         let n = (seed as usize % 300) + 1;
@@ -104,18 +95,15 @@ fn malformed_input_never_panics() {
     corpus.push(truncated_kp);
 
     for (i, buf) in corpus.iter().enumerate() {
-        // process on garbage
         match api.process(group, alice, buf) {
             Err(ClientError::InvalidMessage) | Err(ClientError::InputTooLarge) => {}
             other => panic!("process corpus[{i}] returned {other:?}, expected a typed error"),
         }
-        // join on garbage
         match api.join_from_welcome(bob, buf) {
             Ok(_) => panic!("garbage should never produce a valid group (corpus[{i}])"),
             Err(ClientError::InvalidMessage) | Err(ClientError::InputTooLarge) => {}
             Err(other) => panic!("join corpus[{i}] returned {other:?}"),
         }
-        // add_member on garbage key package
         match api.add_member(group, alice, buf) {
             Ok(_) => panic!("garbage key package should not add a member (corpus[{i}])"),
             Err(ClientError::InvalidMessage) | Err(ClientError::InputTooLarge) => {}

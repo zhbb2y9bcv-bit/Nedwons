@@ -1,6 +1,5 @@
-//! Typed identifiers. Internal identity is a random 16-byte value that is *never* derived
-//! from a hardware identifier (ADR-0002) and is separate from the changeable public
-//! username (ABUSE_MODEL.md).
+//! Internal identity is a random 16-byte value, **never** derived from a hardware identifier
+//! (ADR-0002) and separate from the changeable public username (ABUSE_MODEL.md).
 
 use crate::crypto::random_bytes;
 
@@ -11,7 +10,7 @@ macro_rules! byte_id {
         pub struct $name(pub [u8; $len]);
 
         impl $name {
-            /// Generate a fresh random id from the platform CSPRNG.
+            /// From the platform CSPRNG.
             pub fn random() -> Self {
                 Self(random_bytes::<$len>())
             }
@@ -22,8 +21,7 @@ macro_rules! byte_id {
 
         impl core::fmt::Debug for $name {
             fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                // Show only a short prefix in debug output; ids are not secrets but we avoid
-                // dumping full identifiers into logs by habit.
+                // Short prefix only: ids are not secrets, but keep full ones out of logs by habit.
                 write!(f, "{}({:02x}{:02x}…)", stringify!($name), self.0[0], self.0[1])
             }
         }
@@ -31,18 +29,18 @@ macro_rules! byte_id {
 }
 
 byte_id!(
-    /// Immutable random internal account identifier.
+    /// Immutable.
     AccountId, 16
 );
 byte_id!(
-    /// Random device-record identifier assigned at enrollment.
+    /// Assigned at enrollment.
     DeviceId, 16
 );
 byte_id!(
-    /// Per-transaction identifier that also keys a challenge.
+    /// Also keys a challenge.
     TxnId, 16
 );
 byte_id!(
-    /// Refresh-token family identifier (reuse-detection lineage).
+    /// Reuse-detection lineage.
     FamilyId, 16
 );

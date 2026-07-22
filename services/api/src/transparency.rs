@@ -1,11 +1,10 @@
 //! Key-transparency store + Signed Tree Head signing (R-201).
 //!
-//! The append-only log records every account→device-key binding as an RFC 6962 leaf
-//! (`auth_core::transparency`). The server signs Signed Tree Heads (STHs) with the log key
-//! (production: KMS/HSM; here: an env-provided or ephemeral key). Clients verify inclusion +
-//! consistency proofs and **self-monitor** their own account — they do NOT trust the server to log
-//! honestly; they check. See `docs/KEY_TRANSPARENCY.md` for the honest threat scope (split-view
-//! equivocation and verifiable-map non-inclusion are out of scope for this slice).
+//! Records every account→device-key binding as an RFC 6962 leaf and signs Signed Tree Heads with
+//! the log key (production: KMS/HSM; here: env-provided or ephemeral). Clients verify inclusion +
+//! consistency proofs and **self-monitor** their own account rather than trusting the server to log
+//! honestly. `docs/KEY_TRANSPARENCY.md` has the honest scope — split-view equivocation and
+//! verifiable-map non-inclusion are out of scope here.
 
 use std::sync::Arc;
 

@@ -1,11 +1,7 @@
 import SwiftUI
 
-/// Design tokens for Nedwons's visual system: *futuristic precision + modern restraint +
-/// visible trust* (see the design section of the product spec). Dark is the default
-/// foundation (near-black graphite/obsidian, deep navy surfaces); a complete accessible
-/// light theme is provided. Primary accent is a controlled electric cyan/ice blue; the
-/// secondary is a restrained violet/indigo. Green means verified/success only; red means
-/// destructive/security-alert only.
+/// Design tokens. Dark is the default foundation with a complete accessible light theme. Green
+/// means verified/success ONLY; red means destructive/security-alert ONLY.
 ///
 /// These are literal color values so the package type-checks cross-platform. In the Xcode
 /// app they map to asset-catalog colors that adapt automatically to the system appearance;

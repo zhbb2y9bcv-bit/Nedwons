@@ -1,7 +1,6 @@
-//! Profiles, the friendship graph, friend requests, blocking, and reporting. All of this is
-//! social/routing metadata — never message content. Group creation no longer requires a full
-//! friend clique (ADR-0009): any members may be grouped, provided no pair within the group has
-//! blocked each other (`any_block_within`).
+//! Profiles, friendship graph, requests, blocking, reporting — social/routing metadata, never
+//! message content. Group creation requires no friend clique (ADR-0009): any members may be
+//! grouped provided no pair has blocked each other (`any_block_within`).
 
 use auth_core::ids::AccountId;
 use auth_core::store::{StoreError, StoreResult};

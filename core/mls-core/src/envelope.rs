@@ -1,24 +1,20 @@
-//! Application-envelope protocol versioning (R-506 residual).
+//! Client-to-client framing above the opaque MLS ciphertext: `u16-BE(version) || mls_message`.
 //!
-//! A tiny client-to-client framing that sits ABOVE the opaque MLS ciphertext: `u16-BE(version) ||
-//! mls_message`. It lets the application-message wire format evolve — an older client that receives
-//! a newer envelope version **rejects it** instead of feeding unknown bytes to MLS. The MLS-blind
-//! relay forwards these bytes untouched (it never parses them), so this changes nothing about the
-//! server's opacity. Control (membership) messages are versioned separately via the manifest
-//! domain tag (`app.nedwons.membership.v1`).
+//! An older client receiving a newer version **rejects it** rather than feeding unknown bytes to
+//! MLS. The relay forwards these bytes untouched, so its opacity is unaffected. Membership messages
+//! are versioned separately via the manifest domain tag (`app.nedwons.membership.v1`).
 
-/// The current application-envelope version. Bumping this is an explicit, non-silent wire change.
+/// Bumping this is an explicit, non-silent wire change.
 pub const VERSION: u16 = 1;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum EnvelopeError {
     /// Fewer than the 2 version bytes.
     Malformed,
-    /// A version this build does not understand (forward-compat: reject, never guess).
+    /// Forward-compat: reject, never guess.
     UnsupportedVersion(u16),
 }
 
-/// Wrap an MLS message payload in a versioned envelope.
 pub fn wrap(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(2 + payload.len());
     out.extend_from_slice(&VERSION.to_be_bytes());
@@ -26,8 +22,7 @@ pub fn wrap(payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Unwrap a versioned envelope, returning the inner MLS payload. Errors on a short buffer or an
-/// unsupported version.
+/// Returns the inner MLS payload; errors on a short buffer or unsupported version.
 pub fn unwrap(envelope: &[u8]) -> Result<&[u8], EnvelopeError> {
     if envelope.len() < 2 {
         return Err(EnvelopeError::Malformed);
@@ -59,7 +54,6 @@ mod tests {
     fn rejects_short_and_unknown_versions() {
         assert_eq!(unwrap(&[]), Err(EnvelopeError::Malformed));
         assert_eq!(unwrap(&[0x00]), Err(EnvelopeError::Malformed));
-        // Version 2 is not understood by this v1 build.
         let mut future = 2u16.to_be_bytes().to_vec();
         future.extend_from_slice(b"payload");
         assert_eq!(unwrap(&future), Err(EnvelopeError::UnsupportedVersion(2)));

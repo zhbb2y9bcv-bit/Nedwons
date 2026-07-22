@@ -1,18 +1,16 @@
-//! Thin adapters over vetted crypto primitives. No custom cryptography lives here — only
-//! calls into RustCrypto (`p256`, `sha2`) and the platform CSPRNG (`rand_core::OsRng`).
+//! Thin adapters over RustCrypto (`p256`, `sha2`) and the platform CSPRNG. No custom cryptography.
 
 use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 
-/// Fill an `N`-byte array from the operating system CSPRNG.
+/// From the OS CSPRNG.
 pub fn random_bytes<const N: usize>() -> [u8; N] {
     let mut buf = [0u8; N];
     OsRng.fill_bytes(&mut buf);
     buf
 }
 
-/// SHA-256 of `data`.
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(data);
     let mut out = [0u8; 32];
@@ -20,11 +18,9 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Verify an ECDSA-P256 signature (SHA-256) over `message` using a SEC1-encoded public key.
-///
-/// Returns `false` for any malformed key, malformed signature, or verification failure —
-/// this is a fail-closed boolean, never a panic. The client-side signer in production is a
-/// non-exportable Secure Enclave key; this function only ever touches the *public* key.
+/// ECDSA-P256 (SHA-256) with a SEC1 public key. Fail-closed: `false` for a malformed key,
+/// malformed signature, or failed verification — never a panic. Only ever touches the *public*
+/// key; the production signer is a non-exportable Secure Enclave key.
 pub fn verify_p256(public_key_sec1: &[u8], message: &[u8], signature: &[u8]) -> bool {
     let verifying_key = match VerifyingKey::from_sec1_bytes(public_key_sec1) {
         Ok(key) => key,

@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
-# Build + run the NEDWONS demo app on an iOS simulator (closes the software half of R-101 for the
-# Secret Message feature — a runnable @main app). Regenerates the Xcode project from project.yml
-# (xcodegen), builds for a simulator, installs, and launches. Pass `-autoRevealDemo` handling is in
-# the app; this script just boots + launches so you can interact.
+# Regenerate the Xcode project (xcodegen), build for a simulator, install, and launch.
 #
-# Requires: Xcode 26.x, xcodegen (brew install xcodegen), and MlsFfi.xcframework built by
-# scripts/build_mls_ffi.sh. Derived data goes to a temp dir OUTSIDE the TCC-protected project tree
-# (Desktop/Documents), or xctest/launch fails with a misleading "bundle does not exist".
+# Requires: Xcode 26.x, xcodegen (brew install xcodegen), and MlsFfi.xcframework from
+# scripts/build_mls_ffi.sh. Derived data MUST go outside the TCC-protected project tree
+# (Desktop/Documents), or launch fails with a misleading "bundle does not exist".
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

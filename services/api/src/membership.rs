@@ -6,9 +6,9 @@
 //! fan-out → removed-device delivery cutoff → append-only audit log. A failure anywhere applies
 //! nothing.
 //!
-//! The relay stays MLS-blind: this module handles ids, hashes, and opaque ciphertext only. The
-//! manifest signature is verified by the HTTP layer (auth-core) BEFORE this store is called; the
-//! semantic checks that must be atomic with the write happen here, inside the transaction.
+//! The relay stays MLS-blind: ids, hashes, and opaque ciphertext only. The HTTP layer verifies the
+//! manifest signature BEFORE calling this store; the checks that must be atomic with the write
+//! happen here, inside the transaction.
 
 use auth_core::ids::{AccountId, DeviceId};
 use auth_core::store::{StoreError, StoreResult};
@@ -22,11 +22,11 @@ pub enum ApplyOutcome {
     Applied { woken: Vec<[u8; 16]> },
     /// Identical manifest already applied under this idempotency key — a retry. Durable no-op.
     AlreadyApplied,
-    /// Actor is not a member / lacks the required role / a block forbids an added account. One
-    /// generic outcome (no membership oracle).
+    /// Not a member, wrong role, or a block forbids an added account. One generic outcome, so
+    /// there is no membership oracle.
     Forbidden,
-    /// `prev_epoch` did not match the stored epoch: a concurrent commit won. Nothing applied;
-    /// the client must discard its pending commit, resync, and rebuild.
+    /// A concurrent commit won. Nothing applied; the client discards its pending commit and
+    /// rebuilds after resync.
     StaleEpoch,
     /// The idempotency key was used before with a DIFFERENT manifest.
     IdempotencyMismatch,
@@ -35,8 +35,8 @@ pub enum ApplyOutcome {
     Invalid,
 }
 
-/// A stored membership event's evidence (canonical manifest bytes + device signature) plus the
-/// actor's account, so a recipient can locate the actor's transparency-logged device key.
+/// Canonical manifest bytes + signature, plus the actor's account so a recipient can locate its
+/// transparency-logged device key.
 pub struct MembershipEventRow {
     pub manifest: Vec<u8>,
     pub signature: Vec<u8>,
@@ -89,8 +89,8 @@ impl PgMembership {
             .map_err(|e| StoreError(format!("pool: {e}")))
     }
 
-    /// Apply one membership commit atomically (ADR-0010 server acceptance, steps 5–9; the HTTP
-    /// layer performed steps 1–4: auth, signature, freshness, hash binding).
+    /// ADR-0010 server acceptance steps 5–9; the HTTP layer already did 1–4 (auth, signature,
+    /// freshness, hash binding).
     pub fn apply_commit(&self, req: &CommitRequest<'_>) -> StoreResult<ApplyOutcome> {
         let mut conn = self.conn()?;
         let mut txn = conn.transaction().map_err(db_err)?;

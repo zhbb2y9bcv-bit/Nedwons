@@ -2,10 +2,9 @@ import SwiftUI
 
 // MARK: - Secret (view-once) message UI orchestration
 //
-// The SECURITY of the view-once lifecycle lives in Rust (`mls_core::secret` + `durable`): the
-// state machine, the atomic + fail-closed reveal, the 3s/10s deadlines, expiry scrub, replay
-// rejection, and crash recovery are all enforced and tested there and reached over the UniFFI
-// `MlsClient` surface. This file is only PRESENTATION: it queries the engine for the current
+// The SECURITY of the view-once lifecycle lives in Rust (`mls_core::secret` + `durable`): state
+// machine, atomic fail-closed reveal, deadlines, expiry scrub, replay rejection, and crash
+// recovery are enforced and tested there. This file is only PRESENTATION: it queries the engine
 // phase/body/remaining-time and maps that to what the overlay shows. It never reimplements the
 // state machine and never holds decrypted secret text longer than a frame needs it.
 //

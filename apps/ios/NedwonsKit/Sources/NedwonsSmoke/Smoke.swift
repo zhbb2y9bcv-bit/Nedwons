@@ -1,9 +1,8 @@
 import Foundation
 import NedwonsKit
 
-// Live end-to-end smoke test: registers a device, logs in, and calls whoami against a
-// running nedwons-api server. Proves the Swift client interoperates with the real Rust
-// backend over real HTTP. Run by scripts/swift_backend_smoke.sh, which boots the server.
+// Live smoke test proving the Swift client interoperates with the real Rust backend over real
+// HTTP. Run by scripts/swift_backend_smoke.sh, which boots the server.
 //
 //   NEDWONS_URL=http://127.0.0.1:8080 swift run --package-path apps/ios/NedwonsKit NedwonsSmoke
 //

@@ -1,18 +1,16 @@
-//! `auth-core` — the pure, storage-agnostic security logic behind Nedwons's device-bound
-//! authentication (ADR-0002, ADR-0006).
+//! Pure, storage-agnostic security logic for device-bound authentication (ADR-0002, ADR-0006).
 //!
-//! This crate deliberately contains **no** networking, no database, and no framework: only
-//! the security-critical decisions, expressed so they can be unit-tested in isolation. The
-//! production backend supplies PostgreSQL-backed implementations of the [`store`] traits,
+//! Deliberately no networking, database, or framework — only the security-critical decisions, so
+//! they can be unit-tested in isolation. The backend supplies PostgreSQL [`store`] implementations
 //! where the database enforces the atomicity these contracts require.
 //!
-//! The headline property, proven by the tests in `tests/invariants.rs`:
+//! The headline property, proven by `tests/invariants.rs`:
 //!
-//! > A valid username and password, presented from a device that does not hold the
-//! > account's enrolled private device key, cannot create or refresh a session.
+//! > A valid username and password, presented from a device that does not hold the account's
+//! > enrolled private device key, cannot create or refresh a session.
 //!
-//! No custom cryptography lives here — [`crypto`] and [`password`] are thin adapters over
-//! `p256`, `sha2`, and `argon2`.
+//! No custom cryptography: [`crypto`] and [`password`] are thin adapters over `p256`, `sha2`,
+//! and `argon2`.
 
 #![forbid(unsafe_code)]
 

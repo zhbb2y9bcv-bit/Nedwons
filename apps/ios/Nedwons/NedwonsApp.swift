@@ -1,14 +1,11 @@
 import NedwonsUI
 import SwiftUI
 
-/// Application entry point. This file belongs to the iOS app target created in Xcode (see
-/// apps/ios/README.md) and is not built by the SwiftPM `swift build` used for the rest of
-/// NedwonsKit/NedwonsUI. It requires Xcode 26 + the iOS 26 SDK.
+/// Belongs to the Xcode iOS app target, NOT the SwiftPM `swift build` used for the rest of
+/// NedwonsKit/NedwonsUI; requires Xcode 26 + the iOS 26 SDK.
 ///
-/// It constructs an `AppModel` pointed at the backend and hands it to `AppRootView`, whose
-/// buttons are wired to `NedwonsClient` (sign in, search people, friend requests, profile
-/// editing, and clique-gated group creation are all functional). On device the sign-in flow
-/// uses a `SecureEnclaveDeviceSigner`; see AppModel for where to inject it.
+/// Constructs an `AppModel` pointed at the backend and hands it to `AppRootView`. On device the
+/// sign-in flow uses a `SecureEnclaveDeviceSigner`; see AppModel for where it is injected.
 @main
 struct NedwonsApp: App {
     @StateObject private var model = AppModel(baseURL: Self.backendURL)

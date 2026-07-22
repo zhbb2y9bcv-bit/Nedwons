@@ -1,9 +1,8 @@
 import NedwonsKit
 import SwiftUI
 
-/// The full app shell (#9): a single navigable root that gates on auth and, once signed in, presents
-/// the wired product — Chats, Devices (multi-device linking + key-transparency audit), and Settings —
-/// backed by the live `AppModel`. This is the composition of the pieces built across #1–#8.
+/// The app shell: a navigable root that gates on auth and then presents Chats, Devices (linking +
+/// key-transparency audit), and Settings, backed by the live `AppModel`.
 public struct NedwonsAppRoot: View {
     @ObservedObject private var model: AppModel
 

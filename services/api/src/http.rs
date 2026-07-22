@@ -44,8 +44,7 @@ type IpLimiter = RateLimiter<IpAddr, DefaultKeyedStateStore<IpAddr>, DefaultCloc
 /// unknown, so flooding is bounded by the *recipient* device instead.
 type DeviceLimiter = RateLimiter<[u8; 16], DefaultKeyedStateStore<[u8; 16]>, DefaultClock>;
 
-/// Maximum request body on auth endpoints. Message envelopes may be larger (attachments
-/// are chunked separately), so the relay routes get their own higher cap.
+/// Auth endpoints only; relay routes get their own higher cap for opaque envelopes.
 const MAX_BODY_BYTES: usize = 8 * 1024;
 const MAX_RELAY_BODY_BYTES: usize = 256 * 1024;
 
@@ -62,30 +61,26 @@ pub struct AppState {
     pub membership: Arc<PgMembership>,
     notifier: DeliveryNotifier,
     limiter: Arc<IpLimiter>,
-    /// When `Some(h)`, the client IP for rate limiting is taken from header `h` — which MUST be
-    /// set by a trusted reverse proxy. When `None`, the peer socket IP is used and any such header
-    /// is ignored, so a client cannot spoof its IP. See [`build_router_cfg`].
+    /// `Some(h)`: take the rate-limit client IP from header `h`, which MUST be set by a trusted
+    /// proxy. `None`: use the peer socket IP and ignore such headers, so a client cannot spoof it.
     trusted_ip_header: Option<HeaderName>,
-    /// When true, every request bearing an `Authorization` token must also carry a valid
-    /// DPoP-style device proof (ADR-0011, R-308). Off by default during migration.
+    /// Require a DPoP-style device proof alongside every `Authorization` token (ADR-0011, R-308).
+    /// Off by default during migration.
     require_proof: bool,
     proof_cache: Arc<crate::proof::ProofReplayCache>,
-    /// Sealed-sender **sender-certificate** signing key (ADR-0012, R-204). Loaded from
-    /// `NEDWONS_SENDER_CERT_KEY` (hex) or ephemeral (dev). Distinct from the auth/transparency
-    /// keys. Its public key is returned with issued certificates; production clients pin it.
+    /// ADR-0012 sender-certificate signing key, distinct from the auth/transparency keys. Its
+    /// public key ships with issued certificates; production clients pin it.
     sender_cert_key: Arc<p256::ecdsa::SigningKey>,
-    /// Per-recipient-device rate limiter for the unauthenticated sealed-delivery endpoint
-    /// (ADR-0014). Bounds flooding when the sender is unknown.
+    /// Bounds flooding on the unauthenticated sealed-delivery endpoint, where the sender is
+    /// unknown (ADR-0014).
     sealed_limiter: Arc<DeviceLimiter>,
-    /// App Attest verification config (#10). `Some` when `NEDWONS_APP_ATTEST_APP_ID` is set: a
-    /// submitted attestation is then cryptographically verified against the pinned Apple root and
-    /// rejected on failure. `None` ⇒ attestations are stored unverified (bootstrap mode).
+    /// `Some` (when `NEDWONS_APP_ATTEST_APP_ID` is set) verifies attestations against the pinned
+    /// Apple root and rejects failures; `None` stores them unverified (bootstrap mode).
     attest_config: Option<Arc<crate::attest::AttestationConfig>>,
 }
 
-/// Load the sender-certificate signing key from `NEDWONS_SENDER_CERT_KEY` (hex), or generate an
-/// ephemeral one (dev — a restart rotates it, invalidating in-flight certs, which is fine as they
-/// are short-lived).
+/// From `NEDWONS_SENDER_CERT_KEY` (hex), else ephemeral: a dev restart rotates it, invalidating
+/// in-flight certs, which is fine since they are short-lived.
 fn load_or_generate_sender_cert_key() -> p256::ecdsa::SigningKey {
     if let Ok(hex_key) = std::env::var("NEDWONS_SENDER_CERT_KEY") {
         if let Ok(bytes) = hex::decode(hex_key.trim()) {
@@ -98,8 +93,8 @@ fn load_or_generate_sender_cert_key() -> p256::ecdsa::SigningKey {
     p256::ecdsa::SigningKey::random(&mut rand_core::OsRng)
 }
 
-/// Build the router with per-IP rate limiting keyed on the **peer** socket IP (correct when the
-/// service is directly exposed or in tests). Behind a proxy, use [`build_router_cfg`].
+/// Rate-limits on the **peer** socket IP — correct when directly exposed or in tests. Behind a
+/// proxy, use [`build_router_cfg`].
 #[allow(clippy::too_many_arguments)]
 pub fn build_router(
     service: Arc<AuthService>,
@@ -123,18 +118,13 @@ pub fn build_router(
     )
 }
 
-/// As [`build_router`], but `trusted_ip_header` selects where the client IP comes from for rate
-/// limiting.
+/// As [`build_router`], but `trusted_ip_header` selects the rate-limit client IP source.
 ///
-/// - `None` (default): use the peer socket IP; **ignore** any forwarded header (a client cannot
-///   spoof its address).
-/// - `Some(header)`: read the client IP from `header`, which MUST be overwritten on every request
-///   by a trusted reverse proxy that sets it to the single real client IP (e.g. nginx
-///   `proxy_set_header X-Real-Client-IP $remote_addr;`, or Cloudflare `CF-Connecting-IP`). The
-///   value must be one IP address; a multi-value / malformed header falls back to the peer IP
-///   (fail safe — still limited, just by the proxy). **Only enable this behind such a proxy**
-///   (ABUSE_MODEL.md, RISK_REGISTER R-306) — otherwise clients could forge the header to evade
-///   per-IP limits.
+/// - `None`: the peer socket IP; forwarded headers are **ignored**, so a client cannot spoof it.
+/// - `Some(header)`: read from `header`, which a trusted proxy MUST overwrite on every request
+///   with the single real client IP (nginx `proxy_set_header X-Real-Client-IP $remote_addr;`,
+///   Cloudflare `CF-Connecting-IP`). Multi-value/malformed falls back to the peer IP (fail safe).
+///   **Only enable behind such a proxy** (R-306) — otherwise clients forge it to evade limits.
 #[allow(clippy::too_many_arguments)]
 pub fn build_router_cfg(
     service: Arc<AuthService>,
@@ -151,10 +141,8 @@ pub fn build_router_cfg(
         Quota::per_minute(NonZeroU32::new(per_ip_per_minute.max(1)).expect("max(1) is non-zero"));
     let notifier = DeliveryNotifier::default();
 
-    // Push wiring (#4): a device that is not connected is reached by a contentless APNs wake push.
-    // Configured from NEDWONS_APNS_* (disabled otherwise). The transport is the REAL HTTP/2 client
-    // (`NEDWONS_APNS_URL` overrides the host for sandbox/local); it is only contacted when the
-    // service is enabled, so an unconfigured deployment opens no sockets.
+    // Contentless APNs wake for devices that are not connected, configured from NEDWONS_APNS_*.
+    // Only contacted when enabled, so an unconfigured deployment opens no sockets.
     let push = crate::push::PushService::from_env(
         relay.clone(),
         Arc::new(crate::push::HttpPushTransport::from_env()),
@@ -307,7 +295,7 @@ pub fn build_router_cfg(
 
 // ----- errors -------------------------------------------------------------------------
 
-/// External error shape. Deliberately generic (enumeration resistance / fail closed).
+/// Deliberately generic: enumeration resistance, fail closed.
 struct ApiError(StatusCode, &'static str);
 
 impl IntoResponse for ApiError {
@@ -339,14 +327,13 @@ fn internal() -> ApiError {
 }
 
 fn forbidden() -> ApiError {
-    // The relay uses a generic 403 for "not a member" so it does not confirm a
-    // conversation's existence or membership to non-members.
+    // A generic 403 for "not a member", so existence/membership is not confirmed to non-members.
     ApiError(StatusCode::FORBIDDEN, "forbidden")
 }
 
 fn idempotency_conflict() -> ApiError {
-    // An idempotency key was reused with a different payload/conversation. The client must
-    // retry with a fresh key; the original message under this key was not overwritten.
+    // Key reused with a different payload: retry with a fresh one. The original was not
+    // overwritten.
     ApiError(StatusCode::CONFLICT, "idempotency_conflict")
 }
 
@@ -358,15 +345,13 @@ impl From<auth_core::store::StoreError> for ApiError {
 
 // ----- sender-constrained access tokens (DPoP-style, ADR-0011, R-308) -----------------
 
-/// When enforcement is on, any request carrying an `Authorization` token must ALSO carry a valid
-/// device proof binding the method + path + token + timestamp + a single-use nonce, signed by the
-/// device's enrolled key. Requests without an `Authorization` header (register/login/refresh/
-/// healthz) are untouched — the rule is precisely "a bearer token is only honored with proof of
-/// possession of the enrolling key." Off by default during migration.
+/// When on, a request carrying an `Authorization` token must ALSO carry a device proof binding
+/// method + path + token + timestamp + single-use nonce, signed by the enrolled key. Requests
+/// without that header are untouched: a bearer token is only honored with proof of possession.
 async fn proof_layer(State(state): State<AppState>, request: Request, next: Next) -> Response {
     if state.require_proof && request.headers().contains_key(header::AUTHORIZATION) {
-        // Extract owned inputs synchronously — never hold `&Request` across an `.await`, or the
-        // middleware future stops being `Send` (Body is not `Sync`).
+        // Extract owned inputs synchronously: holding `&Request` across an `.await` makes the
+        // middleware future non-`Send` (Body is not `Sync`).
         let bearer = request
             .headers()
             .get(header::AUTHORIZATION)
@@ -432,7 +417,7 @@ async fn verify_request_proof(
         return Err(denied());
     }
 
-    // Single-use within the freshness window (a valid proof cannot be replayed).
+    // Single-use within the freshness window, so a valid proof cannot be replayed.
     if !state.proof_cache.check_and_record(
         &account.device_id.0,
         &parsed.nonce,
@@ -461,9 +446,8 @@ async fn rate_limit(State(state): State<AppState>, request: Request, next: Next)
     next.run(request).await
 }
 
-/// The IP used for rate limiting. Prefers a *trusted* proxy header when configured, else the peer
-/// socket IP. A client-supplied header is only honored when `trusted_ip_header` is set (operator
-/// opt-in), so it can never be used to spoof an address in the default configuration.
+/// A client-supplied header is honored ONLY when `trusted_ip_header` is set (operator opt-in), so
+/// it can never spoof an address in the default configuration.
 fn client_ip(request: &Request, state: &AppState) -> IpAddr {
     if let Some(header) = &state.trusted_ip_header {
         if let Some(ip) = request
@@ -476,8 +460,8 @@ fn client_ip(request: &Request, state: &AppState) -> IpAddr {
         }
         // Header trusted but absent/malformed: fall back to the peer IP (still limited).
     }
-    // ConnectInfo is present when served via into_make_service_with_connect_info (the production
-    // path in main.rs). In-process tests without a socket share one bucket.
+    // Present via into_make_service_with_connect_info (production); in-process tests without a
+    // socket share one bucket.
     request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
@@ -487,11 +471,9 @@ fn client_ip(request: &Request, state: &AppState) -> IpAddr {
 
 // ----- security headers ----------------------------------------------------------------
 
-/// Add conservative security headers to every response (defense-in-depth; OWASP ASVS). This is a
-/// JSON API, so a strict `default-src 'none'` CSP and `nosniff` prevent a browser from ever
-/// interpreting a response as executable/framed content, and `no-store` keeps tokens/profiles out
-/// of shared caches. HSTS is intentionally **not** set here — it belongs at the TLS-terminating
-/// ingress, since this hop runs behind the proxy.
+/// On a JSON API, a strict `default-src 'none'` CSP and `nosniff` stop a browser ever treating a
+/// response as executable/framed content, and `no-store` keeps tokens out of shared caches. HSTS is
+/// deliberately absent — it belongs at the TLS-terminating ingress, not this hop.
 async fn security_headers(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
     let h = response.headers_mut();
@@ -521,7 +503,7 @@ struct SthDto {
     timestamp: u64,
     /// ECDSA-P256 over encode_sth(tree_size, root, timestamp), 64-byte r‖s (hex).
     signature: String,
-    /// The log's SEC1 public key (hex). Clients PIN this out of band; it is echoed for convenience.
+    /// Clients PIN this out of band; echoed here for convenience.
     log_public_key: String,
 }
 
@@ -575,9 +557,8 @@ struct AccountBindingDto {
     /// The canonical leaf INPUT (hex); leaf hash = H(0x00 || entry).
     entry: String,
     proof: Vec<String>,
-    /// Present (unix secs) only when this leaf is a **revocation** of `device_id` (ADR-0013). A
-    /// client can flag a revocation of its own device it did not initiate. Omitted for bindings, so
-    /// older clients that ignore the field are unaffected.
+    /// Only on a **revocation** leaf (ADR-0013), letting a client flag a revocation of its own
+    /// device it did not initiate. Omitted for bindings, so older clients are unaffected.
     #[serde(skip_serializing_if = "Option::is_none")]
     revoked_at: Option<u64>,
 }
@@ -623,7 +604,7 @@ async fn transparency_account(
 
 // ----- hex helpers ---------------------------------------------------------------------
 
-/// Decode a hex field, enforcing the exact expected byte length (size-bounded inputs).
+/// Enforces the exact expected byte length (size-bounded inputs).
 fn hex_exact(input: &str, expected_bytes: usize) -> Result<Vec<u8>, ApiError> {
     if input.len() != expected_bytes * 2 {
         return Err(bad_request());
@@ -640,8 +621,7 @@ fn id16_from_hex(input: &str) -> Result<[u8; 16], ApiError> {
     bytes.try_into().map_err(|_| bad_request())
 }
 
-/// Authenticate the caller from the `Authorization: Bearer <access-token hex>` header,
-/// returning the bound account/device. Any failure is a generic 401.
+/// From `Authorization: Bearer <access-token hex>`. Any failure is a generic 401.
 async fn authed_device(state: &AppState, headers: &HeaderMap) -> Result<AccountDevice, ApiError> {
     let bearer = headers
         .get(header::AUTHORIZATION)
@@ -735,7 +715,7 @@ struct WhoamiDto {
 
 // ----- handlers ------------------------------------------------------------------------
 
-/// Run a blocking closure on the blocking pool, failing closed if the task is cancelled.
+/// Fails closed if the task is cancelled.
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, AuthError> + Send + 'static,
 ) -> Result<T, ApiError> {
@@ -793,12 +773,10 @@ async fn register_finish(
     Ok(Json(session.into()))
 }
 
-/// Publish an account→device-key binding to the transparency log (R-201). Best-effort: the CLIENT
-/// self-monitors and is the real check, so a transient log fault must not block the user. A gap is
-/// a monitorable error (production couples this atomically). Used at every point a device is bound
-/// to an account — registration, trusted-device enrollment, and recovery — so a self-monitoring
-/// client sees EVERY device the server routes for it (a server cannot add a device undetected;
-/// ADR-0008).
+/// Publish an account→device-key binding (R-201). Called at EVERY binding point — registration,
+/// trusted-device enrollment, recovery — so a self-monitoring client sees every device the server
+/// routes for it and none can be added undetected (ADR-0008). Best-effort: the client's own
+/// monitoring is the real check, so a transient log fault must not block the user.
 async fn append_binding_best_effort(
     state: &AppState,
     account: AccountId,
@@ -823,7 +801,7 @@ async fn login_begin(
         return Err(bad_request());
     }
     let service = state.service.clone();
-    // login_begin is infallible by design: bad credentials still produce a decoy challenge.
+    // Infallible by design: bad credentials still produce a decoy challenge.
     let c =
         tokio::task::spawn_blocking(move || service.login_begin(&body.username, &body.password))
             .await
@@ -909,8 +887,7 @@ async fn password_change_begin(
     }))
 }
 
-/// Stage 2: verify the device signature AND the current password, then set the new password
-/// (policy + breach checked, rehashed). Requires both factors.
+/// Stage 2: requires BOTH the device signature and the current password.
 async fn password_change_finish(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -971,8 +948,7 @@ struct DeviceRefBody {
     device_id: String,
 }
 
-/// Stage 1 of trusted-device enrollment: the authenticated (trusted) device reserves the new
-/// device's id + a nonce to sign.
+/// Stage 1: the trusted device reserves the new device's id + a nonce to sign.
 async fn enroll_begin(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -988,8 +964,7 @@ async fn enroll_begin(
     }))
 }
 
-/// Stage 2: the trusted device submits the new device's public key + its signature authorizing it.
-/// Returns a **session for the new device**, relayed to it over the pairing channel.
+/// Stage 2: returns a **session for the NEW device**, relayed over the pairing channel.
 async fn enroll_finish(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1023,7 +998,7 @@ async fn enroll_finish(
     Ok(Json(SessionDto::from(session)))
 }
 
-/// The account's devices (management list). Members-of-account only (the caller's own account).
+/// The caller's own account only.
 async fn list_devices_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1045,7 +1020,7 @@ async fn list_devices_handler(
     ))
 }
 
-/// Revoke one of the caller's own devices (cascades tokens + refresh families + fails closed).
+/// Cascades to tokens + refresh families; fails closed.
 async fn revoke_device_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1059,17 +1034,14 @@ async fn revoke_device_handler(
     if !revoked {
         return Err(forbidden());
     }
-    // Log the removal in the transparency log so a *revocation* is auditable under the signed root,
-    // not just additions (ADR-0013). Best-effort, like binding appends: a log hiccup must not fail
-    // the revocation (the device is already revoked in the source-of-truth store).
+    // ADR-0013: log revocations, not just additions, so removal is auditable under the signed root.
+    // Best-effort — the device is already revoked in the source-of-truth store.
     let transparency = state.transparency.clone();
     let now = now_unix();
     let _ = blocking_store(move || transparency.append_revocation(&account, &target, now)).await;
-    // Housekeeping (ADR-0015 option 3): drop the revoked device from its account's self-group
-    // membership so the relay stops routing self-group traffic to it and the pending-devices view
-    // stays accurate. Best-effort — the *cryptographic* re-key is a separate client action (an
-    // existing device issues an MLS remove-commit via `MlsClient.remove_self_device`). The fan-out
-    // query already excludes revoked devices, so this is cleanup, not a security dependency.
+    // Drop it from self-group membership so routing and the pending-devices view stay accurate.
+    // Cleanup, NOT a security dependency: fan-out already excludes revoked devices, and the
+    // cryptographic re-key is a separate client action (`MlsClient.remove_self_device`).
     let relay = state.relay.clone();
     let _ = blocking_store(move || relay.remove_self_group_member(&account, &target)).await;
     // Drop the revoked device's push tokens so it is never woken again (#4). Best-effort.
@@ -1104,7 +1076,7 @@ struct RecoverFinishBody {
     signature: String,
 }
 
-/// Set (or replace) the caller's recovery secret (authed; you set it up while you have a device).
+/// Authed: you set this up while you still have a device.
 async fn set_recovery(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1116,8 +1088,7 @@ async fn set_recovery(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Stage 1 of recovery (unauthenticated): reserve the recovering device's id + a nonce to sign.
-/// Enumeration-resistant — always returns a challenge.
+/// Stage 1, unauthenticated. Enumeration-resistant: always returns a challenge.
 async fn recover_begin_handler(
     State(state): State<AppState>,
     Json(body): Json<RecoverBeginBody>,
@@ -1133,8 +1104,7 @@ async fn recover_begin_handler(
     }))
 }
 
-/// Stage 2 of recovery (unauthenticated): the recovery secret + the new device's proof of
-/// possession enroll the new device and return its session.
+/// Stage 2, unauthenticated: the recovery secret + the new device's proof of possession.
 async fn recover_finish_handler(
     State(state): State<AppState>,
     Json(body): Json<RecoverFinishBody>,
@@ -1217,8 +1187,7 @@ struct SendWelcomeBody {
 
 #[derive(Serialize)]
 struct FanoutReceiptDto {
-    /// Number of recipient devices the ciphertext was newly queued for (0 on an idempotent
-    /// retry). Delivery to the server, NOT a decryption claim.
+    /// Devices newly queued for (0 on an idempotent retry). Delivery, NOT a decryption claim.
     delivered: usize,
 }
 
@@ -1237,14 +1206,12 @@ struct InboxEnvelopeDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     sender_device: Option<String>,
     ciphertext: String,
-    /// True for a sealed envelope. Sealed ids live in a **separate id space** from identified ones,
-    /// so a client acks them via `AckBody.sealed_ids`, not `ids`.
+    /// Sealed ids live in a **separate id space**, acked via `AckBody.sealed_ids`, not `ids`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     sealed: bool,
-    /// True for a **self-group** envelope (ADR-0015 option 3): a message from one of this account's
-    /// OWN devices (linking Welcome/commit, or a `SecretConsumed`), which the client routes to the
-    /// self-group inbound path. Its own id space — ack via `AckBody.self_group_ids`. `sender_device`
-    /// is present (a sibling device); `conversation_id` is absent (it is not a conversation).
+    /// A message from one of this account's OWN devices (ADR-0015), routed to the self-group
+    /// inbound path. Own id space — ack via `AckBody.self_group_ids`. `sender_device` is the
+    /// sibling; `conversation_id` is absent because this is not a conversation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     self_group: bool,
 }
@@ -1261,17 +1228,14 @@ struct InboxQuery {
 struct AckBody {
     /// Identified envelope ids the client has durably persisted and no longer needs served.
     ids: Vec<i64>,
-    /// **Sealed** envelope ids to ack — a separate id space from `ids` (ADR-0014). Optional so
-    /// existing clients that only send `ids` are unaffected.
+    /// Separate id space from `ids` (ADR-0014). Optional, so clients sending only `ids` still work.
     #[serde(default)]
     sealed_ids: Vec<i64>,
-    /// **Self-group** envelope ids to ack — a separate id space again (ADR-0015 option 3). Optional
-    /// so existing clients are unaffected.
+    /// A third id space (ADR-0015). Optional, so existing clients are unaffected.
     #[serde(default)]
     self_group_ids: Vec<i64>,
 }
 
-/// Publish a key package for the authenticated device.
 async fn publish_key_package(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1316,8 +1280,7 @@ struct KeyPackageCountDto {
     low_watermark: u64,
 }
 
-/// The caller's device's available (non-expired) key-package count, so the client knows when to
-/// replenish its prekeys (MLS hygiene).
+/// Lets the client know when to replenish its prekeys (MLS hygiene).
 async fn key_package_count(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1335,9 +1298,8 @@ async fn key_package_count(
     }))
 }
 
-/// Sealed-sender certificate lifetime (ADR-0012, R-204). Short so a leaked or rotated
-/// sender-certificate key stops being trusted quickly, yet long enough that a device does not
-/// re-fetch per message.
+/// Short, so a leaked or rotated cert key stops being trusted quickly — but long enough that a
+/// device need not re-fetch per message.
 const SENDER_CERT_TTL_SECS: u64 = 24 * 60 * 60;
 
 #[derive(Serialize)]
@@ -1349,16 +1311,13 @@ struct SenderCertDto {
     expires_at: u64,
     /// 64-byte r‖s ECDSA-P256 signature over the canonical certificate encoding.
     signature: String,
-    /// SEC1 public key of the server's sender-certificate signing key. Production clients pin this
-    /// out of band; it is returned here for bootstrap/discovery and tests (ADR-0012).
+    /// Production clients pin this out of band; returned for bootstrap/discovery and tests.
     cert_public_key: String,
 }
 
-/// Issue a short-lived sealed-sender **certificate** for the authenticated device (ADR-0012,
-/// R-204). The device embeds the certificate *inside* the E2EE payload of a sealed-sender message,
-/// so the recipient — and only the recipient — verifies who sent it while the relay never learns
-/// the sender. The relay itself stays MLS-blind: this endpoint only signs `{account, device,
-/// device public key, expiry}` bytes.
+/// The device embeds this INSIDE the E2EE payload, so only the recipient verifies who sent the
+/// message while the relay never learns the sender. The relay stays MLS-blind: this endpoint signs
+/// only `{account, device, device public key, expiry}`.
 async fn issue_sender_certificate(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1398,11 +1357,8 @@ struct DeliveryVerifierBody {
     verifier: String,
 }
 
-/// Register (or rotate) the caller account's sealed-sender **delivery access verifier**
-/// (ADR-0014 Slice 2a). The recipient computes `V_r = SHA-256(K_r)` on-device and registers it here
-/// while authenticated as itself; the relay stores only the 32-byte hash, never `K_r`. This is the
-/// gate value only — no sealed-delivery endpoint exists yet (Slice 2b, gated on ADR-0014 review),
-/// so registering a verifier changes no delivery behavior today.
+/// The recipient computes `V_r = SHA-256(K_r)` on-device and registers it here; the relay stores
+/// only the 32-byte hash, never `K_r` (ADR-0014 Slice 2a).
 async fn set_delivery_access_key(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1433,12 +1389,10 @@ struct SealedDeliverBody {
 /// HTTP header carrying the recipient's delivery access key `K_r` (hex). MUST NOT be logged.
 const DELIVERY_KEY_HEADER: &str = "x-delivery-key";
 
-/// Deliver a **sealed-sender** message (ADR-0014 Slice 2b, R-204). **Unauthenticated:** the caller
-/// proves the right to deliver by presenting the recipient's delivery access key `K_r` (header
-/// `X-Delivery-Key`), not by authenticating as a sender — so the relay stores the envelope with **no
-/// sender and no conversation**. The DAK is verified against the recipient account's registered
-/// verifier `V_r = SHA-256(K_r)`; unknown device, unset verifier, and wrong key all return the SAME
-/// generic 403 (no existence oracle), and the constant-time compare runs on every path.
+/// **Unauthenticated** (ADR-0014 Slice 2b): the caller presents the recipient's `K_r` rather than
+/// authenticating as a sender, so the envelope is stored with **no sender and no conversation**.
+/// Unknown device, unset verifier, and wrong key all return the SAME generic 403 (no existence
+/// oracle), and the constant-time compare runs on every path.
 async fn deliver_sealed_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1457,8 +1411,8 @@ async fn deliver_sealed_handler(
         _ => return Err(forbidden()),
     };
 
-    // Verify the DAK off the async thread. Always run the constant-time compare (against a dummy
-    // verifier when the device/verifier is absent) so unknown-device and bad-key share one path.
+    // Always run the constant-time compare — against a dummy verifier when the device/verifier is
+    // absent — so unknown-device and bad-key share one timing path.
     let relay = state.relay.clone();
     let rec = recipient;
     let authorized = blocking_store(move || {
@@ -1475,8 +1429,8 @@ async fn deliver_sealed_handler(
         return Err(forbidden());
     }
 
-    // Rate-limit only AUTHORIZED deliveries, keyed on the recipient device, so a bad-key flood can't
-    // exhaust a victim's quota (that path is bounded by the per-IP limiter instead).
+    // Only AUTHORIZED deliveries count, so a bad-key flood cannot exhaust a victim's quota; that
+    // path is bounded by the per-IP limiter instead.
     if state.sealed_limiter.check_key(&recipient.0).is_err() {
         return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "rate_limited"));
     }
@@ -1491,13 +1445,11 @@ async fn deliver_sealed_handler(
 
 // ----- Device self-group (ADR-0015 option 3) ------------------------------------------
 //
-// Establish + use the account's own-devices MLS group over the relay so a view-once "consumed"
-// control message fans out to the account's OTHER devices — without the conversation's other party
-// ever being in the channel. Every endpoint is authenticated and account-scoped: a device only ever
-// touches its OWN account's self-group (the account boundary IS the authorization; no manifests).
+// The account's own-devices MLS group, so a view-once "consumed" message fans out to its OTHER
+// devices without the conversation's other party ever being in the channel. Every endpoint is
+// account-scoped: the account boundary IS the authorization, so no manifests are needed.
 
-/// Declare the authenticated device a member of its account's self-group (idempotent). Called by the
-/// device that creates the self-group and by each device after it `join_self_group`s.
+/// Idempotent. Called by the device that creates the self-group and by each device after it joins.
 async fn self_group_register(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1516,8 +1468,7 @@ struct SelfGroupPendingDto {
     pending_devices: Vec<String>,
 }
 
-/// List the account's devices that are enrolled but NOT yet in its self-group — the candidates the
-/// caller links (claim each one's key package, add it, deliver the Welcome).
+/// The candidates to link: claim each one's key package, add it, deliver the Welcome.
 async fn self_group_pending(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1540,9 +1491,8 @@ struct SelfGroupClaimBody {
     device_id: String,
 }
 
-/// Claim one key package for a specific sibling device of the caller's account (to add it to the
-/// self-group). Refuses if the target device is not a non-revoked device of the caller's account —
-/// this endpoint never claims another account's key package.
+/// Refuses unless the target is a non-revoked device of the caller's OWN account — this endpoint
+/// never claims another account's key package.
 async fn self_group_claim_key_package(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1571,9 +1521,8 @@ async fn self_group_claim_key_package(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SelfGroupDeliverBody {
-    /// Targeted delivery to one of the caller's own devices (an MLS Welcome/commit during linking).
-    /// Omit to **fan out** to every OTHER joined member of the self-group (a `SecretConsumed` control
-    /// message).
+    /// Targeted delivery to one own device (Welcome/commit while linking); omit to **fan out** to
+    /// every OTHER joined member.
     #[serde(default)]
     recipient_device: Option<String>,
     /// Opaque MLS ciphertext (hex) — the relay never decrypts it.
@@ -1582,9 +1531,7 @@ struct SelfGroupDeliverBody {
     idempotency_key: String,
 }
 
-/// Deliver a self-group envelope. With `recipient_device`: targeted to that sibling device (Welcome
-/// or commit). Without: fan out to every OTHER joined member of the caller's self-group (the
-/// consumption control message). Relay-blind: opaque ciphertext, account-scoped routing only.
+/// Relay-blind: opaque ciphertext, account-scoped routing only.
 async fn self_group_deliver(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1630,8 +1577,7 @@ struct RegisterPushBody {
     token: String,
 }
 
-/// Register (or rotate) this device's push token so it can be woken to fetch its inbox when not
-/// connected (#4). The token addresses a **contentless** wake push; no E2EE content is ever pushed.
+/// The token addresses a **contentless** wake push; no E2EE content is ever pushed.
 async fn register_push_token_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1659,8 +1605,7 @@ struct AttestChallengeDto {
     challenge: String,
 }
 
-/// Issue a short-lived App Attest challenge for the authenticated device (#10). The client hashes it
-/// into its attestation object so a replayed attestation is rejected.
+/// The client hashes it into its attestation object, so a replayed attestation is rejected.
 async fn attest_challenge_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1691,12 +1636,10 @@ struct AttestSubmitBody {
     attestation: String,
 }
 
-/// Submit an App Attest attestation for the authenticated device (#10). The outstanding challenge is
-/// consumed (anti-replay); then, when `NEDWONS_APP_ATTEST_APP_ID` is configured, the attestation
-/// object is **cryptographically verified** (`crate::attest`: chain to the pinned Apple root, nonce,
-/// key id, authData) and rejected outright on failure — a verified row is stored with
-/// `verified=true`. Unconfigured deployments store unverified (bootstrap mode). **Honest limit:**
-/// producing a real attestation still requires a physical device (docs/APP_ATTEST.md).
+/// Consumes the outstanding challenge (anti-replay). With `NEDWONS_APP_ATTEST_APP_ID` configured
+/// the object is **cryptographically verified** (`crate::attest`) and rejected outright on failure;
+/// unconfigured deployments store it unverified (bootstrap). **Honest limit:** producing a real
+/// attestation still requires a physical device (docs/APP_ATTEST.md).
 async fn attest_submit_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1721,8 +1664,8 @@ async fn attest_submit_handler(
         None => false, // bootstrap mode: stored, explicitly unverified
         Some(cfg) => {
             let key_id = crate::attest::decode_key_id(&body.key_id).ok_or_else(bad_request)?;
-            // The client attested over SHA-256(challenge) (see `AppAttestation.attestKey`), so that
-            // hash is the clientDataHash bound into the nonce.
+            // The client attested over SHA-256(challenge), so that hash is the clientDataHash
+            // bound into the nonce.
             let client_data_hash = auth_core::crypto::sha256(&challenge);
             crate::attest::verify_attestation(
                 &attestation,
@@ -1767,9 +1710,8 @@ async fn list_conversations(
     ))
 }
 
-/// Optional create-conversation body. `mls_authoritative` opts the conversation into
-/// commit-authoritative membership (ADR-0010): afterwards the legacy direct-mutation endpoints
-/// refuse and all membership changes go through `/commit`. Absent/`{}` ⇒ legacy (false).
+/// `mls_authoritative` opts into commit-authoritative membership (ADR-0010): the legacy
+/// direct-mutation endpoints then refuse and all changes go through `/commit`.
 #[derive(Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 struct CreateConversationBody {
@@ -1803,8 +1745,7 @@ async fn create_conversation(
     }))
 }
 
-/// Reject a legacy membership mutation on an MLS-authoritative conversation (ADR-0010): such
-/// conversations accept membership changes only through `/commit`. Returns `409 commits_required`.
+/// ADR-0010: such conversations accept membership changes only through `/commit`.
 async fn reject_if_authoritative(
     state: &AppState,
     conversation_id: &[u8; 16],
@@ -1817,8 +1758,7 @@ async fn reject_if_authoritative(
     Ok(())
 }
 
-/// Add a target account's active device to a conversation's routing membership. The caller
-/// must already be a member.
+/// The caller must already be a member.
 async fn add_member(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1835,10 +1775,9 @@ async fn add_member(
     let groups = state.groups.clone();
     let social = state.social.clone();
     blocking_store(move || {
-        // Direct add is consent-by-proxy, so it is tightly gated (ADR-0009): the caller must be
-        // an ADMIN of the group AND friends with the target (friends = implied consent to be
-        // added by you; strangers join via invite links = their own consent), and no block may
-        // exist between the target and any current member. Non-members/non-admins learn nothing.
+        // Direct add is consent-by-proxy, so it is tightly gated (ADR-0009): admin AND friends
+        // with the target (friendship implies consent; strangers join via invite links, which are
+        // their own consent), and no block between the target and any member.
         if !relay.is_member(&conversation_id, &me.device_id)?
             || !groups.is_admin(&conversation_id, &me.account_id)?
             || !social.are_friends(&me.account_id, &target_account)?
@@ -1846,7 +1785,7 @@ async fn add_member(
         {
             return Ok(None);
         }
-        // Resolve the target's active device (server-side authority, never client-asserted).
+        // Server-side authority, never client-asserted.
         let device = service
             .active_device(&target_account)
             .map_err(|_| auth_core::store::StoreError("device lookup".into()))?;
@@ -1863,10 +1802,9 @@ async fn add_member(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Leave a conversation (consent withdrawal, ADR-0009). Removes all of the caller's devices from
-/// routing and purges their queued undelivered envelopes for it. Idempotent `204`: leaving a
-/// conversation you're not in (or that doesn't exist) is a no-op — ids are opaque random values,
-/// so this discloses nothing.
+/// Consent withdrawal (ADR-0009): removes all the caller's devices from routing and purges their
+/// queued envelopes. Idempotent `204` — leaving a conversation you're not in discloses nothing,
+/// since ids are opaque random values.
 async fn leave_conversation(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1928,8 +1866,7 @@ fn token32_from_hex(input: &str) -> Result<[u8; 32], ApiError> {
     bytes.try_into().map_err(|_| bad_request())
 }
 
-/// Guard: true iff the caller is a routed member AND an admin of the conversation. Handlers treat
-/// `false` as a generic forbidden — non-members/non-admins learn nothing. Store errors stay 500.
+/// Handlers treat `false` as a generic forbidden, so non-members and non-admins learn nothing.
 fn is_conversation_admin(
     state: &AppState,
     conversation_id: &[u8; 16],
@@ -1947,8 +1884,8 @@ async fn create_invite(
 ) -> Result<Json<InviteDto>, ApiError> {
     let me = authed_device(&state, &headers).await?;
     let conversation_id = id16_from_hex(&conversation_hex)?;
-    // Authoritative conversations grow only through /commit, so they mint no invite links: this
-    // closes the invite/join join-path at its source (no invite ⇒ no accept ⇒ no join request).
+    // Authoritative conversations grow only through /commit, so minting no invite closes the whole
+    // join path at its source: no invite ⇒ no accept ⇒ no join request.
     reject_if_authoritative(&state, &conversation_id).await?;
     let expires = body
         .expires_in_secs
@@ -2036,9 +1973,8 @@ async fn revoke_invite(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Present an invite token: the joiner's own consent. Joins immediately, or files a join request
-/// when the group requires approval. One generic 403 on any refusal — a token must not become an
-/// oracle for group/block state.
+/// The token IS the joiner's own consent. One generic 403 on any refusal, so a token never becomes
+/// an oracle for group or block state.
 async fn accept_invite(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2051,7 +1987,7 @@ async fn accept_invite(
     let outcome = blocking_store(move || {
         let outcome = groups.accept_invite(&token, &me.account_id)?;
         if let InviteOutcome::Joined { conversation_id } = &outcome {
-            // Routing add after the validated consume; the caller's own device only.
+            // The caller's own device only.
             relay.add_member(conversation_id, me.account_id, me.device_id)?;
         }
         Ok(outcome)
@@ -2148,8 +2084,7 @@ async fn deny_join_request(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Admin removes a member. Uses the same exit path as leave (routing removal + queued-mail purge +
-/// role cleanup). Removing yourself is a `leave`, not a remove.
+/// Same exit path as leave. Removing yourself is a `leave`, not a remove.
 async fn remove_member(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2249,9 +2184,8 @@ async fn update_settings(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Send an MLS application message: ONE ciphertext, fanned out server-side to every other
-/// member device in a single round trip (the client uploads once, not once per recipient).
-/// Idempotent per `idempotency_key`.
+/// ONE ciphertext, fanned out server-side to every other member device, so the client uploads once
+/// rather than once per recipient. Idempotent per `idempotency_key`.
 async fn send_message(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2275,8 +2209,8 @@ async fn send_message(
     .await?;
     match outcome {
         FanoutOutcome::Forbidden => Err(forbidden()),
-        // Key reused for a different payload/conversation: refusing (409) beats silently
-        // deduping, which would drop the new message while reporting success.
+        // Refusing beats silently deduping, which would drop the new message while reporting
+        // success.
         FanoutOutcome::IdempotencyMismatch => Err(idempotency_conflict()),
         FanoutOutcome::Delivered { newly_queued } => {
             // Wake any long-poll waiters for the recipients that just got mail.
@@ -2366,13 +2300,12 @@ struct EpochDto {
     epoch: u64,
 }
 
-/// Bounds membership-change fan-in per commit (defense in depth; MLS groups this size need the
-/// future attachment path anyway).
+/// Bounds membership-change fan-in per commit (defense in depth).
 const MAX_COMMIT_MEMBER_DELTA: usize = 32;
 
-/// Apply an MLS membership commit (ADR-0010): verify the device-signed manifest, enforce
-/// governance and the per-group epoch CAS, and atomically apply routing + fan out the commit and
-/// welcomes. The relay never parses the commit — recipients verify correspondence client-side.
+/// ADR-0010: verify the device-signed manifest, enforce governance + the per-group epoch CAS, then
+/// atomically apply routing and fan out commit + welcomes. The relay never parses the commit —
+/// recipients verify correspondence client-side.
 async fn membership_commit(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2426,8 +2359,8 @@ async fn membership_commit(
     for d in &body.removed {
         removed.push(DeviceId(id16_from_hex(d)?));
     }
-    // Sorted + duplicate-free lists are part of the canonical form (the encoding is otherwise
-    // ambiguous between semantically-equal manifests).
+    // Part of the canonical form: the encoding is otherwise ambiguous between semantically-equal
+    // manifests.
     let sorted_unique_pairs = added
         .windows(2)
         .all(|w| (w[0].0.as_bytes(), w[0].1.as_bytes()) < (w[1].0.as_bytes(), w[1].1.as_bytes()));
@@ -2521,8 +2454,7 @@ async fn membership_commit(
     }
 }
 
-/// A stored membership event's manifest (decoded) + evidence, for a recipient's correspondence
-/// check (ADR-0010). Members only.
+/// Evidence for a recipient's correspondence check (ADR-0010). Members only.
 #[derive(Serialize)]
 struct MembershipEventDto {
     control_type: u8,
@@ -2530,8 +2462,8 @@ struct MembershipEventDto {
     next_epoch: u64,
     commit_hash: String,
     actor_device: String,
-    /// The actor's account — where its device key lives in the transparency log, so the recipient
-    /// can verify the signature against the LOGGED key rather than a server-asserted one.
+    /// Locates the actor's device key in the transparency log, so the recipient verifies the
+    /// signature against the LOGGED key rather than a server-asserted one.
     actor_account: String,
     added: Vec<CommitAddDto>,
     removed: Vec<String>,
@@ -2542,9 +2474,8 @@ struct MembershipEventDto {
     signature: String,
 }
 
-/// Fetch the membership event for an epoch transition (`{epoch}` = its `next_epoch`). A recipient
-/// at local epoch N fetches `N+1` to learn the manifest's `added`/`removed` before running the
-/// client-side correspondence check. Members only (generic `403` otherwise).
+/// `{epoch}` is the transition's `next_epoch`: a recipient at local epoch N fetches `N+1` to learn
+/// the manifest's `added`/`removed` before its correspondence check. Members only.
 async fn membership_event(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2569,7 +2500,7 @@ async fn membership_event(
     if !is_member {
         return Err(forbidden());
     }
-    // Not-found and not-a-member both surface as a generic 403 (no oracle on which epochs exist).
+    // Not-found and not-a-member share one 403: no oracle on which epochs exist.
     let row = row.ok_or_else(forbidden)?;
     let m = auth_core::membership::decode(&row.manifest).ok_or_else(internal)?;
     Ok(Json(MembershipEventDto {
@@ -2595,8 +2526,7 @@ async fn membership_event(
     }))
 }
 
-/// The conversation's current membership epoch (members only; one generic 403 otherwise). A
-/// client rebasing after `stale_epoch` reads this before rebuilding its commit.
+/// A client rebasing after `stale_epoch` reads this before rebuilding its commit. Members only.
 async fn conversation_epoch(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2612,11 +2542,9 @@ async fn conversation_epoch(
     Ok(Json(EpochDto { epoch }))
 }
 
-/// Peek the authenticated device's queued envelopes (does NOT mark delivered — the client
-/// acks via `/v1/inbox/ack` after persisting, giving at-least-once delivery). With `?wait=N`
-/// this long-polls: it returns immediately if mail is present, otherwise parks until mail
-/// arrives (woken by a send) or `N` seconds elapse — near-zero idle delivery latency without
-/// burning a database connection while waiting.
+/// Peek only — does NOT mark delivered; the client acks after persisting, giving at-least-once
+/// delivery. `?wait=N` long-polls: returns immediately on mail, else parks until a send wakes it or
+/// `N` seconds elapse, without holding a database connection.
 async fn fetch_inbox(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2668,8 +2596,7 @@ async fn fetch_inbox(
     Ok(Json(out))
 }
 
-/// Acknowledge durably-persisted envelopes so the server can purge them. At-least-once: a
-/// client peeks, persists locally, then acks; a crash before ack just re-peeks (dedup by id).
+/// At-least-once: peek, persist locally, then ack; a crash before ack just re-peeks (dedup by id).
 async fn ack_inbox(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2691,9 +2618,8 @@ async fn ack_inbox(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Peek identified, sealed (ADR-0014), and self-group (ADR-0015 option 3) envelopes for a device.
-/// Each lives in a separate table/id space, so they are returned as separate lists the caller tags
-/// distinctly (`sealed` / `self_group` flags), and the client acks each via its own id list.
+/// Identified, sealed (ADR-0014), and self-group (ADR-0015) envelopes each live in a separate
+/// table/id space, so they are tagged distinctly and acked via their own id lists.
 #[allow(clippy::type_complexity)]
 async fn read_all_inbox(
     state: &AppState,
@@ -2723,10 +2649,8 @@ struct StreamPush {
     envelopes: Vec<InboxEnvelopeDto>,
 }
 
-/// Client → server ack over the socket. Each channel has its own id space (identified conversation
-/// mail, sealed-sender, self-group), so acks are carried in three separate lists — a client acks
-/// each envelope in the list matching its `sealed` / `self_group` flag. All optional (a client that
-/// only receives identified mail sends `ack` alone).
+/// Each channel has its own id space, so acks ride three separate lists matching the envelope's
+/// `sealed` / `self_group` flag. All optional: a client receiving only identified mail sends `ack`.
 #[derive(Deserialize)]
 struct StreamAck {
     #[serde(default)]
@@ -2737,11 +2661,9 @@ struct StreamAck {
     self_group_ack: Vec<i64>,
 }
 
-/// Authenticated WebSocket push channel: `GET /v1/stream` with `Authorization: Bearer
-/// <access-token hex>` on the upgrade request. The server pushes new envelopes the instant
-/// they arrive (woken by the same `DeliveryNotifier` as long-poll — sub-100 ms, no polling)
-/// and the client acks over the same socket. Same at-least-once semantics as HTTP: unacked
-/// envelopes are re-delivered on reconnect.
+/// Pushes envelopes the instant they arrive, woken by the same `DeliveryNotifier` as long-poll, and
+/// the client acks over the same socket. Same at-least-once semantics as HTTP: unacked envelopes
+/// are re-delivered on reconnect.
 async fn stream_handler(
     ws: axum::extract::ws::WebSocketUpgrade,
     State(state): State<AppState>,
@@ -2764,19 +2686,18 @@ async fn stream_socket(
 
     let device = me.device_id;
     let notify = state.notifier.handle(&device.0);
-    // Only push envelopes newer than what we've already sent this session; unacked ones are
-    // re-served from the DB on reconnect (the cursors reset to 0). Each channel has its own
-    // BIGSERIAL id space (separate tables), so it needs its own cursor — a single one would let a
-    // high id in one channel suppress a lower id in another.
+    // Push only what this session has not sent; unacked envelopes are re-served from the DB on
+    // reconnect (cursors reset to 0). Each channel needs its OWN cursor because they are separate
+    // BIGSERIAL id spaces — one shared cursor would let a high id in one suppress a lower id in
+    // another.
     let mut last_identified: i64 = 0;
     let mut last_sealed: i64 = 0;
     let mut last_self_group: i64 = 0;
     let heartbeat = std::time::Duration::from_secs(30);
 
     loop {
-        // Deliver anything pending and not yet pushed this session, across ALL three channels
-        // (identified conversation mail, sealed-sender, self-group) so real-time delivery — e.g. a
-        // view-once consumption fan-out — rides the socket, not just the HTTP long-poll.
+        // All three channels, so real-time delivery — e.g. a view-once consumption fan-out — rides
+        // the socket, not just the HTTP long-poll.
         match read_all_inbox(&state, device).await {
             Ok((identified, sealed, self_group)) => {
                 let mut fresh: Vec<InboxEnvelopeDto> = Vec::new();
@@ -2996,8 +2917,7 @@ async fn search_profiles(
     axum::extract::Query(query): axum::extract::Query<SearchQuery>,
 ) -> Result<Json<Vec<ProfileSummaryDto>>, ApiError> {
     let _me = authed_device(&state, &headers).await?;
-    // Username search is over the normalized (lowercase) handle; require a minimum length so
-    // this is deliberate discovery, not a bulk directory scan (ABUSE_MODEL.md).
+    // A minimum length keeps this deliberate discovery, not a bulk directory scan (ABUSE_MODEL.md).
     let q = query.q.trim().to_lowercase();
     if q.chars().count() < MIN_SEARCH_CHARS || q.len() > 64 {
         return Err(bad_request());
@@ -3094,7 +3014,7 @@ const MAX_REPORT_EVIDENCE_CHARS: usize = 16_384;
 struct ReportBody {
     account_id: String,
     reason: String,
-    /// Optional reporter-chosen excerpt. The server never derives this from E2EE content.
+    /// Reporter-chosen; the server never derives this from E2EE content.
     #[serde(default)]
     evidence: Option<String>,
 }
@@ -3173,9 +3093,8 @@ async fn friend_remove(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Create a group conversation. Members need not be friends (ADR-0009), but creation is refused
-/// if any pair within the group has blocked each other. Adds all members' active devices to
-/// routing so the group's messages reach every person.
+/// Members need not be friends (ADR-0009), but creation is refused if any pair has blocked each
+/// other.
 async fn create_group(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3205,11 +3124,10 @@ async fn create_group(
     let others_for_task = others.clone();
     let groups = state.groups.clone();
     let outcome = blocking_store(move || {
-        // Gates (ADR-0009): listing someone is a DIRECT add, so the creator must be friends with
-        // each listed member (friends = implied consent to be added by you — strangers join via
-        // invite links, which is their own consent; this stops forced-membership spam). Members
-        // need NOT be friends with each other. And a group must never force together a pair that
-        // has blocked each other.
+        // ADR-0009: listing someone is a DIRECT add, so the creator must be friends with each
+        // listed member (friendship implies consent; strangers join via invite links, stopping
+        // forced-membership spam). Members need NOT be friends with each other, but a group must
+        // never force together a pair that has blocked each other.
         for member in &others_for_task {
             if !social.are_friends(&me.account_id, member)? {
                 return Ok(Err("not_friends"));
@@ -3219,13 +3137,12 @@ async fn create_group(
             return Ok(Err("blocked_member"));
         }
         let conversation_id = auth_core::crypto::random_bytes::<16>();
-        // Legacy multi-member group creation stays non-authoritative (it seeds routing directly);
-        // authoritative groups are created empty via POST /v1/conversations {mls_authoritative}
-        // and grow through /commit.
+        // Legacy multi-member creation seeds routing directly, so it stays non-authoritative;
+        // authoritative groups start empty and grow through /commit.
         relay.create_conversation(conversation_id, me.account_id, me.device_id, false)?;
         groups.bootstrap_admin(&conversation_id, &me.account_id)?;
         for member in &others_for_task {
-            // Resolve each member's active device server-side (never client-asserted).
+            // Server-side, never client-asserted.
             if let Some(device) = service
                 .active_device(member)
                 .map_err(|_| auth_core::store::StoreError("device lookup".into()))?

@@ -1,7 +1,6 @@
-//! Reads three hex lines (public key, message, signature) from stdin and verifies the
-//! signature with the backend's own `verify_p256`. Paired with the Swift `InteropEmit`
-//! tool, this proves the iOS client's ECDSA-P256 signatures over the canonical transcript
-//! are accepted by the server. Prints `INTEROP_OK` (exit 0) or `INTEROP_FAIL` (exit 1).
+//! Verifies a (public key, message, signature) hex triple from stdin with the backend's own
+//! `verify_p256`. Paired with the Swift `InteropEmit` tool, this proves the iOS client's
+//! signatures are accepted by the server. Prints `INTEROP_OK` / `INTEROP_FAIL`.
 
 use std::io::Read;
 

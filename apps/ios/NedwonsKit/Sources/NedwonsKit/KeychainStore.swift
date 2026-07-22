@@ -1,11 +1,10 @@
 import Foundation
 import Security
 
-/// Thin wrapper over the Keychain for the small, sensitive blobs the client persists: the
-/// Secure Enclave key's encrypted `dataRepresentation`, the local DB wrapping key, and the
-/// refresh token. Items default to `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` so they
-/// are not included in backups and never leave the originating device (SECURITY.md,
-/// CRYPTOGRAPHY.md §5). Passwords are never stored.
+/// Keychain wrapper for the small sensitive blobs: the Enclave key's encrypted
+/// `dataRepresentation`, the local DB wrapping key, and the refresh token. Defaults to
+/// `WhenUnlockedThisDeviceOnly`, so items stay out of backups and never leave the originating
+/// device. Passwords are never stored.
 ///
 /// This type type-checks with `swift build`; its runtime behavior depends on a real
 /// Keychain and is validated on device (RISK_REGISTER R-101).

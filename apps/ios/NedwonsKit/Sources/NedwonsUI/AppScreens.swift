@@ -1,9 +1,6 @@
 import SwiftUI
 
-/// Runtime feature flags. Unfinished features stay behind a disabled flag and are shown as
-/// disabled controls with an explanation — never as dead buttons (per the engineering
-/// rules). In this scaffold the backend is not configured, so network-dependent actions are
-/// disabled rather than silently doing nothing.
+/// Unfinished features appear as disabled controls with an explanation, never as dead buttons.
 public struct FeatureFlags: Sendable {
     public var backendConfigured: Bool
     public var callsEnabled: Bool

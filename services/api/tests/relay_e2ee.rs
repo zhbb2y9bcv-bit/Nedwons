@@ -1,7 +1,6 @@
-//! The end-to-end E2EE evidence for THREAT_MODEL.md INV-1 / RISK_REGISTER R-104: real MLS
-//! ciphertext (from `mls-core`) is routed through the real HTTP relay backed by real
-//! PostgreSQL, and a direct query of the `envelopes` table confirms the stored bytes contain
-//! NO plaintext. The `nedwons-api` library never links `mls-core`; only this test does.
+//! Evidence for INV-1 / R-104: real MLS ciphertext routed through the real HTTP relay and real
+//! PostgreSQL, then a direct `envelopes` query confirming the stored bytes contain NO plaintext.
+//! The `nedwons-api` library never links `mls-core`; only this test does.
 
 mod common;
 

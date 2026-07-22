@@ -1,28 +1,25 @@
 import CryptoKit
 import Foundation
 
-/// Provisions and reloads the device proof-of-possession key, and is the **single place** that
-/// decides hardware-vs-software. The app never constructs a `DeviceSigner` directly (Gate 0
-/// finding R-G0-2): registration must enroll the Secure Enclave key when the hardware exists,
-/// and login must reload the **same enrolled key** from the Keychain — otherwise a fresh key is
-/// signed each time and device binding (INV-2) silently breaks.
+/// The **single place** deciding hardware-vs-software; the app never constructs a `DeviceSigner`
+/// directly (R-G0-2). Registration enrolls the Enclave key when the hardware exists and login
+/// reloads that **same enrolled key** — signing a fresh key each time would silently break device
+/// binding (INV-2).
 ///
-/// Policy (ADR-0002, ADR-0008): the Secure Enclave is preferred; a device without it is handled
-/// by an **explicit** policy — either fail closed or an acknowledged, lower-assurance software
-/// fallback — **never a silent downgrade** and never the same key written to ordinary files.
+/// A device without an Enclave is handled by an **explicit** policy (ADR-0002, ADR-0008): fail
+/// closed, or an acknowledged lower-assurance software fallback — never a silent downgrade.
 
 public enum DeviceAssurance: String, Sendable, Equatable {
     /// Non-exportable key generated in the Secure Enclave.
     case hardware
-    /// Software P-256 key (device lacks a usable Secure Enclave). Lower assurance; surfaced to the user.
+    /// The device lacks a usable Enclave. Lower assurance; surfaced to the user.
     case software
 }
 
 public enum DeviceProvisionPolicy: Sendable, Equatable {
-    /// Require the Secure Enclave; if unavailable, refuse to enroll (no session possible).
+    /// If the Enclave is unavailable, refuse to enroll — no session is possible.
     case requireHardware
-    /// Permit an explicit software fallback when the Secure Enclave is unavailable. The caller is
-    /// responsible for having obtained the user's acknowledgement first; this is not silent.
+    /// The caller MUST have obtained the user's acknowledgement first; this is never silent.
     case allowSoftwareFallback
 }
 

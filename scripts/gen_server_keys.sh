@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
-# Generate STABLE server signing keys (BN-3). In dev the server mints EPHEMERAL transparency-log and
-# sender-certificate keys on each start — which invalidates anything a client pinned and breaks the
-# key-transparency self-audit across restarts. Before device testing, generate stable keys once and
-# hold them in your secrets store, then export them to the server:
+# Generate STABLE server signing keys (BN-3). Dev mints EPHEMERAL log + sender-cert keys per start,
+# which invalidates anything a client pinned and breaks the key-transparency self-audit across
+# restarts. Before device testing, generate these once, hold them in your secrets store, and export:
 #
 #   NEDWONS_LOG_SIGNING_KEY  — the transparency log's ECDSA P-256 private scalar (32-byte hex).
 #                               Its PUBLIC key is what clients pin (NedwonsTransparencyLogKey).

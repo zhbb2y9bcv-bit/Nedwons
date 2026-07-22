@@ -1,6 +1,5 @@
-//! Security invariants exercised against a REAL PostgreSQL — this is the evidence that
-//! closes RISK_REGISTER R-102: the SQL implementations enforce the same atomicity the
-//! in-memory stores promised (ADR-0006), including under true concurrency.
+//! Evidence closing R-102: against a REAL PostgreSQL, the SQL implementations enforce the same
+//! atomicity the in-memory stores promised (ADR-0006), including under true concurrency.
 
 mod common;
 

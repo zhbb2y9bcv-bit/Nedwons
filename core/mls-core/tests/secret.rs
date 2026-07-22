@@ -274,10 +274,8 @@ fn multiple_secrets_are_independent_sealed_placeholders() {
     );
 }
 
-/// ADR-0015: account-wide single-consumption across a recipient's TWO devices. Alice sends a secret
-/// to a group containing Bob's phone AND tablet. When the phone reveals it, it emits an E2EE
-/// `SecretConsumed` control message; delivering that to the tablet consumes the tablet's copy too,
-/// so the tablet can never open it. The sender's copy no-ops. The relay only ever sees opaque MLS
+/// ADR-0015 account-wide single-consumption: the phone's reveal emits an E2EE `SecretConsumed`
+/// that consumes the tablet's copy too; the sender's copy no-ops; the relay sees only opaque
 /// ciphertext (asserted).
 #[test]
 fn revealing_on_one_device_consumes_it_on_the_other() {
@@ -392,11 +390,9 @@ fn tombstone_text_is_the_exact_string() {
     );
 }
 
-/// ADR-0015 **option 3**: the consumption message travels over the account's device **self-group**
-/// (phone + tablet), which the conversation's other party (alice, the sender) is NOT a member of.
-/// So opening on the phone consumes the tablet's copy — account-wide single-view — while the sender
-/// never receives, and cannot even decrypt, the read signal. This is the improvement over option 2
-/// (where the consumption message rode the conversation group and the sender learned of the open).
+/// ADR-0015 option 3: the consumption message rides the self-group, which the sender is NOT a
+/// member of — so the sender never receives, and cannot even decrypt, the read signal (the
+/// improvement over option 2, where the sender learned of the open).
 #[test]
 fn consumption_syncs_over_the_self_group_without_the_sender_learning() {
     // Conversation group: alice (sender) + phone + tablet (Bob's two devices).
@@ -605,12 +601,9 @@ fn delivery_key_grant_travels_e2ee_and_is_surfaced() {
     );
 }
 
-/// ADR-0015 option 3, full lifecycle: a THREE-device self-group (phone + tablet + laptop) where
-/// adding the third device requires a commit to the existing member; a consumption fans out to BOTH
-/// other devices (each consuming its own held copy); and — the security-critical part — when the
-/// laptop is REVOKED, an existing device re-keys the self-group with an MLS remove-commit, after
-/// which the laptop cannot decrypt subsequent self-group traffic (cryptographic forward secrecy, not
-/// merely relay-side exclusion).
+/// Three-device self-group lifecycle: adding the third device commits to the existing member; a
+/// consumption fans out to BOTH others; and after the laptop is REVOKED via an MLS remove-commit it
+/// cannot decrypt later self-group traffic — cryptographic forward secrecy, not relay exclusion.
 #[test]
 fn three_device_self_group_fans_out_then_revocation_rekeys() {
     // Conversation: alice (sender) + phone + tablet + laptop (Bob's three devices).

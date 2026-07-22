@@ -1,7 +1,6 @@
-//! Message relay storage. Handles key-package publication/claiming, conversation routing
-//! membership, and opaque encrypted-envelope queue/fetch. The relay never decrypts anything
-//! — `ciphertext` is stored and returned as-is (THREAT_MODEL.md INV-1). This module does not
-//! depend on `mls-core`; the server cannot read message content by construction.
+//! Message relay storage: key packages, conversation routing membership, and the opaque envelope
+//! queue. `ciphertext` is stored and returned as-is (INV-1), and this module does not depend on
+//! `mls-core` — the server cannot read message content by construction.
 
 use auth_core::ids::{AccountId, DeviceId};
 use auth_core::store::{StoreError, StoreResult};
@@ -9,8 +8,7 @@ use auth_core::store::{StoreError, StoreResult};
 use crate::pgstore::PgPool;
 use r2d2_postgres::postgres::NoTls;
 
-/// MLS key packages ("prekeys") expire after this (hygiene): a stale prekey must never be used to
-/// add a device. The client replenishes when its available count drops below the low-watermark.
+/// A stale prekey must never be used to add a device. Clients replenish below the low-watermark.
 pub const KEY_PACKAGE_TTL_SECS: u64 = 30 * 24 * 3600;
 /// Suggested client replenishment threshold (surfaced via the count endpoint).
 pub const KEY_PACKAGE_LOW_WATERMARK: u64 = 5;
@@ -29,16 +27,14 @@ pub struct EnvelopeOut {
     pub ciphertext: Vec<u8>,
 }
 
-/// A queued **sealed-sender** envelope (ADR-0014): the relay knows only who to deliver it to and the
-/// opaque ciphertext — never the sender or conversation.
+/// ADR-0014: the relay knows only the recipient and the ciphertext — never sender or conversation.
 pub struct SealedEnvelopeOut {
     pub id: i64,
     pub ciphertext: Vec<u8>,
 }
 
-/// A queued **self-group** envelope (ADR-0015 option 3): opaque ciphertext for one of the account's
-/// own devices — an MLS Welcome/commit during device linking, or a `SecretConsumed` control message.
-/// Both endpoints are the same account's authenticated devices, so the sender device is recorded.
+/// ADR-0015: ciphertext for one of the account's OWN devices. Both endpoints are the same account's
+/// authenticated devices, so the sender device is recorded.
 pub struct SelfGroupEnvelopeOut {
     pub id: i64,
     pub sender_device: [u8; 16],
@@ -50,8 +46,7 @@ pub struct SelfGroupEnvelopeOut {
 pub enum SelfGroupSendOutcome {
     /// The recipient device is not a device of the delivering account (targeted delivery only).
     Forbidden,
-    /// Delivered (or already delivered on an idempotent retry). Carries the recipient devices that
-    /// received a *new* envelope, so only those get woken.
+    /// Carries only the devices that received a *new* envelope, so only those get woken.
     Delivered { newly_queued: Vec<[u8; 16]> },
 }
 

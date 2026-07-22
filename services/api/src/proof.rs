@@ -47,11 +47,10 @@ pub fn parse_proof_header(value: &str) -> Option<ParsedProof> {
     })
 }
 
-/// Process-local single-use nonce cache within the freshness window (ADR-0011). Keyed by
-/// `(device, nonce)` so a nonce from one device cannot burn another's. **Per-instance** — a
-/// multi-instance deployment needs a shared cache or server-issued nonces (same caveat as the
-/// rate limiter, R-306); until then a proof could be replayed against a *different* instance
-/// within the skew window. Kept honest in R-308.
+/// Single-use nonces within the freshness window (ADR-0011), keyed by `(device, nonce)` so one
+/// device cannot burn another's. **Per-instance**: until a multi-instance deployment adds a shared
+/// cache or server-issued nonces, a proof could be replayed against a *different* instance within
+/// the skew window (R-306, tracked honestly in R-308).
 #[derive(Default)]
 pub struct ProofReplayCache {
     inner: Mutex<Inner>,
@@ -68,10 +67,8 @@ impl ProofReplayCache {
         Self::default()
     }
 
-    /// Record `(device, nonce)` as used until `expiry`. Returns `false` if it was already used
-    /// (a replay) — a proof is single-use. Prunes expired entries at most once per second so the
-    /// map stays bounded by the request rate over the freshness window, without an O(n) sweep on
-    /// every call.
+    /// `false` if already used — a proof is single-use. Prunes at most once per second, so the map
+    /// stays bounded by the request rate without an O(n) sweep per call.
     pub fn check_and_record(
         &self,
         device: &[u8; 16],

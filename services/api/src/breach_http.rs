@@ -1,13 +1,9 @@
 //! HTTP k-anonymity breach provider (R-305) — the transport-agnostic half.
 //!
-//! [`auth_core::breach`] defines the pure k-anonymity protocol and the [`RangeProvider`] seam; the
-//! bundled [`auth_core::breach::StaticCorpus`] backs it today. This module adds the **HIBP range
-//! API** shape (`https://api.pwnedpasswords.com/range/{prefix}` returns `SUFFIX:COUNT` lines for the
-//! 35-hex suffix that follows the 5-hex prefix), split into:
-//!
-//! 1. [`hibp_range_url`] + [`parse_hibp_range`] — pure, fully tested string logic, and
-//! 2. [`HttpRangeProvider`] — a [`RangeProvider`] whose actual network fetch is an **injected
-//!    closure**, so this crate stays free of any HTTP-client dependency.
+//! Adds the HIBP range-API shape (`/range/{prefix}` → `SUFFIX:COUNT` lines) over the
+//! [`auth_core::breach`] seam, split into pure string logic ([`hibp_range_url`],
+//! [`parse_hibp_range`]) and [`HttpRangeProvider`], whose network fetch is an **injected closure**
+//! so this crate needs no HTTP-client dependency.
 //!
 //! Wiring a concrete HTTPS client (with a strict timeout, and **fail-open** per R-305 so a slow or
 //! unreachable corpus never blocks registration) is a deliberate, separately-reviewed step — adding

@@ -1,19 +1,12 @@
-//! Narrow, FFI-ready client façade over the MLS primitives (Gate 2, ADR-0007).
-//!
-//! The iOS/Android client never holds MLS objects or secrets: it holds **opaque `u64` handles**
-//! and passes/receives only `Vec<u8>` and small typed values. This is the surface a UniFFI (or C
-//! ABI) layer wraps — kept deliberately small so it is easy to fuzz.
+//! Narrow, FFI-ready client façade over the MLS primitives (Gate 2, ADR-0007). Kept small so it is
+//! easy to fuzz; the client holds only opaque `u64` handles, never MLS objects or secrets.
 //!
 //! Boundary guarantees:
-//! - **`&self` methods** over interior mutability (a `Mutex`), so the generated FFI object exposes
-//!   `&self` calls (ADR-0007 item 1) — Swift/Kotlin need no `&mut`.
-//! - **Bounded inputs:** every byte input is length-checked against an explicit maximum *before*
-//!   any parsing/allocation, so an oversized buffer is rejected, not processed.
-//! - **Typed, stable, redacted errors:** hostile or malformed input yields [`ClientError`], never
-//!   a panic and never leaked library internals. Every public entry point is wrapped in
-//!   `catch_unwind`, so even an unexpected panic deep in a dependency becomes `Internal` instead
-//!   of unwinding across the FFI boundary (which would be undefined behavior).
-//! - **No secrets cross:** only ciphertext/opaque bytes and handles leave this type.
+//! - **`&self` methods** over a `Mutex`, so the generated FFI object needs no `&mut` (ADR-0007).
+//! - **Bounded inputs:** length-checked *before* any parsing or allocation.
+//! - **Typed, redacted errors:** never a panic, never leaked library internals. Every entry point
+//!   is `catch_unwind`-wrapped, since unwinding across the FFI boundary is undefined behavior.
+//! - **No secrets cross:** only opaque bytes and handles leave this type.
 
 use std::collections::HashMap;
 use std::panic::catch_unwind;
@@ -21,34 +14,29 @@ use std::sync::Mutex;
 
 use crate::{Incoming, Member, MlsError};
 
-/// Explicit input bounds. Defense-in-depth at the trust boundary: reject before parsing. Envelope
-/// and welcome bounds match the relay's 256 KiB body cap (contracts/API.md).
+/// Reject before parsing. Envelope/welcome bounds match the relay's 256 KiB body cap
+/// (contracts/API.md).
 pub const MAX_IDENTITY_LEN: usize = 256;
 pub const MAX_KEY_PACKAGE_LEN: usize = 64 * 1024;
 pub const MAX_WELCOME_LEN: usize = 256 * 1024;
 pub const MAX_ENVELOPE_LEN: usize = 256 * 1024;
 pub const MAX_PLAINTEXT_LEN: usize = 64 * 1024;
 
-/// Stable, redacted error surface for the FFI boundary. Intentionally coarse: it must not leak
-/// which internal step failed to a potentially hostile caller.
+/// Intentionally coarse: must not leak which internal step failed to a hostile caller.
 #[derive(Debug, thiserror::Error, PartialEq, Eq, Clone)]
 pub enum ClientError {
-    /// A byte input exceeded its documented maximum length.
     #[error("input too large")]
     InputTooLarge,
-    /// No identity/conversation exists for the supplied handle.
     #[error("unknown handle")]
     NotFound,
-    /// The supplied bytes were not a valid/processable MLS message for this state.
     #[error("invalid message")]
     InvalidMessage,
-    /// An unexpected internal fault (also the fail-safe result of a caught panic or poisoned lock).
+    /// Also the fail-safe result of a caught panic or poisoned lock.
     #[error("internal error")]
     Internal,
 }
 
-/// Result of adding a member: opaque bytes for the caller to route. `commit` fans out to existing
-/// members; `welcome` goes to the joining device.
+/// Opaque bytes for the caller to route: `commit` to existing members, `welcome` to the joiner.
 pub struct AddOutcome {
     pub commit: Vec<u8>,
     pub welcome: Vec<u8>,
@@ -60,7 +48,7 @@ struct State {
     conversations: HashMap<u64, crate::Conversation>,
 }
 
-/// The handle registry. One instance per app process.
+/// One instance per app process.
 pub struct ClientApi {
     inner: Mutex<State>,
 }
@@ -82,8 +70,7 @@ impl ClientApi {
         }
     }
 
-    /// Create a fresh local identity (its signature key + credential + key store live in Rust).
-    /// Returns an opaque identity handle.
+    /// Signature key, credential and key store stay in Rust; returns an opaque handle.
     pub fn create_identity(&self, identity: &[u8]) -> Result<u64, ClientError> {
         catch(|| {
             check(identity.len(), MAX_IDENTITY_LEN)?;
@@ -95,7 +82,7 @@ impl ClientApi {
         })
     }
 
-    /// Serialize a fresh key package ("prekey") for `identity` to publish to the directory.
+    /// A fresh prekey for `identity` to publish to the directory.
     pub fn key_package(&self, identity: u64) -> Result<Vec<u8>, ClientError> {
         catch(|| {
             let st = self.lock()?;
@@ -104,7 +91,6 @@ impl ClientApi {
         })
     }
 
-    /// Create a new conversation (MLS group) owned by `identity`. Returns a conversation handle.
     pub fn create_group(&self, identity: u64) -> Result<u64, ClientError> {
         catch(|| {
             let mut st = self.lock()?;
@@ -118,7 +104,6 @@ impl ClientApi {
         })
     }
 
-    /// Join a conversation from a serialized Welcome. Returns a conversation handle.
     pub fn join_from_welcome(&self, identity: u64, welcome: &[u8]) -> Result<u64, ClientError> {
         catch(|| {
             check(welcome.len(), MAX_WELCOME_LEN)?;
@@ -133,7 +118,6 @@ impl ClientApi {
         })
     }
 
-    /// Add a member (by their key-package bytes) to a conversation. Returns commit + welcome.
     pub fn add_member(
         &self,
         conversation: u64,
@@ -157,7 +141,7 @@ impl ClientApi {
         })
     }
 
-    /// Encrypt an application message. Returns an opaque envelope.
+    /// Returns an opaque envelope.
     pub fn encrypt(
         &self,
         conversation: u64,
@@ -177,7 +161,6 @@ impl ClientApi {
         })
     }
 
-    /// Process an inbound envelope: application plaintext, or a state-advancing control message.
     pub fn process(
         &self,
         conversation: u64,
@@ -200,7 +183,6 @@ impl ClientApi {
         })
     }
 
-    /// Current epoch of a conversation (advances on every membership change).
     pub fn epoch(&self, conversation: u64) -> Result<u64, ClientError> {
         catch(|| {
             let st = self.lock()?;
@@ -213,7 +195,7 @@ impl ClientApi {
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, State>, ClientError> {
-        // A poisoned lock (a prior panic) fails safe rather than propagating the panic.
+        // A poisoned lock fails safe rather than propagating the prior panic.
         self.inner.lock().map_err(|_| ClientError::Internal)
     }
 }
@@ -226,12 +208,10 @@ impl State {
     }
 }
 
-/// FFI-friendly result of [`ClientApi::process`].
 #[derive(Debug, PartialEq, Eq)]
 pub enum Received {
-    /// Decrypted application plaintext.
     Application(Vec<u8>),
-    /// A membership/commit message advanced group state (no user-visible content).
+    /// A commit advanced group state; no user-visible content.
     StateAdvanced,
 }
 
@@ -243,17 +223,15 @@ fn check(len: usize, max: usize) -> Result<(), ClientError> {
     }
 }
 
-/// Convert a panic (unwound as `Box<dyn Any>`) into a typed `Internal` error. Panics must never
-/// cross the FFI boundary — that is undefined behavior — so every entry point is wrapped.
+/// Panics must never cross the FFI boundary (undefined behavior), so every entry point is wrapped.
 fn catch<T>(
     f: impl FnOnce() -> Result<T, ClientError> + std::panic::UnwindSafe,
 ) -> Result<T, ClientError> {
     catch_unwind(f).unwrap_or(Err(ClientError::Internal))
 }
 
-/// Map errors from **inbound-processing** paths: malformed/unverifiable input is caller-supplied,
-/// so it is reported as `InvalidMessage` (redacted — no library detail). A manifest mismatch is
-/// also hostile input at this boundary.
+/// Inbound paths: the bytes are caller-supplied, so failures (including a manifest mismatch) are
+/// hostile input, reported redacted as `InvalidMessage`.
 fn map_input(e: MlsError) -> ClientError {
     match e {
         MlsError::MemberNotFound => ClientError::NotFound,
@@ -263,8 +241,7 @@ fn map_input(e: MlsError) -> ClientError {
     }
 }
 
-/// Map errors from **local-generation** paths (create key package, encrypt): a failure here is our
-/// own fault, not bad input, so it is `Internal`.
+/// Local-generation paths: a failure is our own fault, not bad input, so it is `Internal`.
 fn map_local(e: MlsError) -> ClientError {
     match e {
         MlsError::MemberNotFound => ClientError::NotFound,

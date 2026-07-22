@@ -1,6 +1,5 @@
-//! Argon2id cost benchmark (R-302). Run this ON PRODUCTION-CLASS HARDWARE to measure the real
-//! per-hash time of the configured parameters, then tune `password::{MEMORY_KIB, ITERATIONS,
-//! PARALLELISM}` so a hash costs the target (~0.25–0.5 s per OWASP) and record the chosen values.
+//! Argon2id cost benchmark (R-302). Run ON PRODUCTION-CLASS HARDWARE, then tune
+//! `password::{MEMORY_KIB, ITERATIONS, PARALLELISM}` so one hash costs ~0.25–0.5 s (OWASP).
 //!
 //!   cargo run --release -p auth-core --example argon2_bench [samples]
 //!
