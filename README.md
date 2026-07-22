@@ -44,29 +44,40 @@ later without redesign.
 
 ## Build & test status (this working copy)
 
-| Component | Toolchain present | Compiles here | Tested here |
-|-----------|-------------------|---------------|-------------|
-| `services/auth-core` (Rust) | Rust 1.97.1 stable | ✅ | ✅ `cargo test` — 17 unit + golden vector |
-| `services/api` (Rust: Postgres stores + axum HTTP + E2EE relay + WebSocket) | Rust 1.97.1 + PostgreSQL 17 | ✅ | ✅ 24 integration tests vs **real Postgres**: concurrency races, full HTTP flow, MLS relay + DB no-plaintext, fan-out, idempotency, long-poll, WebSocket push, at-least-once peek/ack, load (idle-waiters > pool) |
-| `core/mls-core` (Rust: OpenMLS E2EE) | Rust 1.97.1 | ✅ | ✅ 3 tests — encrypted exchange, no plaintext in ciphertext, removed-member epoch |
-| `apps/ios/NedwonsKit` (Swift crypto/protocol + full HTTP client) | Xcode 26.6 / Swift 6.3.3 | ✅ `swift build` | ✅ `swift test` — 7 tests |
-| `apps/ios/NedwonsUI` (design system + **wired app screens + AppModel**) | Swift 6.3.3 | ✅ `swift build` | — (buttons wired to the client; runs in Xcode) |
-| **Swift client ↔ live backend** (auth + profiles + friends + groups + messaging) | Swift + Rust + Postgres | ✅ | ✅ `scripts/swift_backend_smoke.sh` — SMOKE_OK (INV-2 negative, befriend→group→deliver, non-friend-group 403) |
-| `apps/ios/NedwonsUI` (SwiftUI design system + screens) | Swift 6.3.3 | ✅ `swift build` | — (visual; no unit tests) |
-| Cross-language interop (Swift signs → Rust verifies) | both | ✅ | ✅ `INTEROP_OK` + byte-identical transcript vectors |
-| `infra` (docker-compose) | Docker/Colima (installed) | ✅ `config` validates | ✅ Postgres service verified up; API image build not run |
-| `apps/ios/Nedwons` (`@main` app target) | Xcode 26.6 | requires Xcode app target (see apps/ios/README.md) | ⚠️ not run on a simulator/device (R-101) |
-| `core/mls-ffi` Rust↔Swift MLS bridge (UniFFI 0.29) | Rust 1.97.1 + Swift 6.3.3 | ✅ implemented + packaged (`scripts/build_mls_ffi.sh` → `MlsFfi.xcframework`, macOS+iOS+sim) | ✅ Swift↔Rust integration test on the host slice **and RUNNING in the iOS simulator** (`scripts/test_mls_sim.sh`); + Rust FFI/adversarial tests + fuzz. Device slice compiles; **on-device *run* still R-101.** |
+| Component | Toolchain | Compiles | Tested |
+|-----------|-----------|----------|--------|
+| `services/auth-core` (Rust: device-bound auth logic) | Rust 1.97.1 | ✅ | ✅ `cargo test` — unit tests + golden cross-language vectors |
+| `services/api` (Rust: Postgres stores + axum HTTP + E2EE relay + WebSocket) | Rust 1.97.1 + PostgreSQL 17 | ✅ | ✅ integration tests against **real Postgres**: concurrency races, full HTTP flow, relay-blindness (no plaintext in the DB), fan-out, idempotency, long-poll, WebSocket push, at-least-once ack, load (idle waiters exceeding the connection pool) |
+| `core/mls-core` (Rust: OpenMLS E2EE core) | Rust 1.97.1 | ✅ | ✅ unit + property tests — encrypted exchange, no plaintext in ciphertext, removed-member epoch, crash-safe durable state, secret-message state machine |
+| `core/mls-ffi` (Rust↔Swift MLS bridge, UniFFI 0.29) | Rust 1.97.1 + Swift 6.3.3 | ✅ packaged as `MlsFfi.xcframework` (macOS + iOS device + iOS simulator) via `scripts/build_mls_ffi.sh` | ✅ Rust-side integration/adversarial tests, continuous fuzzing (`content_decode`, `envelope`, `secret_state`), and a Swift↔Rust bridge test **running in the iOS simulator** (`scripts/test_mls_sim.sh`) |
+| `apps/ios/NedwonsKit` (Swift crypto/protocol + full HTTP client + SwiftUI app shell) | Xcode 26.6 / Swift 6.3.3 | ✅ `swift build` | ✅ `swift test` |
+| `apps/ios/NedwonsApp` (composition layer: real `SecretEngine` + self-group linker over the live MLS core) | Swift 6.3.3 | ✅ `swift build` | ✅ `swift test`, driven against the real Rust core |
+| `apps/ios/Nedwons` (`@main` app target + Notification Service Extension) | Xcode 26.6 | ✅ builds and runs on the iOS simulator | ✅ launched, exercised, and screenshotted on-simulator; **not yet run on a physical device** (needs Apple Developer provisioning — App Group, shared Keychain, push cert, App Attest environment) |
+| Swift client ↔ live backend (auth, profiles, friends, groups, messaging, self-group device linking) | Swift + Rust + Postgres | ✅ | ✅ live end-to-end scripts (`scripts/swift_backend_smoke.sh`, `scripts/self_group_live_run.sh`) against a booted server |
+| Cross-language interop (Swift signs → Rust verifies, and vice versa) | both | ✅ | ✅ byte-identical golden test vectors on both sides |
+| `infra` (docker-compose) | Docker/Colima | ✅ `config` validates | ✅ Postgres service verified up |
 
+The backend, `mls-core`, and `mls-ffi` workspaces are formatted and linted clean (`cargo fmt`,
+`cargo clippy -D warnings`) and audited for dependency vulnerabilities (`cargo audit`); the one
+outstanding advisory is an unmaintained compile-time-only macro crate with no runtime exposure.
 See each milestone report in the git history for exactly what was run and what was not.
 
-## Current milestone
+## Current state
 
-**Milestone 0 (foundations) + the first tested slice of Milestone 1 (device-bound auth).**
-The implemented, *tested* security property today is:
+The messaging core, backend, and iOS client are implemented and tested end to end: device-bound
+authentication, MLS group messaging with **hybrid post-quantum key exchange** (X-Wing: X25519 +
+ML-KEM-768), sealed-sender delivery, key transparency with client-side self-monitoring, multi-device
+support via a device self-group, view-once secret messages, and a Notification Service Extension for
+contentless push. The implemented, *tested* security properties include:
 
-> A valid username and password, presented from a device that does **not** hold the
-> account's enrolled private device key, cannot create a session.
+> A valid username and password, presented from a device that does **not** hold the account's
+> enrolled private device key, cannot create or refresh a session.
 
-This is proven by `cargo test` in `services/auth-core`. See
-[docs/MILESTONE_LEDGER.md](docs/MILESTONE_LEDGER.md).
+> The relay routes only opaque MLS ciphertext; a direct query of its own database confirms it
+> never stores plaintext.
+
+These are proven by the automated test suites listed above, not asserted. The remaining gaps are
+strictly hardware- and deployment-bound (physical-device testing, Apple provisioning, live push
+delivery, external security audits) — see [RISK_REGISTER.md](RISK_REGISTER.md) for the complete,
+honest list of what is unproven, assumed, or accepted. See
+[docs/MILESTONE_LEDGER.md](docs/MILESTONE_LEDGER.md) for the full history.

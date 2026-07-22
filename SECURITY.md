@@ -13,7 +13,7 @@ vulnerability-disclosure process. It complements [THREAT_MODEL.md](THREAT_MODEL.
 - **NIST SSDF** — secure development lifecycle.
 
 A traceability matrix mapping each control to code, tests, evidence, exceptions, and owners
-is maintained at [docs/TRACEABILITY.md](docs/TRACEABILITY.md) (seeded; grows per milestone).
+is planned, and will grow per milestone.
 
 ## Client hardening (iOS)
 
@@ -62,8 +62,7 @@ API fuzzing, property-based tests and fuzzers for parsers/transcripts/crypto ada
 - Report privately to the security contact. We acknowledge within a target window, triage by
   severity, and coordinate disclosure. Do not test against other users' accounts or data.
 - We maintain an incident-response plan, a key-compromise playbook, and a dependency
-  emergency-update process (see [docs/runbooks/](docs/runbooks/)). A bug bounty is planned
-  post-launch.
+  emergency-update process. A bug bounty is planned post-launch.
 
 ## Pre-launch external review (required, not yet done — R-503)
 
