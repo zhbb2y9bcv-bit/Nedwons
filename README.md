@@ -41,6 +41,7 @@ later without redesign.
 5. [PRIVACY.md](PRIVACY.md) / [DATA_RETENTION.md](DATA_RETENTION.md) / [ABUSE_MODEL.md](ABUSE_MODEL.md).
 6. [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) and [RISK_REGISTER.md](RISK_REGISTER.md).
 7. [PERFORMANCE.md](PERFORMANCE.md) — messaging efficiency: fan-out, long-poll, idempotency, and the counterintuitive pitfalls.
+8. [docs/HOSTING.md](docs/HOSTING.md) — what Apple hosts versus what Nedwons must operate, and what each infrastructure provider can still observe.
 
 ## Build & test status (this working copy)
 
@@ -50,9 +51,9 @@ later without redesign.
 | `services/api` (Rust: Postgres stores + axum HTTP + E2EE relay + WebSocket) | Rust 1.97.1 + PostgreSQL 17 | ✅ | ✅ integration tests against **real Postgres**: concurrency races, full HTTP flow, relay-blindness (no plaintext in the DB), fan-out, idempotency, long-poll, WebSocket push, at-least-once ack, load (idle waiters exceeding the connection pool) |
 | `core/mls-core` (Rust: OpenMLS E2EE core) | Rust 1.97.1 | ✅ | ✅ unit + property tests — encrypted exchange, no plaintext in ciphertext, removed-member epoch, crash-safe durable state, secret-message state machine |
 | `core/mls-ffi` (Rust↔Swift MLS bridge, UniFFI 0.29) | Rust 1.97.1 + Swift 6.3.3 | ✅ packaged as `MlsFfi.xcframework` (macOS + iOS device + iOS simulator) via `scripts/build_mls_ffi.sh` | ✅ Rust-side integration/adversarial tests, continuous fuzzing (`content_decode`, `envelope`, `secret_state`), and a Swift↔Rust bridge test **running in the iOS simulator** (`scripts/test_mls_sim.sh`) |
-| `apps/ios/NedwonsKit` (Swift crypto/protocol + full HTTP client + SwiftUI app shell) | Xcode 26.6 / Swift 6.3.3 | ✅ `swift build` | ✅ `swift test` |
-| `apps/ios/NedwonsApp` (composition layer: real `SecretEngine` + self-group linker over the live MLS core) | Swift 6.3.3 | ✅ `swift build` | ✅ `swift test`, driven against the real Rust core |
-| `apps/ios/Nedwons` (`@main` app target + Notification Service Extension) | Xcode 26.6 | ✅ builds and runs on the iOS simulator | ✅ launched, exercised, and screenshotted on-simulator; **not yet run on a physical device** (needs Apple Developer provisioning — App Group, shared Keychain, push cert, App Attest environment) |
+| `apps/ios/NedwonsKit` (Swift crypto/protocol + full HTTP client + SwiftUI app: launch state machine, authentication, Chats/People/Settings, private aliases) | Xcode 26.6 / Swift 6.3.3 | ✅ `swift build` | ✅ `swift test` — 100 tests, including launch phases, session persistence, alias validation/encryption, search ordering, and conversation-deletion semantics |
+| `apps/ios/NedwonsApp` (composition layer: real `SecretEngine`, self-group linker, and per-conversation MLS coordinator over the live core) | Swift 6.3.3 | ✅ `swift build` | ✅ `swift test`, driven against the real Rust core |
+| `apps/ios/Nedwons` (`@main` app target + Notification Service Extension) | Xcode 26.6 | ✅ builds and runs on the iOS simulator | ✅ a clean install launches to the authentication screen and registration validation was exercised on-simulator; contains no demo or seeded data. **Not yet run on a physical device** (needs Apple Developer provisioning — App Group, shared Keychain, push cert, App Attest environment) |
 | Swift client ↔ live backend (auth, profiles, friends, groups, messaging, self-group device linking) | Swift + Rust + Postgres | ✅ | ✅ live end-to-end scripts (`scripts/swift_backend_smoke.sh`, `scripts/self_group_live_run.sh`) against a booted server |
 | Cross-language interop (Swift signs → Rust verifies, and vice versa) | both | ✅ | ✅ byte-identical golden test vectors on both sides |
 | `infra` (docker-compose) | Docker/Colima | ✅ `config` validates | ✅ Postgres service verified up |
@@ -75,6 +76,16 @@ contentless push. The implemented, *tested* security properties include:
 
 > The relay routes only opaque MLS ciphertext; a direct query of its own database confirms it
 > never stores plaintext.
+
+> Deleting a conversation on one device clears its visible history there only — the MLS ratchet,
+> replay-protection state, and secret records are untouched, so a later message still decrypts and
+> a previously revealed secret cannot be re-revealed.
+
+The app itself is a real messaging client, not a scaffold: a launch state machine validates any
+stored session before showing protected content, registration enforces the permanent-username rule,
+and Chats/People/Settings navigation is backed by the live backend and the real MLS core — including
+on-device conversation previews, debounced username search, viewer-private aliases (encrypted at
+rest, never transmitted), and local-only conversation deletion.
 
 These are proven by the automated test suites listed above, not asserted. The remaining gaps are
 strictly hardware- and deployment-bound (physical-device testing, Apple provisioning, live push
