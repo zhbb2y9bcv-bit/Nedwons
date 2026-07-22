@@ -201,3 +201,56 @@ fn out_of_order_across_relaunch() {
     ));
     assert_eq!(bob.messages().len(), 2);
 }
+
+/// Deleting a conversation clears what the user sees WITHOUT touching the ratchet: after wiping the
+/// log, a brand-new message from the peer still decrypts, and the deleted history stays gone.
+#[test]
+fn clear_visible_history_preserves_decryption() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+
+    let id = alice.enqueue(b"before-delete").expect("enqueue");
+    let ct = alice.encrypt(id).expect("encrypt");
+    bob.process_inbound(1, &ct).expect("process");
+    assert_eq!(bob.messages().len(), 1);
+
+    bob.clear_visible_history().expect("clear");
+    assert!(bob.messages().is_empty());
+
+    // The thread returns on the next legitimate message, carrying only post-deletion content.
+    let id2 = alice.enqueue(b"after-delete").expect("enqueue 2");
+    let ct2 = alice.encrypt(id2).expect("encrypt 2");
+    assert_eq!(
+        bob.process_inbound(2, &ct2).expect("decrypt after clear"),
+        InboundOutcome::Application(b"after-delete".to_vec())
+    );
+    assert_eq!(bob.messages().len(), 1);
+    assert_eq!(bob.messages()[0].plaintext, b"after-delete");
+}
+
+/// Clearing history must not reopen the replay window: an envelope id already processed before the
+/// delete is still rejected as a duplicate afterwards.
+#[test]
+fn clear_visible_history_keeps_replay_protection() {
+    let (mut alice, _ja, mut bob, jb) = pair();
+
+    let id = alice.enqueue(b"replay-me").expect("enqueue");
+    let ct = alice.encrypt(id).expect("encrypt");
+    bob.process_inbound(7, &ct).expect("first delivery");
+
+    bob.clear_visible_history().expect("clear");
+
+    assert_eq!(
+        bob.process_inbound(7, &ct).expect("replayed"),
+        InboundOutcome::Duplicate,
+        "dedup state must survive a history delete"
+    );
+    assert!(
+        bob.messages().is_empty(),
+        "a replay must not resurrect history"
+    );
+
+    // And the erasure is durable across relaunch.
+    drop(bob);
+    let bob = DurableSession::open(jb).expect("reopen");
+    assert!(bob.messages().is_empty());
+}

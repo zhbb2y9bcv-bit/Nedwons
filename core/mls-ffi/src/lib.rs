@@ -742,6 +742,18 @@ impl MlsClient {
         })
     }
 
+    /// Erase this device's visible message log when the user deletes the conversation. Protocol
+    /// state (ratchet, replay watermark, outbox, secret records) is retained, so later messages
+    /// still decrypt and a replayed secret still cannot be re-revealed. Local only — nothing is
+    /// sent, and the peer's copy is untouched.
+    pub fn clear_visible_history(&self) -> Result<(), MlsClientError> {
+        catch(move || {
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session.clear_visible_history().map_err(map_durable)
+        })
+    }
+
     /// Cheap: no payload crosses the boundary.
     pub fn message_count(&self) -> Result<u64, MlsClientError> {
         catch(move || {
