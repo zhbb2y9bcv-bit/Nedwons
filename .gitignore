@@ -40,7 +40,12 @@ core/mls-ffi/fuzz/coverage/
 !.env.example
 secrets/
 *.pem
-!contracts/**/*.pem  # (none expected; guard against accidental private keys)
+# (no contracts pems expected; the blanket *.pem rule guards against committing private keys)
+!contracts/**/*.pem
+# Apple's App Attest root CA is a PUBLIC certificate that nedwons-api include_str!'s at build
+# time (services/api/src/attest.rs), so it MUST be tracked despite the *.pem ignore above.
+# Verified as a CERTIFICATE, not a private key (subject/issuer: Apple App Attestation Root CA).
+!services/api/src/apple_app_attest_root.pem
 
 # Editor
 .idea/
