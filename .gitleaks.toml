@@ -1,0 +1,33 @@
+# gitleaks configuration for Nedwons.
+#
+# We keep the ENTIRE default gitleaks ruleset active (`useDefault = true`) so every real
+# credential pattern — API keys, tokens, private-key blocks, connection strings — is still
+# detected across the repo and its full git history. The allowlist below suppresses only a
+# handful of manually vetted FALSE POSITIVES from the broad `generic-api-key` heuristic.
+#
+# Each allowlisted string was confirmed to be public, non-secret data:
+#   - `libcrux-sha3`            — a public crates.io package NAME. The generic-api-key rule
+#                                 fires on the quoted crate name printed right after the
+#                                 `libcrux-secrets` checksum line in every Cargo.lock, purely
+#                                 because the neighbouring crate name contains "secrets".
+#   - `P256.Signing.PrivateKey` — an Apple CryptoKit TYPE name in a Swift declaration
+#                                 (`private let privateKey: P256.Signing.PrivateKey`). It is a
+#                                 type, not a key value; no secret material is present.
+#
+# These are exact, low-entropy, public identifiers. A real leaked secret is high-entropy and
+# will not match them, so detection everywhere else — including inside the same files — is
+# unchanged. If a dependency bump makes a different lockfile line trip the same heuristic,
+# re-vet it and extend this list rather than broadening it to whole files.
+
+title = "Nedwons gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Manually vetted false positives from the generic-api-key heuristic (see header)."
+regexTarget = "match"
+regexes = [
+  '''libcrux-sha3''',
+  '''P256\.Signing\.PrivateKey''',
+]
