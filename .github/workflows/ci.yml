@@ -142,6 +142,10 @@ jobs:
             --ignore RUSTSEC-2026-0173
       - name: Secret scan
         uses: gitleaks/gitleaks-action@v2
+        env:
+          # Use the repo's vetted allowlist (keeps the full default ruleset; suppresses only
+          # manually-confirmed false positives — see .gitleaks.toml).
+          GITLEAKS_CONFIG: ${{ github.workspace }}/.gitleaks.toml
 
   swift-package:
     name: NedwonsKit (build + test)
