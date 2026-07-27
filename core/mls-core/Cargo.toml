@@ -29,6 +29,23 @@ serde_json = "1"
 aes-gcm = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
 
+# WASM spike: on wasm32 there is no OS randomness syscall, so `getrandom` must be pointed at the
+# browser's `crypto.getRandomValues` explicitly or it `compile_error!`s. Two majors are in the graph
+# and each has its own opt-in, so both are named here purely to turn the feature on (feature
+# unification); no code in this crate calls them directly.
+#   0.2 (via rand_core 0.6 → OsRng, used by durable.rs)  -> "js"
+#   0.4 (via rand 0.10 → hpke-rs, libcrux-sha3, uuid)    -> "wasm_js"
+# Target-gated so the native/iOS build graph is completely unaffected.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+# OpenMLS hard-errors on wasm32 unless told JS APIs exist. The feature swaps `std::time::SystemTime`
+# (which panics on wasm32-unknown-unknown) for a `Date.now()`-backed clock, used to stamp and check
+# KeyPackage lifetimes. SECURITY NOTE: this puts KeyPackage lifetime validation on the browser's wall
+# clock, which the user can set freely — unlike iOS. Lifetime enforcement is therefore advisory on
+# web; the server-side prekey TTL (KEY_PACKAGE_TTL_SECS) remains the authority.
+openmls = { version = "0.8", features = ["js"] }
+
 # PQ: substitute the vendored provider (core/vendor/openmls_rust_crypto) for the crates.io one.
 # Same crate, version 0.5.1, with two documented changes (see its README): the X-Wing hybrid
 # post-quantum KEM arm is implemented (upstream left it unimplemented!()) and the hpke-rs stack is
