@@ -10,6 +10,12 @@
 //!   for rate limiting is read from that header. **Only** set this behind a trusted reverse proxy
 //!   that overwrites the header on every request; otherwise clients could forge it (R-306). Unset
 //!   ⇒ rate limit by peer socket IP and ignore the header.
+//! * `NEDWONS_REQUIRE_HARDWARE_APPROVER` — `1`/`true` to require `hardware` device assurance to
+//!   authorize enrollment of another device (ADR-0017), so a software-signer client (the web
+//!   client, whose WebCrypto key injected script can *use*) cannot turn one XSS into account-wide
+//!   device injection. Default off during rollout. **Requires `NEDWONS_APP_ATTEST_APP_ID`** — a
+//!   device only earns `hardware` by submitting a verified App Attest attestation, so enabling this
+//!   without attestation configured refuses ALL enrollment (the server logs an error at boot).
 //!
 //! Logging: tracing with target-level filters. No request/response bodies, tokens, or
 //! credentials are ever logged (INV-8).
@@ -88,6 +94,30 @@ fn main() {
     };
     let stores = Arc::new(PgStores::new(pool));
 
+    // Device-assurance approver restriction (ADR-0017): only a `hardware`-assurance device — one
+    // that earned the class by submitting a cryptographically verified App Attest attestation — may
+    // authorize enrollment of another device. Opt-in during rollout, like `NEDWONS_REQUIRE_PROOF`.
+    let require_hardware_approver = std::env::var("NEDWONS_REQUIRE_HARDWARE_APPROVER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if require_hardware_approver {
+        tracing::info!("hardware assurance REQUIRED to approve device enrollment (ADR-0017)");
+        // Misconfiguration guard: devices only reach `hardware` via a VERIFIED attestation, and
+        // verification is off unless `NEDWONS_APP_ATTEST_APP_ID` is set. With this combination the
+        // fleet stays uniformly `software`, so NO account can ever enroll a second device.
+        //
+        // Logged rather than fatal on purpose: this combination fails *closed* (nobody gains
+        // approval rights), so it is an availability problem, not a security hole — refusing to boot
+        // would be a worse outcome than a loud, actionable error.
+        if std::env::var("NEDWONS_APP_ATTEST_APP_ID").is_err() {
+            tracing::error!(
+                "NEDWONS_REQUIRE_HARDWARE_APPROVER is set but NEDWONS_APP_ATTEST_APP_ID is not: \
+                 attestations cannot be verified, so no device can ever reach hardware assurance \
+                 and ALL device enrollment will be refused. Set NEDWONS_APP_ATTEST_APP_ID."
+            );
+        }
+    }
+
     let service = AuthService::new(
         stores.clone(),
         stores.clone(),
@@ -95,7 +125,10 @@ fn main() {
         stores.clone(),
         stores.clone(),
         Arc::new(SystemClock),
-        Config::default(),
+        Config {
+            require_hardware_approver,
+            ..Config::default()
+        },
     )
     // Compromised-credential check (R-305): a bundled corpus of common breached passwords that
     // pass the length policy. Production swaps this `RangeProvider` for a large corpus (an HTTP

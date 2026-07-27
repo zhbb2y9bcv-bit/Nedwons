@@ -1682,6 +1682,31 @@ async fn attest_submit_handler(
     let device = me.device_id;
     blocking_store(move || relay.store_attestation(&device, &body.key_id, &attestation, verified))
         .await?;
+
+    // ADR-0017: a VERIFIED attestation is the only way a device reaches `Assurance::Hardware`, which
+    // is what lets it authorize enrollment of another device.
+    //
+    // Why this inference is sound, stated explicitly because it spans two different keys: App Attest
+    // proves "a genuine, unmodified build of THIS app is running on real Apple hardware" — it does
+    // NOT directly prove the *auth* device key lives in the Secure Enclave. The chain that closes
+    // that gap is: attestation ⇒ the binary is our unmodified build ⇒ that build's `DeviceIdentity`
+    // selects an Enclave signer **fail-closed** and refuses to run without hardware (R-G0-2) ⇒ the
+    // auth key is Enclave-backed. The chain rests on binary integrity, which is precisely what App
+    // Attest attests. It would break if a build ever shipped a software-signer fallback — so that
+    // fallback must never return.
+    //
+    // `verified` is false in bootstrap mode (`NEDWONS_APP_ATTEST_APP_ID` unset), so an unconfigured
+    // deployment promotes nothing and the fleet stays uniformly `Software` — fail closed.
+    //
+    // Ordered AFTER the attestation is stored: a crash between the two leaves a recorded attestation
+    // and an un-promoted (still `Software`) device, which is the safe direction. Promoting first
+    // could leave a `Hardware` device with no attestation on record. Idempotent, so the client may
+    // simply retry if this errors — which is why the error propagates instead of being swallowed:
+    // a silent failure would leave the user unable to enroll a second device with no way to tell why.
+    if verified {
+        let service = state.service.clone();
+        blocking(move || service.promote_to_hardware(&device)).await?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

@@ -16,8 +16,9 @@ use crate::error::{AuthError, Result};
 use crate::ids::{AccountId, DeviceId, TxnId};
 use crate::password;
 use crate::store::{
-    AccountDevice, AccountRecord, ChallengeRecord, ChallengeStore, Clock, CredentialStore,
-    DeviceRecord, DeviceStore, RefreshOutcome, RefreshStore, SessionStore, StoreError,
+    AccountDevice, AccountRecord, Assurance, ChallengeRecord, ChallengeStore, Clock,
+    CredentialStore, DeviceRecord, DeviceStore, RefreshOutcome, RefreshStore, SessionStore,
+    StoreError,
 };
 use crate::transcript::{Action, Transcript};
 
@@ -34,6 +35,19 @@ pub struct Config {
     pub challenge_ttl_secs: u64,
     pub access_ttl_secs: u64,
     pub refresh_ttl_secs: u64,
+    /// ADR-0017: when true, only an [`Assurance::Hardware`] device may authorize enrollment of
+    /// another device — a `Software` device (e.g. the web client) is refused.
+    ///
+    /// **Defaults to `false`**, matching the `NEDWONS_REQUIRE_PROOF` (DPoP, ADR-0011) precedent for
+    /// a new control that would otherwise break already-working flows. It must default off because
+    /// devices are only promoted to `Hardware` by a *verified* App Attest submission: with
+    /// attestation unconfigured (bootstrap/dev, and every existing test fixture) the whole fleet is
+    /// `Software`, so defaulting this on would lock every account out of enrollment entirely.
+    ///
+    /// **Turning this on is a launch gate, not an optional hardening step** — while it is off, a
+    /// compromised web session can approve a new device, which is the threat the assurance class
+    /// exists to prevent. Flip it once the iOS fleet reliably attests.
+    pub require_hardware_approver: bool,
 }
 
 impl Default for Config {
@@ -42,6 +56,7 @@ impl Default for Config {
             challenge_ttl_secs: 120,
             access_ttl_secs: 15 * 60,
             refresh_ttl_secs: 30 * 24 * 60 * 60,
+            require_hardware_approver: false,
         }
     }
 }
@@ -259,6 +274,8 @@ impl AuthService {
                 account_id: challenge.account_id,
                 public_key: req.device_public_key,
                 revoked: false,
+                // The very first device is no exception (ADR-0017): it is promoted once it attests.
+                assurance: Assurance::Software,
             },
         )?;
         if !created {
@@ -365,12 +382,29 @@ impl AuthService {
 
     /// Stage 1: a trusted device reserves ids for a NEW device. Only a non-revoked device may
     /// authorize enrollment — never a password-only path.
-    pub fn enroll_device_begin(&self, trusted: &AccountDevice) -> Result<EnrollChallenge> {
-        // The authorizing device must currently be active.
-        self.devices
+    /// The single definition of "may this device authorize an enrollment?", so the two enrollment
+    /// stages cannot drift apart — a check present only in `begin` would be trivially bypassed by
+    /// calling `finish` with a challenge obtained earlier.
+    ///
+    /// Requires the approver to be active, to belong to the claimed account, and — when
+    /// [`Config::require_hardware_approver`] is set — to be [`Assurance::Hardware`] (ADR-0017).
+    /// Every failure is the same generic [`AuthError::Denied`]: distinguishing "revoked" from
+    /// "software-assurance" would tell an attacker which devices are worth targeting.
+    fn approver(&self, trusted: &AccountDevice) -> Result<DeviceRecord> {
+        let device = self
+            .devices
             .device(&trusted.device_id)?
             .filter(|d| !d.revoked && d.account_id == trusted.account_id)
             .ok_or(AuthError::Denied)?;
+        if self.config.require_hardware_approver && device.assurance != Assurance::Hardware {
+            return Err(AuthError::Denied);
+        }
+        Ok(device)
+    }
+
+    pub fn enroll_device_begin(&self, trusted: &AccountDevice) -> Result<EnrollChallenge> {
+        // The authorizing device must currently be active and hardware-backed (ADR-0017).
+        self.approver(trusted)?;
 
         let device_id = DeviceId::random();
         let txn_id = TxnId::random();
@@ -421,12 +455,9 @@ impl AuthService {
             expires_at: challenge.expires_at,
             txn_id: &req.txn_id,
         };
-        let trusted_key = self
-            .devices
-            .device(&trusted.device_id)?
-            .filter(|d| !d.revoked && d.account_id == trusted.account_id)
-            .ok_or(AuthError::Denied)?
-            .public_key;
+        // Re-checked here, not just in `begin`: a challenge issued while the approver was still
+        // eligible must not remain redeemable after it was revoked or downgraded.
+        let trusted_key = self.approver(trusted)?.public_key;
         if !verify_p256(&trusted_key, &transcript.encode(), &req.signature) {
             return Err(AuthError::Denied);
         }
@@ -437,6 +468,11 @@ impl AuthService {
                 account_id: challenge.account_id,
                 public_key: req.device_public_key,
                 revoked: false,
+                // Always born Software (ADR-0017). The enrolling client cannot declare its own
+                // class — that would be self-asserted and a web client would simply claim
+                // `hardware`. It is promoted only by `promote_to_hardware` after a verified App
+                // Attest submission proves real Apple hardware.
+                assurance: Assurance::Software,
             },
             Self::MAX_ACTIVE_DEVICES,
         )?;
@@ -456,6 +492,23 @@ impl AuthService {
     /// Public keys included; nothing secret.
     pub fn list_devices(&self, account_id: &AccountId) -> Result<Vec<DeviceRecord>> {
         Ok(self.devices.list_devices(account_id)?)
+    }
+
+    /// Promote a device to [`Assurance::Hardware`] (ADR-0017) — the ONLY path to that class.
+    ///
+    /// **The caller must have cryptographically verified an App Attest attestation for this device
+    /// first.** This method deliberately takes no attestation argument: verification lives in
+    /// `nedwons_api::attest`, which owns Apple's root certificate and the nonce/key-id checks, and
+    /// `auth-core` must not grow a dependency on it. The contract is therefore on the caller — do
+    /// not call this on the strength of a client's claim, only on a verified attestation.
+    ///
+    /// This is what finally makes App Attest do real work: ADR-0002 correctly refuses to treat it as
+    /// an authentication factor (it is bypassable), but it is exactly the right evidence for
+    /// *classifying key custody*, which is all this grants.
+    ///
+    /// Idempotent; promoting an already-`Hardware` device is a no-op.
+    pub fn promote_to_hardware(&self, device_id: &DeviceId) -> Result<()> {
+        Ok(self.devices.set_assurance(device_id, Assurance::Hardware)?)
     }
 
     // ----- Account recovery (ADR-0003, R-304) ---------------------------------------
@@ -605,6 +658,9 @@ impl AuthService {
                 account_id: account.account_id,
                 public_key: req.new_device_public_key,
                 revoked: false,
+                // Recovery enrolls a device with no approver at all, so it certainly does not get
+                // to start Hardware (ADR-0017).
+                assurance: Assurance::Software,
             },
             Self::MAX_ACTIVE_DEVICES,
         )?;

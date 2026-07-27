@@ -226,6 +226,39 @@ pub async fn make_app_with_proof(per_ip_per_minute: u32) -> Router {
     .expect("app setup")
 }
 
+/// Build the app with the ADR-0017 approver restriction ON, so tests can exercise the device
+/// assurance class end to end (a `software` device must not be able to approve an enrollment).
+/// Mirrors what `NEDWONS_REQUIRE_HARDWARE_APPROVER=1` does in `main.rs`.
+#[allow(dead_code)]
+pub async fn make_app_requiring_hardware_approver(per_ip_per_minute: u32) -> Router {
+    tokio::task::spawn_blocking(move || {
+        let stores = shared_stores();
+        let service = Arc::new(AuthService::new(
+            stores.clone(),
+            stores.clone(),
+            stores.clone(),
+            stores.clone(),
+            stores.clone(),
+            Arc::new(SystemClock),
+            Config {
+                require_hardware_approver: true,
+                ..Config::default()
+            },
+        ));
+        nedwons_api::http::build_router(
+            service,
+            shared_relay(),
+            shared_social(),
+            shared_groups(),
+            shared_transparency(),
+            shared_membership(),
+            per_ip_per_minute,
+        )
+    })
+    .await
+    .expect("app setup")
+}
+
 /// Build the app trusting a client-IP header (`x-real-client-ip`) for rate limiting, so tests can
 /// exercise per-client-IP buckets behind a proxy.
 pub async fn make_app_with_trusted_ip_header(per_ip_per_minute: u32) -> Router {

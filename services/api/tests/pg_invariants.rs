@@ -212,13 +212,16 @@ fn refresh_rotate_race_at_most_one_winner() {
 /// resolves the deterministic primary.
 #[test]
 fn schema_allows_capped_multi_device_and_unique_usernames() {
-    use auth_core::store::DeviceRecord;
+    use auth_core::store::{Assurance, DeviceRecord};
     const MAX: usize = auth_core::AuthService::MAX_ACTIVE_DEVICES;
     let new_device = |account| DeviceRecord {
         device_id: DeviceId::random(),
         account_id: account,
         public_key: vec![0x04; 65],
         revoked: false,
+        // This test is about the cap and uniqueness, not assurance; enrolled devices are always
+        // born Software (ADR-0017).
+        assurance: Assurance::Software,
     };
 
     let (stores, service) = setup();
