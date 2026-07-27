@@ -60,6 +60,48 @@ async fn attest_challenge_then_submit_stores_unverified() {
     );
 }
 
+/// ADR-0017 fail-closed guard: in bootstrap mode (`NEDWONS_APP_ATTEST_APP_ID` unset) an attestation
+/// is stored but NOT cryptographically verified, so it must not promote the device to
+/// `Hardware` — otherwise any client could mint enrollment-approval rights by POSTing arbitrary
+/// bytes to `/v1/attest/key`. The promotion path is proven separately in `attest_promotion.rs`.
+#[tokio::test]
+async fn an_unverified_attestation_does_not_grant_hardware_assurance() {
+    use auth_core::store::{Assurance, DeviceStore};
+
+    let app = make_app(100_000).await;
+    let (_dev, session) = http_register(&app, &unique_username("attestnoprom")).await;
+    let token = session["access_token"].as_str().unwrap();
+    let device = DeviceId(id16(session["device_id"].as_str().unwrap()));
+
+    let (_, ch) = get_auth(&app, "/v1/attest/challenge", token).await;
+    let challenge = ch["challenge"].as_str().unwrap().to_string();
+    let (status, _) = post_json_auth(
+        &app,
+        "/v1/attest/key",
+        token,
+        json!({ "key_id": "unverified-key", "challenge": challenge, "attestation": "cafebabe" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "stored in bootstrap mode");
+
+    // Stored, but explicitly unverified...
+    assert_eq!(
+        stored_attestation(device).await,
+        Some(("unverified-key".to_string(), false))
+    );
+    // ...and therefore still Software.
+    let record = tokio::task::spawn_blocking(move || {
+        common::shared_stores().device(&device).unwrap().unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        record.assurance,
+        Assurance::Software,
+        "an unverified attestation must never confer Hardware assurance"
+    );
+}
+
 #[tokio::test]
 async fn a_wrong_challenge_is_refused() {
     let app = make_app(100_000).await;

@@ -12,8 +12,8 @@
 
 use auth_core::ids::{AccountId, DeviceId, FamilyId, TxnId};
 use auth_core::store::{
-    AccountDevice, AccountRecord, ChallengeRecord, ChallengeStore, CredentialStore, DeviceRecord,
-    DeviceStore, RefreshOutcome, RefreshStore, SessionStore, StoreError, StoreResult,
+    AccountDevice, AccountRecord, Assurance, ChallengeRecord, ChallengeStore, CredentialStore,
+    DeviceRecord, DeviceStore, RefreshOutcome, RefreshStore, SessionStore, StoreError, StoreResult,
 };
 use auth_core::Action;
 use r2d2::Pool;
@@ -118,12 +118,15 @@ impl CredentialStore for PgStores {
             return Ok(false);
         }
         txn.execute(
-            "INSERT INTO devices (device_id, account_id, public_key, revoked)
-             VALUES ($1, $2, $3, FALSE)",
+            // `assurance` is written explicitly rather than left to the column default, so the
+            // record's field is the single source of truth and cannot silently disagree with the row.
+            "INSERT INTO devices (device_id, account_id, public_key, revoked, assurance)
+             VALUES ($1, $2, $3, FALSE, $4)",
             &[
                 &device.device_id.as_bytes(),
                 &device.account_id.as_bytes(),
                 &device.public_key,
+                &device.assurance.as_str(),
             ],
         )
         .map_err(db_err)?;
@@ -263,7 +266,7 @@ impl DeviceStore for PgStores {
         // login/bootstrap target when several exist.
         let row = conn
             .query_opt(
-                "SELECT device_id, account_id, public_key, revoked
+                "SELECT device_id, account_id, public_key, revoked, assurance
                  FROM devices WHERE account_id = $1 AND NOT revoked
                  ORDER BY created_at, device_id LIMIT 1",
                 &[&account_id.as_bytes()],
@@ -290,12 +293,13 @@ impl DeviceStore for PgStores {
         }
         let inserted = txn
             .execute(
-                "INSERT INTO devices (device_id, account_id, public_key, revoked)
-                 VALUES ($1, $2, $3, FALSE) ON CONFLICT (device_id) DO NOTHING",
+                "INSERT INTO devices (device_id, account_id, public_key, revoked, assurance)
+                 VALUES ($1, $2, $3, FALSE, $4) ON CONFLICT (device_id) DO NOTHING",
                 &[
                     &device.device_id.as_bytes(),
                     &device.account_id.as_bytes(),
                     &device.public_key,
+                    &device.assurance.as_str(),
                 ],
             )
             .map_err(db_err)?;
@@ -307,7 +311,7 @@ impl DeviceStore for PgStores {
         let mut conn = self.conn()?;
         let rows = conn
             .query(
-                "SELECT device_id, account_id, public_key, revoked
+                "SELECT device_id, account_id, public_key, revoked, assurance
                  FROM devices WHERE account_id = $1 ORDER BY created_at, device_id",
                 &[&account_id.as_bytes()],
             )
@@ -315,11 +319,23 @@ impl DeviceStore for PgStores {
         rows.into_iter().map(row_to_device).collect()
     }
 
+    fn set_assurance(&self, device_id: &DeviceId, assurance: Assurance) -> StoreResult<()> {
+        let mut conn = self.conn()?;
+        // A revoked device is deliberately NOT excluded: reclassification is not authorization, and
+        // a revoked device stays revoked and unusable regardless of its class.
+        conn.execute(
+            "UPDATE devices SET assurance = $2 WHERE device_id = $1",
+            &[&device_id.as_bytes(), &assurance.as_str()],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     fn device(&self, device_id: &DeviceId) -> StoreResult<Option<DeviceRecord>> {
         let mut conn = self.conn()?;
         let row = conn
             .query_opt(
-                "SELECT device_id, account_id, public_key, revoked
+                "SELECT device_id, account_id, public_key, revoked, assurance
                  FROM devices WHERE device_id = $1",
                 &[&device_id.as_bytes()],
             )
@@ -344,6 +360,10 @@ fn row_to_device(r: postgres::Row) -> StoreResult<DeviceRecord> {
         account_id: AccountId(id16(r.get::<_, &[u8]>(1), "account_id")?),
         public_key: r.get::<_, Vec<u8>>(2),
         revoked: r.get(3),
+        // Fail closed: an unrecognized value degrades to Software, never Hardware. The column's
+        // CHECK constraint (V21) makes that unreachable today, but the decode must not be the weak
+        // link if it ever changes.
+        assurance: Assurance::from_str_or_software(r.get::<_, &str>(4)),
     })
 }
 

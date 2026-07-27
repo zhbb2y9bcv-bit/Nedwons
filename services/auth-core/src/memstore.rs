@@ -9,8 +9,9 @@ use std::sync::Mutex;
 
 use crate::ids::{AccountId, DeviceId, FamilyId, TxnId};
 use crate::store::{
-    AccountDevice, AccountRecord, ChallengeRecord, ChallengeStore, Clock, CredentialStore,
-    DeviceRecord, DeviceStore, RefreshOutcome, RefreshStore, SessionStore, StoreResult,
+    AccountDevice, AccountRecord, Assurance, ChallengeRecord, ChallengeStore, Clock,
+    CredentialStore, DeviceRecord, DeviceStore, RefreshOutcome, RefreshStore, SessionStore,
+    StoreResult,
 };
 
 /// Real wall-clock.
@@ -221,6 +222,13 @@ impl DeviceStore for MemAccountStore {
         }
         inner.devices_by_id.insert(device.device_id, device);
         Ok(true)
+    }
+
+    fn set_assurance(&self, device_id: &DeviceId, assurance: Assurance) -> StoreResult<()> {
+        if let Some(d) = self.inner.lock().unwrap().devices_by_id.get_mut(device_id) {
+            d.assurance = assurance;
+        }
+        Ok(())
     }
 
     fn list_devices(&self, account_id: &AccountId) -> StoreResult<Vec<DeviceRecord>> {

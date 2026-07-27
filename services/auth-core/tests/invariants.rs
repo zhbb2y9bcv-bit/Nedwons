@@ -687,6 +687,166 @@ fn enrollment_is_capped_and_revoke_cascades() {
     assert!(enroll(&service, &trusted, &device_a, &replacement).is_ok());
 }
 
+// ----- Device assurance class (ADR-0017) --------------------------------------------------
+//
+// A `Software`-assurance device (the web client: a non-extractable WebCrypto key that injected
+// script can still USE) must not be able to authorize enrollment of another device — otherwise one
+// XSS becomes account-wide device injection. These prove the control, its fail-closed defaults, and
+// that the privilege cannot propagate.
+
+use auth_core::store::{Assurance, DeviceStore};
+
+/// Same as [`make_service`] but with the ADR-0017 approver restriction switched ON.
+fn make_service_requiring_hardware() -> (AuthService, Arc<MemAccountStore>) {
+    let clock = Arc::new(MockClock::new(1_000_000));
+    let accounts = Arc::new(MemAccountStore::default());
+    let service = AuthService::new(
+        accounts.clone(),
+        accounts.clone(),
+        Arc::new(MemChallengeStore::default()),
+        Arc::new(MemRefreshStore::default()),
+        Arc::new(MemSessionStore::default()),
+        clock,
+        Config {
+            require_hardware_approver: true,
+            ..Config::default()
+        },
+    );
+    (service, accounts)
+}
+
+#[test]
+fn devices_are_born_software_regardless_of_how_they_were_created() {
+    let (service, _clock) = make_service();
+    let (device_a, reg) = register(&service, "assurance_birth");
+    let trusted = AccountDevice {
+        account_id: reg.account_id,
+        device_id: reg.device_id,
+    };
+
+    // The registering (first) device is Software until it proves hardware by attesting.
+    let devices = service.list_devices(&reg.account_id).unwrap();
+    assert_eq!(devices[0].assurance, Assurance::Software);
+
+    // And so is an enrolled one.
+    let device_b = TestDevice::new();
+    enroll(&service, &trusted, &device_a, &device_b).expect("enroll succeeds");
+    let devices = service.list_devices(&reg.account_id).unwrap();
+    assert!(devices.iter().all(|d| d.assurance == Assurance::Software));
+}
+
+#[test]
+fn software_device_cannot_authorize_enrollment() {
+    let (service, _accounts) = make_service_requiring_hardware();
+    let (device_a, reg) = register(&service, "assurance_software_denied");
+    let trusted = AccountDevice {
+        account_id: reg.account_id,
+        device_id: reg.device_id,
+    };
+
+    // The approver is Software (as every device starts), so enrollment is refused outright.
+    let device_b = TestDevice::new();
+    assert!(matches!(
+        enroll(&service, &trusted, &device_a, &device_b),
+        Err(AuthError::Denied)
+    ));
+    // Nothing was added — the refusal is not merely cosmetic.
+    assert_eq!(service.list_devices(&reg.account_id).unwrap().len(), 1);
+}
+
+#[test]
+fn hardware_device_can_authorize_enrollment_and_the_new_device_stays_software() {
+    let (service, _accounts) = make_service_requiring_hardware();
+    let (device_a, reg) = register(&service, "assurance_hardware_ok");
+    let trusted = AccountDevice {
+        account_id: reg.account_id,
+        device_id: reg.device_id,
+    };
+    // Stand-in for "submitted a cryptographically verified App Attest attestation".
+    service
+        .promote_to_hardware(&reg.device_id)
+        .expect("promote");
+
+    let device_b = TestDevice::new();
+    enroll(&service, &trusted, &device_a, &device_b).expect("hardware approver is accepted");
+
+    // **The privilege does not propagate.** A device enrolled BY a hardware device is still
+    // Software, so it cannot itself approve a further enrollment — otherwise one attested phone
+    // would launder approval rights to an unlimited chain of unattested devices.
+    let devices = service.list_devices(&reg.account_id).unwrap();
+    let enrolled = devices
+        .iter()
+        .find(|d| d.device_id != reg.device_id)
+        .expect("the enrolled device");
+    assert_eq!(enrolled.assurance, Assurance::Software);
+}
+
+#[test]
+fn approver_is_rechecked_at_finish_not_just_at_begin() {
+    // The two-stage ceremony must not be bypassable by obtaining a challenge while eligible and
+    // redeeming it after being downgraded — the reason the check lives in one shared helper.
+    let (service, accounts) = make_service_requiring_hardware();
+    let (device_a, reg) = register(&service, "assurance_recheck");
+    let trusted = AccountDevice {
+        account_id: reg.account_id,
+        device_id: reg.device_id,
+    };
+    service
+        .promote_to_hardware(&reg.device_id)
+        .expect("promote");
+
+    // Stage 1 succeeds while the approver is still Hardware.
+    let ch = service.enroll_device_begin(&trusted).expect("begin");
+
+    // The device is downgraded before the challenge is redeemed.
+    accounts
+        .set_assurance(&reg.device_id, Assurance::Software)
+        .expect("downgrade");
+
+    let device_b = TestDevice::new();
+    let transcript = Transcript {
+        action: Action::DeviceEnroll,
+        account_id: &trusted.account_id,
+        device_id: &ch.device_id,
+        public_key: &device_b.public_key,
+        challenge: &ch.nonce,
+        expires_at: ch.expires_at,
+        txn_id: &ch.txn_id,
+    };
+    let signature = device_a.sign(&transcript.encode());
+    assert!(matches!(
+        service.enroll_device_finish(
+            &trusted,
+            EnrollRequest {
+                txn_id: ch.txn_id,
+                device_public_key: device_b.public_key.clone(),
+                signature,
+            },
+        ),
+        Err(AuthError::Denied)
+    ));
+    assert_eq!(service.list_devices(&reg.account_id).unwrap().len(), 1);
+}
+
+#[test]
+fn the_restriction_is_off_by_default_which_is_a_deliberate_rollout_gap() {
+    // Documents (and pins) the shipped default: with `require_hardware_approver` unset, a Software
+    // device CAN still approve enrollment. This is the DPoP-style rollout seam — the control is
+    // inert until operators flip it, and until then the XSS-to-device-injection path is open.
+    // If this test ever starts failing because the default flipped, that is the intended hardening;
+    // update the test rather than restoring the old default.
+    assert!(!Config::default().require_hardware_approver);
+
+    let (service, _clock) = make_service();
+    let (device_a, reg) = register(&service, "assurance_default_off");
+    let trusted = AccountDevice {
+        account_id: reg.account_id,
+        device_id: reg.device_id,
+    };
+    let device_b = TestDevice::new();
+    assert!(enroll(&service, &trusted, &device_a, &device_b).is_ok());
+}
+
 // ----- Account recovery (ADR-0003 / R-304) ----------------------------------------------
 
 use auth_core::RecoveryRequest;

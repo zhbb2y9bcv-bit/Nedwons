@@ -32,6 +32,50 @@ pub struct AccountRecord {
     pub password_phc: String,
 }
 
+/// How well protected a device's proof key is (ADR-0008, pinned down by ADR-0017).
+///
+/// This is **not** a second authentication factor — the device-key signature remains the only
+/// credential (ADR-0002). It classifies *custody* of that key, which decides one thing: whether the
+/// device may authorize enrollment of ANOTHER device.
+///
+/// - `Hardware` — the key is non-exportable in a Secure Enclave. It cannot be exfiltrated **or used**
+///   off-device without physical possession and user presence.
+/// - `Software` — the key cannot be exfiltrated but CAN be used by whatever runs in its context. A
+///   web client's non-extractable WebCrypto key is the motivating case: script injected into the
+///   origin (XSS) becomes a signing oracle while the page is open. Letting such a device approve
+///   enrollments would turn one XSS into account-wide device injection — ADR-0008's "downgrade via
+///   software-signer device" threat.
+///
+/// [`Default`] is `Software` on purpose: **fail closed.** A code path that forgets to classify a
+/// device produces the *less* privileged class, never the more privileged one. This mirrors the
+/// `DEFAULT 'software'` on the `devices.assurance` column (migration V21).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Assurance {
+    Hardware,
+    #[default]
+    Software,
+}
+
+impl Assurance {
+    /// The wire/storage spelling. Kept next to the parser so the two can never drift.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Assurance::Hardware => "hardware",
+            Assurance::Software => "software",
+        }
+    }
+
+    /// **Fail closed:** anything unrecognized — a value written by a newer version, or a corrupted
+    /// row — reads back as `Software`, the less privileged class. Never widen this to a fallible
+    /// parse that a caller might `unwrap_or(Hardware)`.
+    pub fn from_str_or_software(s: &str) -> Self {
+        match s {
+            "hardware" => Assurance::Hardware,
+            _ => Assurance::Software,
+        }
+    }
+}
+
 /// The server stores only the **public** key (INV-3); the private key never leaves the Enclave.
 #[derive(Clone, Debug)]
 pub struct DeviceRecord {
@@ -40,6 +84,8 @@ pub struct DeviceRecord {
     /// SEC1-encoded P-256 public key.
     pub public_key: Vec<u8>,
     pub revoked: bool,
+    /// Key-custody class; gates enrollment approval only. See [`Assurance`].
+    pub assurance: Assurance,
 }
 
 /// Bound to account + device + action + expiry; single-use.
@@ -116,6 +162,14 @@ pub trait DeviceStore {
     fn add_active_device(&self, device: DeviceRecord, max_active: usize) -> StoreResult<bool>;
     /// Revoked included; ordered deterministically (creation, then id).
     fn list_devices(&self, account_id: &AccountId) -> StoreResult<Vec<DeviceRecord>>;
+    /// Reclassify a device's key custody (ADR-0017).
+    ///
+    /// Devices are always CREATED as [`Assurance::Software`]; this is the only way to reach
+    /// `Hardware`, and the caller must have *proof* — today a cryptographically verified Apple App
+    /// Attest attestation, which is exactly a proof of "genuine unmodified app on real Apple
+    /// hardware". A self-asserted client claim MUST NOT reach this method: assurance is earned, not
+    /// declared, or a web client could simply claim `hardware`.
+    fn set_assurance(&self, device_id: &DeviceId, assurance: Assurance) -> StoreResult<()>;
 }
 
 pub trait ChallengeStore {
