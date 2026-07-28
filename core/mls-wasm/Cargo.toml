@@ -1,0 +1,57 @@
+# Standalone crate (its own workspace), sibling of `core/mls-ffi`: the WebAssembly binding over the
+# same `mls-core` (ADR-0017). Two bindings, ONE crypto/MLS authority and ONE persistence authority —
+# a second core would double the audit surface for the least reviewable part of the system.
+#
+# The wasm32 feature opt-ins live HERE rather than in `mls-core` on purpose. Cargo resolves
+# `Cargo.lock` target-agnostically, so putting them in `mls-core` wrote browser-only crates
+# (fluvio-wasm-timer, instant, …) into `mls-ffi`'s and `services`' lockfiles too — polluting the
+# SERVER's `cargo audit` output and SBOM with dependencies the server can never execute. Scoped to
+# this crate, only this lockfile carries them.
+[package]
+name = "mls-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+rust-version = "1.85"
+
+[workspace]
+
+[lib]
+# cdylib = the .wasm artifact wasm-bindgen post-processes; rlib = native `cargo test` for the
+# platform-independent logic (see tests/).
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mls-core = { path = "../mls-core" }
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+# At-rest sealing for the browser journal. Same crate + same wire layout as `mls-core`'s
+# `FileJournal` (nonce ‖ AES-256-GCM ciphertext), so a blob is byte-compatible across platforms.
+aes-gcm = "0.10"
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# No OS randomness syscall on wasm32: `getrandom` must be pointed at `crypto.getRandomValues` or it
+# `compile_error!`s. TWO majors are in the graph, each with its own opt-in, and they are NOT
+# interchangeable:
+#   0.2 — via rand_core 0.6 (`OsRng`, used by mls-core's durable layer + this crate) -> "js"
+#   0.4 — via rand 0.10 (hpke-rs, libcrux-sha3) -> "wasm_js", already pulled in by openmls's `js`
+#         feature below, but named explicitly so it does not silently depend on that.
+# NB: 0.4 does NOT need the `--cfg getrandom_backend` RUSTFLAG; that was 0.3-only.
+getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+# OpenMLS hard-errors on ANY wasm32 target without this. It swaps `std::time::SystemTime` for a
+# `Date.now()`-backed clock used to stamp/check KeyPackage lifetimes.
+# SECURITY (ADR-0017): that is the browser's WALL CLOCK, which the user controls — unlike iOS. So
+# lifetime validation is advisory on web; the server-side prekey TTL stays the authority.
+openmls = { version = "0.8", features = ["js"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+
+# PQ: substitute the vendored provider for the crates.io one, exactly as `mls-core` and `mls-ffi`
+# do. A `[patch]` only takes effect in the workspace ROOT, so each standalone workspace must repeat
+# it — omitting it here would silently build a provider whose X-Wing arm is `unimplemented!()`.
+[patch.crates-io]
+openmls_rust_crypto = { path = "../vendor/openmls_rust_crypto" }
