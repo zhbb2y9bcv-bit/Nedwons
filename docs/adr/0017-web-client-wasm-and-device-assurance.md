@@ -174,10 +174,13 @@ change. The PQ ciphersuite works unmodified in a browser.
   - **The generated server SBOM will list wasm-only crates** (`scripts/generate_sbom.sh`), which
     misrepresents what the deployed `nedwons-api` binary actually contains.
 
-  If this proves objectionable, the clean fix is to move the wasm feature opt-ins out of `mls-core`
-  and into the `core/mls-wasm` binding crate, so only that crate's lockfile carries them. That is
-  preferable long-term and should be done when `mls-wasm` is created; the spike put them in
-  `mls-core` only because no binding crate exists yet.
+  **RESOLVED when `core/mls-wasm` was created.** The opt-ins moved into that crate, and all three
+  lockfiles are now byte-identical to their pre-spike state — `instant` and `fluvio-wasm-timer` are
+  gone from the server's graph and `cargo audit` on `services` is back to its single pre-existing
+  warning. The trade-off is that `cargo build --target wasm32-*` from `core/mls-core` now fails by
+  design; `core/mls-wasm` is the only crate built for wasm32, and feature unification applies the
+  opt-ins to `mls-core` within that build graph. A note in `mls-core/Cargo.toml` says so, since the
+  failure is otherwise baffling.
 
 **Deliberately accepted cost.** Until the iOS enrollment path declares `assurance = 'hardware'`
 explicitly, newly enrolled iOS devices land as `software` and cannot approve enrollments. Existing
@@ -223,10 +226,24 @@ fail-closed direction and is the immediate follow-up task.
   registered device is `software` and its enrollment attempt is refused **401**; it attests; it is
   promoted; the *same* enrollment then succeeds **200**. Mutation-checked at both points (removing
   the promotion, and flipping the config flag, each fail it).
-- **Not yet done (blocks moving this ADR to Accepted):** `core/mls-wasm` crate; the OPFS journal and
-  a crash-injection test proving the two-slot commit is untearable; iOS attesting reliably in the
-  field, then turning `NEDWONS_REQUIRE_HARDWARE_APPROVER` on in production. **Until that flag is on,
-  the control is inert and a compromised web session could approve a new device** — the class is
-  recorded and earned correctly, but nothing enforces it by default.
+- **Done:** `core/mls-wasm` exists and builds for `wasm32-unknown-unknown` (release artifact
+  **3.39 MB** before `wasm-opt`/gzip — a real page-weight cost to budget for). It exposes the
+  ADR-0007 surface: create/join, staged commits + `processCommit`, the self-group, enqueue/encrypt/
+  markSent, `processInbound`/`processSelfInbound`, the full secret reveal state machine, history
+  sync, bounded paging, `clearVisibleHistory`, and `capabilities()`. 11 tests run the binding as
+  ordinary Rust on the host — **no browser or wasm toolchain needed** — including a REAL two-party
+  X-Wing MLS round trip, no-plaintext-in-ciphertext, idempotent redelivery and re-encrypt, the
+  sealed→countdown→visible→consumed lifecycle, and typed refusals for oversized/malformed input.
+  Two deliberate divergences from `mls-ffi`, both documented in the module header: a `RefCell`
+  replaces the `Mutex` (wasm is single-threaded, so a `Mutex` would imply a guarantee nothing
+  needs), and **there is no `catch_unwind` equivalent** — a panic aborts the whole module instance,
+  which is memory-safe but a denial of service, so `setPanicHook()` at least makes it diagnosable.
+- **Not yet done (blocks moving this ADR to Accepted):** the **JS/OPFS host** implementing the
+  `JournalHost` seam (`journal.rs` specifies the two-slot + generation-counter contract it must
+  honour) and a crash-injection test proving the commit is untearable — the Rust side is ready but
+  nothing persists in a browser yet; a `wasm-bindgen-test` pass exercising the JS glue, which the
+  host-side tests deliberately do not cover; iOS attesting reliably in the field, then turning
+  `NEDWONS_REQUIRE_HARDWARE_APPROVER` on in production. **Until that flag is on, the assurance
+  control is inert and a compromised web session could approve a new device.**
 - **Note:** `FileJournal` currently *compiles* for wasm and would fail at runtime on every call. It
   should be `cfg`-gated out of wasm builds rather than left as a runtime trap.
