@@ -285,7 +285,13 @@ impl PushService {
         for (platform, token) in tokens {
             if platform == "apns" {
                 let req = build_push(&inner.cfg, &token, iat);
-                let _ = inner.transport.post(&req);
+                // Best-effort by design (a wake push is a hint, never the delivery path), but the
+                // OUTCOME still has to be observable: silent push failure looks exactly like "no
+                // traffic" from the outside, and that is how an outage hides.
+                match inner.transport.post(&req) {
+                    Ok(_) => crate::metrics::PUSH_SENT.incr(),
+                    Err(_) => crate::metrics::PUSH_FAILURES.incr(),
+                }
             }
         }
     }

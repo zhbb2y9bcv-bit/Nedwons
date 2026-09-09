@@ -562,6 +562,7 @@ impl PgRelay {
             .into_iter()
             .map(|r| id16(r.get::<_, &[u8]>(0)))
             .collect::<StoreResult<Vec<_>>>()?;
+        crate::metrics::ENVELOPES_ENQUEUED.add(newly_queued.len() as u64);
         Ok(FanoutOutcome::Delivered { newly_queued })
     }
 
@@ -609,7 +610,30 @@ impl PgRelay {
                 &[&device.as_bytes(), &ids],
             )
             .map_err(db_err)?;
+        crate::metrics::ENVELOPES_DELIVERED.add(acked);
         Ok(acked)
+    }
+
+    /// Sample the gauges that describe capacity rather than events.
+    ///
+    /// Polled on the existing retention tick rather than maintained incrementally: queue depth is
+    /// a property of the DATABASE, not of this process, so a counter kept in memory would be wrong
+    /// the moment a second instance existed or this one restarted. Failure is not fatal — stale
+    /// metrics are better than a monitoring path that can take the service down.
+    pub fn sample_capacity_gauges(&self) {
+        if let Ok(mut conn) = self.pool.get() {
+            if let Ok(row) =
+                conn.query_one("SELECT count(*) FROM envelopes WHERE NOT delivered", &[])
+            {
+                crate::metrics::QUEUE_DEPTH.set(row.get::<_, i64>(0));
+            }
+        } else {
+            // A checkout timeout here is itself the signal: the pool is saturated.
+            crate::metrics::DB_POOL_WAIT_FAILURES.incr();
+        }
+        let state = self.pool.state();
+        crate::metrics::DB_POOL_IN_USE
+            .set(i64::from(state.connections) - i64::from(state.idle_connections));
     }
 
     /// Retention TTL (DATA_RETENTION.md): purge envelopes older than `ttl` (the 30-day queue
