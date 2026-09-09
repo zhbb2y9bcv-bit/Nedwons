@@ -3,7 +3,9 @@
 //! relaunch — proven by exchanging a message *after* both sides reopen from their journals.
 
 use mls_core::content::ReceiptKind;
-use mls_core::durable::{Direction, DurableError, DurableSession, InMemoryJournal, InboundOutcome};
+use mls_core::durable::{
+    Direction, DurableError, DurableSession, InMemoryJournal, InboundOutcome, Journal,
+};
 use mls_core::Member;
 
 /// Two durable sessions in one group, plus a shared clone of each journal for "relaunch".
@@ -796,5 +798,171 @@ fn delete_for_everyone_tombstones_both_sides() {
     assert!(matches!(
         alice.enqueue_delete(unknown_target),
         Err(DurableError::UnknownLocal)
+    ));
+}
+
+/// R-105: history beyond the hot window spills into the append-only archive — the committed BLOB
+/// stops containing old message bodies (the actual fix: commits stop rewriting all history), the
+/// full log stays pageable in order, and everything survives reopen.
+#[test]
+fn history_spills_to_the_archive_and_the_blob_stops_growing_with_it() {
+    let (mut alice, _ja, mut bob, jb) = pair();
+    bob.set_hot_limit(6);
+
+    let mut blob_at_window_full = 0usize;
+    for i in 0..20 {
+        let id = alice
+            .enqueue(format!("archived-msg-{i:02}").as_bytes())
+            .expect("enqueue");
+        let env = alice.encrypt(id).expect("encrypt");
+        bob.process_inbound(i + 1, &env).expect("process");
+        if i == 6 {
+            blob_at_window_full = jb.load().expect("load").expect("blob").len();
+        }
+    }
+
+    // The hot window is bounded; the total is not lost.
+    assert!(
+        bob.messages().len() <= 6,
+        "hot window bounded: {}",
+        bob.messages().len()
+    );
+    assert_eq!(bob.total_message_count(), 20);
+
+    // THE R-105 PROPERTY: once the window is full, the per-commit blob stops growing with
+    // history. Thirteen further equal-sized messages must not add thirteen messages' worth of
+    // bytes — the slack below is a fraction of ONE message's footprint (bookkeeping like the
+    // dedup tail and receipt sets), not a multiple.
+    let blob_at_20 = jb.load().expect("load").expect("blob").len();
+    assert!(
+        blob_at_20 < blob_at_window_full + 600,
+        "blob grew with history: {blob_at_window_full} -> {blob_at_20}"
+    );
+
+    // Full history pages in order across the archive/hot boundary.
+    let first = bob.message_views_page(0, 5).expect("page");
+    assert_eq!(
+        first
+            .iter()
+            .map(|v| String::from_utf8_lossy(&v.plaintext).into_owned())
+            .collect::<Vec<_>>(),
+        (0..5)
+            .map(|i| format!("archived-msg-{i:02}"))
+            .collect::<Vec<_>>()
+    );
+    let straddle = bob.message_views_page(12, 6).expect("page");
+    assert_eq!(
+        straddle
+            .iter()
+            .map(|v| String::from_utf8_lossy(&v.plaintext).into_owned())
+            .collect::<Vec<_>>(),
+        (12..18)
+            .map(|i| format!("archived-msg-{i:02}"))
+            .collect::<Vec<_>>()
+    );
+
+    // Reopen: watermark + archive line up again.
+    let mut bob = DurableSession::open(jb.clone()).expect("reopen");
+    bob.set_hot_limit(6);
+    assert_eq!(bob.total_message_count(), 20);
+    let after = bob.message_views_page(0, 3).expect("page");
+    assert_eq!(after[0].plaintext, b"archived-msg-00");
+}
+
+/// The spill is WRITE-AHEAD: when the blob commit fails after archive records were appended, the
+/// messages are still hot on reopen (nothing lost), and the crash leftovers in the archive never
+/// surface as duplicates.
+#[test]
+fn failed_spill_commit_loses_nothing_and_duplicates_nothing() {
+    let (mut alice, _ja, mut bob, jb) = pair();
+    bob.set_hot_limit(3);
+
+    for i in 0..3u64 {
+        let id = alice
+            .enqueue(format!("pre-{i}").as_bytes())
+            .expect("enqueue");
+        let env = alice.encrypt(id).expect("encrypt");
+        bob.process_inbound(i + 1, &env).expect("process");
+    }
+    // The next inbound overflows the window; its commit (which would also spill) is failed.
+    let id = alice.enqueue(b"overflow").expect("enqueue");
+    let env = alice.encrypt(id).expect("encrypt");
+    jb.fail_next_commit();
+    assert!(
+        bob.process_inbound(4, &env).is_err(),
+        "injected commit failure"
+    );
+
+    // Recovery contract: reopen from the journal. All three pre-messages are present exactly
+    // once; the archive's write-ahead leftovers (if the failure landed after appends) are
+    // invisible because the watermark never advanced.
+    let mut bob = DurableSession::open(jb.clone()).expect("reopen");
+    bob.set_hot_limit(3);
+    assert_eq!(bob.total_message_count(), 3);
+    let all = bob.message_views_page(0, 10).expect("page");
+    let texts: Vec<_> = all
+        .iter()
+        .map(|v| String::from_utf8_lossy(&v.plaintext).into_owned())
+        .collect();
+    assert_eq!(texts, vec!["pre-0", "pre-1", "pre-2"]);
+
+    // Redelivery of the failed envelope now processes and spills cleanly.
+    assert!(matches!(
+        bob.process_inbound(4, &env).expect("redelivered"),
+        InboundOutcome::Application(_)
+    ));
+    assert_eq!(bob.total_message_count(), 4);
+    let all = bob.message_views_page(0, 10).expect("page");
+    assert_eq!(all.len(), 4, "no duplicates after the crash-and-retry");
+}
+
+/// Disappearing messages never enter the immutable archive: the scrub owns their deletion, so
+/// they hold the spill (and the messages behind them) hot until they expire.
+#[test]
+fn disappearing_messages_stay_hot_until_scrubbed() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+    bob.set_hot_limit(2);
+
+    let t = alice.enqueue_timer_change(1).expect("timer");
+    let t_env = alice.encrypt(t).expect("encrypt");
+    bob.process_inbound(1, &t_env).expect("process");
+
+    for i in 0..5u64 {
+        let id = alice
+            .enqueue(format!("fleeting-{i}").as_bytes())
+            .expect("enqueue");
+        let env = alice.encrypt(id).expect("encrypt");
+        bob.process_inbound(i + 2, &env).expect("process");
+    }
+    assert_eq!(bob.total_message_count(), 5);
+    assert_eq!(bob.messages().len(), 5, "expiring messages refuse to spill");
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    assert_eq!(bob.scrub_expired().expect("scrub"), 5);
+    assert_eq!(bob.total_message_count(), 0);
+}
+
+/// Local history erase covers the archive too, and (unchanged contract) decryption continues.
+#[test]
+fn clear_visible_history_erases_the_archive() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+    bob.set_hot_limit(2);
+    for i in 0..6u64 {
+        let id = alice
+            .enqueue(format!("gone-{i}").as_bytes())
+            .expect("enqueue");
+        let env = alice.encrypt(id).expect("encrypt");
+        bob.process_inbound(i + 1, &env).expect("process");
+    }
+    assert!(bob.total_message_count() == 6);
+    bob.clear_visible_history().expect("clear");
+    assert_eq!(bob.total_message_count(), 0);
+    assert!(bob.message_views_page(0, 10).expect("page").is_empty());
+
+    let id = alice.enqueue(b"after the purge").expect("enqueue");
+    let env = alice.encrypt(id).expect("encrypt");
+    assert!(matches!(
+        bob.process_inbound(7, &env).expect("process"),
+        InboundOutcome::Application(_)
     ));
 }

@@ -1150,20 +1150,22 @@ impl MlsClient {
         })
     }
 
-    /// Cheap: no payload crosses the boundary.
+    /// TOTAL history: archive + hot window (R-105). Cheap — a stored counter, no archive read.
     pub fn message_count(&self) -> Result<u64, MlsClientError> {
         catch(move || {
             let g = self.lock()?;
             match &*g {
-                ClientState::Active { session } => Ok(session.messages().len() as u64),
+                ClientState::Active { session } => Ok(session.total_message_count()),
                 ClientState::Pending { .. } => Err(MlsClientError::WrongState),
                 ClientState::Closed => Err(MlsClientError::Closed),
             }
         })
     }
 
-    /// Bounded window, oldest first. `limit` is clamped to [`MAX_PAGE_MESSAGES`] so one call can
-    /// never marshal an unbounded payload; an offset past the end returns an empty page.
+    /// Bounded window over the FULL history (archive + hot), oldest first. `limit` is clamped to
+    /// [`MAX_PAGE_MESSAGES`]; an offset past the end returns an empty page. Pages inside the hot
+    /// window never touch the archive, so live rendering stays cheap; scrollback and search pay
+    /// for the archive read only when they actually cross into it.
     pub fn messages_page(
         &self,
         offset: u64,
@@ -1174,10 +1176,12 @@ impl MlsClient {
             match &*g {
                 ClientState::Active { session } => {
                     let capped = limit.min(MAX_PAGE_MESSAGES) as usize;
-                    let all = session.message_views();
-                    let start = (offset as usize).min(all.len());
-                    let end = start.saturating_add(capped).min(all.len());
-                    Ok(all[start..end].iter().map(to_stored).collect())
+                    Ok(session
+                        .message_views_page(offset as usize, capped)
+                        .map_err(map_durable)?
+                        .iter()
+                        .map(to_stored)
+                        .collect())
                 }
                 ClientState::Pending { .. } => Err(MlsClientError::WrongState),
                 ClientState::Closed => Err(MlsClientError::Closed),

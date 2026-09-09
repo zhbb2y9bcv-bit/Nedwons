@@ -668,7 +668,7 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func mergeStaged() throws 
     
     /**
-     * Cheap: no payload crosses the boundary.
+     * TOTAL history: archive + hot window (R-105). Cheap — a stored counter, no archive read.
      */
     func messageCount() throws  -> UInt64
     
@@ -679,8 +679,10 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func messages() throws  -> [StoredMessage]
     
     /**
-     * Bounded window, oldest first. `limit` is clamped to [`MAX_PAGE_MESSAGES`] so one call can
-     * never marshal an unbounded payload; an offset past the end returns an empty page.
+     * Bounded window over the FULL history (archive + hot), oldest first. `limit` is clamped to
+     * [`MAX_PAGE_MESSAGES`]; an offset past the end returns an empty page. Pages inside the hot
+     * window never touch the archive, so live rendering stays cheap; scrollback and search pay
+     * for the archive read only when they actually cross into it.
      */
     func messagesPage(offset: UInt64, limit: UInt32) throws  -> [StoredMessage]
     
@@ -1210,7 +1212,7 @@ open func mergeStaged()throws   {try rustCallWithError(FfiConverterTypeMlsClient
 }
     
     /**
-     * Cheap: no payload crosses the boundary.
+     * TOTAL history: archive + hot window (R-105). Cheap — a stored counter, no archive read.
      */
 open func messageCount()throws  -> UInt64  {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -1231,8 +1233,10 @@ open func messages()throws  -> [StoredMessage]  {
 }
     
     /**
-     * Bounded window, oldest first. `limit` is clamped to [`MAX_PAGE_MESSAGES`] so one call can
-     * never marshal an unbounded payload; an offset past the end returns an empty page.
+     * Bounded window over the FULL history (archive + hot), oldest first. `limit` is clamped to
+     * [`MAX_PAGE_MESSAGES`]; an offset past the end returns an empty page. Pages inside the hot
+     * window never touch the archive, so live rendering stays cheap; scrollback and search pay
+     * for the archive read only when they actually cross into it.
      */
 open func messagesPage(offset: UInt64, limit: UInt32)throws  -> [StoredMessage]  {
     return try  FfiConverterSequenceTypeStoredMessage.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -3528,13 +3532,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_merge_staged() != 17494) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_message_count() != 39791) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_message_count() != 38509) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_messages() != 9968) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_messages_page() != 36640) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_messages_page() != 31557) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_process_commit() != 4908) {
