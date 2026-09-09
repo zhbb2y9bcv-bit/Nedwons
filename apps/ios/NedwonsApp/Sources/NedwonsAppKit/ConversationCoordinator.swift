@@ -41,6 +41,9 @@ public final class ConversationCoordinator {
     /// store id → Pending (lobby) client
     private var lobbyClients: [String: MlsClient] = [:]
     private var receiveTask: Task<Void, Never>?
+    /// The cover-traffic scheduler (R-204), non-nil only while cover traffic is enabled AND the
+    /// receive loop is running. Sends decoys on a randomized cadence.
+    private var coverTask: Task<Void, Never>?
     /// The cross-process single-writer lock over the (possibly shared) store directory. Held from
     /// `start()` to `stop()`; the notification extension takes it non-blockingly while we're away.
     private var storeLock: StoreLock?
@@ -151,12 +154,17 @@ public final class ConversationCoordinator {
                     snippet: $0.snippet, timestamp: $0.timestamp, mine: $0.mine)
             } ?? []
         }
+        model.coverTrafficControl = { [weak self] enabled in
+            self?.setCoverTraffic(enabled)
+        }
     }
 
     /// Begin the receive loop for the signed-in session. Idempotent.
     public func start() {
         guard receiveTask == nil else { return }
         isActive = true
+        // Resume cover traffic if the user left it on. (No-op if disabled.)
+        if model.coverTrafficEnabled { setCoverTraffic(true) }
         receiveTask = Task { [weak self] in
             // Single-writer (ADR-0007): the Notification Service Extension may be mid-decrypt in
             // the shared store. Wait for the cross-process lock BEFORE opening anything; the wait
@@ -189,6 +197,8 @@ public final class ConversationCoordinator {
         isActive = false
         receiveTask?.cancel()
         receiveTask = nil
+        coverTask?.cancel()
+        coverTask = nil
         for client in clients.values { client.close() }
         for client in lobbyClients.values { client.close() }
         clients.removeAll()
@@ -656,6 +666,53 @@ public final class ConversationCoordinator {
                 }
             }
             refresh(conversationID)
+        }
+    }
+
+    // MARK: Cover traffic (R-204)
+
+    /// The decoy cadence: a fresh random gap in this range before each cover send. Deliberately
+    /// coarse — cover traffic here raises the cost of timing analysis without the battery/data cost
+    /// (and the collateral traffic to contacts) of a tight constant rate. Honest scope: this is not
+    /// enough to defeat a global passive adversary; see ADR-0014 (R-204).
+    private static let coverGapSeconds: ClosedRange<UInt64> = 90...420
+
+    /// Start or stop the decoy scheduler. Idempotent; only runs while the receive loop is active.
+    func setCoverTraffic(_ enabled: Bool) {
+        coverTask?.cancel()
+        coverTask = nil
+        guard enabled, isActive else { return }
+        coverTask = Task { [weak self] in
+            while !Task.isCancelled {
+                guard let self else { return }
+                let gap = UInt64.random(in: Self.coverGapSeconds)
+                try? await Task.sleep(nanoseconds: gap * 1_000_000_000)
+                if Task.isCancelled { return }
+                await self.sendCoverDecoy()
+            }
+        }
+    }
+
+    /// Send one decoy into a randomly chosen conversation. The padding length is drawn so the decoy
+    /// lands in a plausible envelope size bucket (arc J), making it indistinguishable to the relay
+    /// from a real message. Best-effort and silent: a decoy that fails to send is simply skipped.
+    private func sendCoverDecoy() async {
+        guard token != nil, isActive else { return }
+        // Only conversations whose composer isn't locked (a muted member can't send anyway).
+        let candidates = index.conversations.keys.filter { model.composerLock(for: $0) == nil }
+        guard let conversationID = candidates.randomElement(),
+            let client = activeClient(for: conversationID)
+        else { return }
+        // Random size within the normal body range, so bucketed envelopes look like real chatter.
+        // The bytes are discarded on arrival, so ordinary randomness is enough — no need for the
+        // CSPRNG, and the content is meaningless either way.
+        let padLen = Int.random(in: 0...512)
+        let padding = Data((0..<padLen).map { _ in UInt8.random(in: 0...255) })
+        do {
+            let localID = try client.sendCover(padding: padding)
+            try await upload(localID: localID, client: client, conversationID: conversationID)
+        } catch {
+            lastSyncError = error
         }
     }
 

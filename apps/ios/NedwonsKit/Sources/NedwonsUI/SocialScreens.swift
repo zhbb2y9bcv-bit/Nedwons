@@ -304,6 +304,7 @@ struct SettingsRootView: View {
                 Section {
                     NavigationLink("Blocked") { BlockedUsersView(model: model) }
                     DiagnosticsToggleRow(model: model)
+                    CoverTrafficToggleRow(model: model)
                 } header: {
                     Text("Privacy")
                 } footer: {
@@ -753,5 +754,30 @@ struct DiagnosticsToggleRow: View {
         }
         .onAppear { on = model.diagnostics.enabled }
         .onChange(of: on) { _, value in model.diagnostics.setEnabled(value) }
+    }
+}
+
+/// Opt-in cover traffic. The footer is deliberately honest about both what it buys and what it
+/// costs — this is a defense-in-depth trade, not a switch that makes you invisible.
+struct CoverTrafficToggleRow: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Nedwons.Spacing.xxs) {
+            Toggle(
+                "Cover traffic",
+                isOn: Binding(
+                    get: { model.coverTrafficEnabled },
+                    set: { model.setCoverTraffic($0) })
+            )
+            .accessibilityIdentifier("settings.coverTraffic")
+            Text(
+                "Off by default. When on, this device occasionally sends decoy messages so the times "
+                    + "you really message are harder to single out. Decoys carry nothing and are "
+                    + "discarded on arrival. It raises the cost of traffic analysis — it does not make "
+                    + "you invisible — and it uses extra data and battery, yours and your contacts'.")
+                .font(Nedwons.TypeScale.caption)
+                .foregroundStyle(.secondary)
+        }
     }
 }

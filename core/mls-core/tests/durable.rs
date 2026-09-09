@@ -1064,3 +1064,36 @@ fn group_avatar_is_set_removed_and_bounded() {
     // thumbnail).
     assert!(alice.enqueue_group_avatar(&vec![1u8; 20_000]).is_err());
 }
+
+/// A cover-traffic decoy (R-204): it advances the ratchet like any send, but leaves NO message row
+/// on either side, decrypts to `Cover`, and owes no receipt — and a real message sent right after
+/// still decrypts, proving the decoy did not desync the ratchet.
+#[test]
+fn cover_decoy_is_invisible_and_does_not_desync() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+
+    let before = alice.messages().len();
+    let decoy = alice.enqueue_cover(vec![0x11u8; 300]).expect("enqueue cover");
+    let env = alice.encrypt(decoy).expect("encrypt cover");
+    // The sender keeps no local trace of a decoy.
+    assert_eq!(alice.messages().len(), before, "no sender-side row for a decoy");
+
+    assert_eq!(
+        bob.process_inbound(1, &env).expect("process cover"),
+        InboundOutcome::Cover
+    );
+    assert_eq!(bob.messages().len(), 0, "a decoy is never stored");
+    assert!(
+        bob.unacknowledged_inbound(ReceiptKind::Delivered).is_empty(),
+        "a decoy is nothing to acknowledge"
+    );
+
+    // The ratchet is intact: a real message after the decoy decrypts normally.
+    let id = alice.enqueue(b"real one").expect("enqueue real");
+    let env2 = alice.encrypt(id).expect("encrypt real");
+    assert_eq!(
+        bob.process_inbound(2, &env2).expect("process real"),
+        InboundOutcome::Application(b"real one".to_vec())
+    );
+    assert_eq!(bob.messages().len(), 1);
+}

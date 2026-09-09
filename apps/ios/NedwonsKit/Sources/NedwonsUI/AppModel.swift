@@ -429,6 +429,22 @@ public final class AppModel: ObservableObject {
     /// Opt-in crash/hang diagnostics (MetricKit). Constructed lazily so the shared client is used.
     public lazy var diagnostics = DiagnosticsReporter(client: client)
 
+    /// Opt-in cover traffic (R-204): when on, this device emits decoy messages on a randomized
+    /// schedule so the times it really sends are harder to pick out. OFF by default. Persisted
+    /// locally (it's a UI preference, not a secret). The coordinator owns the actual scheduler and
+    /// wires `coverTrafficControl` to start/stop it; the model just remembers the choice.
+    @Published public var coverTrafficEnabled: Bool = UserDefaults.standard.bool(
+        forKey: "nedwons.coverTraffic")
+    /// Set by the coordinator (which can import the MLS core) to start/stop decoy sending.
+    public var coverTrafficControl: ((Bool) -> Void)?
+
+    /// Turn cover traffic on or off: remember the choice and tell the coordinator to start/stop.
+    public func setCoverTraffic(_ enabled: Bool) {
+        coverTrafficEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "nedwons.coverTraffic")
+        coverTrafficControl?(enabled)
+    }
+
     /// Per-chat local presentation preferences (pin / archive / mute). Never sent to the relay.
     @Published public internal(set) var chatPrefs = ChatPrefs()
     public var chatPrefsStore: ChatPrefsStoring = UserDefaultsChatPrefsStore()

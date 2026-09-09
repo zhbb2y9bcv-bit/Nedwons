@@ -767,6 +767,13 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func sendAttachment(blobId: Data, key: Data, digest: Data, size: UInt64, mime: String, filename: String, caption: String) throws  -> UInt64
     
     /**
+     * Queue a cover-traffic decoy (R-204) with the given random `padding`. It encrypts and uploads
+     * on the ordinary send path, so the relay sees an envelope indistinguishable from a real one;
+     * the recipient recognises the kind and discards it. Returns the outbound local id to encrypt.
+     */
+    func sendCover(padding: Data) throws  -> UInt64
+    
+    /**
      * Queue one batched receipt for these ids, and remember they were acknowledged so the same
      * message is never acknowledged twice.
      */
@@ -1433,6 +1440,19 @@ open func sendAttachment(blobId: Data, key: Data, digest: Data, size: UInt64, mi
         FfiConverterString.lower(mime),
         FfiConverterString.lower(filename),
         FfiConverterString.lower(caption),$0
+    )
+})
+}
+    
+    /**
+     * Queue a cover-traffic decoy (R-204) with the given random `padding`. It encrypts and uploads
+     * on the ordinary send path, so the relay sees an envelope indistinguishable from a real one;
+     * the recipient recognises the kind and discards it. Returns the outbound local id to encrypt.
+     */
+open func sendCover(padding: Data)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_send_cover(self.uniffiClonePointer(),
+        FfiConverterData.lower(padding),$0
     )
 })
 }
@@ -2763,6 +2783,11 @@ public enum InboundResult {
      */
     case groupAvatarChanged(removed: Bool
     )
+    /**
+     * A cover-traffic decoy (R-204). Nothing happened — discard it. Surfaced only so the caller
+     * can see it was recognised (and still ack the envelope).
+     */
+    case cover
 }
 
 
@@ -2825,6 +2850,8 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         
         case 16: return .groupAvatarChanged(removed: try FfiConverterBool.read(from: &buf)
         )
+        
+        case 17: return .cover
         
         default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -2913,6 +2940,10 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
             writeInt(&buf, Int32(16))
             FfiConverterBool.write(removed, into: &buf)
             
+        
+        case .cover:
+            writeInt(&buf, Int32(17))
+        
         }
     }
 }
@@ -3672,6 +3703,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_send_attachment() != 37619) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_send_cover() != 4629) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_send_receipt() != 50179) {

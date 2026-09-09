@@ -35,6 +35,7 @@ const KIND_TIMER_CHANGE: u8 = 10;
 const KIND_DELETE: u8 = 11;
 const KIND_EDIT: u8 = 12;
 const KIND_GROUP_AVATAR: u8 = 13;
+const KIND_COVER: u8 = 14;
 
 /// Longest allowed disappearing-message timer: 90 days. A cap bounds the arithmetic every client
 /// does with it and refuses nonsense values a hostile member might encode.
@@ -159,6 +160,13 @@ pub enum Content {
     /// leak, subpoena, or index). Empty = remove the photo. Same no-roles honesty as `GroupName`:
     /// any member can technically send one; the app offers it to admins.
     GroupAvatar { image: Vec<u8> },
+    /// A DECOY (R-204 cover traffic). Carries only random padding and means nothing: a recipient
+    /// decrypts it, recognises the kind, and discards it — it is never stored, shown, receipted, or
+    /// counted. Its purpose is to exist on the wire so that, combined with the envelope's size
+    /// bucketing, a real send is harder to distinguish from silence by its timing. HONEST SCOPE: a
+    /// decoy raises the cost of traffic analysis; it does not defeat a global passive adversary, and
+    /// its value depends on how often it is sent and how many people send it (see ADR-0014, R-204).
+    Cover { padding: Vec<u8> },
     /// A file. The bytes live on the relay as opaque ciphertext; everything that makes them
     /// meaningful — the key, what kind of file it is, what it was called, how big it is — is in
     /// here, inside the MLS ciphertext. The relay can tell that an account uploaded *something* of
@@ -208,7 +216,8 @@ impl Content {
             | Content::TimerChange { .. }
             | Content::Delete { .. }
             | Content::Edit { .. }
-            | Content::GroupAvatar { .. } => &[],
+            | Content::GroupAvatar { .. }
+            | Content::Cover { .. } => &[],
         }
     }
 
@@ -303,6 +312,10 @@ impl Content {
             Content::GroupAvatar { image } => {
                 out.push(KIND_GROUP_AVATAR);
                 out.extend_from_slice(image);
+            }
+            Content::Cover { padding } => {
+                out.push(KIND_COVER);
+                out.extend_from_slice(padding);
             }
             Content::Attachment {
                 message_id,
@@ -488,6 +501,15 @@ impl Content {
                 }
                 Ok(Content::GroupAvatar {
                     image: rest.to_vec(),
+                })
+            }
+            KIND_COVER => {
+                if rest.len() > MAX_CONTENT_BODY {
+                    return Err(ContentError::TooLarge);
+                }
+                // The bytes are meaningless by design; keep them only so this round-trips.
+                Ok(Content::Cover {
+                    padding: rest.to_vec(),
                 })
             }
             other => Err(ContentError::UnknownKind(other)),
@@ -742,6 +764,24 @@ mod tests {
         assert_eq!(Content::decode(&over), Err(ContentError::Malformed));
         let short = &c.encode()[..c.encode().len() - 1];
         assert_eq!(Content::decode(short), Err(ContentError::Malformed));
+    }
+
+    #[test]
+    fn cover_round_trips_carries_no_body_and_is_bounded() {
+        // Varying padding lengths so a decoy can match a real message's size bucket.
+        for len in [0usize, 1, 200, 4096] {
+            let c = Content::Cover {
+                padding: vec![0x5Au8; len],
+            };
+            assert_eq!(Content::decode(&c.encode()).unwrap(), c);
+            // A decoy is not a message: it exposes no readable body.
+            assert!(c.body().is_empty());
+        }
+        // Over the body bound is refused before allocation blows up.
+        let mut over = CONTENT_VERSION.to_be_bytes().to_vec();
+        over.push(KIND_COVER);
+        over.extend_from_slice(&vec![0u8; MAX_CONTENT_BODY + 1]);
+        assert_eq!(Content::decode(&over), Err(ContentError::TooLarge));
     }
 
     #[test]

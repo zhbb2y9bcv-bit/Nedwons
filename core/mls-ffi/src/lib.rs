@@ -208,6 +208,9 @@ pub enum InboundResult {
     GroupAvatarChanged {
         removed: bool,
     },
+    /// A cover-traffic decoy (R-204). Nothing happened — discard it. Surfaced only so the caller
+    /// can see it was recognised (and still ack the envelope).
+    Cover,
 }
 
 /// A file referenced by a message. The bytes live on the relay as ciphertext; this is everything
@@ -824,6 +827,7 @@ impl MlsClient {
                 InboundOutcome::GroupAvatarChanged { removed } => {
                     InboundResult::GroupAvatarChanged { removed }
                 }
+                InboundOutcome::Cover => InboundResult::Cover,
             })
         })
     }
@@ -890,6 +894,7 @@ impl MlsClient {
                 InboundOutcome::GroupAvatarChanged { removed } => {
                     InboundResult::GroupAvatarChanged { removed }
                 }
+                InboundOutcome::Cover => InboundResult::Cover,
             })
         })
     }
@@ -1098,6 +1103,17 @@ impl MlsClient {
             let mut g = self.lock()?;
             let session = active_mut(&mut g)?;
             session.enqueue_typing(active).map_err(map_durable_input)
+        })
+    }
+
+    /// Queue a cover-traffic decoy (R-204) with the given random `padding`. It encrypts and uploads
+    /// on the ordinary send path, so the relay sees an envelope indistinguishable from a real one;
+    /// the recipient recognises the kind and discards it. Returns the outbound local id to encrypt.
+    pub fn send_cover(&self, padding: Vec<u8>) -> Result<u64, MlsClientError> {
+        catch(move || {
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session.enqueue_cover(padding).map_err(map_durable_input)
         })
     }
 
