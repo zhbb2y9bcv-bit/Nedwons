@@ -66,6 +66,9 @@ struct QRCodeView: View {
 struct CodeCaptureView: View {
     @Environment(\.colorScheme) private var scheme
     let prompt: String
+    /// Off when the host screen provides its own entry field (the join screen does), so the user
+    /// never sees two paste boxes for one code.
+    var showPasteFallback = true
     let onCode: (String) -> Void
 
     @State private var pasted = ""
@@ -88,13 +91,15 @@ struct CodeCaptureView: View {
                 Text(prompt)
                     .font(Nedwons.TypeScale.caption)
                     .foregroundStyle(palette.textSecondary)
-                HStack(spacing: Nedwons.Spacing.sm) {
-                    TextField("Paste a code", text: $pasted)
-                        .textFieldStyle(.roundedBorder)
-                        .autocorrectionDisabled()
-                        .accessibilityIdentifier(VerificationA11y.pasteField)
-                    Button("Use") { onCode(pasted) }
-                        .disabled(pasted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                if showPasteFallback {
+                    HStack(spacing: Nedwons.Spacing.sm) {
+                        TextField("Paste a code", text: $pasted)
+                            .textFieldStyle(.roundedBorder)
+                            .autocorrectionDisabled()
+                            .accessibilityIdentifier(VerificationA11y.pasteField)
+                        Button("Use") { onCode(pasted) }
+                            .disabled(pasted.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    }
                 }
             }
         }
@@ -335,8 +340,10 @@ public struct JoinByInviteView: View {
 
     public var body: some View {
         VStack(spacing: Nedwons.Spacing.lg) {
-            CodeCaptureView(prompt: "Scan an invite QR, or paste the invite code you were sent.") {
-                scanned in
+            CodeCaptureView(
+                prompt: "Scan an invite QR, or paste the invite code you were sent.",
+                showPasteFallback: false
+            ) { scanned in
                 accept(raw: scanned)
             }
             TextField("Invite code", text: $code)
