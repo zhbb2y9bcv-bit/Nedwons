@@ -1229,6 +1229,23 @@ public final class AppModel: ObservableObject {
     /// The message being replied to, per conversation, while the user composes.
     @Published public var replyDrafts: [String: ThreadLine] = [:]
 
+    /// Unsent composer text, per conversation, so switching chats (or, on iPad, selecting another
+    /// thread) doesn't discard a half-written message. IN-MEMORY ONLY and deliberately so: a draft
+    /// is message *content*, and Nedwons keeps content out of the unencrypted defaults plist — it
+    /// survives navigation within a session, not an app relaunch. Sent/cleared text is removed.
+    /// Not `@Published`: it's read when a composer appears, so per-keystroke writes must not
+    /// re-render the thread.
+    public var composeDrafts: [String: String] = [:]
+
+    /// Remember (or, when blank, forget) the unsent composer text for a conversation.
+    public func setComposeDraft(_ text: String, for conversationID: String) {
+        if text.isEmpty {
+            composeDrafts.removeValue(forKey: conversationID)
+        } else {
+            composeDrafts[conversationID] = text
+        }
+    }
+
     public func typingNames(in conversationID: String) -> [String] {
         (typingBy[conversationID] ?? []).sorted().map { id in
             displayName(for: id, username: username(forAccountID: id) ?? "Someone")

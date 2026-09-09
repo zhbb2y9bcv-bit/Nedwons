@@ -757,14 +757,19 @@ struct ConversationView: View {
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...4)
                 .accessibilityIdentifier(GroupAdminA11y.composerField)
+            // Restore a draft left here before the user navigated away (or, on iPad, switched to
+            // another thread) so a half-written message is not silently lost.
+            .onAppear { if draft.isEmpty { draft = model.composeDrafts[chat.conversationID] ?? "" } }
             .onChange(of: draft) { _, text in
                 // Intent, not keystrokes: the composition layer throttles, and stops when the
                 // field empties so a cleared draft does not leave someone "typing".
                 Task { await model.setTyping(!text.isEmpty, in: chat.conversationID) }
+                model.setComposeDraft(text, for: chat.conversationID)
             }
             Button {
                 let body = draft.trimmingCharacters(in: .whitespacesAndNewlines)
                 draft = ""
+                model.setComposeDraft("", for: chat.conversationID)
                 Task {
                     await model.setTyping(false, in: chat.conversationID)
                     await model.sendMessageOrReply(body, to: chat.conversationID)
