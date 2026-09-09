@@ -135,3 +135,22 @@ extension MessageToolsTests {
         XCTAssertNil(bob.model.editDrafts[conv], "only the author may edit")
     }
 }
+
+extension MessageToolsTests {
+    /// The E2EE group photo: set by one member, rendered by the other, removed for everyone —
+    /// with the relay never holding anything but ciphertext (same story the name test tells).
+    func testGroupAvatarPropagatesAndRemoves() async throws {
+        let (_, alice, bob) = try await pairedConversation()
+
+        let thumb = Data(repeating: 0xCC, count: 2048)
+        await alice.model.setGroupAvatar(thumb, in: conv)
+        XCTAssertEqual(alice.model.groupAvatars[conv], thumb, "sender applies at send")
+        _ = try await bob.coordinator.syncOnce()
+        XCTAssertEqual(bob.model.groupAvatars[conv], thumb, "decrypted on the other side")
+
+        await alice.model.setGroupAvatar(nil, in: conv)
+        _ = try await bob.coordinator.syncOnce()
+        XCTAssertNil(alice.model.groupAvatars[conv])
+        XCTAssertNil(bob.model.groupAvatars[conv])
+    }
+}

@@ -39,6 +39,8 @@ public final class AppModel: ObservableObject {
     /// no name to serve and this map is populated only by the composition layer reading local
     /// state — never from a server response.
     @Published public var groupNames: [String: String] = [:]
+    /// Group photo thumbnails, decrypted on this device — same E2EE story as the names.
+    @Published public var groupAvatars: [String: Data] = [:]
     @Published public var inbox: [InboxEnvelope] = []
     @Published public var isBusy = false
     @Published public var banner: String?
@@ -1001,6 +1003,24 @@ public final class AppModel: ObservableObject {
 
     /// Injected: rename the group for everyone, over the E2EE channel.
     public var renameGroupAction: ((String, String) async throws -> Void)?
+
+    /// Injected: set (or with nil remove) the group's photo for everyone, over the E2EE channel.
+    public var setGroupAvatarAction: ((Data?, String) async throws -> Void)?
+
+    /// Set the group photo from an ALREADY-DOWNSCALED thumbnail (the UI scales; the wire refuses
+    /// anything over the content cap). `nil` removes it.
+    public func setGroupAvatar(_ thumbnail: Data?, in conversationID: String) async {
+        guard let setGroupAvatarAction else {
+            banner = "Group photos aren't available in this build."
+            return
+        }
+        do {
+            try await setGroupAvatarAction(thumbnail, conversationID)
+            banner = thumbnail == nil ? "Group photo removed." : "Group photo updated."
+        } catch {
+            banner = "Couldn't change the group photo."
+        }
+    }
 
     /// Injected: mark a conversation read on this device.
     public var markConversationReadAction: ((String) async -> Void)?

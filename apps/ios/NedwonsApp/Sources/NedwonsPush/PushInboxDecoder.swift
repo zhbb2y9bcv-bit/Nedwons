@@ -102,7 +102,7 @@ public enum PushInboxDecoder {
         // deliberately silent — the state is still applied durably by the core.
         case .duplicate, .stateAdvanced, .secretConsumedRemotely, .deliveryKeyGranted,
             .historySynced, .groupRenamed, .reactionChanged, .receiptsReceived, .typing,
-            .timerChanged, .messageDeleted, .messageEdited:
+            .timerChanged, .messageDeleted, .messageEdited, .groupAvatarChanged:
             return nil
         }
     }
@@ -148,7 +148,7 @@ public enum PushInboxDecoder {
             // reaction is visible next time they look. The state is still applied by the core.
             case .duplicate, .stateAdvanced, .secretConsumedRemotely, .deliveryKeyGranted,
                 .historySynced, .groupRenamed, .reactionChanged, .receiptsReceived, .typing,
-            .timerChanged, .messageDeleted, .messageEdited:
+            .timerChanged, .messageDeleted, .messageEdited, .groupAvatarChanged:
                 continue
             }
         }

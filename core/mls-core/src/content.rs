@@ -34,6 +34,7 @@ const KIND_TYPING: u8 = 9;
 const KIND_TIMER_CHANGE: u8 = 10;
 const KIND_DELETE: u8 = 11;
 const KIND_EDIT: u8 = 12;
+const KIND_GROUP_AVATAR: u8 = 13;
 
 /// Longest allowed disappearing-message timer: 90 days. A cap bounds the arithmetic every client
 /// does with it and refuses nonsense values a hostile member might encode.
@@ -153,6 +154,11 @@ pub enum Content {
         target: [u8; MESSAGE_ID_LEN],
         body: Vec<u8>,
     },
+    /// The group's photo, as a small pre-scaled thumbnail carried INSIDE the MLS ciphertext —
+    /// like the name, the relay never learns what a group looks like (no server-side avatar to
+    /// leak, subpoena, or index). Empty = remove the photo. Same no-roles honesty as `GroupName`:
+    /// any member can technically send one; the app offers it to admins.
+    GroupAvatar { image: Vec<u8> },
     /// A file. The bytes live on the relay as opaque ciphertext; everything that makes them
     /// meaningful — the key, what kind of file it is, what it was called, how big it is — is in
     /// here, inside the MLS ciphertext. The relay can tell that an account uploaded *something* of
@@ -201,7 +207,8 @@ impl Content {
             | Content::Typing { .. }
             | Content::TimerChange { .. }
             | Content::Delete { .. }
-            | Content::Edit { .. } => &[],
+            | Content::Edit { .. }
+            | Content::GroupAvatar { .. } => &[],
         }
     }
 
@@ -292,6 +299,10 @@ impl Content {
                 out.push(KIND_EDIT);
                 out.extend_from_slice(target);
                 out.extend_from_slice(body);
+            }
+            Content::GroupAvatar { image } => {
+                out.push(KIND_GROUP_AVATAR);
+                out.extend_from_slice(image);
             }
             Content::Attachment {
                 message_id,
@@ -469,6 +480,14 @@ impl Content {
                 Ok(Content::Edit {
                     target,
                     body: rest.to_vec(),
+                })
+            }
+            KIND_GROUP_AVATAR => {
+                if rest.len() > MAX_CONTENT_BODY {
+                    return Err(ContentError::TooLarge); // a THUMBNAIL, pre-scaled by the sender
+                }
+                Ok(Content::GroupAvatar {
+                    image: rest.to_vec(),
                 })
             }
             other => Err(ContentError::UnknownKind(other)),
