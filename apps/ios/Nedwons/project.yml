@@ -81,6 +81,42 @@ targets:
         # authorize them are configured in the Apple Developer portal (your side).
         CODE_SIGN_ENTITLEMENTS: Nedwons.entitlements
 
+  # The macOS companion app: the SAME @main, composition, screens, and Rust core (the xcframework
+  # carries a macos-arm64 slice), sandboxed with least privilege. It is a second DEVICE of your
+  # account (ADR-0008 enrollment + the V27 setup queue admit it to conversations) — platform-only
+  # features stay iOS's: no notification extension, no App Attest, no QR scanning (paste works).
+  Nedwons-macOS:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - Sources
+      - path: PrivacyInfo.xcprivacy
+        buildPhase: resources
+    dependencies:
+      - package: NedwonsKit
+        product: NedwonsUI
+      - package: NedwonsMLS
+        product: MlsFfi
+      - package: NedwonsApp
+        product: NedwonsAppKit
+    info:
+      path: Nedwons-macOS/Info.plist
+      properties:
+        CFBundleDisplayName: Nedwons
+        NSMicrophoneUsageDescription: "Record voice messages. Audio is end-to-end encrypted before it leaves your device."
+        NedwonsServerURL: ""
+        NedwonsTransparencyLogKey: ""
+        NedwonsAppGroup: ""
+        ITSAppUsesNonExemptEncryption: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.nedwons.demo.mac
+        SWIFT_VERSION: "6.0"
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        CODE_SIGN_ENTITLEMENTS: Nedwons-macOS.entitlements
+
   # XCUITest suite: drives the REAL app (real @main, AppModel, NedwonsClient, SwiftUI screens) on a
   # simulator, with only the network replaced by the Debug-only in-process fixture
   # (NedwonsUI/UITestHarness.swift, selected by launch argument). Before this target existed there
