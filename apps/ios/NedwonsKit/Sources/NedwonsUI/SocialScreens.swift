@@ -147,7 +147,10 @@ struct NewMessageView: View {
                                 Spacer()
                                 Image(systemName: "bubble.left.fill")
                                     .foregroundStyle(palette.accentPrimary)
+                                    .accessibilityHidden(true) // the row itself is the control
                             }
+                            .accessibilityElement(children: .combine)
+                            .accessibilityHint("Opens a conversation")
                         }
                         .buttonStyle(.plain)
                     }
@@ -214,9 +217,13 @@ struct NewGroupView: View {
                                 Spacer()
                                 Image(systemName: selected.contains(friend.accountID) ? "checkmark.circle.fill" : "circle")
                                     .foregroundStyle(selected.contains(friend.accountID) ? palette.accentPrimary : palette.textSecondary)
+                                    .accessibilityHidden(true)
                             }
                             // Plain-style buttons hit-test only drawn content; make the whole row tappable.
                             .contentShape(Rectangle())
+                            .accessibilityElement(children: .combine)
+                            .accessibilityAddTraits(
+                                selected.contains(friend.accountID) ? .isSelected : [])
                         }
                         .buttonStyle(.plain)
                     }
