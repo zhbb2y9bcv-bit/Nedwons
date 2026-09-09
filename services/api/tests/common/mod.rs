@@ -247,6 +247,33 @@ pub async fn make_app_with_moderation(per_ip_per_minute: u32, token: &str) -> Ro
             false,
             None,
             Some(token),
+            None,
+        )
+    })
+    .await
+    .expect("app setup")
+}
+
+/// Build the app with the CROSS-INSTANCE wake bus attached (Postgres LISTEN/NOTIFY), so a test
+/// can prove a long-poll parked on one instance wakes when another instance queues its mail.
+#[allow(dead_code)]
+pub async fn make_app_with_wake_bus(per_ip_per_minute: u32) -> Router {
+    tokio::task::spawn_blocking(move || {
+        let stores = shared_stores();
+        let service = Arc::new(make_service(&stores));
+        nedwons_api::http::build_router_full(
+            service,
+            shared_relay(),
+            shared_social(),
+            shared_groups(),
+            shared_transparency(),
+            shared_membership(),
+            per_ip_per_minute,
+            None,
+            false,
+            None,
+            None,
+            Some(db_url()),
         )
     })
     .await

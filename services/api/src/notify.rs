@@ -1,9 +1,13 @@
-//! In-process delivery notifications for long-polling: a queued envelope wakes that device's
-//! waiters immediately, so a waiting client costs **zero** database queries.
+//! Delivery notifications for long-polling: a queued envelope wakes that device's waiters
+//! immediately, so a waiting client costs **zero** database queries while idle.
 //!
-//! Single-instance. Across processes a waiter and its sender may differ, so production adds a
-//! cross-instance signal (`LISTEN/NOTIFY` or a bus). The database stays the source of truth and
-//! every wait is timeout-bounded, so a missed signal only delays delivery — it never loses a
+//! **Cross-instance (2026-09-09):** a sender's instance and a waiter's instance may differ, so
+//! `wake` also publishes the device id over Postgres `LISTEN/NOTIFY` (`nedwons_wake` channel —
+//! the database is already the shared component, no new infrastructure), and every instance runs
+//! a listener that turns remote signals into LOCAL wakes only (`wake_local`): no push hook and no
+//! re-publish, so a fan-out wakes each waiter once and dispatches each push once (on the origin
+//! instance). The database stays the source of truth and every wait is timeout-bounded, so a
+//! missed signal — a bus disconnect, a dropped NOTIFY — only delays delivery; it never loses a
 //! message.
 //!
 //! A device that is NOT connected (backgrounded/killed) is reached instead by push (#4): an
@@ -19,10 +23,14 @@ use tokio::sync::Notify;
 /// A side-effect invoked for a device on every `wake` — used to dispatch push notifications.
 pub type WakeHook = Arc<dyn Fn([u8; 16]) + Send + Sync>;
 
+/// Publishes a wake to OTHER instances (Postgres NOTIFY). Best-effort by contract.
+pub type WakePublisher = Arc<dyn Fn([u8; 16]) + Send + Sync>;
+
 #[derive(Default)]
 struct Inner {
     waiters: HashMap<[u8; 16], Arc<Notify>>,
     on_wake: Option<WakeHook>,
+    publisher: Option<WakePublisher>,
 }
 
 #[derive(Clone, Default)]
@@ -46,14 +54,23 @@ impl DeliveryNotifier {
             .clone()
     }
 
+    /// Install the cross-instance publisher (Postgres NOTIFY). Set once at startup.
+    pub fn set_publisher(&self, publisher: WakePublisher) {
+        self.inner.lock().unwrap().publisher = Some(publisher);
+    }
+
     /// Signal that a device has new mail. `notify_one` stores a single permit if no waiter
     /// is currently parked, so a notification that races just ahead of a waiter's park is
     /// still delivered on its next poll. Also fires the wake hook (push) for a device that has
-    /// no connected waiter.
+    /// no connected waiter, and publishes to other instances.
     pub fn wake(&self, device: &[u8; 16]) {
-        let (handle, hook) = {
+        let (handle, hook, publisher) = {
             let g = self.inner.lock().unwrap();
-            (g.waiters.get(device).cloned(), g.on_wake.clone())
+            (
+                g.waiters.get(device).cloned(),
+                g.on_wake.clone(),
+                g.publisher.clone(),
+            )
         };
         if let Some(notify) = handle {
             notify.notify_one();
@@ -61,7 +78,103 @@ impl DeliveryNotifier {
         if let Some(hook) = hook {
             hook(*device);
         }
+        if let Some(publisher) = publisher {
+            publisher(*device);
+        }
     }
+
+    /// A wake that arrived FROM another instance: local waiters only. Deliberately no push hook
+    /// (the origin dispatched it) and no re-publish (no echo storms).
+    pub fn wake_local(&self, device: &[u8; 16]) {
+        let handle = self.inner.lock().unwrap().waiters.get(device).cloned();
+        if let Some(notify) = handle {
+            notify.notify_one();
+        }
+    }
+}
+
+// --------------------------------------------------------------------------------------------
+// Cross-instance wake bus over Postgres LISTEN/NOTIFY.
+
+/// The NOTIFY channel. Payload = the woken device id, hex.
+const WAKE_CHANNEL: &str = "nedwons_wake";
+
+/// Start both halves of the bus. The PUBLISH half drains an in-process queue through one pooled
+/// connection at a time (a burst of fan-out wakes becomes a burst of cheap `pg_notify` calls,
+/// never a burst of pool checkouts per message). The LISTEN half holds its own dedicated
+/// connection (LISTEN state must never leak back into the pool) and reconnects with backoff.
+pub fn spawn_wake_bus(
+    notifier: DeliveryNotifier,
+    pool: crate::pgstore::PgPool,
+    listen_url: String,
+) {
+    // Publisher: wake() -> channel -> pg_notify.
+    let (tx, rx) = std::sync::mpsc::channel::<[u8; 16]>();
+    notifier.set_publisher(Arc::new(move |device| {
+        let _ = tx.send(device); // receiver gone = shutdown; nothing to do
+    }));
+    std::thread::Builder::new()
+        .name("wake-publish".into())
+        .spawn(move || {
+            while let Ok(first) = rx.recv() {
+                // Batch whatever is already queued behind it into one connection checkout.
+                let mut batch = vec![first];
+                while let Ok(more) = rx.try_recv() {
+                    batch.push(more);
+                    if batch.len() >= 256 {
+                        break;
+                    }
+                }
+                let Ok(mut conn) = pool.get() else { continue };
+                for device in batch {
+                    let _ = conn.execute(
+                        "SELECT pg_notify($1, $2)",
+                        &[&WAKE_CHANNEL, &hex::encode(device)],
+                    );
+                }
+            }
+        })
+        .expect("spawn wake-publish");
+
+    // Listener: dedicated connection, LISTEN, forward payloads as LOCAL wakes.
+    std::thread::Builder::new()
+        .name("wake-listen".into())
+        .spawn(move || {
+            loop {
+                let mut client = match postgres::Client::connect(&listen_url, postgres::NoTls) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        continue;
+                    }
+                };
+                if client
+                    .batch_execute(&format!("LISTEN {WAKE_CHANNEL}"))
+                    .is_err()
+                {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    continue;
+                }
+                let mut notifications = client.notifications();
+                let mut iter = notifications.blocking_iter();
+                // FallibleIterator: Ok(None) or Err both mean the connection is gone.
+                loop {
+                    use fallible_iterator::FallibleIterator;
+                    match iter.next() {
+                        Ok(Some(n)) => {
+                            if let Ok(bytes) = hex::decode(n.payload()) {
+                                if let Ok(device) = <[u8; 16]>::try_from(bytes.as_slice()) {
+                                    notifier.wake_local(&device);
+                                }
+                            }
+                        }
+                        Ok(None) | Err(_) => break, // connection gone: reconnect with backoff
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        })
+        .expect("spawn wake-listen");
 }
 
 #[cfg(test)]

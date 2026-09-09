@@ -23,11 +23,15 @@ a parked waiter holds **no database connection** — only a cheap async task —
 cost nothing. Tested: `inbox_long_poll_wakes_on_delivery` asserts the waiter returns in well
 under the timeout when a message is sent 200 ms in.
 
-*Honest limit:* the notifier is per-process. Across multiple API instances a waiter and its
-sender may be on different processes, so production adds a cross-instance signal (PostgreSQL
-`LISTEN/NOTIFY` or a bus). The database stays the source of truth and every wait is
-timeout-bounded, so a missed cross-instance wake only delays by the timeout — it never loses
-a message. WebSocket/QUIC streaming is the next upgrade beyond long-poll.
+**Cross-instance since 2026-09-09:** every `wake` also publishes the device id over PostgreSQL
+`LISTEN/NOTIFY` (`nedwons_wake`; the database is already the shared component, so no new
+infrastructure), and each instance's listener — a dedicated, reconnecting connection, never a
+pooled one — turns remote signals into LOCAL wakes only (no push re-dispatch, no echo).
+Publishes drain through one batching thread, so a fan-out burst is one pool checkout, not one
+per recipient. Proven by `tests/wake_bus.rs`: a long-poll parked on one router instance wakes
+from a send on another. The database stays the source of truth and every wait is
+timeout-bounded, so a bus disconnect only delays by the timeout — it never loses a message.
+WebSocket/QUIC streaming is the next upgrade beyond long-poll.
 
 ### 3. Idempotent send (safe aggressive retries)
 Every send carries a 16-byte `idempotency_key`. A retry after a dropped response is a no-op
@@ -96,8 +100,7 @@ eligible for retention purge (DATA_RETENTION.md). Tested: `peek_is_non_destructi
 
 - **WebTransport / QUIC** and multiplexed streams beyond the current WebSocket, plus carrying
   typing/presence over the same channel.
-- **Cross-instance delivery signal** (PostgreSQL `LISTEN/NOTIFY` or a bus) so the notifier
-  works across multiple API instances, not just in-process.
+- ~~Cross-instance delivery signal~~ — DONE 2026-09-09 (PostgreSQL `LISTEN/NOTIFY`, above).
 - **Prepared-statement reuse** for the hottest queries (the sync `postgres` client re-parses
   string queries; caching `Statement` handles per pooled connection removes a parse per call).
 - **Batch key-package claim / prekey prefetch** so adding several members is one round trip.

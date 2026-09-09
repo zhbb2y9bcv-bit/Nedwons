@@ -1821,6 +1821,7 @@ dependencies = [
  "axum",
  "base64",
  "ciborium",
+ "fallible-iterator",
  "futures-util",
  "governor",
  "hex",

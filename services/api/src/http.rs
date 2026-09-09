@@ -196,6 +196,8 @@ pub fn build_router_with_blobs(
     let moderation_token = std::env::var("NEDWONS_MODERATION_TOKEN")
         .ok()
         .filter(|t| t.len() >= 32);
+    // Cross-instance delivery wake rides the database itself (LISTEN/NOTIFY) — no new infra.
+    let wake_bus_url = std::env::var("DATABASE_URL").ok();
     build_router_full(
         service,
         relay,
@@ -208,6 +210,7 @@ pub fn build_router_with_blobs(
         require_proof,
         blobs,
         moderation_token,
+        wake_bus_url,
     )
 }
 
@@ -226,6 +229,7 @@ pub fn build_router_full(
     require_proof: bool,
     blobs: Option<Arc<dyn BlobStore>>,
     moderation_token: Option<String>,
+    wake_bus_url: Option<String>,
 ) -> Router {
     let quota =
         Quota::per_minute(NonZeroU32::new(per_ip_per_minute.max(1)).expect("max(1) is non-zero"));
@@ -276,6 +280,13 @@ pub fn build_router_full(
         moderation: Arc::new(crate::moderation::PgModeration::new(relay_pool2)),
         moderation_token: moderation_token.map(|t| Arc::from(t.into_boxed_str())),
     };
+
+    // Cross-instance wake bus (see `notify.rs`): publish each wake as a Postgres NOTIFY, and
+    // turn every remote NOTIFY into a LOCAL wake. Both halves are best-effort and reconnecting;
+    // the timeout-bounded polls make a lost signal a delay, never a loss.
+    if let Some(bus_url) = wake_bus_url {
+        crate::notify::spawn_wake_bus(state.notifier.clone(), state.pool.clone(), bus_url);
+    }
 
     // Relay routes accept larger bodies (opaque envelopes) than auth routes.
     let relay_routes = Router::new()
