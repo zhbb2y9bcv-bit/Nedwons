@@ -373,6 +373,10 @@ pub struct MessageView {
     pub expires_at_ms: Option<u64>,
     /// Retracted by its author (delete-for-everyone); body and attachment are gone.
     pub deleted: bool,
+    /// The MLS-authenticated credential identity that sent this (empty for pre-field history and
+    /// replicated history). What a REPORT identifies a group message's author by — the relay
+    /// resolves the device to its account server-side.
+    pub sender: Vec<u8>,
 }
 
 /// Add or remove one person's reaction, idempotently: reacting twice with the same emoji is one
@@ -1676,6 +1680,7 @@ impl<J: Journal> DurableSession<J> {
             read_count: receipt.map(|r| r.read_by.len() as u32).unwrap_or(0),
             expires_at_ms: m.expires_at_ms,
             deleted: m.deleted,
+            sender: m.sender.clone(),
         }
     }
 

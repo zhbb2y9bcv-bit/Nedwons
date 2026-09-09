@@ -99,3 +99,52 @@ final class NedwonsClientTests: XCTestCase {
         XCTAssertFalse(issued.verify(pinnedCertPublicKeyX963: certPub, now: expiresAt + 1))
     }
 }
+
+/// The report pipeline's client half (docs/MODERATION.md): the request carries exactly what the
+/// reporter selected — category, words, optional decrypted text and media — addressed by device
+/// identity for group messages, and nothing more.
+final class ReportContentTests: XCTestCase {
+    func testReportEncodesOnlyTheReportersChoices() async throws {
+        StubURLProtocol.statusCode = 200
+        StubURLProtocol.responseBody = try JSONSerialization.data(withJSONObject: ["report_id": 7])
+        let client = NedwonsClient(
+            baseURL: URL(string: "https://unit.test")!, session: StubURLProtocol.session())
+
+        let media = Data([0xFF, 0xD8, 1, 2])
+        let id = try await client.reportContent(
+            accessToken: String(repeating: "a", count: 64),
+            deviceID: String(repeating: "b", count: 32),
+            reason: "illegal image",
+            category: "illegal_content",
+            evidence: "look at this",
+            conversationID: String(repeating: "c", count: 32),
+            messageID: String(repeating: "d", count: 32),
+            evidenceMedia: media,
+            evidenceMediaMime: "image/jpeg")
+        XCTAssertEqual(id, 7)
+
+        let request = try XCTUnwrap(StubURLProtocol.lastRequest)
+        XCTAssertEqual(request.url?.path, "/v1/reports")
+        var body = request.httpBody
+        if body == nil, let stream = request.httpBodyStream {
+            // URLSession moves httpBody into a stream before the protocol sees it.
+            stream.open()
+            var data = Data()
+            var buf = [UInt8](repeating: 0, count: 4096)
+            while stream.hasBytesAvailable {
+                let n = stream.read(&buf, maxLength: buf.count)
+                if n <= 0 { break }
+                data.append(buf, count: n)
+            }
+            body = data
+        }
+        let json = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: XCTUnwrap(body)) as? [String: Any])
+        XCTAssertEqual(json["device_id"] as? String, String(repeating: "b", count: 32))
+        XCTAssertNil(json["account_id"] as? String, "device-addressed report names no account")
+        XCTAssertEqual(json["category"] as? String, "illegal_content")
+        XCTAssertEqual(json["evidence"] as? String, "look at this")
+        XCTAssertEqual(json["evidence_media"] as? String, Hex.encode(media))
+        XCTAssertEqual(json["evidence_media_mime"] as? String, "image/jpeg")
+    }
+}

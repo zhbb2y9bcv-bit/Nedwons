@@ -46,3 +46,9 @@ user-initiated **reporting** (with explicit, user-selected decrypted evidence), 
 local pre-send **warnings**, account/behavior signals (rate/fanout/velocity), and
 device/attestation risk — **never** a hidden decryption capability or universal scanning.
 This is a deliberate, stated tradeoff.
+
+## Content moderation
+
+The report → review → ban pipeline (categories, evidence model, the review team's surface and
+tooling, what a ban does, and the honest limits) is specified in **docs/MODERATION.md** and
+implemented as of 2026-09-09 (migration V28).

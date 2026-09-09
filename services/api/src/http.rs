@@ -81,6 +81,12 @@ pub struct AppState {
     /// Shared across instances in production (`PgReplayCache`), so a captured proof cannot be
     /// replayed against a different instance inside the freshness window.
     proof_cache: Arc<dyn crate::proof::ReplayGuard>,
+    /// Report review + bans (docs/MODERATION.md). Always constructed — the ban check runs at the
+    /// auth gate regardless; the REVIEW endpoints additionally require `moderation_token`.
+    pub moderation: Arc<crate::moderation::PgModeration>,
+    /// The ops-held review-team secret. `None` ⇒ `/v1/moderation/*` answers 404 (hidden), which
+    /// is the correct default for a deployment that has not stood up a review process.
+    moderation_token: Option<Arc<str>>,
     /// Where attachment ciphertext is written. `None` disables the attachment endpoints entirely.
     pub blobs: Option<Arc<dyn BlobStore>>,
     /// ADR-0012 sender-certificate signing key, distinct from the auth/transparency keys. Its
@@ -185,6 +191,42 @@ pub fn build_router_with_blobs(
     require_proof: bool,
     blobs: Option<Arc<dyn BlobStore>>,
 ) -> Router {
+    // Review endpoints are OFF unless the deployment holds a review-team secret. Short tokens
+    // are refused outright: a guessable moderation token would be an account-ban oracle.
+    let moderation_token = std::env::var("NEDWONS_MODERATION_TOKEN")
+        .ok()
+        .filter(|t| t.len() >= 32);
+    build_router_full(
+        service,
+        relay,
+        social,
+        groups,
+        transparency,
+        membership,
+        per_ip_per_minute,
+        trusted_ip_header,
+        require_proof,
+        blobs,
+        moderation_token,
+    )
+}
+
+/// As [`build_router_with_blobs`], but the moderation token is supplied rather than read from the
+/// environment (tests; env vars are process-global and race between parallel tests).
+#[allow(clippy::too_many_arguments)]
+pub fn build_router_full(
+    service: Arc<AuthService>,
+    relay: Arc<PgRelay>,
+    social: Arc<PgSocial>,
+    groups: Arc<PgGroups>,
+    transparency: Arc<PgTransparency>,
+    membership: Arc<PgMembership>,
+    per_ip_per_minute: u32,
+    trusted_ip_header: Option<HeaderName>,
+    require_proof: bool,
+    blobs: Option<Arc<dyn BlobStore>>,
+    moderation_token: Option<String>,
+) -> Router {
     let quota =
         Quota::per_minute(NonZeroU32::new(per_ip_per_minute.max(1)).expect("max(1) is non-zero"));
     let notifier = DeliveryNotifier::default();
@@ -208,6 +250,7 @@ pub fn build_router_with_blobs(
     // transactions; taking it here keeps `build_router_cfg`'s signature unchanged for callers.
     let pool = relay.pool_clone();
     let relay_pool = relay.pool_clone();
+    let relay_pool2 = relay.pool_clone();
     let quota_pool = relay.pool_clone();
     let state = AppState {
         service,
@@ -230,6 +273,8 @@ pub fn build_router_with_blobs(
         sealed_limiter: Arc::new(RateLimiter::keyed(quota)),
         attest_config: crate::attest::AttestationConfig::from_env().map(Arc::new),
         blobs,
+        moderation: Arc::new(crate::moderation::PgModeration::new(relay_pool2)),
+        moderation_token: moderation_token.map(|t| Arc::from(t.into_boxed_str())),
     };
 
     // Relay routes accept larger bodies (opaque envelopes) than auth routes.
@@ -322,9 +367,28 @@ pub fn build_router_with_blobs(
         .route("/v1/friends/remove", post(friend_remove))
         .route("/v1/blocks", get(list_blocked).post(block_user))
         .route("/v1/blocks/remove", post(unblock_user))
-        .route("/v1/reports", post(create_report))
         .route("/v1/groups", post(create_group))
         .layer(RequestBodyLimitLayer::new(MAX_RELAY_BODY_BYTES));
+
+    // Reports may carry a reporter-submitted photo (decrypted on their device) as evidence, so
+    // they get a media-sized limit of their own rather than raising anyone else's.
+    let report_routes = Router::new()
+        .route("/v1/reports", post(create_report))
+        .layer(RequestBodyLimitLayer::new(MAX_REPORT_BODY_BYTES));
+
+    // The review team's surface (docs/MODERATION.md). Registered unconditionally; every handler
+    // first checks the deployment's moderation token and answers 404 when none is configured, so
+    // an unconfigured server shows no sign these routes exist.
+    let moderation_routes = Router::new()
+        .route("/v1/moderation/reports", get(moderation_list_reports))
+        .route("/v1/moderation/reports/{id}", get(moderation_get_report))
+        .route(
+            "/v1/moderation/reports/{id}/resolve",
+            post(moderation_resolve_report),
+        )
+        .route("/v1/moderation/bans", get(moderation_list_bans))
+        .route("/v1/moderation/unban", post(moderation_unban))
+        .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES));
 
     // Attachments carry megabytes, so they get their own body limit rather than raising the
     // relay's — a 25 MB ceiling on `/v1/friends/request` would be an abuse surface for nothing.
@@ -373,6 +437,8 @@ pub fn build_router_with_blobs(
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .merge(relay_routes)
         .merge(attachment_routes)
+        .merge(report_routes)
+        .merge(moderation_routes)
         .layer(middleware::from_fn_with_state(state.clone(), proof_layer))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .route("/healthz", get(|| async { "ok" }))
@@ -820,7 +886,17 @@ async fn authed_device(state: &AppState, headers: &HeaderMap) -> Result<AccountD
     let access_token =
         hex_exact(bearer, 32).map_err(|_| ApiError(StatusCode::UNAUTHORIZED, "denied"))?;
     let service = state.service.clone();
-    blocking(move || service.validate_access(&access_token)).await
+    let moderation = state.moderation.clone();
+    let who = blocking(move || service.validate_access(&access_token)).await?;
+    // Ban enforcement (docs/MODERATION.md): one indexed point read per authenticated request.
+    // Checked here, at the single gate every authed handler passes through, so a ban takes
+    // effect immediately — held tokens keep verifying but buy nothing.
+    let account = who.account_id;
+    let banned = blocking_store(move || moderation.is_banned(&account)).await?;
+    if banned {
+        return Err(ApiError(StatusCode::FORBIDDEN, "account_banned"));
+    }
+    Ok(who)
 }
 
 // ----- DTOs ----------------------------------------------------------------------------
@@ -1020,6 +1096,11 @@ async fn login_finish(
     let session = blocking(move || service.login_finish(&txn_id, &signature))
         .await
         .inspect_err(|_| crate::metrics::AUTH_FAILURES.incr())?;
+    let moderation = state.moderation.clone();
+    let account = session.account_id;
+    if blocking_store(move || moderation.is_banned(&account)).await? {
+        return Err(ApiError(StatusCode::FORBIDDEN, "account_banned"));
+    }
     crate::metrics::AUTH_SUCCESSES.incr();
     Ok(Json(session.into()))
 }
@@ -3851,15 +3932,43 @@ async fn list_blocked(
 
 const MAX_REPORT_REASON_CHARS: usize = 500;
 const MAX_REPORT_EVIDENCE_CHARS: usize = 16_384;
+/// Reporter-submitted media evidence cap (V28 CHECK agrees), plus hex + JSON overhead.
+const MAX_REPORT_MEDIA_BYTES: usize = 5 * 1024 * 1024;
+const MAX_REPORT_BODY_BYTES: usize = 11 * 1024 * 1024;
+const REPORT_CATEGORIES: [&str; 5] = [
+    "illegal_content",
+    "sexual_exploitation",
+    "threats_violence",
+    "spam_fraud",
+    "other",
+];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReportBody {
-    account_id: String,
+    /// The reported ACCOUNT — or supply `device_id` instead and the server resolves the account
+    /// (a group message's sender is known to the client only by its MLS device identity).
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    device_id: Option<String>,
     reason: String,
     /// Reporter-chosen; the server never derives this from E2EE content.
     #[serde(default)]
     evidence: Option<String>,
+    /// Legality category (docs/MODERATION.md); defaults to 'other'.
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    conversation_id: Option<String>,
+    #[serde(default)]
+    message_id: Option<String>,
+    /// The reported photo/file, decrypted by the reporter and re-uploaded as evidence (hex).
+    /// Never the E2EE blob id — the server has no key for that and must not pretend otherwise.
+    #[serde(default)]
+    evidence_media: Option<String>,
+    #[serde(default)]
+    evidence_media_mime: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -3876,10 +3985,6 @@ async fn create_report(
     // Reporting stays cheap for real users, but unbounded reporting is itself an abuse vector
     // (mass false reports to trigger moderation against a target).
     enforce_quota(&state, crate::quota::REPORTS, &me.account_id).await?;
-    let target = AccountId(id16_from_hex(&body.account_id)?);
-    if target.0 == me.account_id.0 {
-        return Err(bad_request());
-    }
     let reason = body.reason.trim().to_string();
     if reason.is_empty() || reason.chars().count() > MAX_REPORT_REASON_CHARS {
         return Err(bad_request());
@@ -3889,13 +3994,256 @@ async fn create_report(
             return Err(bad_request());
         }
     }
+    let category = body.category.as_deref().unwrap_or("other").to_string();
+    if !REPORT_CATEGORIES.contains(&category.as_str()) {
+        return Err(bad_request());
+    }
+    let conversation_id = body
+        .conversation_id
+        .as_deref()
+        .map(id16_from_hex)
+        .transpose()?;
+    let message_id = body.message_id.as_deref().map(id16_from_hex).transpose()?;
+    let media = body
+        .evidence_media
+        .as_deref()
+        .map(|h| hex::decode(h).map_err(|_| bad_request()))
+        .transpose()?;
+    if let Some(m) = &media {
+        if m.is_empty() || m.len() > MAX_REPORT_MEDIA_BYTES {
+            return Err(bad_request());
+        }
+    }
+    let media_mime = body
+        .evidence_media_mime
+        .clone()
+        .filter(|m| !m.is_empty() && m.len() <= 100 && m.bytes().all(|b| b.is_ascii_graphic()));
+
+    // The reported party: an account id directly, or a DEVICE id resolved server-side (how a
+    // group message's sender is identified — the client knows only the MLS credential identity).
+    let target_account = body
+        .account_id
+        .as_deref()
+        .map(id16_from_hex)
+        .transpose()?
+        .map(AccountId);
+    let target_device = body.device_id.as_deref().map(id16_from_hex).transpose()?;
+    if target_account.is_none() && target_device.is_none() {
+        return Err(bad_request());
+    }
+    let relay = state.relay.clone();
     let social = state.social.clone();
+    let moderation = state.moderation.clone();
     let evidence = body.evidence.clone();
-    let id = blocking_store(move || {
-        social.create_report(&me.account_id, &target, &reason, evidence.as_deref())
+    let reporter = me.account_id;
+    let outcome = blocking_store(move || {
+        let target = match (target_account, target_device) {
+            (Some(account), _) => account,
+            (None, Some(device)) => match relay.account_for_device(&DeviceId(device))? {
+                Some(account) => account,
+                // An unknown device is a malformed report, not a server fault: message senders
+                // are always enrolled devices, so this only happens to a hand-crafted request.
+                None => return Ok(Err(StatusCode::BAD_REQUEST)),
+            },
+            (None, None) => unreachable!("validated above"),
+        };
+        if target.0 == reporter.0 {
+            return Ok(Err(StatusCode::BAD_REQUEST));
+        }
+        let id = social.create_report(&reporter, &target, &reason, evidence.as_deref())?;
+        moderation.attach_report_details(
+            id,
+            &category,
+            conversation_id.as_ref(),
+            message_id.as_ref(),
+            media.as_deref(),
+            media_mime.as_deref(),
+        )?;
+        Ok(Ok(id))
     })
     .await?;
-    Ok(Json(ReportDto { report_id: id }))
+    match outcome {
+        Ok(id) => Ok(Json(ReportDto { report_id: id })),
+        Err(status) => Err(ApiError(status, "bad_request")),
+    }
+}
+
+// ----- Moderation review surface (docs/MODERATION.md) ---------------------------------
+
+/// The review-team gate: 404 when the deployment holds no moderation token (the surface does not
+/// exist), 401 on a wrong one. Constant-time comparison; the token never appears in logs (the
+/// redaction layer scrubs high-entropy values, and we never format it).
+fn moderation_guard(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let Some(expected) = &state.moderation_token else {
+        return Err(ApiError(StatusCode::NOT_FOUND, "not_found"));
+    };
+    let presented = headers
+        .get("x-moderation-token")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !auth_core::crypto::ct_eq(presented.as_bytes(), expected.as_bytes()) {
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "denied"));
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct ModerationReportDto {
+    id: i64,
+    reporter: String,
+    reported: String,
+    category: String,
+    reason: String,
+    evidence: Option<String>,
+    conversation_id: Option<String>,
+    message_id: Option<String>,
+    has_media: bool,
+    status: String,
+    created_at: i64,
+}
+
+impl From<crate::moderation::ReportRow> for ModerationReportDto {
+    fn from(r: crate::moderation::ReportRow) -> Self {
+        Self {
+            id: r.id,
+            reporter: hex::encode(r.reporter),
+            reported: hex::encode(r.reported),
+            category: r.category,
+            reason: r.reason,
+            evidence: r.evidence,
+            conversation_id: r.conversation_id.map(hex::encode),
+            message_id: r.message_id.map(hex::encode),
+            has_media: r.has_media,
+            status: r.status,
+            created_at: r.created_at_unix,
+        }
+    }
+}
+
+async fn moderation_list_reports(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    moderation_guard(&state, &headers)?;
+    let moderation = state.moderation.clone();
+    let reports = blocking_store(move || moderation.open_reports(100)).await?;
+    Ok(Json(serde_json::json!({
+        "reports": reports.into_iter().map(ModerationReportDto::from).collect::<Vec<_>>()
+    })))
+}
+
+async fn moderation_get_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    moderation_guard(&state, &headers)?;
+    let moderation = state.moderation.clone();
+    let found = blocking_store(move || moderation.report(id))
+        .await?
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))?;
+    let (row, media) = found;
+    Ok(Json(serde_json::json!({
+        "report": ModerationReportDto::from(row),
+        "evidence_media": media.as_ref().map(|(bytes, _)| hex::encode(bytes)),
+        "evidence_media_mime": media.map(|(_, mime)| mime),
+    })))
+}
+
+#[derive(Deserialize)]
+struct ResolveReportBody {
+    /// "ban" (actioned + account ban) or "dismiss".
+    action: String,
+    /// Who reviewed it — recorded in the audit trail.
+    reviewer: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+async fn moderation_resolve_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(body): Json<ResolveReportBody>,
+) -> Result<StatusCode, ApiError> {
+    moderation_guard(&state, &headers)?;
+    let reviewer = body.reviewer.trim().to_string();
+    if reviewer.is_empty() || reviewer.len() > 100 {
+        return Err(bad_request());
+    }
+    let ban = match body.action.as_str() {
+        "ban" => true,
+        "dismiss" => false,
+        _ => return Err(bad_request()),
+    };
+    let note = body.note.unwrap_or_default();
+    if note.len() > 2000 {
+        return Err(bad_request());
+    }
+    let moderation = state.moderation.clone();
+    let resolved = blocking_store(move || {
+        let Some((row, _)) = moderation.report(id)? else {
+            return Ok(None);
+        };
+        if !moderation.resolve_report(id, ban, &reviewer, &note)? {
+            return Ok(Some(false)); // already resolved — first reviewer won
+        }
+        if ban {
+            let why = if note.is_empty() {
+                format!("report #{id}: {}", row.category)
+            } else {
+                note.clone()
+            };
+            moderation.ban(&AccountId(row.reported), &why, &reviewer, Some(id))?;
+        }
+        Ok(Some(true))
+    })
+    .await?
+    .ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))?;
+    if resolved {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError(StatusCode::CONFLICT, "already_resolved"))
+    }
+}
+
+async fn moderation_list_bans(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    moderation_guard(&state, &headers)?;
+    let moderation = state.moderation.clone();
+    let bans = blocking_store(move || moderation.bans(200)).await?;
+    Ok(Json(serde_json::json!({
+        "bans": bans.into_iter().map(|b| serde_json::json!({
+            "account_id": hex::encode(b.account_id),
+            "reason": b.reason,
+            "banned_by": b.banned_by,
+            "report_id": b.report_id,
+            "created_at": b.created_at_unix,
+        })).collect::<Vec<_>>()
+    })))
+}
+
+#[derive(Deserialize)]
+struct UnbanBody {
+    account_id: String,
+}
+
+async fn moderation_unban(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<UnbanBody>,
+) -> Result<StatusCode, ApiError> {
+    moderation_guard(&state, &headers)?;
+    let account = AccountId(id16_from_hex(&body.account_id)?);
+    let moderation = state.moderation.clone();
+    let lifted = blocking_store(move || moderation.unban(&account)).await?;
+    if lifted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError(StatusCode::NOT_FOUND, "not_found"))
+    }
 }
 
 async fn friend_accept(

@@ -34,11 +34,15 @@ public struct ThreadLine: Identifiable, Sendable, Equatable {
     /// Retracted by its author (delete-for-everyone): rendered as "Message deleted", offers no
     /// reply/react/forward, and quotes as nothing.
     public let deleted: Bool
+    /// The sender's MLS device identity (hex), for REPORTING a group message's author — the
+    /// server resolves the device to its account. Empty for pre-field history.
+    public let senderDeviceID: String
 
     public init(
         id: UInt64, kind: Kind, mine: Bool, timestamp: Date? = nil, isPending: Bool = false,
         messageID: String = "", replyTo: String? = nil, reactions: [ReactionSummary] = [],
-        deliveredCount: Int = 0, readCount: Int = 0, deleted: Bool = false
+        deliveredCount: Int = 0, readCount: Int = 0, deleted: Bool = false,
+        senderDeviceID: String = ""
     ) {
         self.id = id
         self.kind = kind
@@ -51,6 +55,7 @@ public struct ThreadLine: Identifiable, Sendable, Equatable {
         self.deliveredCount = deliveredCount
         self.readCount = readCount
         self.deleted = deleted
+        self.senderDeviceID = senderDeviceID
     }
 
     /// The plain text of this line, for quoting it in a reply preview. A secret never yields one —
@@ -132,6 +137,7 @@ struct ConversationView: View {
     @State private var pickedItem: PhotosPickerItem?
     @State private var deleteCandidate: ThreadLine?
     @State private var forwardCandidate: ThreadLine?
+    @State private var reportCandidate: ThreadLine?
     private var palette: Nedwons.Palette { .forScheme(scheme) }
 
     var body: some View {
@@ -180,6 +186,9 @@ struct ConversationView: View {
         }
         .sheet(item: $forwardCandidate) { line in
             ForwardPickerView(model: model, line: line, sourceConversationID: chat.conversationID)
+        }
+        .sheet(item: $reportCandidate) { line in
+            ReportMessageSheet(model: model, line: line, chat: chat)
         }
         // The picker returns the image's own bytes; they are encrypted before anything leaves the
         // device, so what the relay receives is never the photo.
@@ -443,6 +452,13 @@ struct ConversationView: View {
                 deleteCandidate = line
             } label: {
                 Label("Delete for everyone", systemImage: "trash")
+            }
+        }
+        if !line.mine, !line.deleted {
+            Button(role: .destructive) {
+                reportCandidate = line
+            } label: {
+                Label("Report", systemImage: "flag")
             }
         }
     }

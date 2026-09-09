@@ -2335,6 +2335,10 @@ public struct StoredMessage {
      * Retracted by its author (delete-for-everyone): render "message deleted", body is gone.
      */
     public var deleted: Bool
+    /**
+     * The MLS-authenticated sender identity (device id bytes; empty for pre-field history).
+     */
+    public var sender: Data
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -2370,7 +2374,10 @@ public struct StoredMessage {
          */expiresAtMs: UInt64?, 
         /**
          * Retracted by its author (delete-for-everyone): render "message deleted", body is gone.
-         */deleted: Bool) {
+         */deleted: Bool, 
+        /**
+         * The MLS-authenticated sender identity (device id bytes; empty for pre-field history).
+         */sender: Data) {
         self.localId = localId
         self.direction = direction
         self.plaintext = plaintext
@@ -2386,6 +2393,7 @@ public struct StoredMessage {
         self.readCount = readCount
         self.expiresAtMs = expiresAtMs
         self.deleted = deleted
+        self.sender = sender
     }
 }
 
@@ -2441,6 +2449,9 @@ extension StoredMessage: Equatable, Hashable {
         if lhs.deleted != rhs.deleted {
             return false
         }
+        if lhs.sender != rhs.sender {
+            return false
+        }
         return true
     }
 
@@ -2460,6 +2471,7 @@ extension StoredMessage: Equatable, Hashable {
         hasher.combine(readCount)
         hasher.combine(expiresAtMs)
         hasher.combine(deleted)
+        hasher.combine(sender)
     }
 }
 
@@ -2486,7 +2498,8 @@ public struct FfiConverterTypeStoredMessage: FfiConverterRustBuffer {
                 deliveredCount: FfiConverterUInt32.read(from: &buf), 
                 readCount: FfiConverterUInt32.read(from: &buf), 
                 expiresAtMs: FfiConverterOptionUInt64.read(from: &buf), 
-                deleted: FfiConverterBool.read(from: &buf)
+                deleted: FfiConverterBool.read(from: &buf), 
+                sender: FfiConverterData.read(from: &buf)
         )
     }
 
@@ -2506,6 +2519,7 @@ public struct FfiConverterTypeStoredMessage: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.readCount, into: &buf)
         FfiConverterOptionUInt64.write(value.expiresAtMs, into: &buf)
         FfiConverterBool.write(value.deleted, into: &buf)
+        FfiConverterData.write(value.sender, into: &buf)
     }
 }
 
