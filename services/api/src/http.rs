@@ -370,6 +370,7 @@ pub fn build_router_full(
         .route("/v1/profile", get(get_my_profile).put(update_profile))
         .route("/v1/profile/{account_id}", get(get_profile_by_id))
         .route("/v1/profiles/search", get(search_profiles))
+        .route("/v1/usernames/available", get(username_available))
         .route("/v1/friends", get(list_friends))
         .route("/v1/friends/requests", get(list_friend_requests))
         .route("/v1/friends/request", post(friend_request))
@@ -3839,6 +3840,46 @@ async fn get_profile_by_id(
         .await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))?;
     Ok(Json(profile_dto(profile)))
+}
+
+#[derive(Deserialize)]
+struct AvailabilityQuery {
+    u: String,
+}
+
+/// Pre-registration availability check (unauthenticated — there is no account yet). This reveals
+/// nothing new: registration itself already answers 409 for a taken name, and usernames are
+/// deliberately discoverable by prefix search. The per-IP rate limiter is the enumeration bound,
+/// exactly as it is for registration attempts. An INVALID candidate reports as unavailable with
+/// the reason, so the client can show why before anyone submits a form.
+async fn username_available(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<AvailabilityQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let Ok(normalized) = auth_core::normalize_username(&query.u) else {
+        return Ok(Json(serde_json::json!({
+            "available": false,
+            "reason": "invalid"
+        })));
+    };
+    let pool = state.pool.clone();
+    let taken = tokio::task::spawn_blocking(move || -> Result<bool, ()> {
+        let mut conn = pool.get().map_err(|_| ())?;
+        Ok(conn
+            .query_opt(
+                "SELECT 1 FROM accounts WHERE username_normalized = $1",
+                &[&normalized],
+            )
+            .map_err(|_| ())?
+            .is_some())
+    })
+    .await
+    .map_err(|_| internal())?
+    .map_err(|_| internal())?;
+    Ok(Json(serde_json::json!({
+        "available": !taken,
+        "reason": if taken { "taken" } else { "ok" }
+    })))
 }
 
 async fn search_profiles(

@@ -700,3 +700,20 @@ pub async fn http_register(app: &Router, username: &str) -> (TestDevice, Value) 
     assert_eq!(status, StatusCode::OK, "register finish: {session}");
     (device, session)
 }
+
+/// Unauthenticated GET returning JSON.
+#[allow(dead_code)]
+pub async fn get_json(app: &Router, path: &str) -> (StatusCode, Value) {
+    use tower::ServiceExt;
+    let request = axum::http::Request::builder()
+        .method("GET")
+        .uri(path)
+        .body(axum::body::Body::empty())
+        .expect("request");
+    let response = app.clone().oneshot(request).await.expect("response");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+}

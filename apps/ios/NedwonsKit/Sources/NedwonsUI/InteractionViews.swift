@@ -131,3 +131,36 @@ struct ForwardPickerView: View {
         }
     }
 }
+
+/// A curated reaction grid beyond the six quick ones — enough coverage without a full system
+/// emoji keyboard (which is a text-input feature, not a picker component Apple exposes).
+struct ReactionPickerSheet: View {
+    @ObservedObject var model: AppModel
+    let line: ThreadLine
+    let conversationID: String
+    @Environment(\.dismiss) private var dismiss
+
+    static let emoji: [String] = [
+        "👍", "👎", "❤️", "🔥", "🎉", "😂", "🤣", "😮", "😢", "😡",
+        "🙏", "👏", "💯", "✅", "❌", "❓", "‼️", "🤝", "🫡", "🤔",
+        "😍", "🥳", "😴", "🤯", "🙄", "😅", "🤷", "🫶", "💀", "🌟",
+        "🍀", "☕️", "🍕", "⚽️", "🎵", "📸", "✈️", "🏠", "⏰", "💡",
+    ]
+
+    var body: some View {
+        ScrollView {
+            LazyVGrid(columns: Array(repeating: GridItem(.flexible()), count: 8),
+                      spacing: Nedwons.Spacing.md) {
+                ForEach(Self.emoji, id: \.self) { emoji in
+                    Button(emoji) {
+                        dismiss()
+                        Task { await model.toggleReaction(emoji, on: line, in: conversationID) }
+                    }
+                    .font(.system(size: 28))
+                    .accessibilityLabel("React with \(emoji)")
+                }
+            }
+            .padding(Nedwons.Spacing.lg)
+        }
+    }
+}

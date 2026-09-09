@@ -133,7 +133,12 @@ struct ChatsListView: View {
     /// Derived from the server's conversation list (routing metadata only) joined with local
     /// display state. Previews come from decrypted on-device history, never from the relay.
     private var chats: [ChatSummary] {
-        sortedByRecency(model.chatSummaries)
+        sortedForChatList(model.chatSummaries, prefs: model.chatPrefs)
+    }
+
+    private var archivedChats: [ChatSummary] {
+        sortedByRecency(
+            model.chatSummaries.filter { model.chatPrefs.archived.contains($0.conversationID) })
     }
 
     /// Message hits, newest first; tapping opens the conversation. (Jump-to-message inside the
@@ -146,7 +151,10 @@ struct ChatsListView: View {
             }
             ForEach(model.messageSearchHits) { hit in
                 Button {
-                    if let chat = chats.first(where: { $0.conversationID == hit.conversationID }) {
+                    if let chat = model.chatSummaries.first(where: {
+                        $0.conversationID == hit.conversationID
+                    }) {
+                        model.pendingScrollTarget[hit.conversationID] = hit.localID
                         searchQuery = ""
                         path.append(chat)
                     }
@@ -183,24 +191,76 @@ struct ChatsListView: View {
     private var list: some View {
         List {
             ForEach(chats) { chat in
-                NavigationLink(value: chat) {
-                    ChatRow(model: model, chat: chat, palette: palette)
+                chatRow(chat)
+            }
+            if !archivedChats.isEmpty {
+                NavigationLink {
+                    ArchivedChatsView(model: model)
+                } label: {
+                    Label("Archived (\(archivedChats.count))", systemImage: "archivebox")
+                        .foregroundStyle(palette.textSecondary)
                 }
-                // Stable handle for the XCUITest suite (apps/ios/Nedwons/UITests).
-                .accessibilityIdentifier("chats.row.\(chat.conversationID)")
-                .contextMenu {
-                    Button("Delete conversation", systemImage: "trash", role: .destructive) {
-                        pendingDelete = chat
-                    }
-                }
-                .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                    Button(role: .destructive) { pendingDelete = chat } label: {
-                        Label("Delete", systemImage: "trash")
-                    }
-                }
+                .accessibilityIdentifier("chats.archived")
             }
         }
         .listStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func chatRow(_ chat: ChatSummary) -> some View {
+        NavigationLink(value: chat) {
+            HStack(spacing: Nedwons.Spacing.xs) {
+                ChatRow(model: model, chat: chat, palette: palette)
+                if model.chatPrefs.pinned.contains(chat.conversationID) {
+                    Image(systemName: "pin.fill")
+                        .imageScale(.small)
+                        .foregroundStyle(palette.textSecondary)
+                        .accessibilityLabel("Pinned")
+                }
+                if model.chatPrefs.muted.contains(chat.conversationID) {
+                    Image(systemName: "bell.slash.fill")
+                        .imageScale(.small)
+                        .foregroundStyle(palette.textSecondary)
+                        .accessibilityLabel("Muted")
+                }
+            }
+        }
+        // Stable handle for the XCUITest suite (apps/ios/Nedwons/UITests).
+        .accessibilityIdentifier("chats.row.\(chat.conversationID)")
+        .contextMenu {
+            Button("Delete conversation", systemImage: "trash", role: .destructive) {
+                pendingDelete = chat
+            }
+        }
+        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+            Button {
+                model.togglePinned(chat.conversationID)
+            } label: {
+                Label(
+                    model.chatPrefs.pinned.contains(chat.conversationID) ? "Unpin" : "Pin",
+                    systemImage: "pin")
+            }
+            .tint(.orange)
+        }
+        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+            Button(role: .destructive) { pendingDelete = chat } label: {
+                Label("Delete", systemImage: "trash")
+            }
+            Button {
+                model.toggleArchived(chat.conversationID)
+            } label: {
+                Label("Archive", systemImage: "archivebox")
+            }
+            .tint(.indigo)
+            Button {
+                model.toggleMuted(chat.conversationID)
+            } label: {
+                Label(
+                    model.chatPrefs.muted.contains(chat.conversationID) ? "Unmute" : "Mute",
+                    systemImage: "bell.slash")
+            }
+            .tint(.gray)
+        }
     }
 
     private var emptyState: some View {
@@ -292,5 +352,41 @@ struct Avatar: View {
 
     private var initial: String {
         String(label.trimmingCharacters(in: .whitespaces).prefix(1)).uppercased()
+    }
+}
+
+/// Archived chats: hidden from the main list, one tap away, un-archive by swipe. Local
+/// presentation state only — nothing about archiving reaches the relay.
+struct ArchivedChatsView: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.colorScheme) private var scheme
+    private var palette: Nedwons.Palette { .forScheme(scheme) }
+
+    private var chats: [ChatSummary] {
+        sortedByRecency(
+            model.chatSummaries.filter { model.chatPrefs.archived.contains($0.conversationID) })
+    }
+
+    var body: some View {
+        List {
+            ForEach(chats) { chat in
+                NavigationLink {
+                    ConversationView(model: model, chat: chat)
+                } label: {
+                    ChatRow(model: model, chat: chat, palette: palette)
+                }
+                .swipeActions(edge: .trailing) {
+                    Button {
+                        model.toggleArchived(chat.conversationID)
+                    } label: {
+                        Label("Unarchive", systemImage: "tray.and.arrow.up")
+                    }
+                    .tint(.indigo)
+                }
+            }
+        }
+        .listStyle(.plain)
+        .navigationTitle("Archived")
+        .inlineNavigationTitle()
     }
 }

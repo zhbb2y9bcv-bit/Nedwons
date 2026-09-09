@@ -249,6 +249,7 @@ public final class AppModel: ObservableObject {
         devices = []
         deviceAssurance = nil
         verifiedPeers = [] // published copy only; the per-account persisted set survives sign-out
+        chatPrefs = ChatPrefs()
         phase = .unauthenticated
     }
 
@@ -382,6 +383,7 @@ public final class AppModel: ObservableObject {
 
     private func loadInitial() async {
         loadVerifiedPeers() // local-only; before any network so badges render immediately
+        loadChatPrefs()
         guard let token else { return }
         myProfile = try? await client.myProfile(accessToken: token)
         friends = (try? await client.listFriends(accessToken: token)) ?? []
@@ -421,6 +423,44 @@ public final class AppModel: ObservableObject {
     /// Persists `verifiedPeers` across launches, keyed by the signed-in account. Replaceable in
     /// tests; the default keeps it in `UserDefaults` (it holds no secrets — account ids only).
     public var verifiedPeersStore: VerifiedPeersStoring = UserDefaultsVerifiedPeersStore()
+
+    /// Per-chat local presentation preferences (pin / archive / mute). Never sent to the relay.
+    @Published public internal(set) var chatPrefs = ChatPrefs()
+    public var chatPrefsStore: ChatPrefsStoring = UserDefaultsChatPrefsStore()
+
+    public func loadChatPrefs() {
+        guard let account = session?.accountID else { return }
+        chatPrefs = chatPrefsStore.load(account: account)
+    }
+
+    private func saveChatPrefs() {
+        guard let account = session?.accountID else { return }
+        chatPrefsStore.save(chatPrefs, account: account)
+    }
+
+    public func togglePinned(_ conversationID: String) {
+        if chatPrefs.pinned.remove(conversationID) == nil {
+            chatPrefs.pinned.insert(conversationID)
+        }
+        saveChatPrefs()
+    }
+
+    public func toggleArchived(_ conversationID: String) {
+        if chatPrefs.archived.remove(conversationID) == nil {
+            chatPrefs.archived.insert(conversationID)
+        }
+        saveChatPrefs()
+    }
+
+    public func toggleMuted(_ conversationID: String) {
+        if chatPrefs.muted.remove(conversationID) == nil {
+            chatPrefs.muted.insert(conversationID)
+        }
+        saveChatPrefs()
+    }
+
+    /// The scroll target a search hit or a reply-quote tap asked for, consumed by the thread view.
+    @Published public var pendingScrollTarget: [String: UInt64] = [:]
 
     /// True while a link pass is running (drives the Devices button's spinner).
     @Published public var isLinking = false

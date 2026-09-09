@@ -76,22 +76,39 @@ struct RegisterView: View {
     @State private var password = ""
     @State private var confirmPassword = ""
     @State private var acceptedPermanence = false
+    @State private var availability: Availability = .unknown
+    @State private var availabilityTask: Task<Void, Never>?
     private var palette: Nedwons.Palette { .forScheme(scheme) }
+
+    enum Availability: Equatable {
+        case unknown, checking, available, taken
+    }
 
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    TextField("Username", text: $username)
-                        .usernameInput()
+                    HStack {
+                        TextField("Username", text: $username)
+                            .usernameInput()
+                        availabilityBadge
+                    }
                     if let problem = usernameProblem {
                         Text(problem).font(Nedwons.TypeScale.caption).foregroundStyle(.orange)
+                    } else if availability == .taken {
+                        Text("That username is taken.")
+                            .font(Nedwons.TypeScale.caption)
+                            .foregroundStyle(.orange)
+                            .accessibilityIdentifier("register.taken")
                     }
                 } header: {
                     Text("Username")
                 } footer: {
                     Text("Your username is permanent and cannot be changed later.")
                         .foregroundStyle(.orange)
+                }
+                .onChange(of: username) { _, candidate in
+                    checkAvailability(of: candidate)
                 }
 
                 Section("Password") {
@@ -142,6 +159,48 @@ struct RegisterView: View {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }.disabled(model.isBusy)
                 }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var availabilityBadge: some View {
+        switch availability {
+        case .checking:
+            ProgressView().controlSize(.small)
+        case .available:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(palette.verified)
+                .accessibilityLabel("Username available")
+        case .taken:
+            Image(systemName: "xmark.circle.fill")
+                .foregroundStyle(.orange)
+                .accessibilityLabel("Username taken")
+        case .unknown:
+            EmptyView()
+        }
+    }
+
+    /// Debounced live check. Failure (offline, rate-limited) quietly returns to `unknown` — the
+    /// authoritative answer is registration itself; this is a convenience, never a gate.
+    private func checkAvailability(of candidate: String) {
+        availabilityTask?.cancel()
+        let trimmed = candidate.trimmingCharacters(in: .whitespaces)
+        guard usernameProblem == nil, trimmed.count >= 3 else {
+            availability = .unknown
+            return
+        }
+        availability = .checking
+        availabilityTask = Task {
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard !Task.isCancelled else { return }
+            do {
+                let free = try await model.client.usernameAvailable(trimmed)
+                guard !Task.isCancelled else { return }
+                availability = free ? .available : .taken
+            } catch {
+                guard !Task.isCancelled else { return }
+                availability = .unknown
             }
         }
     }

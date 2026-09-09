@@ -298,3 +298,53 @@ final class MediaHelperTests: XCTestCase {
         XCTAssertEqual(model.banner?.contains("25 MB") , true)
     }
 }
+
+/// Chat-list preferences (arc H): local, per-account, and the ordering they produce.
+@MainActor
+final class ChatPrefsTests: XCTestCase {
+    private func chat(_ id: String, activity: TimeInterval) -> ChatSummary {
+        ChatSummary(conversationID: id, lastActivity: Date(timeIntervalSince1970: activity))
+    }
+
+    func testPinnedFloatAndArchivedHide() {
+        var prefs = ChatPrefs()
+        prefs.pinned = ["old-pinned"]
+        prefs.archived = ["archived"]
+        let ordered = sortedForChatList(
+            [
+                chat("newest", activity: 300),
+                chat("old-pinned", activity: 100),
+                chat("archived", activity: 400),
+                chat("middle", activity: 200),
+            ],
+            prefs: prefs)
+        XCTAssertEqual(
+            ordered.map(\.conversationID), ["old-pinned", "newest", "middle"],
+            "pins float above recency; archived never appears")
+    }
+
+    func testPrefsPersistPerAccountAndToggleCleanly() {
+        let store = MemoryChatPrefsStore()
+        let model = AppModel(baseURL: URL(string: "http://127.0.0.1:1")!)
+        model.chatPrefsStore = store
+        model.session = NedwonsClient.Session(
+            accountID: "acct-a", deviceID: "d", accessToken: "t", accessExpiresAt: .max,
+            refreshToken: "r", refreshExpiresAt: .max)
+
+        model.togglePinned("c1")
+        model.toggleMuted("c2")
+        model.toggleArchived("c3")
+        XCTAssertEqual(store.byAccount["acct-a"]?.pinned, ["c1"])
+        XCTAssertEqual(store.byAccount["acct-a"]?.muted, ["c2"])
+        XCTAssertEqual(store.byAccount["acct-a"]?.archived, ["c3"])
+        model.togglePinned("c1")
+        XCTAssertEqual(store.byAccount["acct-a"]?.pinned, [])
+
+        // A different account loads a clean slate.
+        model.session = NedwonsClient.Session(
+            accountID: "acct-b", deviceID: "d", accessToken: "t", accessExpiresAt: .max,
+            refreshToken: "r", refreshExpiresAt: .max)
+        model.loadChatPrefs()
+        XCTAssertEqual(model.chatPrefs, ChatPrefs())
+    }
+}
