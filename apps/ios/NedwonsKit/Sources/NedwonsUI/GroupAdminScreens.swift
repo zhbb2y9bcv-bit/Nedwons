@@ -203,6 +203,11 @@ struct GroupAdminView: View {
                     .font(Nedwons.TypeScale.caption)
                     .foregroundStyle(palette.textSecondary)
                 if isAdmin {
+                    // .borderless on every button here: a Form row containing multiple plain
+                    // Buttons is ONE tap target that fires ALL of their actions on a single tap
+                    // (so "Name this group" also queued the photo picker, which then presented
+                    // the moment the rename sheet dismissed). Borderless buttons keep their own
+                    // hit regions inside the row.
                     Button {
                         draftName = model.groupName(for: chat.conversationID) ?? ""
                         showRename = true
@@ -211,6 +216,7 @@ struct GroupAdminView: View {
                             model.groupName(for: chat.conversationID) == nil ? "Name this group" : "Change name",
                             systemImage: "pencil")
                     }
+                    .buttonStyle(.borderless)
                     .font(Nedwons.TypeScale.caption)
                     .accessibilityIdentifier(GroupAdminA11y.rename)
                     HStack(spacing: Nedwons.Spacing.lg) {
@@ -222,11 +228,13 @@ struct GroupAdminView: View {
                                     ? "Set photo" : "Change photo",
                                 systemImage: "camera")
                         }
+                        .buttonStyle(.borderless)
                         .accessibilityIdentifier("group.avatar.set")
                         if model.groupAvatars[chat.conversationID] != nil {
                             Button("Remove photo", role: .destructive) {
                                 Task { await model.setGroupAvatar(nil, in: chat.conversationID) }
                             }
+                            .buttonStyle(.borderless)
                         }
                     }
                     .font(Nedwons.TypeScale.caption)

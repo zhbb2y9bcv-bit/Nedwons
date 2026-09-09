@@ -236,6 +236,9 @@ final class GroupAdminUITests: XCTestCase {
         field.tap()
         field.typeText("Weekend Trip")
         waitFor(app.buttons["Save"].firstMatch).tap()
+        // Let the sheet finish dismissing before navigating: the title predicate below turns true
+        // the moment the model updates, while the sheet is still mid-flight.
+        wait("exists == false", on: app.navigationBars["Group name"].firstMatch)
         wait("label == 'Weekend Trip'", on: element(app, "group.title"))
 
         app.navigationBars.buttons.element(boundBy: 0).tap()  // back to the conversation
