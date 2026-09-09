@@ -54,6 +54,10 @@ const MAX_INBOX_WAIT_SECS: u64 = 30;
 #[derive(Clone)]
 pub struct AppState {
     pub service: Arc<AuthService>,
+    /// The shared connection pool every store is built from. Handlers that need two stores to
+    /// agree run them through [`crate::tx::transaction`] on one connection instead of letting each
+    /// store check out its own (which would make the work two transactions by construction).
+    pub pool: crate::pgstore::PgPool,
     pub relay: Arc<PgRelay>,
     pub social: Arc<PgSocial>,
     pub groups: Arc<PgGroups>,
@@ -156,8 +160,12 @@ pub fn build_router_cfg(
         }));
     }
 
+    // All stores are constructed from one pool, so any of them can hand it back for cross-store
+    // transactions; taking it here keeps `build_router_cfg`'s signature unchanged for callers.
+    let pool = relay.pool_clone();
     let state = AppState {
         service,
+        pool,
         relay,
         social,
         groups,
@@ -265,6 +273,10 @@ pub fn build_router_cfg(
         // password change (device-signed + current-password): two stages
         .route("/v1/session/password/begin", post(password_change_begin))
         .route("/v1/session/password/finish", post(password_change_finish))
+        // In-app account deletion (App Store requirement): challenge, then an irreversible
+        // DELETE carrying the device signature and the password.
+        .route("/v1/account/delete/begin", post(account_delete_begin))
+        .route("/v1/account", axum::routing::delete(account_delete))
         // controlled multi-device (ADR-0008): enroll a new device via a trusted device, list, revoke
         .route("/v1/devices", get(list_devices_handler))
         .route("/v1/devices/enroll/begin", post(enroll_begin))
@@ -908,6 +920,69 @@ async fn password_change_finish(
             &body.current_password,
             &body.new_password,
         )
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ----- account deletion (device-signed + password) ------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountDeleteBody {
+    txn_id: String,
+    /// Device signature over the `AccountDelete` transcript (128 hex chars).
+    signature: String,
+    password: String,
+}
+
+/// Stage 1: issue an `AccountDelete` challenge for the authenticated device to sign.
+async fn account_delete_begin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ChallengeDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let service = state.service.clone();
+    let ch = blocking(move || service.account_delete_begin(&me)).await?;
+    Ok(Json(ChallengeDto {
+        account_id: hex::encode(ch.account_id.as_bytes()),
+        device_id: hex::encode(ch.device_id.as_bytes()),
+        txn_id: hex::encode(ch.txn_id.as_bytes()),
+        nonce: hex::encode(ch.nonce),
+        expires_at: ch.expires_at,
+    }))
+}
+
+/// Stage 2: irreversible. Requires BOTH the device signature and the password, so neither a
+/// stolen access token nor a leaked password alone can destroy an account.
+///
+/// Reauthentication and erasure are separate steps on purpose: the auth service decides *who you
+/// are*, then the erasure runs as ONE cross-store transaction (see `account_deletion`), because an
+/// account's data spans every store and only two tables cascade from `accounts`.
+async fn account_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AccountDeleteBody>,
+) -> Result<StatusCode, ApiError> {
+    if body.password.len() > 1024 {
+        return Err(bad_request());
+    }
+    let me = authed_device(&state, &headers).await?;
+    let txn_id = txn_from_hex(&body.txn_id)?;
+    let signature = hex_exact(&body.signature, 64)?;
+
+    let service = state.service.clone();
+    let verified_me = me;
+    blocking(move || {
+        service.account_delete_verify(&verified_me, &txn_id, &signature, &body.password)
+    })
+    .await?;
+
+    let pool = state.pool.clone();
+    blocking_store(move || {
+        crate::tx::transaction(&pool, |txn| {
+            crate::account_deletion::delete_account_in_txn(txn, &me.account_id)
+        })
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1753,16 +1828,20 @@ async fn create_conversation(
     let me = authed_device(&state, &headers).await?;
     let mls_authoritative = body.map(|b| b.0.mls_authoritative).unwrap_or(false);
     let conversation_id = auth_core::crypto::random_bytes::<16>();
-    let relay = state.relay.clone();
-    let groups = state.groups.clone();
+    // One transaction: a conversation created without its first admin can never acquire one
+    // (`promote` requires an existing admin), so these must not be separately committed.
+    let pool = state.pool.clone();
     blocking_store(move || {
-        relay.create_conversation(
-            conversation_id,
-            me.account_id,
-            me.device_id,
-            mls_authoritative,
-        )?;
-        groups.bootstrap_admin(&conversation_id, &me.account_id)
+        crate::tx::transaction(&pool, |txn| {
+            PgRelay::create_conversation_in_txn(
+                txn,
+                conversation_id,
+                me.account_id,
+                me.device_id,
+                mls_authoritative,
+            )?;
+            PgGroups::bootstrap_admin_in_txn(txn, &conversation_id, &me.account_id)
+        })
     })
     .await?;
     Ok(Json(ConversationDto {
@@ -1897,8 +1976,27 @@ fn is_conversation_admin(
     conversation_id: &[u8; 16],
     me: &AccountDevice,
 ) -> auth_core::store::StoreResult<bool> {
-    Ok(state.relay.is_member(conversation_id, &me.device_id)?
-        && state.groups.is_admin(conversation_id, &me.account_id)?)
+    // Both halves in ONE transaction. Read on two pooled connections these could disagree — the
+    // caller could be seen as a member by one and as an admin by the other across a concurrent
+    // removal or demotion, and the answer would describe a state that never existed.
+    crate::tx::transaction(&state.pool, |txn| {
+        is_conversation_admin_in_txn(txn, conversation_id, me)
+    })
+}
+
+/// As [`is_conversation_admin`], but joins a caller-owned transaction so the authorization and the
+/// write it authorizes commit together. Prefer this in any handler that already owns a
+/// transaction: the standalone form leaves a gap in which the caller can be demoted or removed
+/// after passing the check and before its effect lands.
+fn is_conversation_admin_in_txn(
+    txn: &mut postgres::Transaction<'_>,
+    conversation_id: &[u8; 16],
+    me: &AccountDevice,
+) -> auth_core::store::StoreResult<bool> {
+    Ok(
+        PgRelay::is_member_account_in_txn(txn, conversation_id, &me.device_id)?
+            && PgGroups::is_admin_in_txn(txn, conversation_id, &me.account_id)?,
+    )
 }
 
 async fn create_invite(
@@ -2007,15 +2105,19 @@ async fn accept_invite(
 ) -> Result<Json<AcceptInviteDto>, ApiError> {
     let me = authed_device(&state, &headers).await?;
     let token = token32_from_hex(&body.invite_token)?;
-    let groups = state.groups.clone();
-    let relay = state.relay.clone();
+    let pool = state.pool.clone();
     let outcome = blocking_store(move || {
-        let outcome = groups.accept_invite(&token, &me.account_id)?;
-        if let InviteOutcome::Joined { conversation_id } = &outcome {
-            // The caller's own device only.
-            relay.add_member(conversation_id, me.account_id, me.device_id)?;
-        }
-        Ok(outcome)
+        // Burning the invite use and adding the membership are ONE transaction: separately
+        // committed, a failure in between spends the joiner's one chance to join without joining
+        // them, and the invite's use budget is corrupted with nothing to show for it.
+        crate::tx::transaction(&pool, |txn| {
+            let outcome = PgGroups::accept_invite_in_txn(txn, &token, &me.account_id)?;
+            if let InviteOutcome::Joined { conversation_id } = &outcome {
+                // The caller's own device only.
+                PgRelay::add_member_in_txn(txn, conversation_id, me.account_id, me.device_id)?;
+            }
+            Ok(outcome)
+        })
     })
     .await?;
     match outcome {
@@ -2062,21 +2164,33 @@ async fn approve_join_request(
     reject_if_authoritative(&state, &conversation_id).await?;
     let st = state.clone();
     let approved = blocking_store(move || {
-        if !is_conversation_admin(&st, &conversation_id, &me)? {
-            return Ok(None);
-        }
-        // Blocks are re-checked at approval time inside approve_join_request.
-        if !st.groups.approve_join_request(&conversation_id, &target)? {
-            return Ok(Some(false));
-        }
+        // Resolve the target's device BEFORE opening the transaction: the auth service owns its
+        // own connection, so calling it mid-transaction would check out a second one and could
+        // deadlock against a saturated pool. A device that disappears between here and the commit
+        // is handled below by simply not admitting the target.
         let device = st
             .service
             .active_device(&target)
             .map_err(|_| auth_core::store::StoreError("device lookup".into()))?;
-        if let Some(device_id) = device {
-            st.relay.add_member(&conversation_id, target, device_id)?;
-        }
-        Ok(Some(true))
+
+        // Consuming the join request and adding the membership are ONE transaction: separately
+        // committed, a failure in between destroys the request without admitting the user, who
+        // then cannot re-request except via a fresh invite.
+        crate::tx::transaction(&st.pool, |txn| {
+            // Authorization inside the same transaction as its effect: the approver cannot be
+            // demoted or removed between passing this check and the membership landing.
+            if !is_conversation_admin_in_txn(txn, &conversation_id, &me)? {
+                return Ok(None);
+            }
+            // Blocks are re-checked at approval time inside approve_join_request_in_txn.
+            if !PgGroups::approve_join_request_in_txn(txn, &conversation_id, &target)? {
+                return Ok(Some(false));
+            }
+            if let Some(device_id) = device {
+                PgRelay::add_member_in_txn(txn, &conversation_id, target, device_id)?;
+            }
+            Ok(Some(true))
+        })
     })
     .await?
     .ok_or_else(forbidden)?;

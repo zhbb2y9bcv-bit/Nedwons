@@ -376,6 +376,35 @@ pub async fn post_json(app: &Router, path: &str, body: Value) -> (StatusCode, Va
 }
 
 /// Authenticated POST/GET with a Bearer access token.
+/// Authenticated DELETE carrying a JSON body (account deletion sends its reauth proof this way).
+pub async fn delete_json_auth(
+    app: &Router,
+    path: &str,
+    token: &str,
+    body: Value,
+) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::delete(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::from(body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    let status = response.status();
+    let bytes = response
+        .into_body()
+        .collect()
+        .await
+        .expect("body")
+        .to_bytes();
+    let value: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+    (status, value)
+}
+
 pub async fn post_json_auth(
     app: &Router,
     path: &str,

@@ -21,6 +21,38 @@ pub struct PgGroups {
     pool: PgPool,
 }
 
+/// A stable advisory-lock key for one conversation's governance state.
+///
+/// The "never zero admins" and "never an orphan conversation" rules are both `count(*)`-then-act,
+/// and at READ COMMITTED a count is not a reservation. Two demotions of two DIFFERENT admins touch
+/// different rows, so no row-level conflict ever arises and both commit against the same stale
+/// count — leaving a populated group unmanageable, permanently, because `promote` itself requires
+/// an existing admin. Row locks cannot fix this: the danger is a phantom (the set changing size),
+/// not one contended row.
+///
+/// So governance mutations serialize per conversation, using the same `pg_advisory_xact_lock`
+/// idiom `transparency.rs` uses for gapless appends. The lock is held until the transaction ends,
+/// and different conversations never contend.
+fn conversation_lock_key(conversation_id: &[u8; 16]) -> i64 {
+    i64::from_be_bytes(
+        auth_core::crypto::sha256(conversation_id)[..8]
+            .try_into()
+            .expect("8 bytes"),
+    )
+}
+
+fn lock_conversation(
+    txn: &mut postgres::Transaction<'_>,
+    conversation_id: &[u8; 16],
+) -> StoreResult<()> {
+    txn.execute(
+        "SELECT pg_advisory_xact_lock($1)",
+        &[&conversation_lock_key(conversation_id)],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
 /// Outcome of presenting an invite token.
 #[derive(Debug, PartialEq, Eq)]
 pub enum InviteOutcome {
@@ -82,6 +114,9 @@ impl PgGroups {
     pub fn promote(&self, conversation_id: &[u8; 16], account: &AccountId) -> StoreResult<bool> {
         let mut conn = self.conn()?;
         let mut txn = conn.transaction().map_err(db_err)?;
+        // Same governance lock as demote/leave: the membership check below and the admin INSERT
+        // must not straddle a concurrent removal, which would leave an admin who is not a member.
+        lock_conversation(&mut txn, conversation_id)?;
         let member = txn
             .query_opt(
                 "SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND account_id = $2",
@@ -107,6 +142,9 @@ impl PgGroups {
     pub fn demote(&self, conversation_id: &[u8; 16], account: &AccountId) -> StoreResult<bool> {
         let mut conn = self.conn()?;
         let mut txn = conn.transaction().map_err(db_err)?;
+        // Without this, concurrent demotions of two different admins both pass the last-admin
+        // guard below and both commit, zeroing the admin set.
+        lock_conversation(&mut txn, conversation_id)?;
         let admins: i64 = txn
             .query_one(
                 "SELECT count(*) FROM group_admins WHERE conversation_id = $1",
@@ -222,6 +260,23 @@ impl PgGroups {
     ) -> StoreResult<InviteOutcome> {
         let mut conn = self.conn()?;
         let mut txn = conn.transaction().map_err(db_err)?;
+        let outcome = Self::accept_invite_in_txn(&mut txn, token, joiner)?;
+        txn.commit().map_err(db_err)?;
+        Ok(outcome)
+    }
+
+    /// As [`Self::accept_invite`], but joins a caller-owned transaction.
+    ///
+    /// This burns an invite USE. The caller must add the resulting routing membership in the SAME
+    /// transaction: committed separately, a failure in between spends the joiner's one chance to
+    /// join without joining them, and the invite's use budget is corrupted with nothing to show
+    /// for it. Every `Refused` path returns before any write, so a caller committing after a
+    /// refusal commits nothing.
+    pub fn accept_invite_in_txn(
+        txn: &mut postgres::Transaction<'_>,
+        token: &[u8; 32],
+        joiner: &AccountId,
+    ) -> StoreResult<InviteOutcome> {
         // Lock the invite row so concurrent accepts serialize on the use counter.
         let row = txn
             .query_opt(
@@ -286,10 +341,8 @@ impl PgGroups {
                 &[&conversation_id.as_slice(), &joiner.as_bytes()],
             )
             .map_err(db_err)?;
-            txn.commit().map_err(db_err)?;
             return Ok(InviteOutcome::Requested { conversation_id });
         }
-        txn.commit().map_err(db_err)?;
         Ok(InviteOutcome::Joined { conversation_id })
     }
 
@@ -318,6 +371,25 @@ impl PgGroups {
     ) -> StoreResult<bool> {
         let mut conn = self.conn()?;
         let mut txn = conn.transaction().map_err(db_err)?;
+        let approved = Self::approve_join_request_in_txn(&mut txn, conversation_id, account)?;
+        txn.commit().map_err(db_err)?;
+        Ok(approved)
+    }
+
+    /// As [`Self::approve_join_request`], but joins a caller-owned transaction.
+    ///
+    /// This CONSUMES the pending request, so the caller must add the routing membership in the
+    /// same transaction — otherwise a failure in between destroys the request without admitting
+    /// the user, and there is no way to re-request except a fresh invite.
+    ///
+    /// The block path deliberately still consumes the request (returning `false`): an approval
+    /// aimed at someone a member has blocked should not remain pending for a later retry. That is
+    /// a policy choice, not an accident, and it survives the caller's commit.
+    pub fn approve_join_request_in_txn(
+        txn: &mut postgres::Transaction<'_>,
+        conversation_id: &[u8; 16],
+        account: &AccountId,
+    ) -> StoreResult<bool> {
         let existed = txn
             .execute(
                 "DELETE FROM group_join_requests WHERE conversation_id = $1 AND account_id = $2",
@@ -339,10 +411,8 @@ impl PgGroups {
             .map_err(db_err)?
             .is_some();
         if blocked {
-            txn.commit().map_err(db_err)?; // request stays consumed
-            return Ok(false);
+            return Ok(false); // request stays consumed
         }
-        txn.commit().map_err(db_err)?;
         Ok(true)
     }
 
@@ -374,6 +444,11 @@ impl PgGroups {
     ) -> StoreResult<()> {
         let mut conn = self.conn()?;
         let mut txn = conn.transaction().map_err(db_err)?;
+        // This function is two count-then-act decisions — delete the conversation when the last
+        // member leaves, and auto-promote when the last admin leaves. Both are phantom-sensitive,
+        // so concurrent leaves could each see the other still present and neither clean up (an
+        // orphan conversation with no members), or race a demotion to zero admins.
+        lock_conversation(&mut txn, conversation_id)?;
         txn.execute(
             "DELETE FROM envelopes
              WHERE conversation_id = $1 AND NOT delivered
@@ -452,6 +527,40 @@ impl PgGroups {
         )
         .map_err(db_err)?;
         Ok(())
+    }
+
+    /// As [`Self::bootstrap_admin`], but joins a caller-owned transaction so the conversation and
+    /// its first admin commit together. Separately committed, a failure in between leaves a
+    /// conversation nobody can ever administer: `promote` requires an existing admin, and only a
+    /// member LEAVING triggers auto-promotion.
+    pub fn bootstrap_admin_in_txn(
+        txn: &mut postgres::Transaction<'_>,
+        conversation_id: &[u8; 16],
+        creator: &AccountId,
+    ) -> StoreResult<()> {
+        txn.execute(
+            "INSERT INTO group_admins (conversation_id, account_id) VALUES ($1, $2)
+             ON CONFLICT DO NOTHING",
+            &[&conversation_id.as_slice(), &creator.as_bytes()],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Adminship inside a caller-owned transaction, so an authorization check can share one
+    /// transaction with the write it authorizes.
+    pub fn is_admin_in_txn(
+        txn: &mut postgres::Transaction<'_>,
+        conversation_id: &[u8; 16],
+        account: &AccountId,
+    ) -> StoreResult<bool> {
+        Ok(txn
+            .query_opt(
+                "SELECT 1 FROM group_admins WHERE conversation_id = $1 AND account_id = $2",
+                &[&conversation_id.as_slice(), &account.as_bytes()],
+            )
+            .map_err(db_err)?
+            .is_some())
     }
 
     /// True iff a block (either direction) exists between `account` and any current member.
