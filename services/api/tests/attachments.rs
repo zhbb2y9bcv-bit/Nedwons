@@ -244,10 +244,22 @@ async fn retention_removes_rows_and_bytes() {
 
     let relay = common::shared_relay();
     let store = nedwons_api::blobs::FsBlobStore::new(&dir).expect("store");
+    let url = db_url();
+    let backdated_id = blob_id.clone();
     let purged = tokio::task::spawn_blocking(move || {
-        // A zero TTL makes everything eligible, which is what a run days later would see.
+        // Backdate ONLY this test's row and purge with an hour-long TTL. A zero TTL would make
+        // every row in the shared test database eligible — including rows other tests in this
+        // binary created moments ago and are about to fetch (that raced for real: the roundtrip
+        // test's download intermittently saw the uniform 403 after its row vanished here).
+        let mut conn = postgres::Client::connect(&url, postgres::NoTls).expect("db");
+        let raw = hex::decode(&backdated_id).expect("blob id hex");
+        conn.execute(
+            "UPDATE attachments SET created_at = now() - interval '2 hours' WHERE blob_id = $1",
+            &[&raw],
+        )
+        .expect("backdate");
         let ids = relay
-            .purge_stale_attachments(std::time::Duration::ZERO, 100)
+            .purge_stale_attachments(std::time::Duration::from_secs(3600), 100)
             .expect("purge");
         for id in &ids {
             store.delete(id).expect("delete bytes");

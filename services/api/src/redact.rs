@@ -249,10 +249,15 @@ mod tests {
 
     #[test]
     fn long_hex_is_treated_as_secret_material() {
-        let token = "a3f5c7e91b2d4f6081a3c5e7b9d1f3a5";
+        // Built at runtime rather than written as a literal. A 32-character hex string in source
+        // is indistinguishable from a real credential to a secret scanner — this exact line was
+        // reported by gitleaks as a leak — and the honest fix is to stop putting one in the file
+        // rather than to teach the scanner to ignore high-entropy strings. The test is unchanged
+        // in substance: `scrub` still receives 32 hex characters.
+        let token: String = std::iter::repeat_n("a3f5c7e9", 4).collect();
         let message = format!("token check failed for {token}");
         let out = scrub(&message);
-        assert!(!out.contains(token), "hex token survived: {out}");
+        assert!(!out.contains(&token), "hex token survived: {out}");
     }
 
     #[test]
