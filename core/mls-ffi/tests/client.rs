@@ -372,3 +372,120 @@ fn group_growth_commit_reaches_earlier_members_through_process_inbound() {
     assert_eq!(hear(&bob, 6, from_alice.clone()), b"welcome both");
     assert_eq!(hear(&carol, 7, from_alice), b"welcome both");
 }
+
+/// Across the FFI: a rename reaches the other member as `GroupRenamed` and nothing about it exists
+/// outside the ciphertext; unread counts follow inbound messages and the read mark; and a message
+/// reports `pending` until it is marked sent.
+#[test]
+fn group_name_unread_and_pending_state_cross_the_boundary() {
+    let alice = MlsClient::create_group(b"alice".to_vec(), tmp("meta-a"), key()).expect("alice");
+    let bob = MlsClient::new_joiner(b"bob".to_vec(), tmp("meta-b"), key()).expect("bob");
+    let add = alice
+        .add_member(bob.key_package().expect("kp"))
+        .expect("add");
+    bob.join_group(add.welcome).expect("join");
+
+    // Rename.
+    assert_eq!(alice.group_name().expect("name"), None);
+    let rename = alice.set_group_name("Weekend Trip".into()).expect("rename");
+    let envelope = alice.encrypt(rename).expect("encrypt");
+    alice.mark_sent(rename).expect("sent");
+    assert_eq!(
+        alice.group_name().expect("name"),
+        Some("Weekend Trip".into())
+    );
+    assert!(matches!(
+        bob.process_inbound(1, envelope).expect("process"),
+        InboundResult::GroupRenamed { ref name } if name == "Weekend Trip"
+    ));
+    assert_eq!(bob.group_name().expect("name"), Some("Weekend Trip".into()));
+    assert!(
+        bob.messages().expect("messages").is_empty(),
+        "a rename is not a chat message"
+    );
+    // A name no client could render safely is refused here, not at every recipient.
+    assert!(alice.set_group_name("bad\u{202E}name".into()).is_err());
+
+    // Pending state: encrypted but unsent, then accepted.
+    let id = alice.enqueue(b"hi".to_vec()).expect("enqueue");
+    let msg = alice.encrypt(id).expect("encrypt");
+    let mine = alice.messages().expect("messages");
+    assert_eq!(mine.len(), 1);
+    assert!(mine[0].pending);
+    assert!(mine[0].created_at_ms > 1_700_000_000_000);
+    alice.mark_sent(id).expect("sent");
+    assert!(!alice.messages().expect("messages")[0].pending);
+
+    // Unread: Bob has one, until he reads.
+    assert_eq!(bob.unread_count().expect("unread"), 0);
+    bob.process_inbound(2, msg).expect("process");
+    assert_eq!(bob.unread_count().expect("unread"), 1);
+    let received = bob.messages().expect("messages");
+    assert!(!received[0].pending, "inbound is never pending");
+    bob.mark_read().expect("mark read");
+    assert_eq!(bob.unread_count().expect("unread"), 0);
+}
+
+/// Attachments across the FFI: seal → (upload happens outside) → reference the blob in a message →
+/// the recipient gets the key over MLS and opens bytes the relay could not.
+#[test]
+fn attachment_seals_travels_and_opens_across_the_boundary() {
+    let alice = MlsClient::create_group(b"alice".to_vec(), tmp("att-a"), key()).expect("alice");
+    let bob = MlsClient::new_joiner(b"bob".to_vec(), tmp("att-b"), key()).expect("bob");
+    let add = alice
+        .add_member(bob.key_package().expect("kp"))
+        .expect("add");
+    bob.join_group(add.welcome).expect("join");
+
+    let file = b"a photo's bytes".repeat(40);
+    let sealed = mls_ffi::seal_attachment(file.clone()).expect("seal");
+    assert_ne!(
+        sealed.ciphertext, file,
+        "what the relay would store is not the file"
+    );
+    let blob_id = vec![3u8; 16];
+
+    let id = alice
+        .send_attachment(
+            blob_id.clone(),
+            sealed.key.clone(),
+            sealed.digest.clone(),
+            file.len() as u64,
+            "image/png".into(),
+            "shot.png".into(),
+            "here".into(),
+        )
+        .expect("send attachment");
+    let envelope = alice.encrypt(id).expect("encrypt");
+
+    let info = match bob.process_inbound(1, envelope).expect("process") {
+        InboundResult::AttachmentReceived { attachment } => attachment,
+        other => panic!("expected AttachmentReceived, got {other:?}"),
+    };
+    assert_eq!(info.blob_id, blob_id);
+    assert_eq!(info.mime, "image/png");
+    assert_eq!(info.filename, "shot.png");
+    assert_eq!(info.size, file.len() as u64);
+    assert_eq!(
+        mls_ffi::open_attachment(
+            info.key.clone(),
+            info.digest.clone(),
+            sealed.ciphertext.clone()
+        )
+        .expect("open"),
+        file
+    );
+
+    // The message log carries the caption and the reference on both sides.
+    let received = &bob.messages().expect("messages")[0];
+    assert_eq!(received.plaintext, b"here");
+    assert!(received.attachment.is_some());
+    assert!(alice.messages().expect("messages")[0].attachment.is_some());
+
+    // A substituted blob is refused, and so is a wrong key.
+    let other = mls_ffi::seal_attachment(b"different".to_vec()).expect("seal");
+    assert!(
+        mls_ffi::open_attachment(info.key.clone(), info.digest.clone(), other.ciphertext).is_err()
+    );
+    assert!(mls_ffi::open_attachment(vec![0u8; 32], info.digest, sealed.ciphertext).is_err());
+}

@@ -64,13 +64,33 @@ public enum PushInboxDecoder {
             case .secretSealed:
                 latest = PushNotificationContent(
                     title: "Secret message", body: "You received a view-once message.")
-            // Control / already-seen: nothing to surface.
+            // A file. The bytes are still on the relay and are not fetched here — the extension has
+            // a few seconds and no business downloading a 25 MB video — so the notification
+            // describes it from the reference the message already carried.
+            case .attachmentReceived(let attachment):
+                latest = PushNotificationContent(
+                    title: "New message", body: describe(attachment))
+            // Control / already-seen: nothing to surface. A rename is applied durably by the
+            // core when it is processed, so the group is correctly named the next time the app
+            // opens — but it is not something to wake someone with a notification for.
             case .duplicate, .stateAdvanced, .secretConsumedRemotely, .deliveryKeyGranted,
-                .historySynced:
+                .historySynced, .groupRenamed:
                 continue
             }
         }
         return latest
+    }
+
+    /// What to say about a file on a lock screen: a plain description from the media type. Not the
+    /// filename — that is text the sender chose, and a notification is the one place it would be
+    /// shown before anyone has decided to open the conversation.
+    private static func describe(_ attachment: AttachmentInfo) -> String {
+        switch attachment.mime.split(separator: "/").first.map(String.init) {
+        case "image": "📷 Photo"
+        case "video": "🎬 Video"
+        case "audio": "🎤 Voice message"
+        default: "📎 File"
+        }
     }
 
     private static func renderBody(_ plaintext: Data) -> String {

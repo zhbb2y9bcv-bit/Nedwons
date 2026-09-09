@@ -8,6 +8,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod attachment;
 pub mod client;
 pub mod content;
 pub mod envelope;

@@ -18,13 +18,14 @@ uniffi::setup_scaffolding!();
 use std::panic::catch_unwind;
 use std::sync::{Arc, Mutex};
 
+use mls_core::attachment::{self, AttachmentRef as CoreAttachmentRef};
 use mls_core::client::{
     MAX_ENVELOPE_LEN, MAX_IDENTITY_LEN, MAX_KEY_PACKAGE_LEN, MAX_PLAINTEXT_LEN, MAX_WELCOME_LEN,
 };
 use mls_core::content::{HistoryEntry as CoreHistoryEntry, SECRET_ID_LEN};
 use mls_core::durable::{
     Direction as CoreDirection, DurableError, DurableSession, FileJournal, InMemoryJournal,
-    InboundOutcome, JournalKind, Message as CoreMessage, PendingIdentity, PendingJoinError,
+    InboundOutcome, JournalKind, MessageView as CoreMessageView, PendingIdentity, PendingJoinError,
     BLOB_FORMAT_VERSION,
 };
 use mls_core::{MlsError, CIPHERSUITE_NAME, VERSION as CORE_VERSION};
@@ -79,6 +80,14 @@ pub struct StoredMessage {
     /// `Some` (16 bytes) for a secret; `plaintext` is then empty — render a placeholder/tombstone
     /// driven by [`MlsClient::secret_phase`], never the body.
     pub secret_id: Option<Vec<u8>>,
+    /// Unix ms stamped by THIS device (queued, for outbound; decrypted, for inbound). Never carried
+    /// on the wire, so a peer cannot forge when a message appeared here. 0 = unknown (logged before
+    /// timestamps existed).
+    pub created_at_ms: u64,
+    /// Outbound only: the relay has not accepted it yet, so render it as sending rather than sent.
+    pub pending: bool,
+    /// `Some` when this message is a file; `plaintext` is then its caption.
+    pub attachment: Option<AttachmentInfo>,
 }
 
 /// Mirrors `mls_core::secret::SecretState`.
@@ -141,6 +150,36 @@ pub enum InboundResult {
     HistorySynced {
         count: u64,
     },
+    /// A member renamed the group; the new name is already persisted. Refresh the title.
+    GroupRenamed {
+        name: String,
+    },
+    /// A file arrived: the reference is durable, the bytes are still on the relay.
+    AttachmentReceived {
+        attachment: AttachmentInfo,
+    },
+}
+
+/// A file referenced by a message. The bytes live on the relay as ciphertext; this is everything
+/// needed to fetch and open them, and it never leaves the E2EE channel.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct AttachmentInfo {
+    pub blob_id: Vec<u8>,
+    pub key: Vec<u8>,
+    pub digest: Vec<u8>,
+    /// Plaintext size in bytes.
+    pub size: u64,
+    pub mime: String,
+    pub filename: String,
+}
+
+/// An encrypted file ready to upload, plus the secrets to put in the message that references it.
+#[derive(uniffi::Record)]
+pub struct SealedAttachment {
+    /// Upload these bytes; the relay learns nothing from them.
+    pub ciphertext: Vec<u8>,
+    pub key: Vec<u8>,
+    pub digest: Vec<u8>,
 }
 
 /// Lets Swift assert it links a compatible core and refuse on mismatch (ADR-0007).
@@ -692,6 +731,12 @@ impl MlsClient {
                     key_r: key_r.to_vec(),
                 },
                 InboundOutcome::HistorySynced { count } => InboundResult::HistorySynced { count },
+                InboundOutcome::GroupRenamed { name } => InboundResult::GroupRenamed { name },
+                InboundOutcome::AttachmentReceived { attachment } => {
+                    InboundResult::AttachmentReceived {
+                        attachment: to_attachment_info(&attachment),
+                    }
+                }
             })
         })
     }
@@ -730,6 +775,12 @@ impl MlsClient {
                     key_r: key_r.to_vec(),
                 },
                 InboundOutcome::HistorySynced { count } => InboundResult::HistorySynced { count },
+                InboundOutcome::GroupRenamed { name } => InboundResult::GroupRenamed { name },
+                InboundOutcome::AttachmentReceived { attachment } => {
+                    InboundResult::AttachmentReceived {
+                        attachment: to_attachment_info(&attachment),
+                    }
+                }
             })
         })
     }
@@ -761,8 +812,92 @@ impl MlsClient {
             let g = self.lock()?;
             match &*g {
                 ClientState::Active { session } => {
-                    Ok(session.messages().iter().map(to_stored).collect())
+                    Ok(session.message_views().iter().map(to_stored).collect())
                 }
+                ClientState::Pending { .. } => Err(MlsClientError::WrongState),
+                ClientState::Closed => Err(MlsClientError::Closed),
+            }
+        })
+    }
+
+    // --- Group name, read state (arc: "feels like a messenger") ---------------------------------
+
+    /// The group's name, or `None` if it has never been named. Set by a member over the E2EE
+    /// channel: the relay stores no name and cannot learn one.
+    pub fn group_name(&self) -> Result<Option<String>, MlsClientError> {
+        catch(move || {
+            let g = self.lock()?;
+            match &*g {
+                ClientState::Active { session } => Ok(session.group_name().map(str::to_string)),
+                ClientState::Pending { .. } => Err(MlsClientError::WrongState),
+                ClientState::Closed => Err(MlsClientError::Closed),
+            }
+        })
+    }
+
+    /// Queue a rename for the whole group, returning its local id — `encrypt`/`mark_sent` it like
+    /// any other message. The local name changes on encrypt, never before the group is told.
+    /// Refuses a name a recipient's decoder would reject (empty, over-long, unsafe to render).
+    pub fn set_group_name(&self, name: String) -> Result<u64, MlsClientError> {
+        catch(move || {
+            bound(name.len(), MAX_PLAINTEXT_LEN)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session.enqueue_group_name(&name).map_err(map_durable_input)
+        })
+    }
+
+    // --- Attachments -----------------------------------------------------------------------------
+
+    /// Queue a message referring to an already-uploaded blob; `encrypt`/`mark_sent` it like any
+    /// other message. The key goes to the group over MLS and never to the relay.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_attachment(
+        &self,
+        blob_id: Vec<u8>,
+        key: Vec<u8>,
+        digest: Vec<u8>,
+        size: u64,
+        mime: String,
+        filename: String,
+        caption: String,
+    ) -> Result<u64, MlsClientError> {
+        catch(move || {
+            bound(
+                mime.len() + filename.len() + caption.len(),
+                MAX_PLAINTEXT_LEN,
+            )?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session
+                .enqueue_attachment(
+                    fixed(&blob_id)?,
+                    fixed(&key)?,
+                    fixed(&digest)?,
+                    size,
+                    &mime,
+                    &filename,
+                    &caption,
+                )
+                .map_err(map_durable_input)
+        })
+    }
+
+    /// Mark the whole conversation read (the user is looking at it).
+    pub fn mark_read(&self) -> Result<(), MlsClientError> {
+        catch(move || {
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session.mark_read().map_err(map_durable)
+        })
+    }
+
+    /// Inbound messages newer than the read mark. Your own messages are never unread.
+    pub fn unread_count(&self) -> Result<u64, MlsClientError> {
+        catch(move || {
+            let g = self.lock()?;
+            match &*g {
+                ClientState::Active { session } => Ok(session.unread_count()),
                 ClientState::Pending { .. } => Err(MlsClientError::WrongState),
                 ClientState::Closed => Err(MlsClientError::Closed),
             }
@@ -818,7 +953,7 @@ impl MlsClient {
             match &*g {
                 ClientState::Active { session } => {
                     let capped = limit.min(MAX_PAGE_MESSAGES) as usize;
-                    let all = session.messages();
+                    let all = session.message_views();
                     let start = (offset as usize).min(all.len());
                     let end = start.saturating_add(capped).min(all.len());
                     Ok(all[start..end].iter().map(to_stored).collect())
@@ -885,6 +1020,33 @@ impl MlsClient {
 }
 
 /// Bundled system text — never an external resource that could fail at runtime.
+/// Encrypt a file under a fresh one-time key, ready to upload. Deliberately NOT a method: it
+/// touches no group state, so a caller can prepare a file before choosing where to send it — and
+/// the upload can fail without ever having created a message that refers to missing bytes.
+#[uniffi::export]
+pub fn seal_attachment(plaintext: Vec<u8>) -> Result<SealedAttachment, MlsClientError> {
+    catch(move || {
+        let sealed = attachment::seal(&plaintext).map_err(map_attachment)?;
+        Ok(SealedAttachment {
+            ciphertext: sealed.ciphertext,
+            key: sealed.key.to_vec(),
+            digest: sealed.digest.to_vec(),
+        })
+    })
+}
+
+/// Verify a downloaded blob against the sender's digest and decrypt it. Fails closed on a
+/// substituted blob distinctly from a bad key, so a client can tell "the relay served the wrong
+/// bytes" from "this is not for me".
+#[uniffi::export]
+pub fn open_attachment(
+    key: Vec<u8>,
+    digest: Vec<u8>,
+    ciphertext: Vec<u8>,
+) -> Result<Vec<u8>, MlsClientError> {
+    catch(move || attachment::open(&key, &digest, &ciphertext).map_err(map_attachment))
+}
+
 #[uniffi::export]
 pub fn secret_tombstone_text() -> String {
     DurableSession::<InMemoryJournal>::secret_tombstone_text().to_string()
@@ -944,7 +1106,7 @@ fn active_mut(g: &mut ClientState) -> Result<&mut DurableSession<JournalKind>, M
     }
 }
 
-fn to_stored(m: &CoreMessage) -> StoredMessage {
+fn to_stored(m: &CoreMessageView) -> StoredMessage {
     StoredMessage {
         local_id: m.local_id,
         direction: match m.direction {
@@ -954,7 +1116,25 @@ fn to_stored(m: &CoreMessage) -> StoredMessage {
         plaintext: m.plaintext.clone(),
         envelope_id: m.envelope_id,
         secret_id: m.secret_id.map(|id| id.to_vec()),
+        created_at_ms: m.created_at_ms,
+        pending: m.pending,
+        attachment: m.attachment.as_ref().map(to_attachment_info),
     }
+}
+
+fn to_attachment_info(a: &CoreAttachmentRef) -> AttachmentInfo {
+    AttachmentInfo {
+        blob_id: a.blob_id.to_vec(),
+        key: a.key.to_vec(),
+        digest: a.digest.to_vec(),
+        size: a.size,
+        mime: a.mime.clone(),
+        filename: a.filename.clone(),
+    }
+}
+
+fn fixed<const N: usize>(bytes: &[u8]) -> Result<[u8; N], MlsClientError> {
+    bytes.try_into().map_err(|_| MlsClientError::InvalidMessage)
 }
 
 /// Fail-closed on any length other than 16.
@@ -981,6 +1161,17 @@ fn catch<T>(
 }
 
 /// Local paths: a fault here is ours.
+/// Attachment failures are input problems, not internal ones: a bad key or a substituted blob is
+/// something the caller must be told precisely so it can say what happened.
+fn map_attachment(e: attachment::AttachmentError) -> MlsClientError {
+    match e {
+        attachment::AttachmentError::BadSize => MlsClientError::InputTooLarge,
+        attachment::AttachmentError::BadKey => MlsClientError::BadKeyLength,
+        attachment::AttachmentError::DigestMismatch
+        | attachment::AttachmentError::Undecryptable => MlsClientError::InvalidMessage,
+    }
+}
+
 fn map_durable(e: DurableError) -> MlsClientError {
     match e {
         DurableError::NoSession => MlsClientError::NoSession,

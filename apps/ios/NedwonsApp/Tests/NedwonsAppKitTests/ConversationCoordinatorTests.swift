@@ -26,6 +26,10 @@ final class InMemoryRelay: ConversationRelay, @unchecked Sendable {
     var refuseSendsWith: String?  // an `{"error": code}` body → 403
     private(set) var deliveries = 0
 
+    /// Bootstrap itself fans out a growth commit, so tests that count what THEY sent zero the
+    /// counter once setup is done.
+    func resetCounters() { sync { deliveries = 0 } }
+
     func register(token: String, accountID: String, deviceID: String) {
         lock.lock(); defer { lock.unlock() }
         devices[token] = Device(accountID: accountID, deviceID: deviceID)
@@ -199,13 +203,16 @@ final class ConversationCoordinatorTests: XCTestCase {
         XCTAssertEqual(available1, 2)
         relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
         try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
+        relay.resetCounters()
 
         await alice.model.sendMessage("hi bob", to: conv)
         XCTAssertNil(alice.model.banner)
         XCTAssertEqual(alice.texts(in: conv).map(\.0), ["hi bob"])
 
+        // Welcome, the growth commit (for the epoch Bob joins at — undecryptable by him and
+        // discarded), and the message.
         let processed = try await bob.coordinator.syncOnce()
-        XCTAssertEqual(processed, 2, "the Welcome and the message")
+        XCTAssertEqual(processed, 3)
         XCTAssertEqual(bob.texts(in: conv).map(\.0), ["hi bob"])
         XCTAssertEqual(bob.texts(in: conv).map(\.1), [false])
         XCTAssertEqual(relay.pending(deviceID: bob.deviceID), 0, "acked after processing")
@@ -255,13 +262,14 @@ final class ConversationCoordinatorTests: XCTestCase {
         await bob.coordinator.ensureKeyPackages()
         relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
         try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
+        relay.resetCounters()
 
         relay.failSends = true
         await alice.model.sendMessage("queued", to: conv)
         XCTAssertEqual(alice.model.banner, "Couldn't send that message. It stays queued and will retry.")
-        // The core logs a message once the relay has accepted it; until then it lives in the
-        // durable outbox, not the thread.
-        XCTAssertEqual(alice.texts(in: conv).map(\.0), [])
+        // Still in the thread — as sending, not delivered — so the user sees it is being retried.
+        XCTAssertEqual(alice.texts(in: conv).map(\.0), ["queued"])
+        XCTAssertEqual(alice.model.threadLines[conv]?.first?.isPending, true)
         XCTAssertEqual(relay.deliveries, 0)
 
         relay.failSends = false
@@ -280,6 +288,7 @@ final class ConversationCoordinatorTests: XCTestCase {
         await bob.coordinator.ensureKeyPackages()
         relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
         try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
+        relay.resetCounters()
 
         relay.failSends = true
         await alice.model.sendMessage("from before the crash", to: conv)
@@ -306,6 +315,7 @@ final class ConversationCoordinatorTests: XCTestCase {
 
         relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
         try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
+        relay.resetCounters()
         await alice.model.sendMessage("welcome back", to: conv)
 
         _ = try await bob.coordinator.syncOnce()
@@ -327,6 +337,7 @@ final class ConversationCoordinatorTests: XCTestCase {
         await bob.coordinator.ensureKeyPackages()
         relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
         try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
+        relay.resetCounters()
 
         relay.refuseSendsWith = "muted"
         await alice.model.sendMessage("too soon", to: conv)
@@ -366,6 +377,134 @@ final class ConversationCoordinatorTests: XCTestCase {
         await alice.model.sendMessage("still works for bob", to: conv)
         _ = try await bob.coordinator.syncOnce()
         XCTAssertEqual(bob.texts(in: conv).map(\.0), ["still works for bob"])
+    }
+
+    /// A rename reaches the other side through the ordinary message path, titles both clients, and
+    /// nothing about the name exists outside the ciphertext — the relay only ever saw envelopes.
+    func testGroupRenamePropagatesAndTitlesBothSides() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        await bob.coordinator.ensureKeyPackages()
+        relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
+        try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
+        relay.resetCounters()
+        _ = try await bob.coordinator.syncOnce()
+
+        let renamed = await alice.model.renameGroup(conv, to: "  Weekend Trip  ")
+        XCTAssertTrue(renamed)
+        XCTAssertEqual(alice.model.groupName(for: conv), "Weekend Trip", "trimmed before sending")
+        XCTAssertEqual(alice.model.banner, "Group renamed.")
+
+        _ = try await bob.coordinator.syncOnce()
+        XCTAssertEqual(bob.model.groupName(for: conv), "Weekend Trip")
+        // A rename is not a chat message on either side.
+        XCTAssertTrue(bob.texts(in: conv).isEmpty)
+        XCTAssertTrue(alice.texts(in: conv).isEmpty)
+        // The list title follows the name; without one it describes the group instead.
+        let chat = ChatSummary(conversationID: conv, memberCount: 3)
+        XCTAssertEqual(bob.model.conversationTitle(for: chat), "Weekend Trip")
+        XCTAssertEqual(
+            bob.model.conversationTitle(for: ChatSummary(conversationID: "other", memberCount: 3)),
+            "Group · 3 people")
+
+        // A name no client could render safely never reaches the relay.
+        let before = relay.deliveries
+        let refused = await alice.model.renameGroup(conv, to: "bad\u{202E}name")
+        XCTAssertFalse(refused)
+        XCTAssertEqual(relay.deliveries, before, "refused locally, nothing sent")
+        XCTAssertEqual(alice.model.groupName(for: conv), "Weekend Trip", "unchanged")
+    }
+
+    /// Unread counts come from decrypted local state, are cleared by opening the thread, and never
+    /// count your own messages.
+    func testUnreadCountsClearOnOpen() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        await bob.coordinator.ensureKeyPackages()
+        relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
+        try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
+        _ = try await bob.coordinator.syncOnce()
+
+        await alice.model.sendMessage("one", to: conv)
+        await alice.model.sendMessage("two", to: conv)
+        XCTAssertEqual(alice.model.unreadCount(for: conv), 0, "your own messages are never unread")
+
+        _ = try await bob.coordinator.syncOnce()
+        XCTAssertEqual(bob.model.unreadCount(for: conv), 2)
+
+        // Opening the conversation marks it read; the count stays cleared across a relaunch.
+        await bob.model.markConversationRead(conv)
+        XCTAssertEqual(bob.model.unreadCount(for: conv), 0)
+        var bobAgain = bob
+        bobAgain.relaunch(relay: relay)
+        await bobAgain.coordinator.prepare()
+        XCTAssertEqual(bobAgain.model.unreadCount(for: conv), 0)
+
+        await alice.model.sendMessage("three", to: conv)
+        _ = try await bobAgain.coordinator.syncOnce()
+        XCTAssertEqual(bobAgain.model.unreadCount(for: conv), 1)
+    }
+
+    /// A message carries the time this device saw it, and is `pending` until the relay accepts it —
+    /// so a failed send renders as sending rather than looking delivered.
+    func testThreadLinesCarryTimeAndPendingState() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        await bob.coordinator.ensureKeyPackages()
+        relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
+        try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
+
+        relay.failSends = true
+        await alice.model.sendMessage("stuck", to: conv)
+        let pending = try XCTUnwrap(alice.model.threadLines[conv]?.first)
+        XCTAssertTrue(pending.isPending, "a failed send shows as sending, not delivered")
+        XCTAssertNotNil(pending.timestamp)
+        XCTAssertEqual(alice.model.localLastActivity(for: conv), pending.timestamp)
+
+        relay.failSends = false
+        await alice.coordinator.retryUnsent()
+        XCTAssertEqual(alice.model.threadLines[conv]?.first?.isPending, false, "accepted ⇒ delivered")
+
+        _ = try await bob.coordinator.syncOnce()
+        let received = try XCTUnwrap(bob.model.threadLines[conv]?.first)
+        XCTAssertFalse(received.isPending, "inbound is never pending")
+        XCTAssertNotNil(received.timestamp)
+    }
+
+    /// Adding someone to an EXISTING group must add them to the MLS group too, not only to relay
+    /// routing — otherwise they are sent ciphertext they hold no key for. They also learn the
+    /// group's name, which exists only inside the ciphertext.
+    func testAddingToAnExistingGroupJoinsTheMlsGroupAndSharesTheName() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        let carol = Participant("carol", relay: relay)
+        await bob.coordinator.ensureKeyPackages()
+        await carol.coordinator.ensureKeyPackages()
+        relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
+        try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
+        _ = try await bob.coordinator.syncOnce()
+        _ = await alice.model.renameGroup(conv, to: "Book Club")
+        _ = try await bob.coordinator.syncOnce()
+
+        // Carol joins an established group.
+        relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID, carol.deviceID])
+        try await alice.coordinator.addMembers(to: conv, memberAccountIDs: [carol.accountID])
+        _ = try await carol.coordinator.syncOnce()
+        XCTAssertEqual(carol.model.groupName(for: conv), "Book Club", "the newcomer learns the name")
+
+        // Everyone can now decrypt everyone: the growth commit reached the earlier members.
+        await carol.model.sendMessage("hello from carol", to: conv)
+        _ = try await alice.coordinator.syncOnce()
+        _ = try await bob.coordinator.syncOnce()
+        XCTAssertEqual(alice.texts(in: conv).map(\.0).last, "hello from carol")
+        XCTAssertEqual(bob.texts(in: conv).map(\.0).last, "hello from carol")
+        await bob.model.sendMessage("welcome carol", to: conv)
+        _ = try await carol.coordinator.syncOnce()
+        XCTAssertEqual(carol.texts(in: conv).map(\.0).last, "welcome carol")
     }
 
     func testIdempotencyKeyIsDeterministicPerMessage() {

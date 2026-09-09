@@ -609,6 +609,12 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     
     func epoch() throws  -> UInt64
     
+    /**
+     * The group's name, or `None` if it has never been named. Set by a member over the E2EE
+     * channel: the relay stores no name and cannot learn one.
+     */
+    func groupName() throws  -> String?
+    
     func hasSelfGroup() throws  -> Bool
     
     /**
@@ -635,6 +641,11 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
      * A one-time prekey to publish so others can add this client.
      */
     func keyPackage() throws  -> Data
+    
+    /**
+     * Mark the whole conversation read (the user is looking at it).
+     */
+    func markRead() throws 
     
     func markSent(localId: UInt64) throws 
     
@@ -712,6 +723,19 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func secretVisibleBody(secretId: Data, nowMs: UInt64) throws  -> Data?
     
     /**
+     * Queue a message referring to an already-uploaded blob; `encrypt`/`mark_sent` it like any
+     * other message. The key goes to the group over MLS and never to the relay.
+     */
+    func sendAttachment(blobId: Data, key: Data, digest: Data, size: UInt64, mime: String, filename: String, caption: String) throws  -> UInt64
+    
+    /**
+     * Queue a rename for the whole group, returning its local id — `encrypt`/`mark_sent` it like
+     * any other message. The local name changes on encrypt, never before the group is told.
+     * Refuses a name a recipient's decoder would reject (empty, over-long, unsafe to render).
+     */
+    func setGroupName(name: String) throws  -> UInt64
+    
+    /**
      * ADR-0010: builds commit + welcome WITHOUT advancing the group. Sign a manifest, POST
      * `/commit`, then [`merge_staged`](Self::merge_staged) on success or
      * [`clear_staged`](Self::clear_staged) on rejection. Never merge before the server's epoch CAS
@@ -729,6 +753,11 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
      * 0 = pre-versioning; a Pending client also reports 0.
      */
     func storageFormatVersion() throws  -> UInt32
+    
+    /**
+     * Inbound messages newer than the read mark. Your own messages are never unread.
+     */
+    func unreadCount() throws  -> UInt64
     
     /**
      * Local ids of outbound messages the server has not accepted yet, oldest first — the upload
@@ -1007,6 +1036,17 @@ open func epoch()throws  -> UInt64  {
 })
 }
     
+    /**
+     * The group's name, or `None` if it has never been named. Set by a member over the E2EE
+     * channel: the relay stores no name and cannot learn one.
+     */
+open func groupName()throws  -> String?  {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_group_name(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
 open func hasSelfGroup()throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_has_self_group(self.uniffiClonePointer(),$0
@@ -1063,6 +1103,15 @@ open func keyPackage()throws  -> Data  {
     uniffi_mls_ffi_fn_method_mlsclient_key_package(self.uniffiClonePointer(),$0
     )
 })
+}
+    
+    /**
+     * Mark the whole conversation read (the user is looking at it).
+     */
+open func markRead()throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_mark_read(self.uniffiClonePointer(),$0
+    )
+}
 }
     
 open func markSent(localId: UInt64)throws   {try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -1222,6 +1271,37 @@ open func secretVisibleBody(secretId: Data, nowMs: UInt64)throws  -> Data?  {
 }
     
     /**
+     * Queue a message referring to an already-uploaded blob; `encrypt`/`mark_sent` it like any
+     * other message. The key goes to the group over MLS and never to the relay.
+     */
+open func sendAttachment(blobId: Data, key: Data, digest: Data, size: UInt64, mime: String, filename: String, caption: String)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_send_attachment(self.uniffiClonePointer(),
+        FfiConverterData.lower(blobId),
+        FfiConverterData.lower(key),
+        FfiConverterData.lower(digest),
+        FfiConverterUInt64.lower(size),
+        FfiConverterString.lower(mime),
+        FfiConverterString.lower(filename),
+        FfiConverterString.lower(caption),$0
+    )
+})
+}
+    
+    /**
+     * Queue a rename for the whole group, returning its local id — `encrypt`/`mark_sent` it like
+     * any other message. The local name changes on encrypt, never before the group is told.
+     * Refuses a name a recipient's decoder would reject (empty, over-long, unsafe to render).
+     */
+open func setGroupName(name: String)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_set_group_name(self.uniffiClonePointer(),
+        FfiConverterString.lower(name),$0
+    )
+})
+}
+    
+    /**
      * ADR-0010: builds commit + welcome WITHOUT advancing the group. Sign a manifest, POST
      * `/commit`, then [`merge_staged`](Self::merge_staged) on success or
      * [`clear_staged`](Self::clear_staged) on rejection. Never merge before the server's epoch CAS
@@ -1253,6 +1333,16 @@ open func stageRemove(identity: Data)throws  -> Data  {
 open func storageFormatVersion()throws  -> UInt32  {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_storage_format_version(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Inbound messages newer than the read mark. Your own messages are never unread.
+     */
+open func unreadCount()throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_unread_count(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -1394,6 +1484,118 @@ public func FfiConverterTypeAddOutcome_lift(_ buf: RustBuffer) throws -> AddOutc
 #endif
 public func FfiConverterTypeAddOutcome_lower(_ value: AddOutcome) -> RustBuffer {
     return FfiConverterTypeAddOutcome.lower(value)
+}
+
+
+/**
+ * A file referenced by a message. The bytes live on the relay as ciphertext; this is everything
+ * needed to fetch and open them, and it never leaves the E2EE channel.
+ */
+public struct AttachmentInfo {
+    public var blobId: Data
+    public var key: Data
+    public var digest: Data
+    /**
+     * Plaintext size in bytes.
+     */
+    public var size: UInt64
+    public var mime: String
+    public var filename: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(blobId: Data, key: Data, digest: Data, 
+        /**
+         * Plaintext size in bytes.
+         */size: UInt64, mime: String, filename: String) {
+        self.blobId = blobId
+        self.key = key
+        self.digest = digest
+        self.size = size
+        self.mime = mime
+        self.filename = filename
+    }
+}
+
+#if compiler(>=6)
+extension AttachmentInfo: Sendable {}
+#endif
+
+
+extension AttachmentInfo: Equatable, Hashable {
+    public static func ==(lhs: AttachmentInfo, rhs: AttachmentInfo) -> Bool {
+        if lhs.blobId != rhs.blobId {
+            return false
+        }
+        if lhs.key != rhs.key {
+            return false
+        }
+        if lhs.digest != rhs.digest {
+            return false
+        }
+        if lhs.size != rhs.size {
+            return false
+        }
+        if lhs.mime != rhs.mime {
+            return false
+        }
+        if lhs.filename != rhs.filename {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(blobId)
+        hasher.combine(key)
+        hasher.combine(digest)
+        hasher.combine(size)
+        hasher.combine(mime)
+        hasher.combine(filename)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAttachmentInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AttachmentInfo {
+        return
+            try AttachmentInfo(
+                blobId: FfiConverterData.read(from: &buf), 
+                key: FfiConverterData.read(from: &buf), 
+                digest: FfiConverterData.read(from: &buf), 
+                size: FfiConverterUInt64.read(from: &buf), 
+                mime: FfiConverterString.read(from: &buf), 
+                filename: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AttachmentInfo, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.blobId, into: &buf)
+        FfiConverterData.write(value.key, into: &buf)
+        FfiConverterData.write(value.digest, into: &buf)
+        FfiConverterUInt64.write(value.size, into: &buf)
+        FfiConverterString.write(value.mime, into: &buf)
+        FfiConverterString.write(value.filename, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAttachmentInfo_lift(_ buf: RustBuffer) throws -> AttachmentInfo {
+    return try FfiConverterTypeAttachmentInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAttachmentInfo_lower(_ value: AttachmentInfo) -> RustBuffer {
+    return FfiConverterTypeAttachmentInfo.lower(value)
 }
 
 
@@ -1607,6 +1809,93 @@ public func FfiConverterTypeHistoryEntry_lower(_ value: HistoryEntry) -> RustBuf
 }
 
 
+/**
+ * An encrypted file ready to upload, plus the secrets to put in the message that references it.
+ */
+public struct SealedAttachment {
+    /**
+     * Upload these bytes; the relay learns nothing from them.
+     */
+    public var ciphertext: Data
+    public var key: Data
+    public var digest: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Upload these bytes; the relay learns nothing from them.
+         */ciphertext: Data, key: Data, digest: Data) {
+        self.ciphertext = ciphertext
+        self.key = key
+        self.digest = digest
+    }
+}
+
+#if compiler(>=6)
+extension SealedAttachment: Sendable {}
+#endif
+
+
+extension SealedAttachment: Equatable, Hashable {
+    public static func ==(lhs: SealedAttachment, rhs: SealedAttachment) -> Bool {
+        if lhs.ciphertext != rhs.ciphertext {
+            return false
+        }
+        if lhs.key != rhs.key {
+            return false
+        }
+        if lhs.digest != rhs.digest {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(ciphertext)
+        hasher.combine(key)
+        hasher.combine(digest)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSealedAttachment: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SealedAttachment {
+        return
+            try SealedAttachment(
+                ciphertext: FfiConverterData.read(from: &buf), 
+                key: FfiConverterData.read(from: &buf), 
+                digest: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SealedAttachment, into buf: inout [UInt8]) {
+        FfiConverterData.write(value.ciphertext, into: &buf)
+        FfiConverterData.write(value.key, into: &buf)
+        FfiConverterData.write(value.digest, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSealedAttachment_lift(_ buf: RustBuffer) throws -> SealedAttachment {
+    return try FfiConverterTypeSealedAttachment.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSealedAttachment_lower(_ value: SealedAttachment) -> RustBuffer {
+    return FfiConverterTypeSealedAttachment.lower(value)
+}
+
+
 public struct SecretHandle {
     public var localId: UInt64
     public var secretId: Data
@@ -1763,6 +2052,20 @@ public struct StoredMessage {
      * driven by [`MlsClient::secret_phase`], never the body.
      */
     public var secretId: Data?
+    /**
+     * Unix ms stamped by THIS device (queued, for outbound; decrypted, for inbound). Never carried
+     * on the wire, so a peer cannot forge when a message appeared here. 0 = unknown (logged before
+     * timestamps existed).
+     */
+    public var createdAtMs: UInt64
+    /**
+     * Outbound only: the relay has not accepted it yet, so render it as sending rather than sent.
+     */
+    public var pending: Bool
+    /**
+     * `Some` when this message is a file; `plaintext` is then its caption.
+     */
+    public var attachment: AttachmentInfo?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -1770,12 +2073,26 @@ public struct StoredMessage {
         /**
          * `Some` (16 bytes) for a secret; `plaintext` is then empty — render a placeholder/tombstone
          * driven by [`MlsClient::secret_phase`], never the body.
-         */secretId: Data?) {
+         */secretId: Data?, 
+        /**
+         * Unix ms stamped by THIS device (queued, for outbound; decrypted, for inbound). Never carried
+         * on the wire, so a peer cannot forge when a message appeared here. 0 = unknown (logged before
+         * timestamps existed).
+         */createdAtMs: UInt64, 
+        /**
+         * Outbound only: the relay has not accepted it yet, so render it as sending rather than sent.
+         */pending: Bool, 
+        /**
+         * `Some` when this message is a file; `plaintext` is then its caption.
+         */attachment: AttachmentInfo?) {
         self.localId = localId
         self.direction = direction
         self.plaintext = plaintext
         self.envelopeId = envelopeId
         self.secretId = secretId
+        self.createdAtMs = createdAtMs
+        self.pending = pending
+        self.attachment = attachment
     }
 }
 
@@ -1801,6 +2118,15 @@ extension StoredMessage: Equatable, Hashable {
         if lhs.secretId != rhs.secretId {
             return false
         }
+        if lhs.createdAtMs != rhs.createdAtMs {
+            return false
+        }
+        if lhs.pending != rhs.pending {
+            return false
+        }
+        if lhs.attachment != rhs.attachment {
+            return false
+        }
         return true
     }
 
@@ -1810,6 +2136,9 @@ extension StoredMessage: Equatable, Hashable {
         hasher.combine(plaintext)
         hasher.combine(envelopeId)
         hasher.combine(secretId)
+        hasher.combine(createdAtMs)
+        hasher.combine(pending)
+        hasher.combine(attachment)
     }
 }
 
@@ -1826,7 +2155,10 @@ public struct FfiConverterTypeStoredMessage: FfiConverterRustBuffer {
                 direction: FfiConverterTypeDirection.read(from: &buf), 
                 plaintext: FfiConverterData.read(from: &buf), 
                 envelopeId: FfiConverterOptionUInt64.read(from: &buf), 
-                secretId: FfiConverterOptionData.read(from: &buf)
+                secretId: FfiConverterOptionData.read(from: &buf), 
+                createdAtMs: FfiConverterUInt64.read(from: &buf), 
+                pending: FfiConverterBool.read(from: &buf), 
+                attachment: FfiConverterOptionTypeAttachmentInfo.read(from: &buf)
         )
     }
 
@@ -1836,6 +2168,9 @@ public struct FfiConverterTypeStoredMessage: FfiConverterRustBuffer {
         FfiConverterData.write(value.plaintext, into: &buf)
         FfiConverterOptionUInt64.write(value.envelopeId, into: &buf)
         FfiConverterOptionData.write(value.secretId, into: &buf)
+        FfiConverterUInt64.write(value.createdAtMs, into: &buf)
+        FfiConverterBool.write(value.pending, into: &buf)
+        FfiConverterOptionTypeAttachmentInfo.write(value.attachment, into: &buf)
     }
 }
 
@@ -1961,6 +2296,16 @@ public enum InboundResult {
      */
     case historySynced(count: UInt64
     )
+    /**
+     * A member renamed the group; the new name is already persisted. Refresh the title.
+     */
+    case groupRenamed(name: String
+    )
+    /**
+     * A file arrived: the reference is durable, the bytes are still on the relay.
+     */
+    case attachmentReceived(attachment: AttachmentInfo
+    )
 }
 
 
@@ -1995,6 +2340,12 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         )
         
         case 7: return .historySynced(count: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        case 8: return .groupRenamed(name: try FfiConverterString.read(from: &buf)
+        )
+        
+        case 9: return .attachmentReceived(attachment: try FfiConverterTypeAttachmentInfo.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -2036,6 +2387,16 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         case let .historySynced(count):
             writeInt(&buf, Int32(7))
             FfiConverterUInt64.write(count, into: &buf)
+            
+        
+        case let .groupRenamed(name):
+            writeInt(&buf, Int32(8))
+            FfiConverterString.write(name, into: &buf)
+            
+        
+        case let .attachmentReceived(attachment):
+            writeInt(&buf, Int32(9))
+            FfiConverterTypeAttachmentInfo.write(attachment, into: &buf)
             
         }
     }
@@ -2318,6 +2679,30 @@ fileprivate struct FfiConverterOptionUInt64: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
+    typealias SwiftType = String?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterString.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
     typealias SwiftType = Data?
 
@@ -2334,6 +2719,30 @@ fileprivate struct FfiConverterOptionData: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterData.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeAttachmentInfo: FfiConverterRustBuffer {
+    typealias SwiftType = AttachmentInfo?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeAttachmentInfo.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeAttachmentInfo.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -2457,8 +2866,32 @@ public func capabilities() -> Capabilities  {
 })
 }
 /**
- * Bundled system text — never an external resource that could fail at runtime.
+ * Verify a downloaded blob against the sender's digest and decrypt it. Fails closed on a
+ * substituted blob distinctly from a bad key, so a client can tell "the relay served the wrong
+ * bytes" from "this is not for me".
  */
+public func openAttachment(key: Data, digest: Data, ciphertext: Data)throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_func_open_attachment(
+        FfiConverterData.lower(key),
+        FfiConverterData.lower(digest),
+        FfiConverterData.lower(ciphertext),$0
+    )
+})
+}
+/**
+ * Bundled system text — never an external resource that could fail at runtime.
+ * Encrypt a file under a fresh one-time key, ready to upload. Deliberately NOT a method: it
+ * touches no group state, so a caller can prepare a file before choosing where to send it — and
+ * the upload can fail without ever having created a message that refers to missing bytes.
+ */
+public func sealAttachment(plaintext: Data)throws  -> SealedAttachment  {
+    return try  FfiConverterTypeSealedAttachment_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_func_seal_attachment(
+        FfiConverterData.lower(plaintext),$0
+    )
+})
+}
 public func secretTombstoneText() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
     uniffi_mls_ffi_fn_func_secret_tombstone_text($0
@@ -2487,7 +2920,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_func_capabilities() != 19744) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_func_secret_tombstone_text() != 3901) {
+    if (uniffi_mls_ffi_checksum_func_open_attachment() != 27686) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_func_seal_attachment() != 21276) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_func_secret_tombstone_text() != 11547) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_ack_eligible() != 21709) {
@@ -2538,6 +2977,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_epoch() != 12252) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_group_name() != 25916) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mls_ffi_checksum_method_mlsclient_has_self_group() != 39595) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2554,6 +2996,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_key_package() != 41222) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_mark_read() != 46393) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_mark_sent() != 42917) {
@@ -2595,6 +3040,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_secret_visible_body() != 8801) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_send_attachment() != 37619) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_set_group_name() != 28282) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mls_ffi_checksum_method_mlsclient_stage_add() != 49236) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2602,6 +3053,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_storage_format_version() != 65410) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_unread_count() != 50121) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_unsent_local_ids() != 39780) {

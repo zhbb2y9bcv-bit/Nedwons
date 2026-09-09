@@ -12,11 +12,20 @@ public struct ThreadLine: Identifiable, Sendable, Equatable {
     public let id: UInt64
     public let kind: Kind
     public let mine: Bool
+    /// When THIS device queued (mine) or decrypted (theirs) the message. `nil` for messages logged
+    /// before timestamps existed — rendered without a time rather than with a guessed one.
+    public let timestamp: Date?
+    /// Mine, and the relay has not accepted it yet: shown as sending, never as delivered.
+    public let isPending: Bool
 
-    public init(id: UInt64, kind: Kind, mine: Bool) {
+    public init(
+        id: UInt64, kind: Kind, mine: Bool, timestamp: Date? = nil, isPending: Bool = false
+    ) {
         self.id = id
         self.kind = kind
         self.mine = mine
+        self.timestamp = timestamp
+        self.isPending = isPending
     }
 }
 
@@ -61,8 +70,12 @@ struct ConversationView: View {
             GroupAdminView(model: model, chat: chat)
         }
         // One round trip on open: the composer locks (or not) from the same rows the relay's send
-        // gate reads, so a muted member finds out here rather than from a refused send.
-        .task { await model.refreshGroupState(chat.conversationID) }
+        // gate reads, so a muted member finds out here rather than from a refused send. Opening the
+        // thread is also what marks it read — the user is looking at it.
+        .task {
+            await model.markConversationRead(chat.conversationID)
+            await model.refreshGroupState(chat.conversationID)
+        }
         .sheet(isPresented: $showProfile) {
             if let accountID = chat.peerAccountID {
                 PersonProfileView(
@@ -98,7 +111,10 @@ struct ConversationView: View {
             }
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Open profile")
+        // The label must name the conversation: a button that only says "open profile" tells a
+        // VoiceOver user which control this is but not which thread they are in.
+        .accessibilityLabel("\(headerTitle), open details")
+        .accessibilityIdentifier(GroupAdminA11y.conversationTitle)
         .onLongPressGesture {
             guard chat.peerAccountID != nil else { return }
             renameText = model.alias(for: chat.peerAccountID ?? "") ?? ""
@@ -111,11 +127,7 @@ struct ConversationView: View {
         return model.alias(for: id) != nil
     }
 
-    private var headerTitle: String {
-        if chat.isGroup { return "Group · \(chat.memberCount) people" }
-        guard let id = chat.peerAccountID else { return "Conversation" }
-        return model.displayName(for: id, username: chat.peerUsername ?? "Unknown")
-    }
+    private var headerTitle: String { model.conversationTitle(for: chat) }
 
     @ViewBuilder
     private var renameActions: some View {
@@ -181,11 +193,14 @@ struct ConversationView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: Nedwons.Spacing.sm) {
                         ForEach(lines) { line in
-                            row(line)
-                                .frame(
-                                    maxWidth: .infinity,
-                                    alignment: line.mine ? .trailing : .leading)
-                                .id(line.id)
+                            VStack(alignment: line.mine ? .trailing : .leading, spacing: 2) {
+                                row(line)
+                                metadata(line)
+                            }
+                            .frame(
+                                maxWidth: .infinity,
+                                alignment: line.mine ? .trailing : .leading)
+                            .id(line.id)
                         }
                     }
                     .padding(Nedwons.Spacing.md)
@@ -195,6 +210,34 @@ struct ConversationView: View {
                 }
             }
         }
+    }
+
+    /// Time, and — for your own messages — whether the relay has it yet. A pending message says so
+    /// rather than looking identical to a delivered one; that difference is the whole point of
+    /// showing it at all.
+    @ViewBuilder
+    private func metadata(_ line: ThreadLine) -> some View {
+        if line.timestamp != nil || line.isPending {
+            HStack(spacing: 4) {
+                if line.isPending {
+                    Image(systemName: "clock")
+                        .font(.system(size: 9))
+                    Text("Sending")
+                } else if let when = line.timestamp {
+                    Text(when, style: .time)
+                }
+            }
+            .font(.system(size: 11))
+            .foregroundStyle(palette.textSecondary)
+            .padding(.horizontal, Nedwons.Spacing.xxs)
+            .accessibilityLabel(accessibilityMetadata(line))
+        }
+    }
+
+    private func accessibilityMetadata(_ line: ThreadLine) -> String {
+        if line.isPending { return "Sending" }
+        guard let when = line.timestamp else { return "" }
+        return "Sent at \(when.formatted(date: .omitted, time: .shortened))"
     }
 
     @ViewBuilder

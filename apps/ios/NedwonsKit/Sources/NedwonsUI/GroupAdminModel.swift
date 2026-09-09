@@ -119,11 +119,22 @@ extension AppModel {
             }
             allAdded = allAdded && ok
         }
-        if allAdded {
-            banner = accountIDs.count == 1 ? "Added to the group." : "Added \(accountIDs.count) people."
-            conversations = (try? await client.listConversations(accessToken: token ?? "")) ?? conversations
+        guard allAdded else { return false }
+        conversations = (try? await client.listConversations(accessToken: token ?? "")) ?? conversations
+        // Routing alone would hand them ciphertext they hold no key for: they must also join the
+        // MLS group, and (if it has one) learn the group's name.
+        if let addMembersToConversationAction {
+            do {
+                try await addMembersToConversationAction(conversationID, accountIDs)
+            } catch {
+                banner = "Added, but secure setup didn't finish for everyone. "
+                    + "Ask them to open Nedwons, then try again."
+                await refreshGroupState(conversationID)
+                return false
+            }
         }
-        return allAdded
+        banner = accountIDs.count == 1 ? "Added to the group." : "Added \(accountIDs.count) people."
+        return true
     }
 
     /// Remove ("kick") a member. Their queued mail for the group is purged server-side.

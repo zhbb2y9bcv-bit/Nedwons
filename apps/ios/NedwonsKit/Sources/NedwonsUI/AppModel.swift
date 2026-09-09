@@ -35,6 +35,10 @@ public final class AppModel: ObservableObject {
     /// Group panel state per conversation (roles, mutes, settings), loaded when a conversation or
     /// its panel opens and refreshed after every admin action. Keyed by conversation id.
     @Published public var groupStates: [String: GroupState] = [:]
+    /// Group names, decrypted on this device. They live INSIDE the MLS ciphertext, so the relay has
+    /// no name to serve and this map is populated only by the composition layer reading local
+    /// state — never from a server response.
+    @Published public var groupNames: [String: String] = [:]
     @Published public var inbox: [InboxEnvelope] = []
     @Published public var isBusy = false
     @Published public var banner: String?
@@ -618,6 +622,46 @@ public final class AppModel: ObservableObject {
 
     // MARK: Groups
 
+    /// The group's name on this device, if a member has set one.
+    public func groupName(for conversationID: String) -> String? {
+        groupNames[conversationID]
+    }
+
+    /// What a conversation is called in the list and the header: the group's E2EE name when it has
+    /// one, else a description of who is in it. A 1:1 thread is titled by the other person (alias
+    /// first, then their real username — an alias never hides who an account is).
+    public func conversationTitle(for chat: ChatSummary) -> String {
+        if let name = groupNames[chat.conversationID], !name.isEmpty { return name }
+        if chat.isGroup { return "Group · \(chat.memberCount) people" }
+        guard let accountID = chat.peerAccountID else { return "Conversation" }
+        return displayName(for: accountID, username: chat.peerUsername ?? "Unknown")
+    }
+
+    /// Rename the group for everyone. The name travels inside the MLS ciphertext, so the relay
+    /// never learns it; every member sees the change on their next sync.
+    @discardableResult
+    public func renameGroup(_ conversationID: String, to rawName: String) async -> Bool {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return false }
+        guard let renameGroupAction else {
+            banner = "Renaming isn't available in this build."
+            return false
+        }
+        var ok = false
+        await run {
+            try await renameGroupAction(conversationID, name)
+            ok = true
+        }
+        if ok { banner = "Group renamed." }
+        return ok
+    }
+
+    /// The user is looking at this conversation, so it is read. Quiet: nothing here is worth
+    /// interrupting them with if it fails.
+    public func markConversationRead(_ conversationID: String) async {
+        await markConversationReadAction?(conversationID)
+    }
+
     /// Leave a group: consent withdrawal. The server removes this account from routing and purges
     /// its queued mail for the conversation; the Chats list refreshes without it.
     public func leaveGroup(_ conversationID: String) async {
@@ -796,6 +840,12 @@ public final class AppModel: ObservableObject {
         localThreads[conversationID]?.lastActivity
     }
 
+    /// Unread inbound messages on THIS device. Derived from decrypted local state — the relay
+    /// cannot count what it cannot read, and never sees a read receipt.
+    public func unreadCount(for conversationID: String) -> Int {
+        localThreads[conversationID]?.unreadCount ?? 0
+    }
+
     // MARK: Local conversation deletion
 
     /// Conversations hidden from the Chats list on THIS device. Deliberately presentation state:
@@ -818,6 +868,16 @@ public final class AppModel: ObservableObject {
     /// MLS group — claim each member's prekey, add them, deliver their Welcomes. Without it a
     /// conversation exists for routing but nothing can be encrypted into it.
     public var bootstrapConversationAction: ((String, [String]) async throws -> Void)?
+
+    /// Injected: add people to an EXISTING conversation's MLS group after the relay has added them
+    /// to routing. Without it they would be routed ciphertext they hold no key for.
+    public var addMembersToConversationAction: ((String, [String]) async throws -> Void)?
+
+    /// Injected: rename the group for everyone, over the E2EE channel.
+    public var renameGroupAction: ((String, String) async throws -> Void)?
+
+    /// Injected: mark a conversation read on this device.
+    public var markConversationReadAction: ((String) async -> Void)?
 
     public var clearHistoryAction: ((String) async throws -> Void)?
 

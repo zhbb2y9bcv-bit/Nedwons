@@ -28,6 +28,8 @@ R-402).
 | Friendship graph & pending requests | Social graph, group gating | Life of relationship | Server (**plaintext**) |
 | Group / conversation membership | Route group messages | Life of membership | Server (**plaintext**) |
 | Group roles, mutes, announcement mode | Group administration; the relay refuses to distribute a muted member's messages | Life of membership (a mute ends with it) | Server (**plaintext**); visible to the group's members |
+| Group name | Title the group | On members' devices only | **Never on the server** — it travels inside the MLS ciphertext like a message; the relay has no name field and cannot learn one |
+| Read state / unread counts | Badges | On the device only | **Never on the server** — derived from decrypted local history; no read receipt is sent to anyone (receipts are not implemented yet) |
 | Blocks & reports | Abuse defense | Retained per policy | Server (access-controlled) |
 | Password (Argon2id hash) | Auth | Life of account | Server (hash only) |
 | Public device key + metadata | Device binding | Life of device enrollment | Server (public key only) |

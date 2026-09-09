@@ -366,6 +366,19 @@
             try? sessionStore.save(fixture.session)
             let model = AppModel(client: client, deviceIdentity: identity, sessionStore: sessionStore)
             model.provisionPolicy = .allowSoftwareFallback
+            // Local-only stand-ins for the coordinator's E2EE features: a rename retitles the group
+            // and a seeded unread count shows the badge, so the screens can be driven without the
+            // MLS core (which the harness deliberately does not link).
+            model.renameGroupAction = { [weak model] conversationID, name in
+                model?.groupNames[conversationID] = name
+            }
+            model.markConversationReadAction = { [weak model] conversationID in
+                guard let model, let thread = model.localThreads[conversationID] else { return }
+                model.localThreads[conversationID] = AppModel.LocalThreadState(
+                    preview: thread.preview, lastActivity: thread.lastActivity, unreadCount: 0)
+            }
+            model.localThreads[GroupAdminFixture.conversationID] = AppModel.LocalThreadState(
+                preview: "see you at 6", lastActivity: Date(), unreadCount: 3)
             // Enough of a send path for the composer to be exercised: the fixture applies the same
             // mute gate the relay does, and an accepted message becomes a local line.
             model.sendMessageAction = { [weak model] body, conversationID in
@@ -375,7 +388,7 @@
                     idempotencyKey: Data((0..<16).map { _ in UInt8.random(in: 0...255) }))
                 let next = UInt64((model.threadLines[conversationID]?.count ?? 0) + 1)
                 model.threadLines[conversationID, default: []].append(
-                    ThreadLine(id: next, kind: .text(body), mine: true))
+                    ThreadLine(id: next, kind: .text(body), mine: true, timestamp: Date()))
             }
             return (model, fixture)
         }

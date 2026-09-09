@@ -19,6 +19,10 @@ public enum GroupAdminA11y {
     /// so a test asserting the mode flipped cannot be satisfied by the switch's caption.
     public static let headerAnnouncementsOnly = "group.header.announcementsOnly"
     public static let toggleAnnouncementsOnly = "group.toggle.announcementsOnly"
+    public static let rename = "group.rename"
+    public static let renameField = "group.rename.field"
+    public static let renameSave = "group.rename.save"
+    public static let title = "group.title"
     public static let toggleJoinApproval = "group.toggle.joinApproval"
     public static let addMembers = "group.addMembers"
     public static let addMembersConfirm = "group.addMembers.confirm"
@@ -40,6 +44,8 @@ public enum GroupAdminA11y {
     public static func requestApprove(_ accountID: String) -> String { "group.request.approve.\(accountID)" }
     public static func requestDeny(_ accountID: String) -> String { "group.request.deny.\(accountID)" }
     public static let conversationGroupInfo = "conversation.groupInfo"
+    /// The conversation header, whose accessibility label names the thread.
+    public static let conversationTitle = "conversation.title"
     public static let composerLocked = "conversation.composer.locked"
     public static let composerField = "conversation.composer.field"
 }
@@ -51,6 +57,8 @@ struct GroupAdminView: View {
     @Environment(\.colorScheme) private var scheme
     @Environment(\.dismiss) private var dismiss
     @State private var showAddMembers = false
+    @State private var showRename = false
+    @State private var draftName = ""
     @State private var confirmLeave = false
     @State private var newInviteToken: String?
     private var palette: Nedwons.Palette { .forScheme(scheme) }
@@ -91,6 +99,7 @@ struct GroupAdminView: View {
         .sheet(isPresented: $showAddMembers) {
             AddGroupMembersView(model: model, conversationID: chat.conversationID)
         }
+        .sheet(isPresented: $showRename) { renameSheet }
         .confirmationDialog(
             "Leave this group?", isPresented: $confirmLeave, titleVisibility: .visible
         ) {
@@ -126,17 +135,72 @@ struct GroupAdminView: View {
         }
     }
 
+    private var renameSheet: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("Group name", text: $draftName)
+                        .accessibilityIdentifier(GroupAdminA11y.renameField)
+                } footer: {
+                    Text(
+                        "The name is encrypted for the group like any message — the Nedwons server "
+                            + "never learns what this group is called. Everyone here sees the change."
+                            + "\n\nRenaming is offered to admins, but the server cannot enforce that "
+                            + "on a message it cannot read: treat the name as something any member "
+                            + "could change.")
+                }
+            }
+            .navigationTitle("Group name")
+            .inlineNavigationTitle()
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showRename = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        Task {
+                            if await model.renameGroup(chat.conversationID, to: draftName) {
+                                showRename = false
+                            }
+                        }
+                    }
+                    .accessibilityIdentifier(GroupAdminA11y.renameSave)
+                    .disabled(
+                        draftName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || model.isBusy)
+                }
+            }
+        }
+    }
+
     // MARK: Sections
 
     private var headerSection: some View {
         Section {
             VStack(spacing: Nedwons.Spacing.sm) {
-                Avatar(label: "G", palette: palette, isGroup: true)
+                Avatar(label: model.groupName(for: chat.conversationID) ?? "G", palette: palette, isGroup: true)
                     .scaleEffect(1.4)
                     .frame(height: 72)
-                Text("\(state?.members.count ?? chat.memberCount) people")
+                Text(model.conversationTitle(for: chat))
                     .font(Nedwons.TypeScale.headline)
                     .foregroundStyle(palette.textPrimary)
+                    .multilineTextAlignment(.center)
+                    .accessibilityIdentifier(GroupAdminA11y.title)
+                Text("\(state?.members.count ?? chat.memberCount) people")
+                    .font(Nedwons.TypeScale.caption)
+                    .foregroundStyle(palette.textSecondary)
+                if isAdmin {
+                    Button {
+                        draftName = model.groupName(for: chat.conversationID) ?? ""
+                        showRename = true
+                    } label: {
+                        Label(
+                            model.groupName(for: chat.conversationID) == nil ? "Name this group" : "Change name",
+                            systemImage: "pencil")
+                    }
+                    .font(Nedwons.TypeScale.caption)
+                    .accessibilityIdentifier(GroupAdminA11y.rename)
+                }
                 if let state, state.announcementsOnly {
                     Label("Announcement mode — only admins can send", systemImage: "megaphone.fill")
                         .font(Nedwons.TypeScale.caption)
