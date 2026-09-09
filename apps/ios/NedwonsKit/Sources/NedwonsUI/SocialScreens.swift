@@ -38,7 +38,25 @@ struct PeopleView: View {
                                 .font(Nedwons.TypeScale.callout)
                                 .foregroundStyle(palette.textSecondary)
                         } else {
-                            ForEach(model.friends) { PersonRow(person: $0) }
+                            // Each contact links to safety-number verification (roadmap step 4);
+                            // a verified contact carries the shield inline.
+                            ForEach(model.friends) { person in
+                                NavigationLink {
+                                    SafetyNumberView(
+                                        model: model, peerAccountID: person.accountID,
+                                        peerLabel: "@\(person.username)")
+                                } label: {
+                                    HStack {
+                                        PersonRow(person: person)
+                                        Spacer()
+                                        if model.isPeerVerified(person.accountID) {
+                                            Image(systemName: "checkmark.shield.fill")
+                                                .foregroundStyle(palette.verified)
+                                                .accessibilityLabel("Verified")
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }

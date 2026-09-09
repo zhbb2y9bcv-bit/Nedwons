@@ -56,6 +56,7 @@ struct ChatsListView: View {
     @Environment(\.colorScheme) private var scheme
     @State private var path = NavigationPath()
     @State private var showCompose = false
+    @State private var showJoin = false
     @State private var pendingDelete: ChatSummary?
     private var palette: Nedwons.Palette { .forScheme(scheme) }
 
@@ -78,6 +79,12 @@ struct ChatsListView: View {
                     Button { showCompose = true } label: { Image(systemName: "square.and.pencil") }
                         .accessibilityLabel("New message")
                 }
+                ToolbarItem(placement: .secondaryAction) {
+                    Button { showJoin = true } label: {
+                        Label("Join with invite", systemImage: "qrcode.viewfinder")
+                    }
+                    .accessibilityIdentifier("chats.join")
+                }
             }
             .navigationDestination(for: ChatSummary.self) { chat in
                 ConversationView(model: model, chat: chat)
@@ -87,6 +94,9 @@ struct ChatsListView: View {
                     showCompose = false
                     path.append(chat)
                 }
+            }
+            .sheet(isPresented: $showJoin) {
+                NavigationStack { JoinByInviteView(model: model) }
             }
             .task { await model.refreshConversations() }
             .refreshable { await model.refreshConversations() }

@@ -240,6 +240,17 @@ public struct TransparencyBinding: Decodable, Sendable {
     }
 }
 
+/// One active device key proven included in the transparency log under the pinned key —
+/// what `verifiedAccountKeys` returns and safety numbers are computed over.
+public struct VerifiedDeviceKey: Sendable, Equatable {
+    public let deviceID: String
+    public let publicKeyX963: Data
+    public init(deviceID: String, publicKeyX963: Data) {
+        self.deviceID = deviceID
+        self.publicKeyX963 = publicKeyX963
+    }
+}
+
 /// A verified device revocation found in the transparency log (ADR-0013).
 public struct LoggedRevocation: Sendable, Equatable {
     public let deviceID: String
@@ -571,6 +582,57 @@ public extension NedwonsClient {
         }
         let active = boundDevices.subtracting(revokedDevices)
         return KeyTransparencyAudit.classify(loggedActive: active, expected: expectedDeviceIDs)
+    }
+
+    /// The account's **active, transparency-verified** device keys — the input to a safety number.
+    ///
+    /// Same fail-closed discipline as the audit: the STH must verify under the *pinned* log key,
+    /// and every leaf's inclusion must prove under that signed root, or the whole call throws
+    /// (`verificationFailed`) rather than returning a set the server merely asserted. A device is
+    /// active iff it has a binding leaf and no revocation leaf (ADR-0013); when a device has
+    /// several binding leaves the earliest wins, matching how the enrolled-key self-check and the
+    /// revocation monitor pick theirs (`.first` by ascending leaf index).
+    func verifiedAccountKeys(
+        accessToken: String,
+        accountID: String,
+        pinnedLogPublicKeyX963: Data
+    ) async throws -> [VerifiedDeviceKey] {
+        let sth = try await transparencySignedTreeHead(accessToken: accessToken)
+        guard let root = Hex.decode(sth.rootHash), let sig = Hex.decode(sth.signature),
+            let advertised = Hex.decode(sth.logPublicKey),
+            advertised == pinnedLogPublicKeyX963,
+            Transparency.verifySTHSignature(
+                treeSize: sth.treeSize, root: root, timestamp: sth.timestamp,
+                signature: sig, logPublicKeyX963: pinnedLogPublicKeyX963)
+        else { throw ClientError.verificationFailed }
+
+        let view = try await transparencyAccount(
+            accessToken: accessToken, accountID: accountID, treeSize: sth.treeSize)
+
+        var firstKeyByDevice: [String: Data] = [:]
+        var revoked = Set<String>()
+        // Leaves arrive in ascending leaf-index order; verify every one before believing any.
+        for b in view.bindings {
+            guard let entry = Hex.decode(b.entry) else { throw ClientError.verificationFailed }
+            let proof = b.proof.compactMap { Hex.decode($0) }
+            guard proof.count == b.proof.count,
+                Transparency.verifyInclusion(
+                    leaf: Transparency.hashLeaf(entry), index: Int(b.leafIndex),
+                    treeSize: Int(sth.treeSize), proof: proof, root: root)
+            else { throw ClientError.verificationFailed }
+            if b.revokedAt != nil {
+                revoked.insert(b.deviceID)
+            } else if firstKeyByDevice[b.deviceID] == nil {
+                guard let key = Hex.decode(b.publicKey) else {
+                    throw ClientError.verificationFailed
+                }
+                firstKeyByDevice[b.deviceID] = key
+            }
+        }
+        return firstKeyByDevice
+            .filter { !revoked.contains($0.key) }
+            .map { VerifiedDeviceKey(deviceID: $0.key, publicKeyX963: $0.value) }
+            .sorted { $0.deviceID < $1.deviceID }
     }
 
     /// Extract the revocation leaves from an account view (pure — no proof verification). The

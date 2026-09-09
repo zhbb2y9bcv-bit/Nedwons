@@ -98,7 +98,15 @@ Rust backend produce byte-identical transcripts.
 ## 6. Identity verification & key transparency
 
 - **Safety numbers / fingerprints** with QR scanning; clear identity-change warnings that
-  are *not* trained-away noise (shown only on real changes).
+  are *not* trained-away noise (shown only on real changes). **Implemented (2026-09-09):**
+  `NedwonsKit.SafetyNumber` — 60 displayed digits (two order-independent halves, each an
+  iterated SHA-256 over `app.nedwons.safety-number.v1`, the account id, and the sorted active
+  device-key set) plus an exact-compare QR payload. The inputs are **transparency-verified**:
+  `verifiedAccountKeys` proves every binding's inclusion under the STH signed by the *pinned*
+  log key before a digit is derived, so the number composes with KT rather than trusting the
+  server's asserted key list. The number covers the whole device set and changes on any
+  add/remove — the screen says to re-verify when it does. "Mark as verified" is a local,
+  per-account judgment stored only on the device.
 - **Key transparency** (append-only log or auditable key directory) is the mechanism that
   makes malicious server key substitution *detectable*. An **RFC 6962-compatible append-only
   Merkle-log primitive is implemented** inside an application-specific KT design (`auth_core::

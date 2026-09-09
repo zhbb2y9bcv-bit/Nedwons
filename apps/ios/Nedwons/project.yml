@@ -54,7 +54,7 @@ targets:
         UIBackgroundModes:
           - remote-notification
         # Pairing to link a device scans a QR code (#8 device linking).
-        NSCameraUsageDescription: "Scan a pairing code to securely link another of your devices."
+        NSCameraUsageDescription: "Scan QR codes to join groups by invite, verify a contact's safety number, or link another of your devices."
         NedwonsServerURL: ""
         NedwonsTransparencyLogKey: ""
         # Export compliance. Declared TRUE deliberately: this app's core function is end-to-end

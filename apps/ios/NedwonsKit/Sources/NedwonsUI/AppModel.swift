@@ -133,6 +133,7 @@ public final class AppModel: ObservableObject {
         } catch NedwonsClient.ClientError.transport {
             // Offline at launch is not an auth failure; keep the session and let the user retry.
             session = stored
+            loadVerifiedPeers()
             phase = .authenticated
             banner = "You're offline. Showing what's stored on this device."
         } catch {
@@ -243,6 +244,7 @@ public final class AppModel: ObservableObject {
         conversations = []
         devices = []
         deviceAssurance = nil
+        verifiedPeers = [] // published copy only; the per-account persisted set survives sign-out
         phase = .unauthenticated
     }
 
@@ -375,6 +377,7 @@ public final class AppModel: ObservableObject {
     }
 
     private func loadInitial() async {
+        loadVerifiedPeers() // local-only; before any network so badges render immediately
         guard let token else { return }
         myProfile = try? await client.myProfile(accessToken: token)
         friends = (try? await client.listFriends(accessToken: token)) ?? []
@@ -405,6 +408,15 @@ public final class AppModel: ObservableObject {
     @Published public var acknowledgedDeviceIDs: Set<String> = []
     /// The out-of-band-pinned transparency log key (fetched once at sign-in in this shell).
     private var pinnedLogKey: Data?
+
+    // MARK: Safety numbers & peer verification (stored here; behavior in VerificationModel.swift)
+
+    /// Peers this user has marked verified after comparing safety numbers. Local state only — a
+    /// verification is this device's judgment, never something the server is told or asked about.
+    @Published public internal(set) var verifiedPeers: Set<String> = []
+    /// Persists `verifiedPeers` across launches, keyed by the signed-in account. Replaceable in
+    /// tests; the default keeps it in `UserDefaults` (it holds no secrets — account ids only).
+    public var verifiedPeersStore: VerifiedPeersStoring = UserDefaultsVerifiedPeersStore()
 
     /// True while a link pass is running (drives the Devices button's spinner).
     @Published public var isLinking = false
@@ -469,7 +481,8 @@ public final class AppModel: ObservableObject {
         }
     }
 
-    private func currentPinnedLogKey() async throws -> Data {
+    // Internal (not private) so the verification surface (`VerificationModel.swift`) shares it.
+    func currentPinnedLogKey() async throws -> Data {
         if let pinnedLogKey { return pinnedLogKey }
         guard let token else { throw NedwonsClient.ClientError.decoding }
         let sth = try await client.transparencySignedTreeHead(accessToken: token)

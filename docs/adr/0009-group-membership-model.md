@@ -152,7 +152,15 @@ cannot police a message it cannot read, so ANY member can technically rename; th
 admins only and the sheet says so. Also landed: on-device unread counts (never a read receipt) and
 per-message time/sending state. See `docs/FFI_BRIDGE.md`.
 
-**Not yet done (designed above):** QR rendering of invites (client UI), group system messages,
+**Landed 2026-09-09:** QR rendering of invites (each invite row + the just-minted sheet shows a
+`nedwons-invite:1:<token>` QR; `InviteQRView`), and the joiner's half — "Join with invite" from
+the chats list scans (VisionKit, hardware only) or accepts a pasted code (`InviteCode.parse`
+refuses anything but a well-formed 64-hex token), then calls `POST /v1/invites/accept`. Honest
+limit, stated in the UI: an invite join adds *routing* membership; a current member's device must
+still run the MLS add ("Finish encryption setup" on the member page) before ciphertext reaches
+them — the deferred-add automation remains open below.
+
+**Not yet done (designed above):** group system messages,
 per-invite member-list preview, and — the big one — binding routing membership to
 **authenticated MLS Add/Remove commits**. That binding is inherently client-driven because the
 relay is deliberately MLS-blind (it must never link the MLS library); it depends on the on-device

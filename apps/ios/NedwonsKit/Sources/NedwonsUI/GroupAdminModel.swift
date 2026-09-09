@@ -137,6 +137,26 @@ extension AppModel {
         return true
     }
 
+    /// Finish an invite joiner's setup: they already hold routing membership (their own consent,
+    /// via the link), so only the MLS add — the part that actually hands them keys — remains.
+    /// Reuses the injected composition-layer add; reports honestly when it isn't available or the
+    /// member is already set up (the duplicate add fails and the banner says so).
+    @discardableResult
+    public func completeMemberEncryption(_ accountID: String, in conversationID: String) async -> Bool {
+        guard let addMembersToConversationAction else {
+            banner = "Encryption setup isn't available in this build."
+            return false
+        }
+        do {
+            try await addMembersToConversationAction(conversationID, [accountID])
+            banner = "Encryption setup finished — new messages reach them now."
+            return true
+        } catch {
+            banner = "Setup didn't complete. They may already be set up, or they haven't opened Nedwons yet."
+            return false
+        }
+    }
+
     /// Remove ("kick") a member. Their queued mail for the group is purged server-side.
     @discardableResult
     public func removeGroupMember(_ accountID: String, from conversationID: String) async -> Bool {
