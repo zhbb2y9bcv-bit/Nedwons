@@ -194,7 +194,13 @@ pub struct AddResult {
 }
 
 pub enum Incoming {
-    Application(Vec<u8>),
+    Application {
+        /// The sender's credential identity, taken from MLS's AUTHENTICATED sender credential —
+        /// not from anything inside the payload. A group member cannot claim to be someone else:
+        /// the signature that admitted this message is what names them.
+        sender: Vec<u8>,
+        payload: Vec<u8>,
+    },
     /// A commit was merged; group state advanced.
     StateAdvanced,
 }
@@ -325,10 +331,15 @@ impl Conversation {
             .group
             .process_message(&me.provider, protocol)
             .map_err(lib)?;
+        // Read the sender BEFORE consuming the message: this is the authenticated credential the
+        // MLS signature check just validated, which is what makes "who reacted" and "who read it"
+        // attributable rather than self-asserted.
+        let sender = processed.credential().serialized_content().to_vec();
         match processed.into_content() {
-            ProcessedMessageContent::ApplicationMessage(app) => {
-                Ok(Incoming::Application(app.into_bytes()))
-            }
+            ProcessedMessageContent::ApplicationMessage(app) => Ok(Incoming::Application {
+                sender,
+                payload: app.into_bytes(),
+            }),
             ProcessedMessageContent::StagedCommitMessage(staged) => {
                 self.group
                     .merge_staged_commit(&me.provider, *staged)

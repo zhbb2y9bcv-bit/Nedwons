@@ -177,7 +177,7 @@ impl ClientApi {
                 .ok_or(ClientError::NotFound)?;
             let member = st.members.get(&identity).ok_or(ClientError::NotFound)?;
             match conv.process(member, envelope).map_err(map_input)? {
-                Incoming::Application(bytes) => Ok(Received::Application(bytes)),
+                Incoming::Application { payload, .. } => Ok(Received::Application(payload)),
                 Incoming::StateAdvanced => Ok(Received::StateAdvanced),
             }
         })

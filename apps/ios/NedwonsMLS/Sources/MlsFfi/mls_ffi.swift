@@ -692,6 +692,11 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func processSelfInbound(envelopeId: UInt64, ciphertext: Data) throws  -> InboundResult
     
     /**
+     * React to a message, or with `remove` take the reaction back. Idempotent on both sides.
+     */
+    func react(target: Data, emoji: String, remove: Bool) throws  -> UInt64
+    
+    /**
      * Used when that device is revoked. The returned remove-commit advances the epoch, so the
      * removed device can no longer decrypt self-group traffic.
      */
@@ -729,6 +734,24 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func sendAttachment(blobId: Data, key: Data, digest: Data, size: UInt64, mime: String, filename: String, caption: String) throws  -> UInt64
     
     /**
+     * Queue one batched receipt for these ids, and remember they were acknowledged so the same
+     * message is never acknowledged twice.
+     */
+    func sendReceipt(kind: ReceiptKindFfi, messageIds: [Data]) throws  -> UInt64
+    
+    /**
+     * Send a message that answers another. The reply carries only the target's id — never a copy
+     * of its text, so a client cannot display words the quoted person never wrote.
+     */
+    func sendReply(body: Data, replyTo: Data) throws  -> UInt64
+    
+    /**
+     * Start or stop a typing indicator. Ephemeral: nothing is logged, and a dropped one costs
+     * nothing, so callers should throttle rather than send per keystroke.
+     */
+    func sendTyping(active: Bool) throws  -> UInt64
+    
+    /**
      * Queue a rename for the whole group, returning its local id — `encrypt`/`mark_sent` it like
      * any other message. The local name changes on encrypt, never before the group is told.
      * Refuses a name a recipient's decoder would reject (empty, over-long, unsafe to render).
@@ -753,6 +776,12 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
      * 0 = pre-versioning; a Pending client also reports 0.
      */
     func storageFormatVersion() throws  -> UInt32
+    
+    /**
+     * Message ids that still owe a receipt of this kind, oldest first. `Read` only ever names
+     * messages the user has actually seen (`mark_read`).
+     */
+    func unacknowledged(kind: ReceiptKindFfi) throws  -> [Data]
     
     /**
      * Inbound messages newer than the read mark. Your own messages are never unread.
@@ -1207,6 +1236,19 @@ open func processSelfInbound(envelopeId: UInt64, ciphertext: Data)throws  -> Inb
 }
     
     /**
+     * React to a message, or with `remove` take the reaction back. Idempotent on both sides.
+     */
+open func react(target: Data, emoji: String, remove: Bool)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_react(self.uniffiClonePointer(),
+        FfiConverterData.lower(target),
+        FfiConverterString.lower(emoji),
+        FfiConverterBool.lower(remove),$0
+    )
+})
+}
+    
+    /**
      * Used when that device is revoked. The returned remove-commit advances the epoch, so the
      * removed device can no longer decrypt self-group traffic.
      */
@@ -1289,6 +1331,44 @@ open func sendAttachment(blobId: Data, key: Data, digest: Data, size: UInt64, mi
 }
     
     /**
+     * Queue one batched receipt for these ids, and remember they were acknowledged so the same
+     * message is never acknowledged twice.
+     */
+open func sendReceipt(kind: ReceiptKindFfi, messageIds: [Data])throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_send_receipt(self.uniffiClonePointer(),
+        FfiConverterTypeReceiptKindFfi_lower(kind),
+        FfiConverterSequenceData.lower(messageIds),$0
+    )
+})
+}
+    
+    /**
+     * Send a message that answers another. The reply carries only the target's id — never a copy
+     * of its text, so a client cannot display words the quoted person never wrote.
+     */
+open func sendReply(body: Data, replyTo: Data)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_send_reply(self.uniffiClonePointer(),
+        FfiConverterData.lower(body),
+        FfiConverterData.lower(replyTo),$0
+    )
+})
+}
+    
+    /**
+     * Start or stop a typing indicator. Ephemeral: nothing is logged, and a dropped one costs
+     * nothing, so callers should throttle rather than send per keystroke.
+     */
+open func sendTyping(active: Bool)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_send_typing(self.uniffiClonePointer(),
+        FfiConverterBool.lower(active),$0
+    )
+})
+}
+    
+    /**
      * Queue a rename for the whole group, returning its local id — `encrypt`/`mark_sent` it like
      * any other message. The local name changes on encrypt, never before the group is told.
      * Refuses a name a recipient's decoder would reject (empty, over-long, unsafe to render).
@@ -1333,6 +1413,18 @@ open func stageRemove(identity: Data)throws  -> Data  {
 open func storageFormatVersion()throws  -> UInt32  {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_storage_format_version(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Message ids that still owe a receipt of this kind, oldest first. `Read` only ever names
+     * messages the user has actually seen (`mark_read`).
+     */
+open func unacknowledged(kind: ReceiptKindFfi)throws  -> [Data]  {
+    return try  FfiConverterSequenceData.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_unacknowledged(self.uniffiClonePointer(),
+        FfiConverterTypeReceiptKindFfi_lower(kind),$0
     )
 })
 }
@@ -1810,6 +1902,85 @@ public func FfiConverterTypeHistoryEntry_lower(_ value: HistoryEntry) -> RustBuf
 
 
 /**
+ * One person's reaction to one message.
+ */
+public struct ReactionInfo {
+    public var emoji: String
+    /**
+     * The MLS-authenticated credential identity of whoever reacted — not a name from the payload.
+     */
+    public var sender: Data
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(emoji: String, 
+        /**
+         * The MLS-authenticated credential identity of whoever reacted — not a name from the payload.
+         */sender: Data) {
+        self.emoji = emoji
+        self.sender = sender
+    }
+}
+
+#if compiler(>=6)
+extension ReactionInfo: Sendable {}
+#endif
+
+
+extension ReactionInfo: Equatable, Hashable {
+    public static func ==(lhs: ReactionInfo, rhs: ReactionInfo) -> Bool {
+        if lhs.emoji != rhs.emoji {
+            return false
+        }
+        if lhs.sender != rhs.sender {
+            return false
+        }
+        return true
+    }
+
+    public func hash(into hasher: inout Hasher) {
+        hasher.combine(emoji)
+        hasher.combine(sender)
+    }
+}
+
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReactionInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReactionInfo {
+        return
+            try ReactionInfo(
+                emoji: FfiConverterString.read(from: &buf), 
+                sender: FfiConverterData.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ReactionInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.emoji, into: &buf)
+        FfiConverterData.write(value.sender, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReactionInfo_lift(_ buf: RustBuffer) throws -> ReactionInfo {
+    return try FfiConverterTypeReactionInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReactionInfo_lower(_ value: ReactionInfo) -> RustBuffer {
+    return FfiConverterTypeReactionInfo.lower(value)
+}
+
+
+/**
  * An encrypted file ready to upload, plus the secrets to put in the message that references it.
  */
 public struct SealedAttachment {
@@ -2066,6 +2237,21 @@ public struct StoredMessage {
      * `Some` when this message is a file; `plaintext` is then its caption.
      */
     public var attachment: AttachmentInfo?
+    /**
+     * The id every other device knows this message by — what a reply, reaction or receipt names.
+     * All-zero for messages logged before ids existed; those cannot be referred to.
+     */
+    public var messageId: Data
+    /**
+     * The message this one answers, if any.
+     */
+    public var replyTo: Data?
+    public var reactions: [ReactionInfo]
+    /**
+     * For our own messages: how many other members have received / read it.
+     */
+    public var deliveredCount: UInt32
+    public var readCount: UInt32
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -2084,7 +2270,17 @@ public struct StoredMessage {
          */pending: Bool, 
         /**
          * `Some` when this message is a file; `plaintext` is then its caption.
-         */attachment: AttachmentInfo?) {
+         */attachment: AttachmentInfo?, 
+        /**
+         * The id every other device knows this message by — what a reply, reaction or receipt names.
+         * All-zero for messages logged before ids existed; those cannot be referred to.
+         */messageId: Data, 
+        /**
+         * The message this one answers, if any.
+         */replyTo: Data?, reactions: [ReactionInfo], 
+        /**
+         * For our own messages: how many other members have received / read it.
+         */deliveredCount: UInt32, readCount: UInt32) {
         self.localId = localId
         self.direction = direction
         self.plaintext = plaintext
@@ -2093,6 +2289,11 @@ public struct StoredMessage {
         self.createdAtMs = createdAtMs
         self.pending = pending
         self.attachment = attachment
+        self.messageId = messageId
+        self.replyTo = replyTo
+        self.reactions = reactions
+        self.deliveredCount = deliveredCount
+        self.readCount = readCount
     }
 }
 
@@ -2127,6 +2328,21 @@ extension StoredMessage: Equatable, Hashable {
         if lhs.attachment != rhs.attachment {
             return false
         }
+        if lhs.messageId != rhs.messageId {
+            return false
+        }
+        if lhs.replyTo != rhs.replyTo {
+            return false
+        }
+        if lhs.reactions != rhs.reactions {
+            return false
+        }
+        if lhs.deliveredCount != rhs.deliveredCount {
+            return false
+        }
+        if lhs.readCount != rhs.readCount {
+            return false
+        }
         return true
     }
 
@@ -2139,6 +2355,11 @@ extension StoredMessage: Equatable, Hashable {
         hasher.combine(createdAtMs)
         hasher.combine(pending)
         hasher.combine(attachment)
+        hasher.combine(messageId)
+        hasher.combine(replyTo)
+        hasher.combine(reactions)
+        hasher.combine(deliveredCount)
+        hasher.combine(readCount)
     }
 }
 
@@ -2158,7 +2379,12 @@ public struct FfiConverterTypeStoredMessage: FfiConverterRustBuffer {
                 secretId: FfiConverterOptionData.read(from: &buf), 
                 createdAtMs: FfiConverterUInt64.read(from: &buf), 
                 pending: FfiConverterBool.read(from: &buf), 
-                attachment: FfiConverterOptionTypeAttachmentInfo.read(from: &buf)
+                attachment: FfiConverterOptionTypeAttachmentInfo.read(from: &buf), 
+                messageId: FfiConverterData.read(from: &buf), 
+                replyTo: FfiConverterOptionData.read(from: &buf), 
+                reactions: FfiConverterSequenceTypeReactionInfo.read(from: &buf), 
+                deliveredCount: FfiConverterUInt32.read(from: &buf), 
+                readCount: FfiConverterUInt32.read(from: &buf)
         )
     }
 
@@ -2171,6 +2397,11 @@ public struct FfiConverterTypeStoredMessage: FfiConverterRustBuffer {
         FfiConverterUInt64.write(value.createdAtMs, into: &buf)
         FfiConverterBool.write(value.pending, into: &buf)
         FfiConverterOptionTypeAttachmentInfo.write(value.attachment, into: &buf)
+        FfiConverterData.write(value.messageId, into: &buf)
+        FfiConverterOptionData.write(value.replyTo, into: &buf)
+        FfiConverterSequenceTypeReactionInfo.write(value.reactions, into: &buf)
+        FfiConverterUInt32.write(value.deliveredCount, into: &buf)
+        FfiConverterUInt32.write(value.readCount, into: &buf)
     }
 }
 
@@ -2306,6 +2537,22 @@ public enum InboundResult {
      */
     case attachmentReceived(attachment: AttachmentInfo
     )
+    /**
+     * Someone reacted to (or un-reacted from) a message this device holds. Re-read the thread.
+     */
+    case reactionChanged(target: Data
+    )
+    /**
+     * Someone acknowledged `count` of OUR messages.
+     */
+    case receiptsReceived(kind: ReceiptKindFfi, count: UInt64
+    )
+    /**
+     * Ephemeral: someone started or stopped typing. Nothing was persisted, and it is safe to
+     * ignore — the UI should time it out on its own rather than trusting a "stopped" to arrive.
+     */
+    case typing(sender: Data, active: Bool
+    )
 }
 
 
@@ -2346,6 +2593,15 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         )
         
         case 9: return .attachmentReceived(attachment: try FfiConverterTypeAttachmentInfo.read(from: &buf)
+        )
+        
+        case 10: return .reactionChanged(target: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 11: return .receiptsReceived(kind: try FfiConverterTypeReceiptKindFfi.read(from: &buf), count: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        case 12: return .typing(sender: try FfiConverterData.read(from: &buf), active: try FfiConverterBool.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -2397,6 +2653,23 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         case let .attachmentReceived(attachment):
             writeInt(&buf, Int32(9))
             FfiConverterTypeAttachmentInfo.write(attachment, into: &buf)
+            
+        
+        case let .reactionChanged(target):
+            writeInt(&buf, Int32(10))
+            FfiConverterData.write(target, into: &buf)
+            
+        
+        case let .receiptsReceived(kind,count):
+            writeInt(&buf, Int32(11))
+            FfiConverterTypeReceiptKindFfi.write(kind, into: &buf)
+            FfiConverterUInt64.write(count, into: &buf)
+            
+        
+        case let .typing(sender,active):
+            writeInt(&buf, Int32(12))
+            FfiConverterData.write(sender, into: &buf)
+            FfiConverterBool.write(active, into: &buf)
             
         }
     }
@@ -2545,6 +2818,79 @@ extension MlsClientError: Foundation.LocalizedError {
         String(reflecting: self)
     }
 }
+
+
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Which way a receipt points.
+ */
+
+public enum ReceiptKindFfi {
+    
+    case delivered
+    case read
+}
+
+
+#if compiler(>=6)
+extension ReceiptKindFfi: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeReceiptKindFfi: FfiConverterRustBuffer {
+    typealias SwiftType = ReceiptKindFfi
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ReceiptKindFfi {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .delivered
+        
+        case 2: return .read
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: ReceiptKindFfi, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .delivered:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .read:
+            writeInt(&buf, Int32(2))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReceiptKindFfi_lift(_ buf: RustBuffer) throws -> ReceiptKindFfi {
+    return try FfiConverterTypeReceiptKindFfi.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeReceiptKindFfi_lower(_ value: ReceiptKindFfi) -> RustBuffer {
+    return FfiConverterTypeReceiptKindFfi.lower(value)
+}
+
+
+extension ReceiptKindFfi: Equatable, Hashable {}
+
+
 
 
 
@@ -2826,6 +3172,31 @@ fileprivate struct FfiConverterSequenceTypeHistoryEntry: FfiConverterRustBuffer 
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeReactionInfo: FfiConverterRustBuffer {
+    typealias SwiftType = [ReactionInfo]
+
+    public static func write(_ value: [ReactionInfo], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeReactionInfo.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ReactionInfo] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ReactionInfo]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeReactionInfo.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeStoredMessage: FfiConverterRustBuffer {
     typealias SwiftType = [StoredMessage]
 
@@ -3025,6 +3396,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_process_self_inbound() != 28883) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_react() != 29136) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mls_ffi_checksum_method_mlsclient_remove_self_device() != 4041) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3043,6 +3417,15 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_send_attachment() != 37619) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_send_receipt() != 50179) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_send_reply() != 94) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_send_typing() != 32858) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mls_ffi_checksum_method_mlsclient_set_group_name() != 28282) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3053,6 +3436,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_storage_format_version() != 65410) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_unacknowledged() != 54499) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_unread_count() != 50121) {

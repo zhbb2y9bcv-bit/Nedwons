@@ -10,7 +10,13 @@
 use crate::attachment::{ATTACHMENT_DIGEST_LEN, ATTACHMENT_KEY_LEN, MAX_ATTACHMENT_BYTES};
 
 /// A bump is an explicit, non-silent wire change; older clients reject rather than guess.
-pub const CONTENT_VERSION: u16 = 1;
+///
+/// **v2** gave every user-visible message a `message_id`, so that one message can be REFERRED TO —
+/// by a reply, a reaction, or a receipt. Nothing else can express "this one"; a local id is local,
+/// and a server envelope id is per-recipient. The id is sender-chosen randomness, which is
+/// deliberate: it is a handle, never a capability or a claim, and every effect keyed by it is
+/// scoped to the conversation the message was actually seen in.
+pub const CONTENT_VERSION: u16 = 2;
 
 /// At/under the FFI `MAX_PLAINTEXT_LEN`, so a body that fits the envelope also fits the transport.
 pub const MAX_CONTENT_BODY: usize = 16 * 1024;
@@ -22,6 +28,9 @@ const KIND_DELIVERY_KEY_GRANT: u8 = 3;
 const KIND_HISTORY_SYNC: u8 = 4;
 const KIND_GROUP_NAME: u8 = 5;
 const KIND_ATTACHMENT: u8 = 6;
+const KIND_REACTION: u8 = 7;
+const KIND_RECEIPT: u8 = 8;
+const KIND_TYPING: u8 = 9;
 
 /// Sender-chosen random, used for placeholder tracking + recipient-side replay rejection.
 pub const SECRET_ID_LEN: usize = 16;
@@ -42,6 +51,16 @@ pub const MAX_FILENAME_BYTES: usize = 256;
 /// The relay's blob id: 16 random bytes.
 pub const BLOB_ID_LEN: usize = 16;
 
+/// Sender-chosen random id for one message, so replies/reactions/receipts can name it.
+pub const MESSAGE_ID_LEN: usize = 16;
+
+/// A reaction is one short grapheme cluster ("👍", "🎉"), not a message. Bounded in bytes.
+pub const MAX_REACTION_BYTES: usize = 32;
+
+/// Receipts are batched; a hostile sender must not be able to make the recipient allocate for
+/// millions of ids.
+pub const MAX_RECEIPT_IDS: usize = 256;
+
 /// One past message replicated to a newly-linked device (#7). Secrets are NOT included — view-once
 /// has no re-showable history.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,30 +70,54 @@ pub struct HistoryEntry {
     pub body: Vec<u8>,
 }
 
+/// Which way a receipt points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptKind {
+    /// The message reached the device and decrypted.
+    Delivered,
+    /// A person actually looked at it.
+    Read,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Content {
     Normal {
+        message_id: [u8; MESSAGE_ID_LEN],
+        /// The message this one answers, if any. A reply is a pointer, not a copy: quoting the
+        /// original's text would let a hostile client show words the "quoted" person never wrote.
+        reply_to: Option<[u8; MESSAGE_ID_LEN]>,
         body: Vec<u8>,
     },
     /// A view-once message.
     Secret {
+        message_id: [u8; MESSAGE_ID_LEN],
         secret_id: [u8; SECRET_ID_LEN],
         body: Vec<u8>,
     },
+    /// An emoji attached to another message. `remove` un-does one, so a reaction is a toggle rather
+    /// than an append-only log that can never be taken back.
+    Reaction {
+        target: [u8; MESSAGE_ID_LEN],
+        emoji: String,
+        remove: bool,
+    },
+    /// "I received / I read these." Batched, because a device coming back online acknowledges a
+    /// backlog at once rather than sending one message per message.
+    Receipt {
+        kind: ReceiptKind,
+        message_ids: Vec<[u8; MESSAGE_ID_LEN]>,
+    },
+    /// Ephemeral: never logged, never persisted, and safe to drop. `active: false` retracts it, so
+    /// a typing indicator cannot get stuck on when someone closes the app mid-word.
+    Typing { active: bool },
     /// ADR-0015: the device that revealed `secret_id` tells the account's OTHER devices to consume
     /// it too (account-wide single-view). No body.
-    SecretConsumed {
-        secret_id: [u8; SECRET_ID_LEN],
-    },
+    SecretConsumed { secret_id: [u8; SECRET_ID_LEN] },
     /// ADR-0014 Slice 2c: shares `K_r` with an approved contact. The relay never sees it — the grant
     /// travels inside the MLS ciphertext.
-    DeliveryKeyGrant {
-        key_r: [u8; DELIVERY_KEY_LEN],
-    },
+    DeliveryKeyGrant { key_r: [u8; DELIVERY_KEY_LEN] },
     /// #7: replicates past messages to a newly-linked device over the account's self-group.
-    HistorySync {
-        entries: Vec<HistoryEntry>,
-    },
+    HistorySync { entries: Vec<HistoryEntry> },
     /// The group's name, set by a member and carried INSIDE the MLS ciphertext — so the relay never
     /// learns what a group is called, exactly as it never learns what is said in it. There is no
     /// server-side name field to leak, subpoena, or index.
@@ -83,14 +126,13 @@ pub enum Content {
     /// message it cannot read. The app offers renaming to admins only; that restriction is UI-level
     /// and a modified client could ignore it. Renaming is not destructive, and every member sees the
     /// change, so this is a deliberate trade rather than an oversight.
-    GroupName {
-        name: String,
-    },
+    GroupName { name: String },
     /// A file. The bytes live on the relay as opaque ciphertext; everything that makes them
     /// meaningful — the key, what kind of file it is, what it was called, how big it is — is in
     /// here, inside the MLS ciphertext. The relay can tell that an account uploaded *something* of
     /// a given size, and nothing else about it.
     Attachment {
+        message_id: [u8; MESSAGE_ID_LEN],
         /// Where to fetch the ciphertext from the relay.
         blob_id: [u8; BLOB_ID_LEN],
         /// One-time AES-256-GCM key ([`crate::attachment`]). Never leaves the E2EE channel.
@@ -122,12 +164,15 @@ impl Content {
     /// Empty for control kinds.
     pub fn body(&self) -> &[u8] {
         match self {
-            Content::Normal { body } | Content::Secret { body, .. } => body,
+            Content::Normal { body, .. } | Content::Secret { body, .. } => body,
             Content::SecretConsumed { .. }
             | Content::DeliveryKeyGrant { .. }
             | Content::HistorySync { .. }
             | Content::GroupName { .. }
-            | Content::Attachment { .. } => &[],
+            | Content::Attachment { .. }
+            | Content::Reaction { .. }
+            | Content::Receipt { .. }
+            | Content::Typing { .. } => &[],
         }
     }
 
@@ -139,16 +184,59 @@ impl Content {
         let mut out = Vec::with_capacity(2 + 1 + SECRET_ID_LEN + 4 + self.body().len());
         out.extend_from_slice(&CONTENT_VERSION.to_be_bytes());
         match self {
-            Content::Normal { body } => {
+            Content::Normal {
+                message_id,
+                reply_to,
+                body,
+            } => {
                 out.push(KIND_NORMAL);
+                out.extend_from_slice(message_id);
+                match reply_to {
+                    Some(target) => {
+                        out.push(1);
+                        out.extend_from_slice(target);
+                    }
+                    None => out.push(0),
+                }
                 out.extend_from_slice(&(body.len() as u32).to_be_bytes());
                 out.extend_from_slice(body);
             }
-            Content::Secret { secret_id, body } => {
+            Content::Secret {
+                message_id,
+                secret_id,
+                body,
+            } => {
                 out.push(KIND_SECRET);
+                out.extend_from_slice(message_id);
                 out.extend_from_slice(secret_id);
                 out.extend_from_slice(&(body.len() as u32).to_be_bytes());
                 out.extend_from_slice(body);
+            }
+            Content::Reaction {
+                target,
+                emoji,
+                remove,
+            } => {
+                out.push(KIND_REACTION);
+                out.extend_from_slice(target);
+                out.push(if *remove { 1 } else { 0 });
+                out.extend_from_slice(&(emoji.len() as u32).to_be_bytes());
+                out.extend_from_slice(emoji.as_bytes());
+            }
+            Content::Receipt { kind, message_ids } => {
+                out.push(KIND_RECEIPT);
+                out.push(match kind {
+                    ReceiptKind::Delivered => 0,
+                    ReceiptKind::Read => 1,
+                });
+                out.extend_from_slice(&(message_ids.len() as u32).to_be_bytes());
+                for id in message_ids {
+                    out.extend_from_slice(id);
+                }
+            }
+            Content::Typing { active } => {
+                out.push(KIND_TYPING);
+                out.push(if *active { 1 } else { 0 });
             }
             Content::SecretConsumed { secret_id } => {
                 out.push(KIND_SECRET_CONSUMED);
@@ -164,6 +252,7 @@ impl Content {
                 out.extend_from_slice(name.as_bytes());
             }
             Content::Attachment {
+                message_id,
                 blob_id,
                 key,
                 digest,
@@ -173,6 +262,7 @@ impl Content {
                 caption,
             } => {
                 out.push(KIND_ATTACHMENT);
+                out.extend_from_slice(message_id);
                 out.extend_from_slice(blob_id);
                 out.extend_from_slice(key);
                 out.extend_from_slice(digest);
@@ -207,16 +297,86 @@ impl Content {
         let rest = &bytes[2..];
         let (&kind, rest) = rest.split_first().ok_or(ContentError::Malformed)?;
         match kind {
-            KIND_NORMAL => Ok(Content::Normal {
-                body: decode_lp_body(rest)?,
-            }),
+            KIND_NORMAL => {
+                let (message_id, rest) = split_id(rest)?;
+                let (&flag, rest) = rest.split_first().ok_or(ContentError::Malformed)?;
+                let (reply_to, rest) = match flag {
+                    0 => (None, rest),
+                    1 => {
+                        let (target, rest) = split_id(rest)?;
+                        (Some(target), rest)
+                    }
+                    _ => return Err(ContentError::Malformed), // only 0/1 are valid flags
+                };
+                Ok(Content::Normal {
+                    message_id,
+                    reply_to,
+                    body: decode_lp_body(rest)?,
+                })
+            }
             KIND_SECRET => {
+                let (message_id, rest) = split_id(rest)?;
                 let (secret_id, rest) = split_secret_id(rest)?;
                 Ok(Content::Secret {
+                    message_id,
                     secret_id,
                     body: decode_lp_body(rest)?,
                 })
             }
+            KIND_REACTION => {
+                let (target, rest) = split_id(rest)?;
+                let (&flag, rest) = rest.split_first().ok_or(ContentError::Malformed)?;
+                let remove = match flag {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(ContentError::Malformed),
+                };
+                let (emoji, tail) = decode_lp_text(rest, MAX_REACTION_BYTES)?;
+                if !tail.is_empty() || emoji.is_empty() {
+                    return Err(ContentError::Malformed);
+                }
+                Ok(Content::Reaction {
+                    target,
+                    emoji,
+                    remove,
+                })
+            }
+            KIND_RECEIPT => {
+                let (&kind, rest) = rest.split_first().ok_or(ContentError::Malformed)?;
+                let kind = match kind {
+                    0 => ReceiptKind::Delivered,
+                    1 => ReceiptKind::Read,
+                    _ => return Err(ContentError::UnknownKind(kind)),
+                };
+                if rest.len() < 4 {
+                    return Err(ContentError::Malformed);
+                }
+                let (count_bytes, mut tail) = rest.split_at(4);
+                let count = u32::from_be_bytes([
+                    count_bytes[0],
+                    count_bytes[1],
+                    count_bytes[2],
+                    count_bytes[3],
+                ]) as usize;
+                if count > MAX_RECEIPT_IDS {
+                    return Err(ContentError::TooLarge);
+                }
+                if tail.len() != count * MESSAGE_ID_LEN {
+                    return Err(ContentError::Malformed); // exact, no trailer
+                }
+                let mut message_ids = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let (id, next) = split_id(tail)?;
+                    message_ids.push(id);
+                    tail = next;
+                }
+                Ok(Content::Receipt { kind, message_ids })
+            }
+            KIND_TYPING => match rest {
+                [0] => Ok(Content::Typing { active: false }),
+                [1] => Ok(Content::Typing { active: true }),
+                _ => Err(ContentError::Malformed),
+            },
             KIND_SECRET_CONSUMED => {
                 let (secret_id, rest) = split_secret_id(rest)?;
                 if !rest.is_empty() {
@@ -249,6 +409,7 @@ impl Content {
 /// and free of anything that must not be rendered — a filename is attacker-chosen text that lands in
 /// a message bubble.
 fn decode_attachment(rest: &[u8]) -> Result<Content, ContentError> {
+    let (message_id, rest) = split_id(rest)?;
     const FIXED: usize = BLOB_ID_LEN + ATTACHMENT_KEY_LEN + ATTACHMENT_DIGEST_LEN + 8;
     if rest.len() < FIXED {
         return Err(ContentError::Malformed);
@@ -286,6 +447,7 @@ fn decode_attachment(rest: &[u8]) -> Result<Content, ContentError> {
         return Err(ContentError::Malformed);
     }
     Ok(Content::Attachment {
+        message_id,
         blob_id,
         key,
         digest,
@@ -351,6 +513,17 @@ fn is_unsafe_to_render(c: char) -> bool {
             c,
             '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
         )
+}
+
+/// A fixed 16-byte id off the front, or `Malformed` — never a short read.
+fn split_id(rest: &[u8]) -> Result<([u8; MESSAGE_ID_LEN], &[u8]), ContentError> {
+    if rest.len() < MESSAGE_ID_LEN {
+        return Err(ContentError::Malformed);
+    }
+    let (id, tail) = rest.split_at(MESSAGE_ID_LEN);
+    let mut arr = [0u8; MESSAGE_ID_LEN];
+    arr.copy_from_slice(id);
+    Ok((arr, tail))
 }
 
 fn split_secret_id(rest: &[u8]) -> Result<([u8; SECRET_ID_LEN], &[u8]), ContentError> {
@@ -428,6 +601,8 @@ mod tests {
     #[test]
     fn normal_round_trips() {
         let c = Content::Normal {
+            message_id: [0x11; MESSAGE_ID_LEN],
+            reply_to: None,
             body: b"hello world".to_vec(),
         };
         assert_eq!(Content::decode(&c.encode()).unwrap(), c);
@@ -436,6 +611,7 @@ mod tests {
     #[test]
     fn secret_round_trips_with_id() {
         let c = Content::Secret {
+            message_id: [0x22; MESSAGE_ID_LEN],
             secret_id: [0xAB; SECRET_ID_LEN],
             body: b"for your eyes only".to_vec(),
         };
@@ -525,6 +701,7 @@ mod tests {
     fn kinds_are_disjoint_encodings() {
         let sid = [0x11; SECRET_ID_LEN];
         let secret = Content::Secret {
+            message_id: [0x33; MESSAGE_ID_LEN],
             secret_id: sid,
             body: vec![],
         }
@@ -535,13 +712,16 @@ mod tests {
 
     #[test]
     fn empty_body_is_valid_for_both_kinds() {
-        assert_eq!(
-            Content::decode(&Content::Normal { body: vec![] }.encode()).unwrap(),
-            Content::Normal { body: vec![] }
-        );
+        let empty = Content::Normal {
+            message_id: [0x44; MESSAGE_ID_LEN],
+            reply_to: None,
+            body: vec![],
+        };
+        assert_eq!(Content::decode(&empty.encode()).unwrap(), empty);
         assert!(matches!(
             Content::decode(
                 &Content::Secret {
+                    message_id: [0x55; MESSAGE_ID_LEN],
                     secret_id: [0; SECRET_ID_LEN],
                     body: vec![]
                 }
@@ -553,43 +733,51 @@ mod tests {
 
     #[test]
     fn rejects_unknown_version() {
-        let mut bytes = 2u16.to_be_bytes().to_vec();
-        bytes.push(KIND_NORMAL);
-        bytes.extend_from_slice(&0u32.to_be_bytes());
-        assert_eq!(
-            Content::decode(&bytes),
-            Err(ContentError::UnsupportedVersion(2))
-        );
+        // A version this build does not implement is refused outright rather than guessed at —
+        // including v1, which is what makes the v2 bump non-silent.
+        for version in [1u16, 3, 999] {
+            let mut bytes = version.to_be_bytes().to_vec();
+            bytes.push(KIND_NORMAL);
+            bytes.extend_from_slice(&[0u8; MESSAGE_ID_LEN]);
+            bytes.push(0);
+            bytes.extend_from_slice(&0u32.to_be_bytes());
+            assert_eq!(
+                Content::decode(&bytes),
+                Err(ContentError::UnsupportedVersion(version))
+            );
+        }
     }
 
     #[test]
     fn rejects_unknown_kind() {
         let mut bytes = CONTENT_VERSION.to_be_bytes().to_vec();
-        bytes.push(9); // unknown kind
-        assert_eq!(Content::decode(&bytes), Err(ContentError::UnknownKind(9)));
+        // Far outside the assigned range, so this test does not have to be edited every time a
+        // kind is added (kind 9 became Typing, which is how this was caught).
+        bytes.push(200);
+        assert_eq!(Content::decode(&bytes), Err(ContentError::UnknownKind(200)));
     }
 
     #[test]
     fn rejects_truncated_secret_id() {
         let mut bytes = CONTENT_VERSION.to_be_bytes().to_vec();
         bytes.push(KIND_SECRET);
-        bytes.extend_from_slice(&[0u8; 8]); // only half an id
+        bytes.extend_from_slice(&[0u8; MESSAGE_ID_LEN]);
+        bytes.extend_from_slice(&[0u8; 8]); // only half a secret id
         assert_eq!(Content::decode(&bytes), Err(ContentError::Malformed));
     }
 
     #[test]
     fn rejects_trailing_and_truncated_body() {
-        let mut c = Content::Normal {
+        let normal = Content::Normal {
+            message_id: [0x66; MESSAGE_ID_LEN],
+            reply_to: None,
             body: b"abc".to_vec(),
-        }
-        .encode();
+        };
+        let mut c = normal.encode();
         c.push(0xFF); // trailing byte
         assert_eq!(Content::decode(&c), Err(ContentError::Malformed));
 
-        let mut c2 = Content::Normal {
-            body: b"abc".to_vec(),
-        }
-        .encode();
+        let mut c2 = normal.encode();
         c2.pop(); // truncated body
         assert_eq!(Content::decode(&c2), Err(ContentError::Malformed));
     }
@@ -599,6 +787,8 @@ mod tests {
         // Declares a body far larger than the cap; must reject on the length field alone.
         let mut bytes = CONTENT_VERSION.to_be_bytes().to_vec();
         bytes.push(KIND_NORMAL);
+        bytes.extend_from_slice(&[0u8; MESSAGE_ID_LEN]);
+        bytes.push(0); // no reply
         bytes.extend_from_slice(&(u32::MAX).to_be_bytes());
         assert_eq!(Content::decode(&bytes), Err(ContentError::TooLarge));
     }

@@ -885,6 +885,107 @@ public final class AppModel: ObservableObject {
     /// Injected: fetch and decrypt one attachment's bytes.
     public var loadAttachmentAction: ((String) async throws -> Data)?
 
+    /// Injected: send a message answering another (`body`, `replyTo`, conversation).
+    public var sendReplyAction: ((String, String, String) async throws -> Void)?
+
+    /// Injected: add or remove a reaction (`messageID`, `emoji`, `remove`, conversation).
+    public var reactAction: ((String, String, Bool, String) async throws -> Void)?
+
+    /// Injected: tell the conversation whether this user is typing.
+    public var setTypingAction: ((Bool, String) async -> Void)?
+
+    /// Who is currently typing, per conversation, as last reported. Ephemeral by construction: it
+    /// is never persisted, and each entry expires on its own — a "stopped typing" that never
+    /// arrives (the app was killed mid-word) must not leave someone typing forever.
+    @Published public var typingBy: [String: Set<String>] = [:]
+
+    /// The message being replied to, per conversation, while the user composes.
+    @Published public var replyDrafts: [String: ThreadLine] = [:]
+
+    public func typingNames(in conversationID: String) -> [String] {
+        (typingBy[conversationID] ?? []).sorted().map { id in
+            displayName(for: id, username: username(forAccountID: id) ?? "Someone")
+        }
+    }
+
+    /// Record a typing signal and schedule its expiry. Called by the composition layer when a
+    /// typing message arrives.
+    public func noteTyping(_ senderID: String, active: Bool, in conversationID: String) {
+        var current = typingBy[conversationID] ?? []
+        if active {
+            current.insert(senderID)
+        } else {
+            current.remove(senderID)
+        }
+        typingBy[conversationID] = current.isEmpty ? nil : current
+        guard active else { return }
+        // Expire on our own clock rather than waiting for a "stopped" that may never come.
+        typingExpiry[senderID]?.cancel()
+        typingExpiry[senderID] = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.noteTyping(senderID, active: false, in: conversationID)
+        }
+    }
+
+    private var typingExpiry: [String: Task<Void, Never>] = [:]
+
+    /// Begin (or continue) composing a reply to `line`.
+    public func startReply(to line: ThreadLine, in conversationID: String) {
+        guard !line.messageID.isEmpty else {
+            banner = "This message is too old to reply to."
+            return
+        }
+        replyDrafts[conversationID] = line
+    }
+
+    public func cancelReply(in conversationID: String) {
+        replyDrafts.removeValue(forKey: conversationID)
+    }
+
+    /// Send `body`, answering the pending reply draft if there is one.
+    public func sendMessageOrReply(_ body: String, to conversationID: String) async {
+        let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        guard let draft = replyDrafts[conversationID], let sendReplyAction else {
+            await sendMessage(trimmed, to: conversationID)
+            return
+        }
+        replyDrafts.removeValue(forKey: conversationID)
+        do {
+            try await sendReplyAction(trimmed, draft.messageID, conversationID)
+            unhideConversation(conversationID)
+        } catch let NedwonsClient.ClientError.http(_, body)
+            where GroupRefusal.from(errorBody: body).map(\.isSendRefusal) == true
+        {
+            banner = GroupRefusal.from(errorBody: body)?.userFacingText
+            await refreshGroupState(conversationID)
+        } catch {
+            banner = "Couldn't send that message. It stays queued and will retry."
+        }
+    }
+
+    /// Toggle one emoji on one message.
+    public func toggleReaction(_ emoji: String, on line: ThreadLine, in conversationID: String) async {
+        guard !line.messageID.isEmpty else {
+            banner = "This message is too old to react to."
+            return
+        }
+        guard let reactAction else { return }
+        let remove = line.reactions.contains { $0.emoji == emoji && $0.includesMe }
+        do {
+            try await reactAction(line.messageID, emoji, remove, conversationID)
+        } catch {
+            banner = "Couldn't send that reaction."
+        }
+    }
+
+    /// Tell the conversation this user is typing. The composition layer throttles; this is the
+    /// intent, not a per-keystroke signal.
+    public func setTyping(_ active: Bool, in conversationID: String) async {
+        await setTypingAction?(active, conversationID)
+    }
+
     /// Decrypted attachment bytes for this session, keyed by blob id.
     ///
     /// In memory on purpose: a decrypted photo written to a cache directory outlives the moment it

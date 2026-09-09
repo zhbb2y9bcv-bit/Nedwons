@@ -2,6 +2,7 @@
 //! failed commit leaves NO partial advance, a retry never re-encrypts, and MLS state survives
 //! relaunch — proven by exchanging a message *after* both sides reopen from their journals.
 
+use mls_core::content::ReceiptKind;
 use mls_core::durable::{Direction, DurableError, DurableSession, InMemoryJournal, InboundOutcome};
 use mls_core::Member;
 
@@ -508,5 +509,185 @@ fn attachment_reference_travels_end_to_end_and_survives_reopen() {
         bob.unread_count(),
         1,
         "a file is an unread message like any other"
+    );
+}
+
+/// Reactions are attributed to the MLS-authenticated sender, toggle cleanly, and are refused for
+/// messages this device does not have — which is what keeps a hostile member from growing the blob
+/// by reacting to ids they invent.
+#[test]
+fn reactions_are_attributed_toggled_and_bounded() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+    let id = alice.enqueue(b"dinner at 8?").expect("enqueue");
+    let envelope = alice.encrypt(id).expect("encrypt");
+    bob.process_inbound(1, &envelope).expect("process");
+    let target = bob.message_views()[0].message_id;
+
+    // Bob reacts; Alice sees it attributed to Bob's identity, not to a claim in the payload.
+    let r = bob.enqueue_reaction(target, "👍", false).expect("react");
+    let reaction = bob.encrypt(r).expect("encrypt");
+    assert_eq!(
+        bob.reactions(&target).len(),
+        1,
+        "the sender sees their own reaction"
+    );
+    assert!(matches!(
+        alice.process_inbound(2, &reaction).expect("process"),
+        InboundOutcome::ReactionChanged { target: t } if t == target
+    ));
+    let seen = alice.reactions(&target);
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].emoji, "👍");
+    assert_eq!(
+        seen[0].sender, b"bob-device",
+        "MLS says who, not the message body"
+    );
+    assert_eq!(alice.message_views()[0].reactions.len(), 1);
+
+    // Reacting again with the same emoji is idempotent; removing takes it back.
+    let again = bob.enqueue_reaction(target, "👍", false).expect("react");
+    let again = bob.encrypt(again).expect("encrypt");
+    alice.process_inbound(3, &again).expect("process");
+    assert_eq!(alice.reactions(&target).len(), 1, "not counted twice");
+    let undo = bob.enqueue_reaction(target, "👍", true).expect("unreact");
+    let undo = bob.encrypt(undo).expect("encrypt");
+    alice.process_inbound(4, &undo).expect("process");
+    assert!(alice.reactions(&target).is_empty());
+
+    // A reaction naming a message Alice does not have is dropped, not stored for later.
+    let ghost = bob
+        .enqueue_reaction([0xEE; 16], "🎉", false)
+        .expect("react");
+    let ghost = bob.encrypt(ghost).expect("encrypt");
+    assert_eq!(
+        alice.process_inbound(5, &ghost).expect("process"),
+        InboundOutcome::Duplicate
+    );
+    assert!(alice.reactions(&[0xEE; 16]).is_empty());
+}
+
+/// A reply carries the id it answers and nothing else — never a copy of the original text, which a
+/// hostile client could use to display words the quoted person never wrote.
+#[test]
+fn replies_reference_the_original_rather_than_quoting_it() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+    let first = alice.enqueue(b"who's bringing dessert?").expect("enqueue");
+    let envelope = alice.encrypt(first).expect("encrypt");
+    bob.process_inbound(1, &envelope).expect("process");
+    let target = bob.message_views()[0].message_id;
+
+    let reply = bob.enqueue_reply(b"me", Some(target)).expect("reply");
+    let reply_env = bob.encrypt(reply).expect("encrypt");
+    assert_eq!(bob.message_views()[1].reply_to, Some(target));
+
+    alice.process_inbound(2, &reply_env).expect("process");
+    let views = alice.message_views();
+    assert_eq!(views[1].plaintext, b"me");
+    assert_eq!(views[1].reply_to, Some(target), "the pointer travelled");
+    // The original is found by id in the local log — the reply carried no copy of it.
+    let quoted = views
+        .iter()
+        .find(|v| v.message_id == target)
+        .expect("original");
+    assert_eq!(quoted.plaintext, b"who's bringing dessert?");
+}
+
+/// Receipts are accepted only for our OWN messages, deduplicate per sender, and the sender-side
+/// bookkeeping stops the same acknowledgement being sent on every sync.
+#[test]
+fn receipts_count_only_our_own_messages() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+    let id = alice.enqueue(b"ping").expect("enqueue");
+    let envelope = alice.encrypt(id).expect("encrypt");
+    alice.mark_sent(id).expect("sent");
+    bob.process_inbound(1, &envelope).expect("process");
+    let mid = bob.message_views()[0].message_id;
+
+    // Nothing is owed until Bob has actually read it; delivery is owed immediately.
+    assert_eq!(
+        bob.unacknowledged_inbound(ReceiptKind::Delivered),
+        vec![mid]
+    );
+    assert!(bob.unacknowledged_inbound(ReceiptKind::Read).is_empty());
+
+    let r = bob
+        .enqueue_receipt(ReceiptKind::Delivered, vec![mid])
+        .expect("receipt");
+    let receipt = bob.encrypt(r).expect("encrypt");
+    bob.record_receipts_sent(ReceiptKind::Delivered, &[mid])
+        .expect("record");
+    assert!(
+        bob.unacknowledged_inbound(ReceiptKind::Delivered)
+            .is_empty(),
+        "a receipt is sent once, not on every sync"
+    );
+
+    assert_eq!(
+        alice.process_inbound(2, &receipt).expect("process"),
+        InboundOutcome::ReceiptsReceived {
+            kind: ReceiptKind::Delivered,
+            count: 1
+        }
+    );
+    assert_eq!(alice.message_views()[0].delivered_count, 1);
+    assert_eq!(alice.message_views()[0].read_count, 0);
+
+    // Now Bob reads it and acknowledges that too.
+    bob.mark_read().expect("read");
+    assert_eq!(bob.unacknowledged_inbound(ReceiptKind::Read), vec![mid]);
+    let r = bob
+        .enqueue_receipt(ReceiptKind::Read, vec![mid])
+        .expect("receipt");
+    let receipt = bob.encrypt(r).expect("encrypt");
+    alice.process_inbound(3, &receipt).expect("process");
+    assert_eq!(alice.message_views()[0].read_count, 1);
+
+    // A receipt naming a message Alice never sent changes nothing.
+    let bogus = bob
+        .enqueue_receipt(ReceiptKind::Read, vec![[0x77; 16]])
+        .expect("receipt");
+    let bogus = bob.encrypt(bogus).expect("encrypt");
+    assert_eq!(
+        alice.process_inbound(4, &bogus).expect("process"),
+        InboundOutcome::ReceiptsReceived {
+            kind: ReceiptKind::Read,
+            count: 0
+        }
+    );
+}
+
+/// Typing is ephemeral: it names its sender, and it adds nothing to either side's message log.
+#[test]
+fn typing_is_reported_but_never_logged() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+    let t = bob.enqueue_typing(true).expect("typing");
+    let envelope = bob.encrypt(t).expect("encrypt");
+    assert!(bob.message_views().is_empty(), "the sender logs nothing");
+
+    assert_eq!(
+        alice.process_inbound(1, &envelope).expect("process"),
+        InboundOutcome::Typing {
+            sender: b"bob-device".to_vec(),
+            active: true
+        }
+    );
+    assert!(
+        alice.message_views().is_empty(),
+        "the recipient logs nothing"
+    );
+    assert_eq!(
+        alice.unread_count(),
+        0,
+        "a typing hint is not an unread message"
+    );
+
+    let stop = bob.enqueue_typing(false).expect("typing");
+    let stop = bob.encrypt(stop).expect("encrypt");
+    assert_eq!(
+        alice.process_inbound(2, &stop).expect("process"),
+        InboundOutcome::Typing {
+            sender: b"bob-device".to_vec(),
+            active: false
+        }
     );
 }

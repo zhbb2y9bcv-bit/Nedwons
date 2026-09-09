@@ -22,6 +22,7 @@ use mls_core::attachment::{self, AttachmentRef as CoreAttachmentRef};
 use mls_core::client::{
     MAX_ENVELOPE_LEN, MAX_IDENTITY_LEN, MAX_KEY_PACKAGE_LEN, MAX_PLAINTEXT_LEN, MAX_WELCOME_LEN,
 };
+use mls_core::content::ReceiptKind as CoreReceiptKind;
 use mls_core::content::{HistoryEntry as CoreHistoryEntry, SECRET_ID_LEN};
 use mls_core::durable::{
     Direction as CoreDirection, DurableError, DurableSession, FileJournal, InMemoryJournal,
@@ -88,6 +89,15 @@ pub struct StoredMessage {
     pub pending: bool,
     /// `Some` when this message is a file; `plaintext` is then its caption.
     pub attachment: Option<AttachmentInfo>,
+    /// The id every other device knows this message by — what a reply, reaction or receipt names.
+    /// All-zero for messages logged before ids existed; those cannot be referred to.
+    pub message_id: Vec<u8>,
+    /// The message this one answers, if any.
+    pub reply_to: Option<Vec<u8>>,
+    pub reactions: Vec<ReactionInfo>,
+    /// For our own messages: how many other members have received / read it.
+    pub delivered_count: u32,
+    pub read_count: u32,
 }
 
 /// Mirrors `mls_core::secret::SecretState`.
@@ -158,6 +168,21 @@ pub enum InboundResult {
     AttachmentReceived {
         attachment: AttachmentInfo,
     },
+    /// Someone reacted to (or un-reacted from) a message this device holds. Re-read the thread.
+    ReactionChanged {
+        target: Vec<u8>,
+    },
+    /// Someone acknowledged `count` of OUR messages.
+    ReceiptsReceived {
+        kind: ReceiptKindFfi,
+        count: u64,
+    },
+    /// Ephemeral: someone started or stopped typing. Nothing was persisted, and it is safe to
+    /// ignore — the UI should time it out on its own rather than trusting a "stopped" to arrive.
+    Typing {
+        sender: Vec<u8>,
+        active: bool,
+    },
 }
 
 /// A file referenced by a message. The bytes live on the relay as ciphertext; this is everything
@@ -171,6 +196,21 @@ pub struct AttachmentInfo {
     pub size: u64,
     pub mime: String,
     pub filename: String,
+}
+
+/// One person's reaction to one message.
+#[derive(uniffi::Record, Clone, Debug)]
+pub struct ReactionInfo {
+    pub emoji: String,
+    /// The MLS-authenticated credential identity of whoever reacted — not a name from the payload.
+    pub sender: Vec<u8>,
+}
+
+/// Which way a receipt points.
+#[derive(uniffi::Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiptKindFfi {
+    Delivered,
+    Read,
 }
 
 /// An encrypted file ready to upload, plus the secrets to put in the message that references it.
@@ -737,6 +777,18 @@ impl MlsClient {
                         attachment: to_attachment_info(&attachment),
                     }
                 }
+                InboundOutcome::ReactionChanged { target } => InboundResult::ReactionChanged {
+                    target: target.to_vec(),
+                },
+                InboundOutcome::ReceiptsReceived { kind, count } => {
+                    InboundResult::ReceiptsReceived {
+                        kind: to_receipt_kind(kind),
+                        count,
+                    }
+                }
+                InboundOutcome::Typing { sender, active } => {
+                    InboundResult::Typing { sender, active }
+                }
             })
         })
     }
@@ -780,6 +832,18 @@ impl MlsClient {
                     InboundResult::AttachmentReceived {
                         attachment: to_attachment_info(&attachment),
                     }
+                }
+                InboundOutcome::ReactionChanged { target } => InboundResult::ReactionChanged {
+                    target: target.to_vec(),
+                },
+                InboundOutcome::ReceiptsReceived { kind, count } => {
+                    InboundResult::ReceiptsReceived {
+                        kind: to_receipt_kind(kind),
+                        count,
+                    }
+                }
+                InboundOutcome::Typing { sender, active } => {
+                    InboundResult::Typing { sender, active }
                 }
             })
         })
@@ -880,6 +944,90 @@ impl MlsClient {
                     &caption,
                 )
                 .map_err(map_durable_input)
+        })
+    }
+
+    // --- Replies, reactions, receipts, typing -----------------------------------------------------
+
+    /// Send a message that answers another. The reply carries only the target's id — never a copy
+    /// of its text, so a client cannot display words the quoted person never wrote.
+    pub fn send_reply(&self, body: Vec<u8>, reply_to: Vec<u8>) -> Result<u64, MlsClientError> {
+        catch(move || {
+            bound(body.len(), MAX_PLAINTEXT_LEN)?;
+            let target = fixed(&reply_to)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session
+                .enqueue_reply(&body, Some(target))
+                .map_err(map_durable_input)
+        })
+    }
+
+    /// React to a message, or with `remove` take the reaction back. Idempotent on both sides.
+    pub fn react(
+        &self,
+        target: Vec<u8>,
+        emoji: String,
+        remove: bool,
+    ) -> Result<u64, MlsClientError> {
+        catch(move || {
+            let target = fixed(&target)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session
+                .enqueue_reaction(target, &emoji, remove)
+                .map_err(map_durable_input)
+        })
+    }
+
+    /// Message ids that still owe a receipt of this kind, oldest first. `Read` only ever names
+    /// messages the user has actually seen (`mark_read`).
+    pub fn unacknowledged(&self, kind: ReceiptKindFfi) -> Result<Vec<Vec<u8>>, MlsClientError> {
+        catch(move || {
+            let g = self.lock()?;
+            match &*g {
+                ClientState::Active { session } => Ok(session
+                    .unacknowledged_inbound(from_receipt_kind(kind))
+                    .iter()
+                    .map(|id| id.to_vec())
+                    .collect()),
+                ClientState::Pending { .. } => Err(MlsClientError::WrongState),
+                ClientState::Closed => Err(MlsClientError::Closed),
+            }
+        })
+    }
+
+    /// Queue one batched receipt for these ids, and remember they were acknowledged so the same
+    /// message is never acknowledged twice.
+    pub fn send_receipt(
+        &self,
+        kind: ReceiptKindFfi,
+        message_ids: Vec<Vec<u8>>,
+    ) -> Result<u64, MlsClientError> {
+        catch(move || {
+            let ids = message_ids
+                .iter()
+                .map(|id| fixed(id))
+                .collect::<Result<Vec<[u8; 16]>, _>>()?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            let local_id = session
+                .enqueue_receipt(from_receipt_kind(kind), ids.clone())
+                .map_err(map_durable_input)?;
+            session
+                .record_receipts_sent(from_receipt_kind(kind), &ids)
+                .map_err(map_durable)?;
+            Ok(local_id)
+        })
+    }
+
+    /// Start or stop a typing indicator. Ephemeral: nothing is logged, and a dropped one costs
+    /// nothing, so callers should throttle rather than send per keystroke.
+    pub fn send_typing(&self, active: bool) -> Result<u64, MlsClientError> {
+        catch(move || {
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session.enqueue_typing(active).map_err(map_durable_input)
         })
     }
 
@@ -1119,6 +1267,32 @@ fn to_stored(m: &CoreMessageView) -> StoredMessage {
         created_at_ms: m.created_at_ms,
         pending: m.pending,
         attachment: m.attachment.as_ref().map(to_attachment_info),
+        message_id: m.message_id.to_vec(),
+        reply_to: m.reply_to.map(|id| id.to_vec()),
+        reactions: m
+            .reactions
+            .iter()
+            .map(|r| ReactionInfo {
+                emoji: r.emoji.clone(),
+                sender: r.sender.clone(),
+            })
+            .collect(),
+        delivered_count: m.delivered_count,
+        read_count: m.read_count,
+    }
+}
+
+fn to_receipt_kind(kind: CoreReceiptKind) -> ReceiptKindFfi {
+    match kind {
+        CoreReceiptKind::Delivered => ReceiptKindFfi::Delivered,
+        CoreReceiptKind::Read => ReceiptKindFfi::Read,
+    }
+}
+
+fn from_receipt_kind(kind: ReceiptKindFfi) -> CoreReceiptKind {
+    match kind {
+        ReceiptKindFfi::Delivered => CoreReceiptKind::Delivered,
+        ReceiptKindFfi::Read => CoreReceiptKind::Read,
     }
 }
 

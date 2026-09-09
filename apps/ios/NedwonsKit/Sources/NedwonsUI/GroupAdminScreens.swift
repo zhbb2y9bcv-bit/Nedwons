@@ -49,6 +49,9 @@ public enum GroupAdminA11y {
     public static let composerLocked = "conversation.composer.locked"
     public static let composerField = "conversation.composer.field"
     public static let composerAttach = "conversation.composer.attach"
+    public static let replyBar = "conversation.reply.bar"
+    public static let replyCancel = "conversation.reply.cancel"
+    public static let typingIndicator = "conversation.typing"
 }
 
 struct GroupAdminView: View {

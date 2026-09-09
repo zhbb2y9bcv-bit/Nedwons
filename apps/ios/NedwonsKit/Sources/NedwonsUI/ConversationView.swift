@@ -21,15 +21,58 @@ public struct ThreadLine: Identifiable, Sendable, Equatable {
     public let timestamp: Date?
     /// Mine, and the relay has not accepted it yet: shown as sending, never as delivered.
     public let isPending: Bool
+    /// The id other devices know this message by — what a reply or reaction names. Empty for
+    /// messages logged before ids existed, which therefore cannot be replied or reacted to.
+    public let messageID: String
+    /// What this message answers, resolved for display by looking it up in the same thread.
+    public let replyTo: String?
+    /// Reactions, grouped for display: emoji → how many people, and whether one of them is you.
+    public let reactions: [ReactionSummary]
+    /// Mine only: how many other members have received / read it.
+    public let deliveredCount: Int
+    public let readCount: Int
 
     public init(
-        id: UInt64, kind: Kind, mine: Bool, timestamp: Date? = nil, isPending: Bool = false
+        id: UInt64, kind: Kind, mine: Bool, timestamp: Date? = nil, isPending: Bool = false,
+        messageID: String = "", replyTo: String? = nil, reactions: [ReactionSummary] = [],
+        deliveredCount: Int = 0, readCount: Int = 0
     ) {
         self.id = id
         self.kind = kind
         self.mine = mine
         self.timestamp = timestamp
         self.isPending = isPending
+        self.messageID = messageID
+        self.replyTo = replyTo
+        self.reactions = reactions
+        self.deliveredCount = deliveredCount
+        self.readCount = readCount
+    }
+
+    /// The plain text of this line, for quoting it in a reply preview. A secret never yields one —
+    /// its body is the thing that must not be shown twice.
+    public var quotableText: String? {
+        switch kind {
+        case .text(let t): t.isEmpty ? nil : t
+        case .attachment(let a): a.caption.isEmpty ? a.displayName : a.caption
+        case .sealedSecret, .consumedSecret: nil
+        }
+    }
+}
+
+/// One emoji on one message, with how many people used it.
+public struct ReactionSummary: Sendable, Equatable, Identifiable {
+    public let emoji: String
+    public let count: Int
+    /// Whether the viewer is one of them — so tapping toggles rather than piling on.
+    public let includesMe: Bool
+
+    public var id: String { emoji }
+
+    public init(emoji: String, count: Int, includesMe: Bool) {
+        self.emoji = emoji
+        self.count = count
+        self.includesMe = includesMe
     }
 }
 
@@ -251,13 +294,27 @@ struct ConversationView: View {
                     LazyVStack(alignment: .leading, spacing: Nedwons.Spacing.sm) {
                         ForEach(lines) { line in
                             VStack(alignment: line.mine ? .trailing : .leading, spacing: 2) {
+                                if let quoted = quotedLine(for: line) {
+                                    QuotedPreview(line: quoted, palette: palette, compact: true)
+                                }
                                 row(line)
+                                if !line.reactions.isEmpty {
+                                    ReactionRow(
+                                        line: line, palette: palette,
+                                        onTap: { emoji in
+                                            Task {
+                                                await model.toggleReaction(
+                                                    emoji, on: line, in: chat.conversationID)
+                                            }
+                                        })
+                                }
                                 metadata(line)
                             }
                             .frame(
                                 maxWidth: .infinity,
                                 alignment: line.mine ? .trailing : .leading)
                             .id(line.id)
+                            .contextMenu { messageActions(line) }
                         }
                     }
                     .padding(Nedwons.Spacing.md)
@@ -282,6 +339,11 @@ struct ConversationView: View {
                     Text("Sending")
                 } else if let when = line.timestamp {
                     Text(when, style: .time)
+                    if line.mine, let ticks = receiptTicks(line) {
+                        Image(systemName: ticks.symbol)
+                            .font(.system(size: 9))
+                            .foregroundStyle(ticks.read ? palette.accentPrimary : palette.textSecondary)
+                    }
                 }
             }
             .font(.system(size: 11))
@@ -294,8 +356,49 @@ struct ConversationView: View {
     private func accessibilityMetadata(_ line: ThreadLine) -> String {
         if line.isPending { return "Sending" }
         guard let when = line.timestamp else { return "" }
-        return "Sent at \(when.formatted(date: .omitted, time: .shortened))"
+        var text = "Sent at \(when.formatted(date: .omitted, time: .shortened))"
+        if line.mine, let ticks = receiptTicks(line) {
+            text += ticks.read ? ", read" : ", delivered"
+        }
+        return text
     }
+
+    /// One tick for delivered, two for read — and nothing at all until someone confirms, rather
+    /// than a tick that merely means "we tried".
+    private func receiptTicks(_ line: ThreadLine) -> (symbol: String, read: Bool)? {
+        if line.readCount > 0 { return ("checkmark.circle.fill", true) }
+        if line.deliveredCount > 0 { return ("checkmark.circle", false) }
+        return nil
+    }
+
+    /// The message a line answers, if it is still in this thread. A reply to something no longer
+    /// held renders as an ordinary message rather than an empty quote.
+    private func quotedLine(for line: ThreadLine) -> ThreadLine? {
+        guard let target = line.replyTo else { return nil }
+        return lines.first { $0.messageID == target }
+    }
+
+    /// Long-press actions. Reply and react need the message to HAVE an id — older messages predate
+    /// ids and honestly cannot be referred to, so the actions are not offered for them.
+    @ViewBuilder
+    private func messageActions(_ line: ThreadLine) -> some View {
+        if !line.messageID.isEmpty {
+            Button {
+                model.startReply(to: line, in: chat.conversationID)
+            } label: {
+                Label("Reply", systemImage: "arrowshape.turn.up.left")
+            }
+            ForEach(Self.quickReactions, id: \.self) { emoji in
+                Button(emoji) {
+                    Task { await model.toggleReaction(emoji, on: line, in: chat.conversationID) }
+                }
+            }
+        }
+    }
+
+    /// A small, fixed set: a picker with every emoji is a different feature, and these cover the
+    /// overwhelming majority of real use.
+    static let quickReactions = ["👍", "❤️", "😂", "😮", "😢", "🎉"]
 
     @ViewBuilder
     private func row(_ line: ThreadLine) -> some View {
@@ -338,6 +441,51 @@ struct ConversationView: View {
     }
 
     private var composer: some View {
+        VStack(spacing: 0) {
+            if let draft = model.replyDrafts[chat.conversationID] {
+                HStack(spacing: Nedwons.Spacing.sm) {
+                    // The identifier sits on the preview, not the row: an identifier on the
+                    // container makes SwiftUI merge it into ONE element, which hides the cancel
+                    // button from assistive technology (and from the UI test that caught it).
+                    QuotedPreview(line: draft, palette: palette, compact: false)
+                        .accessibilityIdentifier(GroupAdminA11y.replyBar)
+                    Spacer()
+                    Button {
+                        model.cancelReply(in: chat.conversationID)
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .accessibilityLabel("Cancel reply")
+                    .accessibilityIdentifier(GroupAdminA11y.replyCancel)
+                }
+                .padding(.horizontal, Nedwons.Spacing.md)
+                .padding(.top, Nedwons.Spacing.xs)
+            }
+            if let typing = typingText {
+                HStack {
+                    Text(typing)
+                        .font(Nedwons.TypeScale.caption)
+                        .foregroundStyle(palette.textSecondary)
+                    Spacer()
+                }
+                .padding(.horizontal, Nedwons.Spacing.md)
+                .accessibilityIdentifier(GroupAdminA11y.typingIndicator)
+            }
+            composerRow
+        }
+        .background(palette.surface)
+    }
+
+    private var typingText: String? {
+        let names = model.typingNames(in: chat.conversationID)
+        switch names.count {
+        case 0: return nil
+        case 1: return "\(names[0]) is typing…"
+        default: return "\(names.count) people are typing…"
+        }
+    }
+
+    private var composerRow: some View {
         HStack(spacing: Nedwons.Spacing.sm) {
             Button {
                 showPhotoPicker = true
@@ -351,17 +499,24 @@ struct ConversationView: View {
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...4)
                 .accessibilityIdentifier(GroupAdminA11y.composerField)
+            .onChange(of: draft) { _, text in
+                // Intent, not keystrokes: the composition layer throttles, and stops when the
+                // field empties so a cleared draft does not leave someone "typing".
+                Task { await model.setTyping(!text.isEmpty, in: chat.conversationID) }
+            }
             Button {
                 let body = draft.trimmingCharacters(in: .whitespacesAndNewlines)
                 draft = ""
-                Task { await model.sendMessage(body, to: chat.conversationID) }
+                Task {
+                    await model.setTyping(false, in: chat.conversationID)
+                    await model.sendMessageOrReply(body, to: chat.conversationID)
+                }
             } label: {
                 Image(systemName: "arrow.up.circle.fill").imageScale(.large)
             }
             .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
         }
         .padding(Nedwons.Spacing.md)
-        .background(palette.surface)
     }
 }
 

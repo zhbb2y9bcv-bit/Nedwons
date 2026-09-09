@@ -73,8 +73,11 @@ public enum PushInboxDecoder {
             // Control / already-seen: nothing to surface. A rename is applied durably by the
             // core when it is processed, so the group is correctly named the next time the app
             // opens — but it is not something to wake someone with a notification for.
+            // Reactions, receipts and typing are deliberately silent: waking someone for "they
+            // are typing" or "your message was read" is a notification nobody asked for, and a
+            // reaction is visible next time they look. The state is still applied by the core.
             case .duplicate, .stateAdvanced, .secretConsumedRemotely, .deliveryKeyGranted,
-                .historySynced, .groupRenamed:
+                .historySynced, .groupRenamed, .reactionChanged, .receiptsReceived, .typing:
                 continue
             }
         }

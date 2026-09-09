@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use mls_ffi::{capabilities, InboundResult, MlsClient, MlsClientError};
+use mls_ffi::{capabilities, InboundResult, MlsClient, MlsClientError, ReceiptKindFfi};
 
 const KEY: [u8; 32] = [7u8; 32];
 
@@ -488,4 +488,108 @@ fn attachment_seals_travels_and_opens_across_the_boundary() {
         mls_ffi::open_attachment(info.key.clone(), info.digest.clone(), other.ciphertext).is_err()
     );
     assert!(mls_ffi::open_attachment(vec![0u8; 32], info.digest, sealed.ciphertext).is_err());
+}
+
+/// Replies, reactions, receipts and typing across the FFI, in the order a conversation actually
+/// uses them.
+#[test]
+fn interaction_layer_crosses_the_boundary() {
+    let alice = MlsClient::create_group(b"alice".to_vec(), tmp("int-a"), key()).expect("alice");
+    let bob = MlsClient::new_joiner(b"bob".to_vec(), tmp("int-b"), key()).expect("bob");
+    let add = alice
+        .add_member(bob.key_package().expect("kp"))
+        .expect("add");
+    bob.join_group(add.welcome).expect("join");
+
+    // Alice sends; Bob receives and learns its id.
+    let id = alice.enqueue(b"dinner at 8?".to_vec()).expect("enqueue");
+    let envelope = alice.encrypt(id).expect("encrypt");
+    alice.mark_sent(id).expect("sent");
+    bob.process_inbound(1, envelope).expect("process");
+    let target = bob.messages().expect("messages")[0].message_id.clone();
+    assert_eq!(target.len(), 16);
+
+    // Reply: the pointer travels, and Alice resolves it against her own log.
+    let reply = bob
+        .send_reply(b"works for me".to_vec(), target.clone())
+        .expect("reply");
+    let reply_env = bob.encrypt(reply).expect("encrypt");
+    alice.process_inbound(2, reply_env).expect("process");
+    let alice_msgs = alice.messages().expect("messages");
+    assert_eq!(alice_msgs[1].reply_to, Some(target.clone()));
+    assert_eq!(
+        alice_msgs[0].message_id, target,
+        "the answered message is ours"
+    );
+
+    // Reaction: attributed to Bob's MLS identity, and it toggles.
+    let react = bob
+        .react(target.clone(), "👍".into(), false)
+        .expect("react");
+    let react_env = bob.encrypt(react).expect("encrypt");
+    assert!(matches!(
+        alice.process_inbound(3, react_env).expect("process"),
+        InboundResult::ReactionChanged { .. }
+    ));
+    let reactions = alice.messages().expect("messages")[0].reactions.clone();
+    assert_eq!(reactions.len(), 1);
+    assert_eq!(reactions[0].emoji, "👍");
+    assert_eq!(reactions[0].sender, b"bob");
+    let unreact = bob
+        .react(target.clone(), "👍".into(), true)
+        .expect("unreact");
+    let unreact_env = bob.encrypt(unreact).expect("encrypt");
+    alice.process_inbound(4, unreact_env).expect("process");
+    assert!(alice.messages().expect("messages")[0].reactions.is_empty());
+
+    // Receipts: delivered is owed immediately, read only after the user has seen it.
+    assert_eq!(
+        bob.unacknowledged(ReceiptKindFfi::Delivered).expect("owed"),
+        vec![target.clone()]
+    );
+    assert!(bob
+        .unacknowledged(ReceiptKindFfi::Read)
+        .expect("owed")
+        .is_empty());
+    let r = bob
+        .send_receipt(ReceiptKindFfi::Delivered, vec![target.clone()])
+        .expect("receipt");
+    let r_env = bob.encrypt(r).expect("encrypt");
+    assert!(
+        bob.unacknowledged(ReceiptKindFfi::Delivered)
+            .expect("owed")
+            .is_empty(),
+        "sending a receipt records it, so it is not sent again"
+    );
+    assert!(matches!(
+        alice.process_inbound(5, r_env).expect("process"),
+        InboundResult::ReceiptsReceived {
+            kind: ReceiptKindFfi::Delivered,
+            count: 1
+        }
+    ));
+    assert_eq!(alice.messages().expect("messages")[0].delivered_count, 1);
+    assert_eq!(alice.messages().expect("messages")[0].read_count, 0);
+
+    bob.mark_read().expect("read");
+    let r = bob
+        .send_receipt(ReceiptKindFfi::Read, vec![target])
+        .expect("receipt");
+    let r_env = bob.encrypt(r).expect("encrypt");
+    alice.process_inbound(6, r_env).expect("process");
+    assert_eq!(alice.messages().expect("messages")[0].read_count, 1);
+
+    // Typing: reported, attributed, and logged by nobody.
+    let logged_before = alice.messages().expect("messages").len();
+    let t = bob.send_typing(true).expect("typing");
+    let t_env = bob.encrypt(t).expect("encrypt");
+    assert!(matches!(
+        alice.process_inbound(7, t_env).expect("process"),
+        InboundResult::Typing { ref sender, active: true } if sender == b"bob"
+    ));
+    assert_eq!(
+        alice.messages().expect("messages").len(),
+        logged_before,
+        "typing is not a message"
+    );
 }

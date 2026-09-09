@@ -30,7 +30,7 @@ fn two_members_exchange_encrypted_message() {
     );
 
     match bob_group.process(&bob, &envelope).expect("bob process") {
-        Incoming::Application(bytes) => assert_eq!(bytes, plaintext),
+        Incoming::Application { payload: bytes, .. } => assert_eq!(bytes, plaintext),
         Incoming::StateAdvanced => panic!("expected application message"),
     }
 }
@@ -101,7 +101,7 @@ fn removed_member_cannot_read_future_messages() {
         .expect("encrypt");
 
     match carol_group.process(&carol, &envelope).expect("carol reads") {
-        Incoming::Application(bytes) => assert_eq!(bytes, b"post-removal secret"),
+        Incoming::Application { payload: bytes, .. } => assert_eq!(bytes, b"post-removal secret"),
         Incoming::StateAdvanced => panic!("expected application message"),
     }
 

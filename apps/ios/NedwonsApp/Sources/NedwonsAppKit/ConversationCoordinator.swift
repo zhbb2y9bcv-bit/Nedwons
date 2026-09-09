@@ -42,6 +42,10 @@ public final class ConversationCoordinator {
     private var receiveTask: Task<Void, Never>?
     /// The most recent background failure, for diagnostics; the UI shows banners on user actions.
     public private(set) var lastSyncError: Error?
+    /// Whether this device tells senders what it has received and read. A privacy choice, not a
+    /// protocol requirement: with it off, nothing about what this device has seen is sent to
+    /// anyone, and every other feature still works. (No settings toggle is wired to it yet.)
+    public var sendReceipts = true
 
     public init(
         model: AppModel,
@@ -84,7 +88,7 @@ public final class ConversationCoordinator {
             try await self.renameGroup(conversationID, to: name)
         }
         model.markConversationReadAction = { [weak self] conversationID in
-            self?.markRead(conversationID)
+            await self?.markRead(conversationID)
         }
         model.sendAttachmentAction = { [weak self] data, mime, filename, caption, conversationID in
             guard let self else { throw CoordinatorError.notSignedIn }
@@ -94,6 +98,17 @@ public final class ConversationCoordinator {
         model.loadAttachmentAction = { [weak self] blobID in
             guard let self else { throw CoordinatorError.notSignedIn }
             return try await self.loadAttachment(blobID)
+        }
+        model.sendReplyAction = { [weak self] body, replyTo, conversationID in
+            guard let self else { throw CoordinatorError.notSignedIn }
+            try await self.sendReply(body, replyTo: replyTo, in: conversationID)
+        }
+        model.reactAction = { [weak self] messageID, emoji, remove, conversationID in
+            guard let self else { throw CoordinatorError.notSignedIn }
+            try await self.react(messageID, emoji: emoji, remove: remove, in: conversationID)
+        }
+        model.setTypingAction = { [weak self] active, conversationID in
+            await self?.setTyping(active, in: conversationID)
         }
         model.clearHistoryAction = { [weak self] conversationID in
             try self?.clearHistory(in: conversationID)
@@ -326,11 +341,91 @@ public final class ConversationCoordinator {
         return nil
     }
 
+    // MARK: Replies, reactions, typing, receipts
+
+    /// Send a message answering another. Same upload path as any message, so a reply that fails is
+    /// retried like one.
+    public func sendReply(_ body: String, replyTo: String, in conversationID: String) async throws {
+        guard let client = activeClient(for: conversationID) else {
+            throw CoordinatorError.noSessionForConversation
+        }
+        guard let target = Hex.decode(replyTo), target.count == 16 else {
+            throw CoordinatorError.unknownMessage
+        }
+        let localID = try client.sendReply(body: Data(body.utf8), replyTo: target)
+        defer { refresh(conversationID) }
+        try await upload(localID: localID, client: client, conversationID: conversationID)
+    }
+
+    /// Add or remove one reaction.
+    public func react(
+        _ messageID: String, emoji: String, remove: Bool, in conversationID: String
+    ) async throws {
+        guard let client = activeClient(for: conversationID) else {
+            throw CoordinatorError.noSessionForConversation
+        }
+        guard let target = Hex.decode(messageID), target.count == 16 else {
+            throw CoordinatorError.unknownMessage
+        }
+        let localID = try client.react(target: target, emoji: emoji, remove: remove)
+        defer { refresh(conversationID) }
+        try await upload(localID: localID, client: client, conversationID: conversationID)
+    }
+
+    /// Tell the conversation whether this user is typing, THROTTLED.
+    ///
+    /// A typing indicator is a message like any other: it is encrypted, fanned out to every member
+    /// device, and stored until acknowledged. Sending one per keystroke would turn a sentence into
+    /// dozens of envelopes for every recipient — so a "started" is repeated at most every
+    /// `typingInterval`, and a "stopped" is always sent (it is what clears the indicator).
+    public func setTyping(_ active: Bool, in conversationID: String) async {
+        guard let client = activeClient(for: conversationID) else { return }
+        if active {
+            let last = lastTypingSent[conversationID] ?? .distantPast
+            guard Date().timeIntervalSince(last) > Self.typingInterval else { return }
+            lastTypingSent[conversationID] = Date()
+        } else {
+            guard lastTypingSent[conversationID] != nil else { return }  // never started
+            lastTypingSent.removeValue(forKey: conversationID)
+        }
+        // Best effort: a lost typing hint is not worth an error, and the receiver expires it.
+        guard let localID = try? client.sendTyping(active: active) else { return }
+        try? await upload(localID: localID, client: client, conversationID: conversationID)
+    }
+
+    private static let typingInterval: TimeInterval = 4
+    private var lastTypingSent: [String: Date] = [:]
+
+    /// Acknowledge what has arrived: `Delivered` for everything decrypted here, `Read` for what the
+    /// user has actually seen. Batched and recorded, so one message is acknowledged once and not on
+    /// every sync.
+    ///
+    /// Receipts are a privacy choice, not a protocol requirement: `sendReceipts` off means this
+    /// device tells nobody what it has seen, and everything else still works.
+    public func sendPendingReceipts(in conversationID: String) async {
+        guard sendReceipts, let client = activeClient(for: conversationID) else { return }
+        for kind in [ReceiptKindFfi.delivered, .read] {
+            guard let owed = try? client.unacknowledged(kind: kind), !owed.isEmpty else { continue }
+            guard let localID = try? client.sendReceipt(kind: kind, messageIds: owed) else { continue }
+            do {
+                try await upload(localID: localID, client: client, conversationID: conversationID)
+            } catch {
+                lastSyncError = error
+            }
+        }
+    }
+
     /// The user is looking at the conversation: everything in it is read.
-    public func markRead(_ conversationID: String) {
+    /// `async` so the receipt it triggers is part of this call rather than an untracked task:
+    /// "the user read it" and "the sender was told" should not be able to drift apart, and an
+    /// unordered fire-and-forget makes that impossible to observe or test.
+    public func markRead(_ conversationID: String) async {
         guard let client = activeClient(for: conversationID) else { return }
         try? client.markRead()
         refresh(conversationID)
+        // Reading is what a read receipt reports, so it is sent from here — never from merely
+        // receiving a message.
+        await sendPendingReceipts(in: conversationID)
     }
 
     // MARK: Send
@@ -412,7 +507,14 @@ public final class ConversationCoordinator {
                 // none can ever be processed later, so the envelope is consumed either way. The
                 // error is kept for diagnostics, never shown: the user did nothing to cause it.
                 do {
-                    _ = try client.processInbound(envelopeId: UInt64(envelope.id), ciphertext: bytes)
+                    let result = try client.processInbound(
+                        envelopeId: UInt64(envelope.id), ciphertext: bytes)
+                    // Typing is the one result that is not about stored state: surface it now,
+                    // because there is nothing in the log for a later refresh to find.
+                    if case .typing(let sender, let active) = result {
+                        model.noteTyping(
+                            Hex.encode(sender), active: active, in: conversationID)
+                    }
                 } catch {
                     lastSyncError = error
                 }
@@ -431,7 +533,11 @@ public final class ConversationCoordinator {
         if !acked.isEmpty {
             try await relay.ackInbox(accessToken: token, ids: acked)
         }
-        for conversationID in touched { refresh(conversationID) }
+        for conversationID in touched {
+            refresh(conversationID)
+            // Everything that decrypted here is now owed a delivered receipt.
+            await sendPendingReceipts(in: conversationID)
+        }
         if joined {
             await model.refreshConversations()
             await ensureKeyPackages()  // one lobby identity was consumed
@@ -536,26 +642,32 @@ public final class ConversationCoordinator {
                     timestamp: timestamp,
                     isPending: message.pending)
             }
-            if let attachment = message.attachment {
-                return ThreadLine(
-                    id: message.localId,
-                    kind: .attachment(
+            let kind: ThreadLine.Kind =
+                if let attachment = message.attachment {
+                    .attachment(
                         AttachmentLine(
                             blobID: Hex.encode(attachment.blobId),
                             mime: attachment.mime,
                             filename: attachment.filename,
                             size: attachment.size,
-                            caption: String(decoding: message.plaintext, as: UTF8.self))),
-                    mine: mine,
-                    timestamp: timestamp,
-                    isPending: message.pending)
-            }
+                            caption: String(decoding: message.plaintext, as: UTF8.self)))
+                } else {
+                    .text(String(decoding: message.plaintext, as: UTF8.self))
+                }
             return ThreadLine(
                 id: message.localId,
-                kind: .text(String(decoding: message.plaintext, as: UTF8.self)),
+                kind: kind,
                 mine: mine,
                 timestamp: timestamp,
-                isPending: message.pending)
+                isPending: message.pending,
+                // An all-zero id means "logged before ids existed": surfaced as empty, so the UI
+                // withholds reply/react rather than offering an action that cannot work.
+                messageID: message.messageId.allSatisfy { $0 == 0 }
+                    ? "" : Hex.encode(message.messageId),
+                replyTo: message.replyTo.map { Hex.encode($0) },
+                reactions: Self.summarize(message.reactions, me: identity),
+                deliveredCount: Int(message.deliveredCount),
+                readCount: Int(message.readCount))
         }
         model.threadLines[conversationID] = lines
         // The group's name lives only inside the ciphertext; this is the one place it is read.
@@ -581,6 +693,21 @@ public final class ConversationCoordinator {
             // whenever this happened to refresh.
             lastActivity: stored.last.flatMap { Self.timestamp($0.createdAtMs) },
             unreadCount: Int((try? client.unreadCount()) ?? 0))
+    }
+
+    /// Group reactions by emoji for display, marking the ones this device sent so tapping toggles
+    /// rather than piling on.
+    private static func summarize(_ reactions: [ReactionInfo], me: Data?) -> [ReactionSummary] {
+        var order: [String] = []
+        var counts: [String: (count: Int, mine: Bool)] = [:]
+        for reaction in reactions {
+            if counts[reaction.emoji] == nil { order.append(reaction.emoji) }
+            let existing = counts[reaction.emoji] ?? (0, false)
+            counts[reaction.emoji] = (existing.count + 1, existing.mine || reaction.sender == me)
+        }
+        return order.map {
+            ReactionSummary(emoji: $0, count: counts[$0]!.count, includesMe: counts[$0]!.mine)
+        }
     }
 
     /// 0 means "logged before timestamps existed" — rendered without a time rather than as 1970.
@@ -631,6 +758,8 @@ public final class ConversationCoordinator {
         case badBlobID
         /// No message in local state references this blob, so there is no key to open it with.
         case unknownAttachment
+        /// A message id that is not 16 bytes, so it names nothing.
+        case unknownMessage
         /// Account ids that could not be added (no prekey, or delivery failed).
         case membersNotSetUp([String])
     }
