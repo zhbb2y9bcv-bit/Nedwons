@@ -157,8 +157,14 @@ pub trait DeviceStore {
     fn device(&self, device_id: &DeviceId) -> StoreResult<Option<DeviceRecord>>;
     /// Future signatures from it MUST fail closed (INV-10).
     fn revoke_device(&self, device_id: &DeviceId) -> StoreResult<()>;
-    /// Count + insert are one transaction, so a race cannot exceed `max_active` (`false` at the
-    /// cap). Used only by the ADR-0008 enrollment ceremony — never a password-only path.
+    /// Returns `false` at the cap. Used only by the ADR-0008 enrollment ceremony — never a
+    /// password-only path.
+    ///
+    /// Implementations MUST enforce `max_active` atomically **against concurrent callers for the
+    /// same account**. A transaction alone does not achieve this at READ COMMITTED — racers would
+    /// each read the same pre-insert count and each insert — so a SQL implementation must
+    /// serialize on the account (e.g. `SELECT ... FROM accounts ... FOR UPDATE`). The cap is a
+    /// server-side invariant; it must never rely on the client serializing its own requests.
     fn add_active_device(&self, device: DeviceRecord, max_active: usize) -> StoreResult<bool>;
     /// Revoked included; ordered deterministically (creation, then id).
     fn list_devices(&self, account_id: &AccountId) -> StoreResult<Vec<DeviceRecord>>;

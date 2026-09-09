@@ -287,6 +287,72 @@ fn schema_allows_capped_multi_device_and_unique_usernames() {
     );
 }
 
+/// The per-account cap must hold under TRUE concurrency, not merely sequentially.
+///
+/// `add_active_device` counts active devices then inserts. Wrapping both in one transaction is
+/// NOT sufficient at PostgreSQL's default READ COMMITTED: concurrent racers each read the same
+/// pre-insert count, each see room under the cap, and each insert — so the account ends up with
+/// more active devices than `MAX_ACTIVE_DEVICES`. V13 dropped `devices_one_active_per_account`,
+/// so no database constraint catches this either; the cap is application-enforced and must
+/// therefore serialize on the account row.
+#[test]
+fn add_active_device_race_never_exceeds_cap() {
+    use auth_core::store::{Assurance, DeviceRecord};
+    const MAX: usize = auth_core::AuthService::MAX_ACTIVE_DEVICES;
+
+    let (stores, service) = setup();
+    let username = unique_username("racecap");
+    let (_device, session) = register(&service, &username);
+
+    // Registration leaves exactly one active device, so MAX - 1 slots remain. Racing more
+    // enrollments than slots means the cap MUST refuse the surplus.
+    const RACERS: usize = 16;
+    assert!(RACERS > MAX, "racers must outnumber the cap to test refusal");
+
+    let granted = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(std::sync::Barrier::new(RACERS));
+    let mut handles = Vec::new();
+    for _ in 0..RACERS {
+        let stores = stores.clone();
+        let granted = granted.clone();
+        let barrier = barrier.clone();
+        let account_id = session.account_id;
+        handles.push(std::thread::spawn(move || {
+            let device = DeviceRecord {
+                device_id: DeviceId::random(),
+                account_id,
+                public_key: vec![0x04; 65],
+                revoked: false,
+                assurance: Assurance::Software,
+            };
+            barrier.wait(); // maximize contention
+            if stores.add_active_device(device, MAX).expect("add") {
+                granted.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+    }
+    for h in handles {
+        h.join().expect("thread");
+    }
+
+    let active = stores
+        .list_devices(&session.account_id)
+        .expect("list")
+        .iter()
+        .filter(|d| !d.revoked)
+        .count();
+
+    assert!(
+        active <= MAX,
+        "cap breached under concurrency: {active} active devices exceeds MAX {MAX}"
+    );
+    assert_eq!(
+        granted.load(Ordering::SeqCst),
+        MAX - 1,
+        "exactly the remaining slots may be granted"
+    );
+}
+
 /// Expired-row purge removes old challenges and access tokens (retention hygiene).
 #[test]
 fn purge_removes_expired_rows() {

@@ -278,9 +278,20 @@ impl DeviceStore for PgStores {
     fn add_active_device(&self, device: DeviceRecord, max_active: usize) -> StoreResult<bool> {
         let mut conn = self.conn()?;
         let mut txn = conn.transaction().map_err(db_err)?;
-        // Count + insert in one transaction so a race cannot exceed the cap. No FOR UPDATE: an
-        // over-limit race needs concurrent enrollments from one account, which the client
-        // serializes.
+        // Count + insert in one transaction is NOT enough at READ COMMITTED: concurrent racers
+        // each read the same pre-insert count, each see room under the cap, and each insert —
+        // breaching it (proved by `add_active_device_race_never_exceeds_cap`). V13 dropped
+        // `devices_one_active_per_account`, so no database constraint catches this either.
+        //
+        // Lock the ACCOUNT row so enrollments for one account serialize; different accounts never
+        // block each other. The cap is a server-side invariant and must not depend on the client
+        // serializing its own requests. A missing account locks nothing here and the INSERT's
+        // foreign key still rejects it, exactly as before.
+        txn.execute(
+            "SELECT 1 FROM accounts WHERE account_id = $1 FOR UPDATE",
+            &[&device.account_id.as_bytes()],
+        )
+        .map_err(db_err)?;
         let active: i64 = txn
             .query_one(
                 "SELECT count(*) FROM devices WHERE account_id = $1 AND NOT revoked",
