@@ -554,6 +554,70 @@ fn concurrent_demotes_never_leave_a_group_without_an_admin() {
     }
 }
 
+/// The last member to leave must delete the conversation. Concurrently, each leaver's
+/// `count(*)` of the remaining members can still see the other, so both take the "someone is
+/// left" branch and neither cleans up — leaving a memberless `conversations` row that
+/// `list_conversations` cannot surface (it joins through `conversation_members`) and no endpoint
+/// can reach or purge.
+#[test]
+fn concurrent_leaves_leave_no_orphan_conversation() {
+    let groups = common::shared_groups();
+    let relay = common::shared_relay();
+    const TRIALS: usize = 30;
+
+    for trial in 0..TRIALS {
+        let conversation_id: [u8; 16] = DeviceId::random().as_bytes().try_into().expect("16 bytes");
+        let a = AccountId::random();
+        let b = AccountId::random();
+
+        relay
+            .create_conversation(conversation_id, a, DeviceId::random(), false)
+            .expect("create");
+        relay
+            .add_member(&conversation_id, b, DeviceId::random())
+            .expect("add b");
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for who in [a, b] {
+            let groups = groups.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                groups
+                    .leave_conversation(&conversation_id, &who)
+                    .expect("leave");
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread");
+        }
+
+        let mut client =
+            postgres::Client::connect(&common::db_url(), postgres::NoTls).expect("connect");
+        let members: i64 = client
+            .query_one(
+                "SELECT count(*) FROM conversation_members WHERE conversation_id = $1",
+                &[&conversation_id.as_slice()],
+            )
+            .expect("count members")
+            .get(0);
+        let conversations: i64 = client
+            .query_one(
+                "SELECT count(*) FROM conversations WHERE conversation_id = $1",
+                &[&conversation_id.as_slice()],
+            )
+            .expect("count conversations")
+            .get(0);
+
+        assert_eq!(members, 0, "trial {trial}: both members left");
+        assert_eq!(
+            conversations, 0,
+            "trial {trial}: memberless conversation row survived — unreachable and unpurgeable"
+        );
+    }
+}
+
 /// Expired-row purge removes old challenges and access tokens (retention hygiene).
 #[test]
 fn purge_removes_expired_rows() {
