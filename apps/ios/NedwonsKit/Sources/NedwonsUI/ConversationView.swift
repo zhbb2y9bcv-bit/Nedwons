@@ -31,11 +31,14 @@ public struct ThreadLine: Identifiable, Sendable, Equatable {
     /// Mine only: how many other members have received / read it.
     public let deliveredCount: Int
     public let readCount: Int
+    /// Retracted by its author (delete-for-everyone): rendered as "Message deleted", offers no
+    /// reply/react/forward, and quotes as nothing.
+    public let deleted: Bool
 
     public init(
         id: UInt64, kind: Kind, mine: Bool, timestamp: Date? = nil, isPending: Bool = false,
         messageID: String = "", replyTo: String? = nil, reactions: [ReactionSummary] = [],
-        deliveredCount: Int = 0, readCount: Int = 0
+        deliveredCount: Int = 0, readCount: Int = 0, deleted: Bool = false
     ) {
         self.id = id
         self.kind = kind
@@ -47,15 +50,17 @@ public struct ThreadLine: Identifiable, Sendable, Equatable {
         self.reactions = reactions
         self.deliveredCount = deliveredCount
         self.readCount = readCount
+        self.deleted = deleted
     }
 
     /// The plain text of this line, for quoting it in a reply preview. A secret never yields one —
-    /// its body is the thing that must not be shown twice.
+    /// its body is the thing that must not be shown twice — and neither does a deleted message.
     public var quotableText: String? {
+        if deleted { return nil }
         switch kind {
-        case .text(let t): t.isEmpty ? nil : t
-        case .attachment(let a): a.caption.isEmpty ? a.displayName : a.caption
-        case .sealedSecret, .consumedSecret: nil
+        case .text(let t): return t.isEmpty ? nil : t
+        case .attachment(let a): return a.caption.isEmpty ? a.displayName : a.caption
+        case .sealedSecret, .consumedSecret: return nil
         }
     }
 }
@@ -125,6 +130,8 @@ struct ConversationView: View {
     @State private var showGroupInfo = false
     @State private var showPhotoPicker = false
     @State private var pickedItem: PhotosPickerItem?
+    @State private var deleteCandidate: ThreadLine?
+    @State private var forwardCandidate: ThreadLine?
     private var palette: Nedwons.Palette { .forScheme(scheme) }
 
     var body: some View {
@@ -152,6 +159,27 @@ struct ConversationView: View {
         }
         .navigationDestination(isPresented: $showGroupInfo) {
             GroupAdminView(model: model, chat: chat)
+        }
+        .confirmationDialog(
+            "Delete for everyone?",
+            isPresented: Binding(
+                get: { deleteCandidate != nil }, set: { if !$0 { deleteCandidate = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Delete for everyone", role: .destructive) {
+                if let line = deleteCandidate {
+                    Task { await model.deleteForEveryone(line, in: chat.conversationID) }
+                }
+                deleteCandidate = nil
+            }
+            Button("Cancel", role: .cancel) { deleteCandidate = nil }
+        } message: {
+            Text(
+                "Everyone's app is asked to remove it. That is best-effort: someone may have "
+                    + "already seen it, and a device that never comes online keeps its copy.")
+        }
+        .sheet(item: $forwardCandidate) { line in
+            ForwardPickerView(model: model, line: line, sourceConversationID: chat.conversationID)
         }
         // The picker returns the image's own bytes; they are encrypted before anything leaves the
         // device, so what the relay receives is never the photo.
@@ -198,10 +226,19 @@ struct ConversationView: View {
             showProfile = true
         } label: {
             VStack(spacing: 0) {
-                Text(headerTitle)
-                    .font(Nedwons.TypeScale.headline)
-                    .foregroundStyle(palette.textPrimary)
-                    .lineLimit(1)
+                HStack(spacing: Nedwons.Spacing.xs) {
+                    Text(headerTitle)
+                        .font(Nedwons.TypeScale.headline)
+                        .foregroundStyle(palette.textPrimary)
+                        .lineLimit(1)
+                    if model.disappearTimer(for: chat.conversationID) > 0 {
+                        Image(systemName: "timer")
+                            .font(.caption2)
+                            .foregroundStyle(palette.textSecondary)
+                            .accessibilityLabel(
+                                "Disappearing messages: \(AppModel.timerLabel(model.disappearTimer(for: chat.conversationID)))")
+                    }
+                }
                 if hasAlias, let username = chat.peerUsername {
                     Text("@\(username)")
                         .font(.caption2)
@@ -382,7 +419,7 @@ struct ConversationView: View {
     /// ids and honestly cannot be referred to, so the actions are not offered for them.
     @ViewBuilder
     private func messageActions(_ line: ThreadLine) -> some View {
-        if !line.messageID.isEmpty {
+        if !line.messageID.isEmpty, !line.deleted {
             Button {
                 model.startReply(to: line, in: chat.conversationID)
             } label: {
@@ -394,6 +431,25 @@ struct ConversationView: View {
                 }
             }
         }
+        if !line.deleted, line.quotableText != nil || lineIsForwardableAttachment(line) {
+            Button {
+                forwardCandidate = line
+            } label: {
+                Label("Forward", systemImage: "arrowshape.turn.up.right")
+            }
+        }
+        if line.mine, !line.messageID.isEmpty, !line.deleted {
+            Button(role: .destructive) {
+                deleteCandidate = line
+            } label: {
+                Label("Delete for everyone", systemImage: "trash")
+            }
+        }
+    }
+
+    private func lineIsForwardableAttachment(_ line: ThreadLine) -> Bool {
+        if case .attachment = line.kind { return true }
+        return false
     }
 
     /// A small, fixed set: a picker with every emoji is a different feature, and these cover the
@@ -402,6 +458,23 @@ struct ConversationView: View {
 
     @ViewBuilder
     private func row(_ line: ThreadLine) -> some View {
+        if line.deleted {
+            // An honest tombstone: the retraction is visible, the words are gone.
+            Text(line.mine ? "You deleted this message" : "Message deleted")
+                .font(Nedwons.TypeScale.callout.italic())
+                .foregroundStyle(palette.textSecondary)
+                .padding(.horizontal, Nedwons.Spacing.md)
+                .padding(.vertical, Nedwons.Spacing.sm)
+                .background(palette.surface)
+                .clipShape(RoundedRectangle(cornerRadius: Nedwons.Radius.bubble))
+                .accessibilityIdentifier("message.deleted.\(line.id)")
+        } else {
+            undeletedRow(line)
+        }
+    }
+
+    @ViewBuilder
+    private func undeletedRow(_ line: ThreadLine) -> some View {
         switch line.kind {
         case .text(let text):
             Text(text)

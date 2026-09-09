@@ -41,26 +41,44 @@ final class NotificationService: UNNotificationServiceExtension {
         }
     }
 
-    /// Under the app-group `flock`. Fully synchronous; the async client calls are bridged below.
+    /// Under the cross-process store lock. Fully synchronous; the async client calls are bridged
+    /// below. Opens the store for each envelope's conversation through the shared `MlsStoreIndex`
+    /// — the app's real layout is one encrypted store per conversation, not one big one.
     private static func resolveBlocking(shared: SharedNotificationContext) -> PushNotificationContent? {
-        let fd = open(shared.lockPath, O_CREAT | O_RDWR, 0o600)
-        guard fd >= 0 else { return nil }
-        defer { close(fd) }
-        guard flock(fd, LOCK_EX) == 0 else { return nil }
-        defer { flock(fd, LOCK_UN) }
-
-        guard let client = try? MlsClient.open(dbPath: shared.mlsDbPath, atRestKey: shared.atRestKey)
+        // Non-blocking: if the app holds the lock it is running and will show the message itself;
+        // waiting out our budget to fight it for the store would be worse than a generic wake.
+        guard let lock = StoreLock.tryAcquire(
+            at: SharedStoreLayout.lockURL(storeDirectory: shared.storeDirectory))
         else { return nil }
+        defer { lock.release() }
+
+        let index = MlsStoreIndex.load(
+            from: SharedStoreLayout.indexURL(storeDirectory: shared.storeDirectory))
         let envelopes = blockingFetchInbox(baseURL: shared.serverURL, token: shared.accessToken)
-        let decoded = try? PushInboxDecoder.decode(
-            client: client, envelopes: envelopes.compactMap(PushEnvelope.init))
-        // Ack what we durably processed, per channel id space, so it is not re-shown.
+
+        var opened: [String: MlsClient] = [:]
+        defer { for client in opened.values { client.close() } }
+        let outcome = PushInboxDecoder.decode(
+            envelopes: envelopes.compactMap(PushEnvelope.init)
+        ) { conversationID in
+            if let cached = opened[conversationID] { return cached }
+            guard let storeID = index.conversations[conversationID],
+                let key = try? shared.keyProvider(storeID),
+                let client = try? MlsClient.open(
+                    dbPath: SharedStoreLayout.storePath(
+                        storeDirectory: shared.storeDirectory, storeID: storeID),
+                    atRestKey: key)
+            else { return nil }
+            opened[conversationID] = client
+            return client
+        }
+        // Ack ONLY what was durably processed (ratchet advanced + committed). Anything else —
+        // sealed, self-group, a store we could not open, a failed decrypt — stays queued for the
+        // app: acking it here would delete mail nothing ever decrypted.
         blockingAck(
             baseURL: shared.serverURL, token: shared.accessToken,
-            ids: envelopes.filter { !$0.sealed && !$0.selfGroup }.map(\.id),
-            sealedIds: envelopes.filter { $0.sealed }.map(\.id),
-            selfGroupIds: envelopes.filter { $0.selfGroup }.map(\.id))
-        return decoded ?? nil
+            ids: outcome.processedIDs, sealedIds: [], selfGroupIds: [])
+        return outcome.content
     }
 }
 
@@ -97,20 +115,45 @@ private func blockingAck(
     sem.wait()
 }
 
-/// Sourced from the app group + shared Keychain; `nil` until those are provisioned on a device
-/// build, so the extension safely falls back. Wiring:
-/// - `serverURL` from `AppConfig` (or the app group's shared config);
-/// - `accessToken` + at-rest root from the **shared Keychain access group**;
-/// - `mlsDbPath` + `lockPath` from the **app-group container**
-///   (`FileManager.containerURL(forSecurityApplicationGroupIdentifier:)`).
+/// Sourced from the app group + shared Keychain; `nil` until those are provisioned, so the
+/// extension safely falls back to the generic wake. What "provisioned" means concretely:
+/// - the `NedwonsAppGroup` Info.plist key names an app group both targets are entitled to
+///   (`com.apple.security.application-groups`), so `containerURL` resolves and the app has been
+///   rooting its MLS stores there (`AppComposition.standard()`);
+/// - the app and this extension share a **Keychain access group** (the first entry of both
+///   `keychain-access-groups` entitlements), so the same `SessionStore` / at-rest root reads here.
+/// The server URL comes from this extension's own Info.plist (`NedwonsServerURL`), mirroring
+/// `AppConfig` — `NedwonsUI` cannot be linked from an extension.
 struct SharedNotificationContext: Sendable {
     let serverURL: URL
     let accessToken: String
-    let mlsDbPath: String
-    let atRestKey: Data
-    let lockPath: String
+    let storeDirectory: URL
+    let keyProvider: @Sendable (String) throws -> Data
 
     static func current() -> SharedNotificationContext? {
-        nil
+        guard let group = SharedStoreLayout.configuredAppGroup(),
+            let storeDirectory = SharedStoreLayout.storeDirectory(appGroup: group),
+            FileManager.default.fileExists(
+                atPath: SharedStoreLayout.indexURL(storeDirectory: storeDirectory).path),
+            let session = SessionStore().load()
+        else { return nil }
+        let keys = AtRestKeyHierarchy(store: KeychainStore(service: "app.nedwons.at-rest"))
+        return SharedNotificationContext(
+            serverURL: Self.serverURL(),
+            accessToken: session.accessToken,
+            storeDirectory: storeDirectory,
+            keyProvider: { storeID in try keys.atRestKey(forStore: storeID) })
+    }
+
+    /// `NedwonsServerURL` from this bundle's Info.plist, with the same loopback dev fallback as
+    /// the app's `AppConfig` (simulator convenience; a device build must configure https).
+    private static func serverURL() -> URL {
+        if let raw = Bundle.main.object(forInfoDictionaryKey: "NedwonsServerURL") as? String {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty, !trimmed.hasPrefix("$("), let url = URL(string: trimmed) {
+                return url
+            }
+        }
+        return URL(string: "http://127.0.0.1:8097")!
     }
 }

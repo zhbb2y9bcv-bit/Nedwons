@@ -845,6 +845,24 @@ public final class AppModel: ObservableObject {
         }
     }
 
+    /// Every visible conversation as the UI renders it: the server's routing metadata joined with
+    /// decrypted local display state (previews, unread counts). Shared by the chats list, the
+    /// forward picker, and message search.
+    public var chatSummaries: [ChatSummary] {
+        visibleConversations.map { conversation in
+            let peer = conversation.memberAccountIDs.first { $0 != session?.accountID }
+            return ChatSummary(
+                conversationID: conversation.conversationID,
+                peerAccountID: peer,
+                peerUsername: peer.flatMap { username(forAccountID: $0) },
+                memberCount: conversation.memberAccountIDs.count,
+                lastMessagePreview: localPreview(for: conversation.conversationID),
+                lastActivity: localLastActivity(for: conversation.conversationID),
+                unreadCount: unreadCount(for: conversation.conversationID)
+            )
+        }
+    }
+
     public func localPreview(for conversationID: String) -> String? {
         localThreads[conversationID]?.preview
     }
@@ -906,6 +924,84 @@ public final class AppModel: ObservableObject {
 
     /// Injected: tell the conversation whether this user is typing.
     public var setTypingAction: ((Bool, String) async -> Void)?
+
+    /// Injected: change the disappearing-message timer for everyone (`seconds`, conversation).
+    public var setDisappearTimerAction: ((UInt32, String) async throws -> Void)?
+
+    /// Injected: retract one of the user's OWN messages everywhere (`messageID`, conversation).
+    public var deleteForEveryoneAction: ((String, String) async throws -> Void)?
+
+    /// Injected: forward a message (`lineID`, from conversation, to conversation).
+    public var forwardMessageAction: ((UInt64, String, String) async throws -> Void)?
+
+    /// Injected: on-device search over the decrypted local history.
+    public var searchMessagesAction: ((String) -> [MessageSearchHit])?
+
+    /// Disappearing-message timer per conversation, in seconds (0/absent = off). Decrypted local
+    /// state, published by the composition layer — never a server field.
+    @Published public var disappearTimers: [String: UInt32] = [:]
+
+    public func disappearTimer(for conversationID: String) -> UInt32 {
+        disappearTimers[conversationID] ?? 0
+    }
+
+    /// Change the disappearing timer for everyone; the honest wording lives with the control.
+    public func setDisappearTimer(_ seconds: UInt32, in conversationID: String) async {
+        guard let setDisappearTimerAction else {
+            banner = "Disappearing messages aren't available in this build."
+            return
+        }
+        do {
+            try await setDisappearTimerAction(seconds, conversationID)
+            banner = seconds == 0
+                ? "Disappearing messages are off for new messages."
+                : "New messages now disappear after \(Self.timerLabel(seconds))."
+        } catch {
+            banner = "Couldn't change the timer. It stays as it was."
+        }
+    }
+
+    /// Retract one of the user's own messages everywhere (best-effort, R-901 — the honest copy is
+    /// on the confirm dialog).
+    public func deleteForEveryone(_ line: ThreadLine, in conversationID: String) async {
+        guard line.mine, !line.messageID.isEmpty, let deleteForEveryoneAction else { return }
+        do {
+            try await deleteForEveryoneAction(line.messageID, conversationID)
+        } catch {
+            banner = "Couldn't delete that message everywhere."
+        }
+    }
+
+    /// Forward a message to another conversation this user is in.
+    public func forward(_ line: ThreadLine, from sourceID: String, to destinationID: String) async {
+        guard let forwardMessageAction else {
+            banner = "Forwarding isn't available in this build."
+            return
+        }
+        do {
+            try await forwardMessageAction(line.id, sourceID, destinationID)
+            banner = "Forwarded."
+        } catch {
+            banner = "Couldn't forward that message."
+        }
+    }
+
+    /// On-device message search results for the chats screen, refreshed as the user types.
+    @Published public var messageSearchHits: [MessageSearchHit] = []
+
+    public func searchMessages(_ query: String) {
+        messageSearchHits = searchMessagesAction?(query) ?? []
+    }
+
+    static func timerLabel(_ seconds: UInt32) -> String {
+        switch seconds {
+        case 0: return "off"
+        case ..<3600: return "\(seconds / 60) min"
+        case ..<86400: return "\(seconds / 3600) hour\(seconds == 3600 ? "" : "s")"
+        case ..<604_800: return "\(seconds / 86400) day\(seconds == 86400 ? "" : "s")"
+        default: return "\(seconds / 604_800) week\(seconds == 604_800 ? "" : "s")"
+        }
+    }
 
     /// Who is currently typing, per conversation, as last reported. Ephemeral by construction: it
     /// is never persisted, and each entry expires on its own — a "stopped typing" that never
@@ -1102,5 +1198,26 @@ public final class AppModel: ObservableObject {
             }
         }
         return conversationID
+    }
+}
+
+/// One on-device search hit over decrypted local history (there is deliberately no server-side
+/// search: the relay holds only ciphertext).
+public struct MessageSearchHit: Sendable, Equatable, Identifiable {
+    public let conversationID: String
+    public let localID: UInt64
+    public let snippet: String
+    public let timestamp: Date?
+    public let mine: Bool
+    public var id: String { "\(conversationID)-\(localID)" }
+
+    public init(
+        conversationID: String, localID: UInt64, snippet: String, timestamp: Date?, mine: Bool
+    ) {
+        self.conversationID = conversationID
+        self.localID = localID
+        self.snippet = snippet
+        self.timestamp = timestamp
+        self.mine = mine
     }
 }

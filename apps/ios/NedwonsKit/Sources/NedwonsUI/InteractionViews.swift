@@ -71,3 +71,63 @@ struct ReactionRow: View {
         }
     }
 }
+
+/// Pick where a forwarded message goes. Groups the user can't send into are shown but disabled
+/// (the relay would refuse anyway — showing why beats a mystery failure).
+struct ForwardPickerView: View {
+    @ObservedObject var model: AppModel
+    let line: ThreadLine
+    let sourceConversationID: String
+
+    @Environment(\.colorScheme) private var scheme
+    @Environment(\.dismiss) private var dismiss
+    @State private var sending = false
+    private var palette: Nedwons.Palette { .forScheme(scheme) }
+
+    private var destinations: [ChatSummary] {
+        sortedByRecency(model.chatSummaries.filter { $0.conversationID != sourceConversationID })
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    if destinations.isEmpty {
+                        Text("No other conversations to forward into.")
+                            .foregroundStyle(palette.textSecondary)
+                    }
+                    ForEach(destinations) { chat in
+                        Button {
+                            guard !sending else { return }
+                            sending = true
+                            Task {
+                                await model.forward(
+                                    line, from: sourceConversationID, to: chat.conversationID)
+                                sending = false
+                                dismiss()
+                            }
+                        } label: {
+                            HStack {
+                                Text(model.conversationTitle(for: chat))
+                                    .foregroundStyle(palette.textPrimary)
+                                Spacer()
+                                if sending { ProgressView() }
+                            }
+                        }
+                        .disabled(model.composerLock(for: chat.conversationID) != nil)
+                        .accessibilityIdentifier("forward.to.\(chat.conversationID)")
+                    }
+                } footer: {
+                    Text("A forwarded file is re-encrypted with a fresh key for the destination — the two conversations never share key material.")
+                }
+            }
+            .navigationTitle("Forward to…")
+            .inlineNavigationTitle()
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+    }
+}

@@ -57,6 +57,11 @@ targets:
         NSCameraUsageDescription: "Scan QR codes to join groups by invite, verify a contact's safety number, or link another of your devices."
         NedwonsServerURL: ""
         NedwonsTransparencyLogKey: ""
+        # The provisioned app group (e.g. group.app.nedwons.demo). Empty ⇒ app-private stores and
+        # generic push wakes. Set it TOGETHER with the com.apple.security.application-groups
+        # entitlement on BOTH targets; AppComposition then roots MLS stores in the shared
+        # container and the notification extension can decrypt (NOTIFICATION_EXTENSION.md).
+        NedwonsAppGroup: ""
         # Export compliance. Declared TRUE deliberately: this app's core function is end-to-end
         # encrypted messaging, so claiming one of the exemptions would be a claim we cannot
         # substantiate — and it is made to a regulator, not to Apple. Declaring true means export
@@ -117,6 +122,10 @@ targets:
         NSExtension:
           NSExtensionPointIdentifier: com.apple.usernotifications.service
           NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+        # Mirror the app's build config (an extension cannot link NedwonsUI/AppConfig): keep these
+        # equal to the app target's values.
+        NedwonsServerURL: ""
+        NedwonsAppGroup: ""
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.nedwons.demo.NotificationService

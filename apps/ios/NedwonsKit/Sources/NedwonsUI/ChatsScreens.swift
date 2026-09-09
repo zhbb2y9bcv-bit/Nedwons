@@ -58,12 +58,15 @@ struct ChatsListView: View {
     @State private var showCompose = false
     @State private var showJoin = false
     @State private var pendingDelete: ChatSummary?
+    @State private var searchQuery = ""
     private var palette: Nedwons.Palette { .forScheme(scheme) }
 
     var body: some View {
         NavigationStack(path: $path) {
             Group {
-                if model.isBusy && model.conversations.isEmpty {
+                if !searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
+                    searchResults
+                } else if model.isBusy && model.conversations.isEmpty {
                     ProgressView("Loading conversations…")
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if chats.isEmpty {
@@ -74,6 +77,10 @@ struct ChatsListView: View {
             }
             .background(palette.background)
             .navigationTitle("Chats")
+            // On-device search over DECRYPTED local history. There is deliberately no server-side
+            // search: the relay holds only ciphertext and has nothing to answer with.
+            .searchable(text: $searchQuery, prompt: "Search messages")
+            .onChange(of: searchQuery) { _, q in model.searchMessages(q) }
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
                     Button { showCompose = true } label: { Image(systemName: "square.and.pencil") }
@@ -126,19 +133,51 @@ struct ChatsListView: View {
     /// Derived from the server's conversation list (routing metadata only) joined with local
     /// display state. Previews come from decrypted on-device history, never from the relay.
     private var chats: [ChatSummary] {
-        sortedByRecency(
-            model.visibleConversations.map { conversation in
-                let peer = conversation.memberAccountIDs.first { $0 != model.session?.accountID }
-                return ChatSummary(
-                    conversationID: conversation.conversationID,
-                    peerAccountID: peer,
-                    peerUsername: peer.flatMap { model.username(forAccountID: $0) },
-                    memberCount: conversation.memberAccountIDs.count,
-                    lastMessagePreview: model.localPreview(for: conversation.conversationID),
-                    lastActivity: model.localLastActivity(for: conversation.conversationID),
-                    unreadCount: model.unreadCount(for: conversation.conversationID)
-                )
-            })
+        sortedByRecency(model.chatSummaries)
+    }
+
+    /// Message hits, newest first; tapping opens the conversation. (Jump-to-message inside the
+    /// thread is an honest not-yet — the hit opens the thread, not the exact bubble.)
+    private var searchResults: some View {
+        List {
+            if model.messageSearchHits.isEmpty {
+                Text("No messages match.")
+                    .foregroundStyle(palette.textSecondary)
+            }
+            ForEach(model.messageSearchHits) { hit in
+                Button {
+                    if let chat = chats.first(where: { $0.conversationID == hit.conversationID }) {
+                        searchQuery = ""
+                        path.append(chat)
+                    }
+                } label: {
+                    VStack(alignment: .leading, spacing: Nedwons.Spacing.xxs) {
+                        HStack {
+                            Text(titleFor(conversationID: hit.conversationID))
+                                .font(Nedwons.TypeScale.caption)
+                                .foregroundStyle(palette.accentPrimary)
+                            Spacer()
+                            if let when = hit.timestamp {
+                                Text(when, style: .date)
+                                    .font(Nedwons.TypeScale.caption)
+                                    .foregroundStyle(palette.textSecondary)
+                            }
+                        }
+                        Text((hit.mine ? "You: " : "") + hit.snippet)
+                            .font(Nedwons.TypeScale.callout)
+                            .foregroundStyle(palette.textPrimary)
+                            .lineLimit(2)
+                    }
+                }
+                .accessibilityIdentifier("search.hit.\(hit.id)")
+            }
+        }
+        .listStyle(.plain)
+    }
+
+    private func titleFor(conversationID: String) -> String {
+        chats.first(where: { $0.conversationID == conversationID })
+            .map { model.conversationTitle(for: $0) } ?? "Conversation"
     }
 
     private var list: some View {

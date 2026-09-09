@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 import MlsFfi
 import NedwonsKit
+import NedwonsPush
 import NedwonsUI
 
 /// The messaging pipeline. Owns one `MlsClient` per conversation (plus the lobby of joiner
@@ -40,6 +41,13 @@ public final class ConversationCoordinator {
     /// store id → Pending (lobby) client
     private var lobbyClients: [String: MlsClient] = [:]
     private var receiveTask: Task<Void, Never>?
+    /// The cross-process single-writer lock over the (possibly shared) store directory. Held from
+    /// `start()` to `stop()`; the notification extension takes it non-blockingly while we're away.
+    private var storeLock: StoreLock?
+    /// False only between `stop()` and the next `start()`: a still-unwinding loop iteration must
+    /// not re-open stores that were just closed and unlocked. True from construction so direct
+    /// (test/tool) use without a receive loop still works.
+    private var isActive = true
     /// The most recent background failure, for diagnostics; the UI shows banners on user actions.
     public private(set) var lastSyncError: Error?
     /// Whether this device tells senders what it has received and read. A privacy choice, not a
@@ -116,12 +124,39 @@ public final class ConversationCoordinator {
         model.wipeAllLocalDataAction = { [weak self] in
             self?.wipeAllLocalData()
         }
+        model.setDisappearTimerAction = { [weak self] seconds, conversationID in
+            guard let self else { throw CoordinatorError.notSignedIn }
+            try await self.setDisappearTimer(seconds, in: conversationID)
+        }
+        model.deleteForEveryoneAction = { [weak self] messageID, conversationID in
+            guard let self else { throw CoordinatorError.notSignedIn }
+            try await self.deleteForEveryone(messageID: messageID, in: conversationID)
+        }
+        model.forwardMessageAction = { [weak self] lineID, sourceID, destinationID in
+            guard let self else { throw CoordinatorError.notSignedIn }
+            try await self.forward(lineID: lineID, from: sourceID, to: destinationID)
+        }
+        model.searchMessagesAction = { [weak self] query in
+            self?.searchMessages(matching: query).map {
+                MessageSearchHit(
+                    conversationID: $0.conversationID, localID: $0.localID,
+                    snippet: $0.snippet, timestamp: $0.timestamp, mine: $0.mine)
+            } ?? []
+        }
     }
 
     /// Begin the receive loop for the signed-in session. Idempotent.
     public func start() {
         guard receiveTask == nil else { return }
+        isActive = true
         receiveTask = Task { [weak self] in
+            // Single-writer (ADR-0007): the Notification Service Extension may be mid-decrypt in
+            // the shared store. Wait for the cross-process lock BEFORE opening anything; the wait
+            // is bounded by the extension's few-second budget and runs off the main thread.
+            if let self, self.storeLock == nil {
+                let url = SharedStoreLayout.lockURL(storeDirectory: self.storeDirectory)
+                self.storeLock = await Task.detached { StoreLock.acquire(at: url) }.value
+            }
             await self?.prepare()
             while !Task.isCancelled {
                 guard let self, self.token != nil else { return }
@@ -139,14 +174,20 @@ public final class ConversationCoordinator {
         }
     }
 
-    /// Stop polling and release every open store (sign-out). Nothing on disk is touched.
+    /// Stop polling and release every open store (sign-out, and entering the background so the
+    /// notification extension can take the single-writer lock). Nothing on disk is touched.
     public func stop() {
+        isActive = false
         receiveTask?.cancel()
         receiveTask = nil
         for client in clients.values { client.close() }
         for client in lobbyClients.values { client.close() }
         clients.removeAll()
         lobbyClients.removeAll()
+        // Re-read on next start(): the extension may have advanced ratchets while we were away.
+        index = MlsStoreIndex.load(from: storeDirectory.appendingPathComponent(MlsStoreIndex.fileName))
+        storeLock?.release()
+        storeLock = nil
     }
 
     /// One-time work after sign-in: render what is stored, replenish prekeys, resume any upload a
@@ -279,6 +320,89 @@ public final class ConversationCoordinator {
     private func sendGroupName(_ name: String, client: MlsClient, conversationID: String) async throws {
         let localID = try client.setGroupName(name: name)
         try await upload(localID: localID, client: client, conversationID: conversationID)
+    }
+
+    // MARK: Disappearing messages, delete-for-everyone, forwarding, search
+
+    /// Change the conversation's disappearing-message timer for everyone (0 = off). An ordinary
+    /// E2EE message on the ordinary upload path; the local timer applies when the group is told.
+    public func setDisappearTimer(_ seconds: UInt32, in conversationID: String) async throws {
+        guard let client = activeClient(for: conversationID) else {
+            throw CoordinatorError.noSessionForConversation
+        }
+        let localID = try client.setDisappearTimer(seconds: seconds)
+        defer { refresh(conversationID) }
+        try await upload(localID: localID, client: client, conversationID: conversationID)
+    }
+
+    /// Retract one of the user's OWN messages everywhere. The core refuses anyone else's message,
+    /// and recipients independently refuse a delete from a non-author — the menu item is UX, the
+    /// core checks are the rule. Best-effort by design (R-901).
+    public func deleteForEveryone(messageID: String, in conversationID: String) async throws {
+        guard let client = activeClient(for: conversationID),
+            let target = Hex.decode(messageID)
+        else { throw CoordinatorError.noSessionForConversation }
+        let localID = try client.deleteForEveryone(target: target)
+        defer { refresh(conversationID) }
+        try await upload(localID: localID, client: client, conversationID: conversationID)
+    }
+
+    /// Forward a message to another conversation. Text forwards as text; a file is fetched,
+    /// decrypted locally, and RE-encrypted under a fresh one-time key for the destination — the
+    /// two conversations never share key material, and the relay sees an unrelated new blob.
+    public func forward(lineID: UInt64, from sourceID: String, to destinationID: String) async throws {
+        guard let source = activeClient(for: sourceID),
+            let message = (try? source.messages())?.first(where: { $0.localId == lineID }),
+            !message.deleted, message.secretId == nil
+        else { throw CoordinatorError.noSessionForConversation }
+        if let attachment = message.attachment {
+            let data = try await loadAttachment(Hex.encode(attachment.blobId))
+            try await sendAttachment(
+                data, mime: attachment.mime, filename: attachment.filename,
+                caption: String(decoding: message.plaintext, as: UTF8.self), to: destinationID)
+        } else {
+            try await send(String(decoding: message.plaintext, as: UTF8.self), in: destinationID)
+        }
+    }
+
+    /// One search hit across the decrypted local history.
+    public struct SearchHit: Sendable, Equatable, Identifiable {
+        public let conversationID: String
+        public let localID: UInt64
+        public let snippet: String
+        public let timestamp: Date?
+        public let mine: Bool
+        public var id: String { "\(conversationID)-\(localID)" }
+    }
+
+    /// Case-insensitive substring search over every conversation's DECRYPTED local log — entirely
+    /// on-device, because the relay holds only ciphertext and there is deliberately nothing
+    /// server-side to ask. Newest first, bounded.
+    public func searchMessages(matching rawQuery: String, limit: Int = 50) -> [SearchHit] {
+        let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !query.isEmpty else { return [] }
+        var hits: [SearchHit] = []
+        for conversationID in index.conversations.keys {
+            guard let client = activeClient(for: conversationID),
+                let messages = try? client.messages()
+            else { continue }
+            for message in messages where !message.deleted && message.secretId == nil {
+                let text = String(decoding: message.plaintext, as: UTF8.self)
+                let name = message.attachment?.filename ?? ""
+                guard text.lowercased().contains(query) || name.lowercased().contains(query)
+                else { continue }
+                hits.append(
+                    SearchHit(
+                        conversationID: conversationID,
+                        localID: message.localId,
+                        snippet: text.isEmpty ? name : text,
+                        timestamp: Self.timestamp(message.createdAtMs),
+                        mine: message.direction == .outbound))
+            }
+        }
+        return Array(
+            hits.sorted { ($0.timestamp ?? .distantPast) > ($1.timestamp ?? .distantPast) }
+                .prefix(limit))
     }
 
     // MARK: Attachments
@@ -570,6 +694,7 @@ public final class ConversationCoordinator {
 
     private func activeClient(for conversationID: String) -> MlsClient? {
         if let existing = clients[conversationID] { return existing }
+        guard isActive else { return nil } // stopped: never re-open a store we just released
         guard let storeID = index.conversations[conversationID],
             let opened = try? MlsClient.open(dbPath: path(storeID), atRestKey: try keyProvider(storeID)),
             (try? opened.isPending()) == false
@@ -580,6 +705,7 @@ public final class ConversationCoordinator {
 
     private func lobbyClient(_ storeID: String) -> MlsClient? {
         if let existing = lobbyClients[storeID] { return existing }
+        guard isActive else { return nil }
         guard let opened = try? MlsClient.open(dbPath: path(storeID), atRestKey: try keyProvider(storeID)),
             (try? opened.isPending()) == true
         else {
@@ -625,9 +751,12 @@ public final class ConversationCoordinator {
 
     /// Rebuild the rendered lines and list preview for one conversation from decrypted local state.
     public func refresh(_ conversationID: String) {
-        guard let client = activeClient(for: conversationID),
-            let stored = try? client.messages()
-        else { return }
+        guard let client = activeClient(for: conversationID) else { return }
+        // Disappearing messages: anything past its expiry goes before it is rendered. Cheap when
+        // nothing expired (no commit), so it simply rides every refresh.
+        _ = try? client.scrubExpired()
+        model.disappearTimers[conversationID] = (try? client.disappearTimer()) ?? 0
+        guard let stored = try? client.messages() else { return }
 
         let lines: [ThreadLine] = stored.map { message in
             let mine = message.direction == .outbound
@@ -667,7 +796,8 @@ public final class ConversationCoordinator {
                 replyTo: message.replyTo.map { Hex.encode($0) },
                 reactions: Self.summarize(message.reactions, me: identity),
                 deliveredCount: Int(message.deliveredCount),
-                readCount: Int(message.readCount))
+                readCount: Int(message.readCount),
+                deleted: message.deleted)
         }
         model.threadLines[conversationID] = lines
         // The group's name lives only inside the ciphertext; this is the one place it is read.

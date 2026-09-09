@@ -233,20 +233,54 @@ struct GroupAdminView: View {
             }
             .accessibilityIdentifier(GroupAdminA11y.toggleJoinApproval)
             .disabled(model.isBusy || state.mlsAuthoritative)
+
+            disappearingPicker
         } header: {
             Text("Group settings")
         } footer: {
             Text(
                 "\"Only admins can send\" mutes everyone else at once and lifts the moment you turn it "
                     + "off. Mutes are enforced by the Nedwons server, which refuses to deliver a muted "
-                    + "member's messages; it cannot read them.")
+                    + "member's messages; it cannot read them. Disappearing messages are different: the "
+                    + "timer travels encrypted, and each member's app deletes its own copy when time is "
+                    + "up — best-effort, not a guarantee someone didn't keep a screenshot.")
         }
     }
 
+    /// The disappearing-message timer: a member-visible setting that never touches the server
+    /// (the relay cannot know a conversation disappears). Applies to NEW messages only.
+    private var disappearingPicker: some View {
+        Picker(
+            selection: Binding(
+                get: { model.disappearTimer(for: chat.conversationID) },
+                set: { seconds in
+                    Task { await model.setDisappearTimer(seconds, in: chat.conversationID) }
+                }
+            )
+        ) {
+            Text("Off").tag(UInt32(0))
+            Text("1 hour").tag(UInt32(3600))
+            Text("1 day").tag(UInt32(86400))
+            Text("1 week").tag(UInt32(604_800))
+        } label: {
+            Label("Disappearing messages", systemImage: "timer")
+        }
+        .accessibilityIdentifier("group.disappearing")
+        .disabled(model.isBusy)
+    }
+
     private func readOnlySettings(_ state: GroupState) -> some View {
-        Section("Group settings") {
+        Section {
             LabeledContent("Who can send", value: state.announcementsOnly ? "Admins only" : "Everyone")
             LabeledContent("New members", value: state.joinApproval ? "Need admin approval" : "Join by invite")
+            LabeledContent(
+                "Disappearing messages",
+                value: model.disappearTimer(for: chat.conversationID) == 0
+                    ? "Off" : AppModel.timerLabel(model.disappearTimer(for: chat.conversationID)))
+        } header: {
+            Text("Group settings")
+        } footer: {
+            Text("When on, each member's app deletes its own copy after the timer — best-effort by design.")
         }
     }
 

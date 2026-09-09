@@ -580,6 +580,19 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func createSelfGroup() throws 
     
     /**
+     * Retract one of THIS DEVICE's own messages everywhere (delete-for-everyone), returning the
+     * local id of the queued retraction. Refused for anyone else's message — recipients only
+     * honor the author's delete. Honest limit (R-901): recipients' clients tombstone their
+     * copies; nothing can force a modified client to.
+     */
+    func deleteForEveryone(target: Data) throws  -> UInt64
+    
+    /**
+     * The conversation's disappearing-message timer in seconds (0 = off).
+     */
+    func disappearTimer() throws  -> UInt32
+    
+    /**
      * Produces the versioned opaque envelope (`app-envelope v1`). **Idempotent:** a retry returns
      * the same bytes and never advances the ratchet again — no double-spend of a message key.
      */
@@ -703,6 +716,12 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func removeSelfDevice(identity: Data) throws  -> Data
     
     /**
+     * Remove every message past its disappearing-message expiry, returning how many went. Call
+     * on open and periodically (the coordinator does, each sync).
+     */
+    func scrubExpired() throws  -> UInt64
+    
+    /**
      * The consumption control message for a secret this device revealed (ADR-0015). `None` if the
      * secret is unknown, the sender's own, or unrevealed here. Encrypted with the self-group when
      * one exists (option 3 — the sender never learns of the open; recipients apply via
@@ -750,6 +769,13 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
      * nothing, so callers should throttle rather than send per keystroke.
      */
     func sendTyping(active: Bool) throws  -> UInt64
+    
+    /**
+     * Queue a timer change for the whole conversation (0 = off), returning its local id —
+     * `encrypt`/`mark_sent` it like any other message. The local timer changes on encrypt, when
+     * the group is actually told. Refuses a timer past the wire cap (90 days).
+     */
+    func setDisappearTimer(seconds: UInt32) throws  -> UInt64
     
     /**
      * Queue a rename for the whole group, returning its local id — `encrypt`/`mark_sent` it like
@@ -998,6 +1024,30 @@ open func createSelfGroup()throws   {try rustCallWithError(FfiConverterTypeMlsCl
     uniffi_mls_ffi_fn_method_mlsclient_create_self_group(self.uniffiClonePointer(),$0
     )
 }
+}
+    
+    /**
+     * Retract one of THIS DEVICE's own messages everywhere (delete-for-everyone), returning the
+     * local id of the queued retraction. Refused for anyone else's message — recipients only
+     * honor the author's delete. Honest limit (R-901): recipients' clients tombstone their
+     * copies; nothing can force a modified client to.
+     */
+open func deleteForEveryone(target: Data)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_delete_for_everyone(self.uniffiClonePointer(),
+        FfiConverterData.lower(target),$0
+    )
+})
+}
+    
+    /**
+     * The conversation's disappearing-message timer in seconds (0 = off).
+     */
+open func disappearTimer()throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_disappear_timer(self.uniffiClonePointer(),$0
+    )
+})
 }
     
     /**
@@ -1261,6 +1311,17 @@ open func removeSelfDevice(identity: Data)throws  -> Data  {
 }
     
     /**
+     * Remove every message past its disappearing-message expiry, returning how many went. Call
+     * on open and periodically (the coordinator does, each sync).
+     */
+open func scrubExpired()throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_scrub_expired(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * The consumption control message for a secret this device revealed (ADR-0015). `None` if the
      * secret is unknown, the sender's own, or unrevealed here. Encrypted with the self-group when
      * one exists (option 3 — the sender never learns of the open; recipients apply via
@@ -1364,6 +1425,19 @@ open func sendTyping(active: Bool)throws  -> UInt64  {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_send_typing(self.uniffiClonePointer(),
         FfiConverterBool.lower(active),$0
+    )
+})
+}
+    
+    /**
+     * Queue a timer change for the whole conversation (0 = off), returning its local id —
+     * `encrypt`/`mark_sent` it like any other message. The local timer changes on encrypt, when
+     * the group is actually told. Refuses a timer past the wire cap (90 days).
+     */
+open func setDisappearTimer(seconds: UInt32)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_set_disappear_timer(self.uniffiClonePointer(),
+        FfiConverterUInt32.lower(seconds),$0
     )
 })
 }
@@ -2252,6 +2326,15 @@ public struct StoredMessage {
      */
     public var deliveredCount: UInt32
     public var readCount: UInt32
+    /**
+     * Wall-clock ms after which this device scrubs its copy (disappearing messages); `None` =
+     * keeps forever.
+     */
+    public var expiresAtMs: UInt64?
+    /**
+     * Retracted by its author (delete-for-everyone): render "message deleted", body is gone.
+     */
+    public var deleted: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -2280,7 +2363,14 @@ public struct StoredMessage {
          */replyTo: Data?, reactions: [ReactionInfo], 
         /**
          * For our own messages: how many other members have received / read it.
-         */deliveredCount: UInt32, readCount: UInt32) {
+         */deliveredCount: UInt32, readCount: UInt32, 
+        /**
+         * Wall-clock ms after which this device scrubs its copy (disappearing messages); `None` =
+         * keeps forever.
+         */expiresAtMs: UInt64?, 
+        /**
+         * Retracted by its author (delete-for-everyone): render "message deleted", body is gone.
+         */deleted: Bool) {
         self.localId = localId
         self.direction = direction
         self.plaintext = plaintext
@@ -2294,6 +2384,8 @@ public struct StoredMessage {
         self.reactions = reactions
         self.deliveredCount = deliveredCount
         self.readCount = readCount
+        self.expiresAtMs = expiresAtMs
+        self.deleted = deleted
     }
 }
 
@@ -2343,6 +2435,12 @@ extension StoredMessage: Equatable, Hashable {
         if lhs.readCount != rhs.readCount {
             return false
         }
+        if lhs.expiresAtMs != rhs.expiresAtMs {
+            return false
+        }
+        if lhs.deleted != rhs.deleted {
+            return false
+        }
         return true
     }
 
@@ -2360,6 +2458,8 @@ extension StoredMessage: Equatable, Hashable {
         hasher.combine(reactions)
         hasher.combine(deliveredCount)
         hasher.combine(readCount)
+        hasher.combine(expiresAtMs)
+        hasher.combine(deleted)
     }
 }
 
@@ -2384,7 +2484,9 @@ public struct FfiConverterTypeStoredMessage: FfiConverterRustBuffer {
                 replyTo: FfiConverterOptionData.read(from: &buf), 
                 reactions: FfiConverterSequenceTypeReactionInfo.read(from: &buf), 
                 deliveredCount: FfiConverterUInt32.read(from: &buf), 
-                readCount: FfiConverterUInt32.read(from: &buf)
+                readCount: FfiConverterUInt32.read(from: &buf), 
+                expiresAtMs: FfiConverterOptionUInt64.read(from: &buf), 
+                deleted: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -2402,6 +2504,8 @@ public struct FfiConverterTypeStoredMessage: FfiConverterRustBuffer {
         FfiConverterSequenceTypeReactionInfo.write(value.reactions, into: &buf)
         FfiConverterUInt32.write(value.deliveredCount, into: &buf)
         FfiConverterUInt32.write(value.readCount, into: &buf)
+        FfiConverterOptionUInt64.write(value.expiresAtMs, into: &buf)
+        FfiConverterBool.write(value.deleted, into: &buf)
     }
 }
 
@@ -2553,6 +2657,16 @@ public enum InboundResult {
      */
     case typing(sender: Data, active: Bool
     )
+    /**
+     * A member changed the disappearing-message timer (0 = off). Already persisted; refresh.
+     */
+    case timerChanged(seconds: UInt32
+    )
+    /**
+     * The author retracted a message; the local copy is tombstoned. Redraw the bubble.
+     */
+    case messageDeleted(target: Data
+    )
 }
 
 
@@ -2602,6 +2716,12 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         )
         
         case 12: return .typing(sender: try FfiConverterData.read(from: &buf), active: try FfiConverterBool.read(from: &buf)
+        )
+        
+        case 13: return .timerChanged(seconds: try FfiConverterUInt32.read(from: &buf)
+        )
+        
+        case 14: return .messageDeleted(target: try FfiConverterData.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -2670,6 +2790,16 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
             writeInt(&buf, Int32(12))
             FfiConverterData.write(sender, into: &buf)
             FfiConverterBool.write(active, into: &buf)
+            
+        
+        case let .timerChanged(seconds):
+            writeInt(&buf, Int32(13))
+            FfiConverterUInt32.write(seconds, into: &buf)
+            
+        
+        case let .messageDeleted(target):
+            writeInt(&buf, Int32(14))
+            FfiConverterData.write(target, into: &buf)
             
         }
     }
@@ -3330,6 +3460,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_create_self_group() != 24532) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_delete_for_everyone() != 59330) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_disappear_timer() != 64338) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mls_ffi_checksum_method_mlsclient_encrypt() != 56956) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3402,6 +3538,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_remove_self_device() != 4041) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_scrub_expired() != 27299) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mls_ffi_checksum_method_mlsclient_secret_consumption_envelope() != 27555) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3424,6 +3563,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_send_typing() != 32858) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_set_disappear_timer() != 9203) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_set_group_name() != 28282) {
