@@ -214,6 +214,67 @@ public final class AppModel: ObservableObject {
         phase = .unauthenticated
     }
 
+    /// Revoke another of this account's devices.
+    ///
+    /// Revocation is how a lost or stolen phone stops being able to act, so it must take effect
+    /// server-side (tokens and refresh families are burned there) rather than merely disappearing
+    /// from this list. Refuses to revoke the CURRENT device: doing so would sign this session out
+    /// through a path that looks like device management, which is a confusing way to lose access —
+    /// "Sign out" is the honest control for that.
+    public func revokeDevice(_ deviceID: String) async {
+        guard let token, let session else { return }
+        guard deviceID != session.deviceID else {
+            banner = "This is the device you're using. Use Sign out instead."
+            return
+        }
+        await run { [self] in
+            try await client.revokeDevice(accessToken: token, deviceID: deviceID)
+            await refreshDevices()
+            banner = "Device revoked. Its sessions are now dead."
+        }
+    }
+
+    /// Set (or replace) the recovery secret.
+    ///
+    /// This is the ONLY path back in when every enrolled device is lost — without it, losing the
+    /// device means losing the account, because a password alone can never enroll a new device
+    /// (INV-2). The UI must say that plainly rather than presenting this as optional polish.
+    public func setRecoverySecret(_ secret: String) async -> String? {
+        guard let token else { return "You are not signed in." }
+        do {
+            try await client.setRecoverySecret(accessToken: token, recoverySecret: secret)
+            return nil
+        } catch let NedwonsClient.ClientError.http(status, _) where status == 400 {
+            return "That recovery phrase is too weak. Use a longer, unique phrase."
+        } catch {
+            return "Couldn't save the recovery phrase. Check your connection and try again."
+        }
+    }
+
+    /// Change the account password. Returns an error message on failure, `nil` on success.
+    public func changePassword(current: String, new: String) async -> String? {
+        guard let token, let session else { return "You are not signed in." }
+        guard let enrolled = try? deviceIdentity.loadEnrolled() else {
+            return "This device's key is unavailable, so the password cannot be changed."
+        }
+        do {
+            try await client.changePassword(
+                accessToken: token,
+                accountID: session.accountID,
+                currentPassword: current,
+                newPassword: new,
+                signer: enrolled.signer)
+            return nil
+        } catch let NedwonsClient.ClientError.http(status, _) where status == 400 {
+            return "That new password was rejected. Use at least 12 characters and avoid common "
+                + "or breached passwords."
+        } catch {
+            // Same text for a wrong current password and other refusals: distinguishing them would
+            // make this endpoint a password oracle for someone holding a stolen token.
+            return "Couldn't change the password. Check your current password and try again."
+        }
+    }
+
     /// Permanently delete this account, then erase everything this device still holds.
     ///
     /// Order matters and is not interchangeable. The server erasure goes FIRST, because it is the

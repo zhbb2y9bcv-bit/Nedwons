@@ -117,6 +117,8 @@ public enum DeviceAuditBanner {
 public struct DevicesScreen: View {
     @ObservedObject private var model: AppModel
     private let palette: Nedwons.Palette
+    /// Device id awaiting revoke confirmation.
+    @State private var revoking: String?
 
     public init(model: AppModel, palette: Nedwons.Palette) {
         self.model = model
@@ -155,8 +157,27 @@ public struct DevicesScreen: View {
                             if !device.revoked && !model.acknowledgedDeviceIDs.contains(device.deviceID) {
                                 Button("Recognize") { model.acknowledgeDevice(device.deviceID) }
                                     .font(.caption)
+                                    .accessibilityLabel("Recognize this device as yours")
                             }
                         }
+                        // Revoking a lost or stolen device is the point of this screen, so it is a
+                        // swipe action on the row rather than buried in a submenu. The current
+                        // device is excluded: signing yourself out through "device management" is a
+                        // confusing way to lose access, and Sign out is the honest control.
+                        .swipeActions(edge: .trailing) {
+                            if !device.revoked && !device.current {
+                                Button(role: .destructive) {
+                                    revoking = device.deviceID
+                                } label: {
+                                    Label("Revoke", systemImage: "xmark.shield")
+                                }
+                            }
+                        }
+                        .accessibilityLabel(
+                            device.current
+                                ? "This device"
+                                : "Device \(shortID(device.deviceID))"
+                                    + (device.revoked ? ", revoked" : ""))
                     }
                 }
 
@@ -186,6 +207,25 @@ public struct DevicesScreen: View {
             }
             .navigationTitle("Devices")
             .task { await model.refreshDevices() }
+            .confirmationDialog(
+                "Revoke this device?",
+                isPresented: Binding(
+                    get: { revoking != nil },
+                    set: { if !$0 { revoking = nil } }),
+                titleVisibility: .visible
+            ) {
+                Button("Revoke", role: .destructive) {
+                    if let id = revoking {
+                        Task { await model.revokeDevice(id) }
+                    }
+                    revoking = nil
+                }
+                Button("Cancel", role: .cancel) { revoking = nil }
+            } message: {
+                Text(
+                    "Its sessions end immediately and it can no longer send or read messages. "
+                        + "This cannot be undone — that device would have to be enrolled again.")
+            }
         }
     }
 

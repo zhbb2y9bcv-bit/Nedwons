@@ -269,6 +269,20 @@ struct SettingsRootView: View {
                     NavigationLink("Devices and key transparency") {
                         DevicesScreen(model: model, palette: palette)
                     }
+                    NavigationLink("Change password") { ChangePasswordView(model: model) }
+                    NavigationLink("Recovery phrase") { RecoverySetupView(model: model) }
+                }
+
+                Section {
+                    NavigationLink("Blocked") { BlockedUsersView(model: model) }
+                } header: {
+                    Text("Privacy")
+                } footer: {
+                    // Stated here because it is the question people actually have about a
+                    // username-only messenger, and the answer is a deliberate design choice.
+                    Text(
+                        "Nedwons never reads your contacts and has no phone-number lookup. People "
+                            + "find you only by the username you chose.")
                 }
 
                 Section {
@@ -453,5 +467,244 @@ struct DeleteAccountView: View {
         failure = await model.deleteAccount(password: password)
         working = false
         password = ""
+    }
+}
+
+/// Blocked people, with unblock.
+///
+/// A block list you cannot review is a trap: people forget who they blocked, then wonder why
+/// someone "can't message them". Unblocking is deliberately NOT symmetric with blocking — it does
+/// not restore a prior friendship, which the footer says plainly so nobody assumes it does.
+struct BlockedUsersView: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.colorScheme) private var scheme
+    @State private var unblocking: ProfileSummary?
+
+    private var palette: Nedwons.Palette { .forScheme(scheme) }
+
+    var body: some View {
+        List {
+            if model.blocked.isEmpty {
+                Section {
+                    ContentUnavailableView(
+                        "No one is blocked",
+                        systemImage: "hand.raised",
+                        description: Text("People you block will appear here."))
+                }
+            } else {
+                Section {
+                    ForEach(model.blocked, id: \.accountID) { person in
+                        BlockedRow(person: person, palette: palette) { unblocking = person }
+                    }
+                } footer: {
+                    Text(
+                        "Unblocking lets them contact you again. It does not restore a previous "
+                            + "contact — you would each need to add the other again.")
+                }
+            }
+        }
+        .navigationTitle("Blocked")
+        .inlineNavigationTitle()
+        .task { await model.refreshFriends() }
+        .confirmationDialog(
+            unblocking.map { "Unblock @\($0.username)?" } ?? "",
+            isPresented: Binding(
+                get: { unblocking != nil }, set: { if !$0 { unblocking = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Unblock") {
+                if let person = unblocking {
+                    Task { await model.unblock(person.accountID) }
+                }
+                unblocking = nil
+            }
+            Button("Cancel", role: .cancel) { unblocking = nil }
+        }
+    }
+}
+
+/// One row in the blocked list. Extracted because the inline form exceeded SwiftUI's
+/// type-checker budget — and because a row with its own accessibility identity is easier to test.
+private struct BlockedRow: View {
+    let person: ProfileSummary
+    let palette: Nedwons.Palette
+    let onUnblock: () -> Void
+
+    private var title: String {
+        person.displayName.isEmpty ? person.username : person.displayName
+    }
+
+    var body: some View {
+        HStack {
+            Avatar(label: person.username, palette: palette)
+            VStack(alignment: .leading) {
+                Text(title).foregroundStyle(palette.textPrimary)
+                Text("@" + person.username)
+                    .font(.caption)
+                    .foregroundStyle(palette.textSecondary)
+            }
+            Spacer()
+            Button("Unblock", action: onUnblock).font(.caption)
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(Text("Blocked: " + person.username))
+    }
+}
+
+/// Recovery-phrase setup.
+///
+/// This is the only way back into an account when every enrolled device is lost. Without it the
+/// account is gone for good, because a password alone can never enroll a new device (INV-2) — so
+/// the screen states that consequence rather than presenting recovery as optional polish.
+struct RecoverySetupView: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.colorScheme) private var scheme
+
+    @State private var phrase = ""
+    @State private var confirmation = ""
+    @State private var acknowledged = false
+    @State private var working = false
+    @State private var message: String?
+    @State private var succeeded = false
+
+    private var palette: Nedwons.Palette { .forScheme(scheme) }
+
+    private var mismatch: Bool { !confirmation.isEmpty && phrase != confirmation }
+    private var canSave: Bool {
+        phrase.count >= 12 && phrase == confirmation && acknowledged && !working
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                Text(
+                    "If you lose every device you've signed in on, this phrase is the only way "
+                        + "back into your account.")
+                    .font(Nedwons.TypeScale.callout)
+                    .foregroundStyle(palette.textPrimary)
+            } footer: {
+                Text(
+                    "Your password alone can never add a new device — that's what stops someone "
+                        + "with a stolen password from reading your messages. It also means "
+                        + "without this phrase, losing your devices means losing the account.")
+            }
+
+            Section {
+                SecureField("Recovery phrase", text: $phrase).usernameInput()
+                SecureField("Repeat the phrase", text: $confirmation).usernameInput()
+                if mismatch {
+                    Text("The phrases don't match.").font(.caption).foregroundStyle(.red)
+                } else if !phrase.isEmpty && phrase.count < 12 {
+                    Text("Use at least 12 characters.")
+                        .font(.caption)
+                        .foregroundStyle(palette.textSecondary)
+                }
+                Toggle("I've stored this somewhere safe", isOn: $acknowledged)
+            } footer: {
+                Text(
+                    "Store it in a password manager or somewhere physically safe. Nedwons cannot "
+                        + "show it to you again and cannot reset it for you.")
+            }
+
+            if let message {
+                Section {
+                    Text(message).foregroundStyle(succeeded ? palette.textSecondary : .red)
+                }
+            }
+
+            Section {
+                Button(working ? "Saving…" : "Save recovery phrase") {
+                    Task { await save() }
+                }
+                .disabled(!canSave)
+            }
+        }
+        .navigationTitle("Recovery")
+        .inlineNavigationTitle()
+    }
+
+    private func save() async {
+        working = true
+        let failure = await model.setRecoverySecret(phrase)
+        working = false
+        succeeded = failure == nil
+        message = failure ?? "Recovery phrase saved."
+        if succeeded {
+            phrase = ""
+            confirmation = ""
+            acknowledged = false
+        }
+    }
+}
+
+/// Password change. Requires the current password AND this device's key, so a stolen session
+/// cannot lock the owner out of their own account.
+struct ChangePasswordView: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.colorScheme) private var scheme
+
+    @State private var current = ""
+    @State private var updated = ""
+    @State private var confirmation = ""
+    @State private var working = false
+    @State private var message: String?
+    @State private var succeeded = false
+
+    private var palette: Nedwons.Palette { .forScheme(scheme) }
+
+    private var mismatch: Bool { !confirmation.isEmpty && updated != confirmation }
+    private var canSave: Bool {
+        !current.isEmpty && updated.count >= 12 && updated == confirmation && !working
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                SecureField("Current password", text: $current).usernameInput()
+            }
+            Section {
+                SecureField("New password", text: $updated).usernameInput()
+                SecureField("Repeat new password", text: $confirmation).usernameInput()
+                if mismatch {
+                    Text("The passwords don't match.").font(.caption).foregroundStyle(.red)
+                } else if !updated.isEmpty && updated.count < 12 {
+                    Text("Use at least 12 characters.")
+                        .font(.caption)
+                        .foregroundStyle(palette.textSecondary)
+                }
+            } footer: {
+                Text(
+                    "Your other devices stay signed in — sessions are bound to each device's key, "
+                        + "not to your password. To end a session, revoke that device.")
+            }
+
+            if let message {
+                Section {
+                    Text(message).foregroundStyle(succeeded ? palette.textSecondary : .red)
+                }
+            }
+
+            Section {
+                Button(working ? "Changing…" : "Change password") {
+                    Task { await save() }
+                }
+                .disabled(!canSave)
+            }
+        }
+        .navigationTitle("Password")
+        .inlineNavigationTitle()
+    }
+
+    private func save() async {
+        working = true
+        let failure = await model.changePassword(current: current, new: updated)
+        working = false
+        succeeded = failure == nil
+        message = failure ?? "Password changed."
+        if succeeded {
+            current = ""
+            updated = ""
+            confirmation = ""
+        }
     }
 }

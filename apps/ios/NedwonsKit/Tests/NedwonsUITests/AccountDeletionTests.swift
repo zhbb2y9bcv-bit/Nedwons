@@ -103,3 +103,59 @@ final class AccountDeletionModelTests: XCTestCase {
         XCTAssertNotNil(store.load(), "the session must survive so the user can retry")
     }
 }
+
+/// Settings actions that guard against destroying your own access.
+@MainActor
+final class SettingsActionTests: XCTestCase {
+    private func signedInModel() -> (AppModel, NedwonsClient.Session) {
+        let session = NedwonsClient.Session(
+            accountID: "acct-1",
+            deviceID: "device-current",
+            accessToken: "access",
+            accessExpiresAt: 9_999_999_999,
+            refreshToken: "refresh",
+            refreshExpiresAt: 9_999_999_999)
+        let m = AppModel(
+            baseURL: URL(string: "http://127.0.0.1:1")!,
+            deviceIdentity: DeviceIdentity(
+                store: InMemoryDeviceKeyStore(), secureEnclaveAvailable: false),
+            sessionStore: SessionStore(store: FakeSecretStore()))
+        m.session = session
+        return (m, session)
+    }
+
+    /// Revoking the device you are holding would end your own session through a control labelled
+    /// "device management" — a confusing way to lose access. It must be refused with an
+    /// explanation, not silently attempted.
+    func testRevokingTheCurrentDeviceIsRefusedWithAnExplanation() async {
+        let (m, session) = signedInModel()
+        await m.revokeDevice(session.deviceID)
+        XCTAssertNotNil(m.banner, "the refusal must be explained to the user")
+        XCTAssertTrue(
+            m.banner?.contains("Sign out") ?? false,
+            "the message should point at the control that actually does this: \(m.banner ?? "nil")")
+    }
+
+    /// Another device is a legitimate target, so it must NOT hit the same guard. The request then
+    /// fails on transport (the base URL is a closed port), which is the expected outcome here —
+    /// what matters is that it was attempted rather than refused locally.
+    func testRevokingAnotherDeviceIsNotBlockedByTheGuard() async {
+        let (m, _) = signedInModel()
+        await m.revokeDevice("device-other")
+        XCTAssertFalse(
+            m.banner?.contains("Sign out") ?? false,
+            "a different device must not trip the current-device guard")
+    }
+
+    func testRecoveryAndPasswordChangeRequireASession() async {
+        let m = AppModel(
+            baseURL: URL(string: "http://127.0.0.1:1")!,
+            deviceIdentity: DeviceIdentity(
+                store: InMemoryDeviceKeyStore(), secureEnclaveAvailable: false),
+            sessionStore: SessionStore(store: FakeSecretStore()))
+        let recovery = await m.setRecoverySecret("a long enough phrase")
+        let password = await m.changePassword(current: "old", new: "a new long password")
+        XCTAssertNotNil(recovery, "setting recovery while signed out must fail")
+        XCTAssertNotNil(password, "changing the password while signed out must fail")
+    }
+}
