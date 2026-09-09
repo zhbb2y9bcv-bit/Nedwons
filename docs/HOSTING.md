@@ -47,7 +47,7 @@ fetches and decrypts on device.
 | PostgreSQL | Accounts, devices, refresh tokens, social graph, conversation membership, queued ciphertext | Managed Postgres with automated backups + PITR |
 | Key-transparency log | Append-only RFC 6962-style log; clients self-monitor their own keys | Runs inside `services/api`; **needs a durable, protected signing key (KMS/HSM)** |
 | APNs credentials | Push certificate / auth key (`.p8`) | Secret manager, never in the image |
-| Attachment store | Not yet implemented | Object storage with per-object encryption when built |
+| Attachment store | **Local directory** (`NEDWONS_BLOB_DIR`); attachments are disabled when unset | Object storage (S3/R2). `services/api/src/blobs.rs` is the seam — a single-node disk is fine for self-hosting, but two API instances do not share one, so a multi-node deployment needs the object-store implementation before enabling attachments. Files are already client-encrypted, so per-object server-side encryption is defence in depth, not the thing keeping them private. |
 
 Not needed in production: `infra/docker-compose.yml` (local dev only), the smoke/live-run scripts
 (CI and manual verification only).

@@ -34,7 +34,7 @@ R-402).
 | Password (Argon2id hash) | Auth | Life of account | Server (hash only) |
 | Public device key + metadata | Device binding | Life of device enrollment | Server (public key only) |
 | Ciphertext message envelopes | Delivery | Until delivered + short TTL, then purged | Server (ciphertext only) |
-| Ciphertext attachments | Delivery | TTL-bounded | Object store (ciphertext only) |
+| Ciphertext attachments | Delivery | Same TTL as queued mail (30 days), then purged with their metadata | Server (**ciphertext only** — the key travels inside the MLS message; the server cannot tell a photo from a PDF). It does learn that an account uploaded an object of some size to some conversation at some time. |
 | Routing metadata (sender/recipient device, timestamps) | Delivery | Minimized; short retention | Server (**plaintext**) |
 | Push token | Wake device | Until rotated/invalid | Server + APNs (opaque) |
 | IP address / proxy logs | Abuse defense, ops | Short, documented window | Server (access-controlled) |

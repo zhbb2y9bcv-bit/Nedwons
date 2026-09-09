@@ -1,4 +1,5 @@
 import NedwonsKit
+import PhotosUI
 import SwiftUI
 
 /// One rendered line in a thread. Secrets carry no body here — they render as a sealed placeholder
@@ -8,6 +9,9 @@ public struct ThreadLine: Identifiable, Sendable, Equatable {
         case text(String)
         case sealedSecret(Data)
         case consumedSecret
+        /// A file. The bytes are not here: they are fetched from the relay and decrypted on
+        /// demand, so a thread with fifty photos does not hold fifty photos in memory.
+        case attachment(AttachmentLine)
     }
     public let id: UInt64
     public let kind: Kind
@@ -29,6 +33,41 @@ public struct ThreadLine: Identifiable, Sendable, Equatable {
     }
 }
 
+/// What the UI needs to render a file, without its bytes.
+public struct AttachmentLine: Sendable, Equatable {
+    /// Relay blob id (hex) — the handle used to fetch it.
+    public let blobID: String
+    public let mime: String
+    public let filename: String
+    /// Plaintext size, for the "1.2 MB" label before anything is downloaded.
+    public let size: UInt64
+    /// A caption typed with the file, if any.
+    public let caption: String
+
+    public init(blobID: String, mime: String, filename: String, size: UInt64, caption: String) {
+        self.blobID = blobID
+        self.mime = mime
+        self.filename = filename
+        self.size = size
+        self.caption = caption
+    }
+
+    public var isImage: Bool { mime.hasPrefix("image/") }
+
+    /// What to call it when there is no filename — never a guess at the content.
+    public var displayName: String {
+        if !filename.isEmpty { return filename }
+        if isImage { return "Photo" }
+        if mime.hasPrefix("video/") { return "Video" }
+        if mime.hasPrefix("audio/") { return "Voice message" }
+        return "File"
+    }
+
+    public var formattedSize: String {
+        ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
+    }
+}
+
 /// A single conversation. The header centers the other person's identity and is the entry point to
 /// their profile and to the private-rename menu; back always returns to the Chats list.
 struct ConversationView: View {
@@ -41,6 +80,8 @@ struct ConversationView: View {
     @State private var showRenameSheet = false
     @State private var renameText = ""
     @State private var showGroupInfo = false
+    @State private var showPhotoPicker = false
+    @State private var pickedItem: PhotosPickerItem?
     private var palette: Nedwons.Palette { .forScheme(scheme) }
 
     var body: some View {
@@ -68,6 +109,22 @@ struct ConversationView: View {
         }
         .navigationDestination(isPresented: $showGroupInfo) {
             GroupAdminView(model: model, chat: chat)
+        }
+        // The picker returns the image's own bytes; they are encrypted before anything leaves the
+        // device, so what the relay receives is never the photo.
+        .photosPicker(isPresented: $showPhotoPicker, selection: $pickedItem, matching: .images)
+        .onChange(of: pickedItem) { _, item in
+            guard let item else { return }
+            Task {
+                defer { pickedItem = nil }
+                guard let data = try? await item.loadTransferable(type: Data.self) else {
+                    model.banner = "Couldn't read that photo."
+                    return
+                }
+                await model.sendAttachment(
+                    data, mime: "image/jpeg", filename: "photo.jpg", caption: "",
+                    to: chat.conversationID)
+            }
         }
         // One round trip on open: the composer locks (or not) from the same rows the relay's send
         // gate reads, so a muted member finds out here rather than from a refused send. Opening the
@@ -256,6 +313,8 @@ struct ConversationView: View {
                 .foregroundStyle(palette.accentSecondary)
         case .consumedSecret:
             SecretTombstoneView(text: model.secretTombstoneText)
+        case .attachment(let attachment):
+            AttachmentBubble(model: model, line: line, attachment: attachment, palette: palette)
         }
     }
 
@@ -280,6 +339,14 @@ struct ConversationView: View {
 
     private var composer: some View {
         HStack(spacing: Nedwons.Spacing.sm) {
+            Button {
+                showPhotoPicker = true
+            } label: {
+                Image(systemName: "paperclip").imageScale(.large)
+            }
+            .accessibilityLabel("Attach a photo")
+            .accessibilityIdentifier(GroupAdminA11y.composerAttach)
+            .disabled(model.isBusy)
             TextField("Message", text: $draft, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...4)

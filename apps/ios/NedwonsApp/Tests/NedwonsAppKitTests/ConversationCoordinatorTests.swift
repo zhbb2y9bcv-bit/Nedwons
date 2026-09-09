@@ -1,4 +1,5 @@
 import Foundation
+import MlsFfi
 import NedwonsKit
 import NedwonsUI
 import XCTest
@@ -109,6 +110,42 @@ final class InMemoryRelay: ConversationRelay, @unchecked Sendable {
             return count
         }
     }
+
+    /// The blob store: opaque bytes keyed by id, exactly what the real relay holds.
+    private var blobs: [String: Data] = [:]
+    /// Serve these bytes for the next download, whatever was uploaded — the relay swapping objects.
+    var substituteBlob: Data?
+    var failUploads = false
+
+    func uploadAttachment(accessToken: String, conversationID: String, ciphertext: Data) async throws
+        -> String
+    {
+        try sync {
+            let d = try device(accessToken)
+            if failUploads { throw NedwonsClient.ClientError.transport("simulated outage") }
+            guard members[conversationID]?.contains(d.deviceID) == true else {
+                throw NedwonsClient.ClientError.http(status: 403, body: #"{"error":"forbidden"}"#)
+            }
+            let id = (0..<16).map { _ in String(format: "%02x", Int.random(in: 0...255)) }.joined()
+            blobs[id] = ciphertext
+            return id
+        }
+    }
+
+    func downloadAttachment(accessToken: String, blobID: String) async throws -> Data {
+        try sync {
+            _ = try device(accessToken)
+            if let substitute = substituteBlob { return substitute }
+            guard let bytes = blobs[blobID] else {
+                throw NedwonsClient.ClientError.http(status: 410, body: #"{"error":"gone"}"#)
+            }
+            return bytes
+        }
+    }
+
+    /// What the relay is holding for a blob — used to prove it is not the file.
+    func storedBlob(_ id: String) -> Data? { sync { blobs[id] } }
+    var blobCount: Int { sync { blobs.count } }
 
     func fetchInbox(accessToken: String, waitSeconds: Int) async throws -> [InboxEnvelope] {
         try sync {
@@ -505,6 +542,96 @@ final class ConversationCoordinatorTests: XCTestCase {
         await bob.model.sendMessage("welcome carol", to: conv)
         _ = try await carol.coordinator.syncOnce()
         XCTAssertEqual(carol.texts(in: conv).map(\.0).last, "welcome carol")
+    }
+
+    /// A photo end to end: encrypted on the sender's device, stored by the relay as bytes it cannot
+    /// read, and opened by the recipient with a key that only ever travelled inside an MLS message.
+    func testAttachmentRoundTripKeepsTheFileFromTheRelay() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        await bob.coordinator.ensureKeyPackages()
+        relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
+        try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
+        _ = try await bob.coordinator.syncOnce()
+
+        let file = Data("pretend PNG bytes".utf8) + Data(repeating: 0xAB, count: 4096)
+        try await alice.coordinator.sendAttachment(
+            file, mime: "image/png", filename: "beach.png", caption: "look", to: conv)
+
+        // The sender's thread shows the file, and the relay holds something that is not it.
+        let sent = try XCTUnwrap(alice.model.threadLines[conv]?.last)
+        guard case .attachment(let mineLine) = sent.kind else {
+            return XCTFail("expected an attachment line, got \(sent.kind)")
+        }
+        XCTAssertEqual(mineLine.filename, "beach.png")
+        XCTAssertEqual(mineLine.caption, "look")
+        XCTAssertEqual(mineLine.size, UInt64(file.count))
+        let stored = try XCTUnwrap(relay.storedBlob(mineLine.blobID))
+        XCTAssertNotEqual(stored, file, "the relay must never hold the file itself")
+        XCTAssertEqual(alice.model.localPreview(for: conv), "beach.png · look")
+
+        // The recipient sees it, downloads on demand, and decrypts it.
+        _ = try await bob.coordinator.syncOnce()
+        let received = try XCTUnwrap(bob.model.threadLines[conv]?.last)
+        guard case .attachment(let theirs) = received.kind else {
+            return XCTFail("expected an attachment line")
+        }
+        XCTAssertEqual(theirs.blobID, mineLine.blobID)
+        XCTAssertEqual(bob.model.attachmentState(theirs.blobID), .notLoaded, "nothing downloads unasked")
+        await bob.model.loadAttachment(theirs)
+        XCTAssertEqual(bob.model.attachmentState(theirs.blobID), .loaded(file))
+    }
+
+    /// A relay that serves different (perfectly valid) bytes under the same id is caught by the
+    /// digest, before decryption — and the user is told, rather than shown nothing.
+    func testSubstitutedBlobIsRefused() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        await bob.coordinator.ensureKeyPackages()
+        relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
+        try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
+        _ = try await bob.coordinator.syncOnce()
+        try await alice.coordinator.sendAttachment(
+            Data("the real file".utf8), mime: "image/png", filename: "a.png", caption: "", to: conv)
+        _ = try await bob.coordinator.syncOnce()
+        guard case .attachment(let line)? = bob.model.threadLines[conv]?.last?.kind else {
+            return XCTFail("expected an attachment")
+        }
+
+        // Someone else's valid ciphertext, served under our id.
+        let other = try sealAttachment(plaintext: Data("a different file".utf8))
+        relay.substituteBlob = other.ciphertext
+        await bob.model.loadAttachment(line)
+        guard case .failed(let reason) = bob.model.attachmentState(line.blobID) else {
+            return XCTFail("a substituted blob must not be accepted")
+        }
+        XCTAssertEqual(reason, "Couldn't download — tap to retry")
+
+        // With the real bytes back, the retry works.
+        relay.substituteBlob = nil
+        await bob.model.loadAttachment(line)
+        XCTAssertEqual(bob.model.attachmentState(line.blobID), .loaded(Data("the real file".utf8)))
+    }
+
+    /// A failed upload sends no message: better a file that never arrived than a permanently broken
+    /// bubble pointing at bytes the relay does not have.
+    func testFailedUploadSendsNoMessage() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        await bob.coordinator.ensureKeyPackages()
+        relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
+        try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
+        let linesBefore = alice.model.threadLines[conv]?.count ?? 0
+
+        relay.failUploads = true
+        await alice.model.sendAttachment(
+            Data("nope".utf8), mime: "image/png", filename: "a.png", caption: "", to: conv)
+        XCTAssertEqual(alice.model.banner, "Couldn't send that file.")
+        XCTAssertEqual(alice.model.threadLines[conv]?.count ?? 0, linesBefore, "no message was created")
+        XCTAssertEqual(relay.blobCount, 0)
     }
 
     func testIdempotencyKeyIsDeterministicPerMessage() {

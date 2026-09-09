@@ -9,7 +9,7 @@ unrecoverable.
 |------------|------------------|-----------|-------|
 | Undelivered ciphertext envelope | Until delivered, else **30-day** queue TTL (`NEDWONS_ENVELOPE_TTL_DAYS`, default 30) | Relay queue TTL job (minutely, **bounded batches** so a backlog drains without one long table-locking DELETE) | After TTL, envelope is purged; sender sees "failed". |
 | Delivered ciphertext envelope | Purged from server **on delivery ack** | Relay | Server does not retain delivered message ciphertext as a store; the device is the store. |
-| Ciphertext attachment (object store) | **30-day** TTL or on message deletion | Object lifecycle policy | Keys live only in the E2EE envelope; expiring the object is sufficient. |
+| Ciphertext attachment (blob store) | **30-day** TTL (`NEDWONS_ENVELOPE_TTL_DAYS`) | Minutely purge task: rows past the TTL are deleted with their bytes, and the store is also swept by file age — which is what collects objects whose rows went with a deleted conversation's cascade | Keys live only in the E2EE envelope; expiring the object is sufficient. |
 | Disappearing-message queue copy | min(disappearing timer, queue TTL) | Relay TTL | Client-enforced too; honest limits (R-901). |
 | Routing metadata | **Short** (target ≤ 30 days), minimized | DB partition drop | Enough to deliver + debug delivery, no more. |
 | IP address / LB & proxy logs | **Short** (target ≤ 7–30 days) | Log rotation | Access-controlled; abuse/security exception may extend for specific investigations. |

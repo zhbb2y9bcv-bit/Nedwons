@@ -32,10 +32,13 @@ use p256::ecdsa::signature::Signer;
 use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
 
+use crate::blobs::BlobStore;
 use crate::groups::{InviteOutcome, MuteOutcome, PgGroups};
 use crate::membership::{ApplyOutcome, CommitRequest, PgMembership};
 use crate::notify::DeliveryNotifier;
-use crate::relay::{FanoutOutcome, PgRelay, SelfGroupSendOutcome, SendOutcome};
+use crate::relay::{
+    AttachmentPermission, FanoutOutcome, PgRelay, SelfGroupSendOutcome, SendOutcome,
+};
 use crate::social::{FriendRequestOutcome, PgSocial};
 use crate::transparency::PgTransparency;
 
@@ -78,6 +81,8 @@ pub struct AppState {
     /// Shared across instances in production (`PgReplayCache`), so a captured proof cannot be
     /// replayed against a different instance inside the freshness window.
     proof_cache: Arc<dyn crate::proof::ReplayGuard>,
+    /// Where attachment ciphertext is written. `None` disables the attachment endpoints entirely.
+    pub blobs: Option<Arc<dyn BlobStore>>,
     /// ADR-0012 sender-certificate signing key, distinct from the auth/transparency keys. Its
     /// public key ships with issued certificates; production clients pin it.
     sender_cert_key: Arc<p256::ecdsa::SigningKey>,
@@ -147,6 +152,39 @@ pub fn build_router_cfg(
     trusted_ip_header: Option<HeaderName>,
     require_proof: bool,
 ) -> Router {
+    // Attachments are OFF unless NEDWONS_BLOB_DIR is set: a deployment that has not chosen where
+    // opaque bytes may be written should refuse to write them, not pick a directory.
+    let blobs = crate::blobs::FsBlobStore::from_env().map(|s| Arc::new(s) as Arc<dyn BlobStore>);
+    build_router_with_blobs(
+        service,
+        relay,
+        social,
+        groups,
+        transparency,
+        membership,
+        per_ip_per_minute,
+        trusted_ip_header,
+        require_proof,
+        blobs,
+    )
+}
+
+/// As [`build_router_cfg`], but the attachment blob store is supplied rather than read from the
+/// environment. Tests use this so each one gets its own directory: a process-global env var is
+/// read once, when a router is built, which makes it a race between tests that run in parallel.
+#[allow(clippy::too_many_arguments)]
+pub fn build_router_with_blobs(
+    service: Arc<AuthService>,
+    relay: Arc<PgRelay>,
+    social: Arc<PgSocial>,
+    groups: Arc<PgGroups>,
+    transparency: Arc<PgTransparency>,
+    membership: Arc<PgMembership>,
+    per_ip_per_minute: u32,
+    trusted_ip_header: Option<HeaderName>,
+    require_proof: bool,
+    blobs: Option<Arc<dyn BlobStore>>,
+) -> Router {
     let quota =
         Quota::per_minute(NonZeroU32::new(per_ip_per_minute.max(1)).expect("max(1) is non-zero"));
     let notifier = DeliveryNotifier::default();
@@ -191,6 +229,7 @@ pub fn build_router_cfg(
         // Reuse the per-IP quota for the per-recipient sealed-delivery cap.
         sealed_limiter: Arc::new(RateLimiter::keyed(quota)),
         attest_config: crate::attest::AttestationConfig::from_env().map(Arc::new),
+        blobs,
     };
 
     // Relay routes accept larger bodies (opaque envelopes) than auth routes.
@@ -280,6 +319,16 @@ pub fn build_router_cfg(
         .route("/v1/groups", post(create_group))
         .layer(RequestBodyLimitLayer::new(MAX_RELAY_BODY_BYTES));
 
+    // Attachments carry megabytes, so they get their own body limit rather than raising the
+    // relay's — a 25 MB ceiling on `/v1/friends/request` would be an abuse surface for nothing.
+    let attachment_routes = Router::new()
+        .route(
+            "/v1/conversations/{id}/attachments",
+            post(upload_attachment),
+        )
+        .route("/v1/attachments/{blob_id}", get(download_attachment))
+        .layer(RequestBodyLimitLayer::new(MAX_ATTACHMENT_BODY_BYTES));
+
     Router::new()
         .route("/v1/register/begin", post(register_begin))
         .route("/v1/register/finish", post(register_finish))
@@ -316,6 +365,7 @@ pub fn build_router_cfg(
         )
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .merge(relay_routes)
+        .merge(attachment_routes)
         .layer(middleware::from_fn_with_state(state.clone(), proof_layer))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .route("/healthz", get(|| async { "ok" }))
@@ -2694,6 +2744,112 @@ async fn group_admin_state(
     .await?
     .ok_or_else(forbidden)?;
     Ok(Json(dto))
+}
+
+// ----- attachments (E2EE files) ---------------------------------------------------------------
+//
+// The relay stores ciphertext it has no key for and serves it back to the conversation's members.
+// It never learns the file, its name, its media type, or even whether it is an image — all of that
+// travels inside the MLS message that references the blob (`Content::Attachment`). What it does
+// learn is recorded honestly in `V26__attachments.sql`: that an account uploaded an object of some
+// size to some conversation at some time.
+
+/// Attachment ciphertext, plus GCM overhead and a little slack. Larger than the relay's ordinary
+/// body limit, which is why these routes carry their own.
+const MAX_ATTACHMENT_BODY_BYTES: usize = 26 * 1024 * 1024;
+
+#[derive(Serialize)]
+struct BlobDto {
+    blob_id: String,
+}
+
+/// Upload one encrypted attachment for a conversation. The caller must be a member AND currently
+/// allowed to send there — a muted member cannot park bytes on the relay any more than they can
+/// deliver a message.
+async fn upload_attachment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+    body: axum::body::Bytes,
+) -> Result<Json<BlobDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let Some(blobs) = state.blobs.clone() else {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "attachments_unavailable",
+        ));
+    };
+    if body.is_empty() || body.len() > MAX_ATTACHMENT_BODY_BYTES {
+        return Err(bad_request());
+    }
+    enforce_quota(&state, crate::quota::ATTACHMENT_UPLOADS, &me.account_id).await?;
+
+    let blob_id = auth_core::crypto::random_bytes::<16>();
+    let size = body.len() as i64;
+    let relay = state.relay.clone();
+    let outcome = blocking_store(move || {
+        // Same gate as sending: membership first, then moderation. Checked before a byte is
+        // written, so a refused upload leaves nothing behind to sweep.
+        relay.attachment_upload_permission(&conversation_id, &me.device_id)
+    })
+    .await?;
+    match outcome {
+        AttachmentPermission::Denied => return Err(forbidden()),
+        AttachmentPermission::Muted { reason } => return Err(muted(reason)),
+        AttachmentPermission::Allowed => {}
+    }
+    // Bytes first, row second: a row with no object would serve a 404 to a client that was told the
+    // upload succeeded, while an object with no row is unreachable and swept by TTL.
+    blobs.put(&blob_id, &body).map_err(|e| {
+        tracing::error!("attachment write failed: {e}");
+        internal()
+    })?;
+    let relay = state.relay.clone();
+    blocking_store(move || {
+        relay.record_attachment(&blob_id, &conversation_id, &me.device_id, size)
+    })
+    .await?;
+    Ok(Json(BlobDto {
+        blob_id: hex::encode(blob_id),
+    }))
+}
+
+/// Serve an attachment's ciphertext to a member of the conversation it belongs to. The response is
+/// opaque bytes; only someone holding the key from the MLS message can do anything with them.
+async fn download_attachment(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(blob_hex): Path<String>,
+) -> Result<Response, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let blob_id = id16_from_hex(&blob_hex)?;
+    let Some(blobs) = state.blobs.clone() else {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "attachments_unavailable",
+        ));
+    };
+    let relay = state.relay.clone();
+    let allowed =
+        blocking_store(move || relay.may_fetch_attachment(&blob_id, &me.device_id)).await?;
+    // One generic 403 whether the blob does not exist or the caller is not in its conversation:
+    // otherwise this endpoint answers "does blob X exist?" for anyone with an id.
+    if !allowed {
+        return Err(forbidden());
+    }
+    let bytes = blobs
+        .get(&blob_id)
+        .map_err(|e| {
+            tracing::error!("attachment read failed: {e}");
+            internal()
+        })?
+        .ok_or(ApiError(StatusCode::GONE, "attachment_expired"))?;
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        bytes,
+    )
+        .into_response())
 }
 
 /// ONE ciphertext, fanned out server-side to every other member device, so the client uploads once

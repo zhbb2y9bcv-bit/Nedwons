@@ -103,6 +103,17 @@ pub enum SendOutcome {
     Muted { reason: SendRefusal },
 }
 
+/// Whether a device may upload an attachment to a conversation.
+pub enum AttachmentPermission {
+    Allowed,
+    /// Not a member (or the conversation does not exist): one generic refusal.
+    Denied,
+    /// A member, but muted or in an announcement-only group.
+    Muted {
+        reason: SendRefusal,
+    },
+}
+
 /// Why a member in good standing was refused a send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SendRefusal {
@@ -484,6 +495,99 @@ impl PgRelay {
 
     // NOTE: leaving/removal moved to `groups::PgGroups::leave_conversation` (ADR-0009), which
     // additionally handles admin-role cleanup and auto-promotion. The relay stays mail-only.
+
+    /// May this device put an attachment in this conversation? Membership AND the moderation gate,
+    /// evaluated exactly as a send is: an upload is the first half of sending a message, so anyone
+    /// who cannot send cannot stage bytes for one either.
+    pub fn attachment_upload_permission(
+        &self,
+        conversation_id: &[u8; 16],
+        device: &DeviceId,
+    ) -> StoreResult<AttachmentPermission> {
+        let mut conn = self.conn()?;
+        let mut txn = conn.transaction().map_err(db_err)?;
+        if !member_in_txn(&mut txn, conversation_id, device.as_bytes())? {
+            return Ok(AttachmentPermission::Denied);
+        }
+        let permission = match send_refusal_in_txn(&mut txn, conversation_id, device.as_bytes())? {
+            Some(reason) => AttachmentPermission::Muted { reason },
+            None => AttachmentPermission::Allowed,
+        };
+        txn.commit().map_err(db_err)?;
+        Ok(permission)
+    }
+
+    // ----- attachment metadata (V26) -------------------------------------------------------
+    //
+    // The BYTES live in the blob store; these rows answer "may this device fetch this blob?" and
+    // give retention something to sweep. See `blobs.rs` and `V26__attachments.sql`.
+
+    /// Record an uploaded blob against a conversation. The caller has already verified that
+    /// `uploader_device` may send there, and has written the bytes.
+    pub fn record_attachment(
+        &self,
+        blob_id: &[u8; 16],
+        conversation_id: &[u8; 16],
+        uploader_device: &DeviceId,
+        size_bytes: i64,
+    ) -> StoreResult<()> {
+        let mut conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO attachments (blob_id, conversation_id, uploader_device, size_bytes)
+             VALUES ($1, $2, $3, $4)",
+            &[
+                &blob_id.as_slice(),
+                &conversation_id.as_slice(),
+                &uploader_device.as_bytes(),
+                &size_bytes,
+            ],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// May `device` fetch this blob? True only if the blob exists AND the device is currently in
+    /// the conversation it belongs to — the same rule the envelope path uses, so leaving a group
+    /// ends access to its files as well as its messages.
+    ///
+    /// A blob id is 16 random bytes and therefore unguessable, but that is not relied on for
+    /// authorization: a link that leaks would otherwise be a capability with no way to revoke it.
+    pub fn may_fetch_attachment(&self, blob_id: &[u8; 16], device: &DeviceId) -> StoreResult<bool> {
+        let mut conn = self.conn()?;
+        Ok(conn
+            .query_opt(
+                "SELECT 1 FROM attachments a
+                  JOIN conversation_members m ON m.conversation_id = a.conversation_id
+                 WHERE a.blob_id = $1 AND m.device_id = $2",
+                &[&blob_id.as_slice(), &device.as_bytes()],
+            )
+            .map_err(db_err)?
+            .is_some())
+    }
+
+    /// Delete attachment rows past the TTL, returning the ids so their bytes can be removed too.
+    /// Bounded like the envelope sweep so a backlog drains across ticks instead of locking.
+    pub fn purge_stale_attachments(
+        &self,
+        ttl: std::time::Duration,
+        batch_size: i64,
+    ) -> StoreResult<Vec<[u8; 16]>> {
+        let mut conn = self.conn()?;
+        let rows = conn
+            .query(
+                "DELETE FROM attachments WHERE blob_id IN (
+                     SELECT blob_id FROM attachments
+                     WHERE created_at < now() - make_interval(secs => $1)
+                     ORDER BY created_at
+                     LIMIT $2)
+                 RETURNING blob_id",
+                &[&ttl.as_secs_f64(), &batch_size],
+            )
+            .map_err(db_err)?;
+        rows.into_iter()
+            .map(|r| id16(r.get::<_, &[u8]>(0)))
+            .collect()
+    }
 
     /// List the conversations a device belongs to, most recent first, each with its member
     /// account ids. Rows for one conversation are contiguous (ordered by created_at then

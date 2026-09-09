@@ -5,6 +5,7 @@
 
 pub mod account_deletion;
 pub mod attest;
+pub mod blobs;
 pub mod breach_http;
 pub mod groups;
 pub mod http;

@@ -244,6 +244,9 @@ async fn serve(
         let stores = stores.clone();
         let relay = relay.clone();
         let quotas = Arc::new(nedwons_api::quota::Quotas::new(relay.pool_clone()));
+        // The same store the router serves from; `None` when attachments are not configured.
+        let blobs: Option<Arc<dyn nedwons_api::blobs::BlobStore>> =
+            nedwons_api::blobs::FsBlobStore::from_env().map(|s| Arc::new(s) as Arc<_>);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
@@ -251,6 +254,7 @@ async fn serve(
                 let stores = stores.clone();
                 let relay = relay.clone();
                 let quotas = quotas.clone();
+                let blobs = blobs.clone();
                 let purged = tokio::task::spawn_blocking(move || {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -274,6 +278,21 @@ async fn serve(
                         PURGE_BATCH_SIZE,
                         PURGE_MAX_BATCHES,
                     )?;
+                    // Attachments (DATA_RETENTION.md gives them the queue TTL): drop the rows,
+                    // then their bytes. The store is ALSO swept by age, which is what collects
+                    // objects whose rows went with a deleted conversation's cascade.
+                    let attachments = match &blobs {
+                        Some(store) => {
+                            let ids =
+                                relay.purge_stale_attachments(envelope_ttl, PURGE_BATCH_SIZE)?;
+                            for id in &ids {
+                                let _ = store.delete(id);
+                            }
+                            let swept = store.sweep_older_than(envelope_ttl).unwrap_or(0);
+                            ids.len() as u64 + swept
+                        }
+                        None => 0,
+                    };
                     // MLS prekey hygiene: drop key packages past their TTL.
                     let prekeys = relay
                         .purge_expired_key_packages(nedwons_api::relay::KEY_PACKAGE_TTL_SECS)?;
@@ -282,7 +301,7 @@ async fn serve(
                     // Capacity gauges are sampled on the same tick (queue depth, pool usage).
                     relay.sample_capacity_gauges();
                     Ok::<u64, auth_core::store::StoreError>(
-                        auth + mail + sealed + self_group + prekeys + counters,
+                        auth + mail + sealed + self_group + prekeys + counters + attachments,
                     )
                 })
                 .await;
