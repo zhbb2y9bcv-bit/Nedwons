@@ -53,6 +53,30 @@ public enum ClientTranscripts {
     }
 
     /// Login transcript, rebuilt from the server's login challenge.
+    /// Account-deletion transcript. Same shape as login: the server issues a challenge and this
+    /// device signs it, so deletion needs BOTH the device key and the password. Neither a stolen
+    /// access token nor a leaked password alone can destroy an account.
+    public static func accountDelete(
+        accountID: Data,
+        deviceID: Data,
+        publicKey: Data,
+        challengeNonce: Data,
+        expiresAt: UInt64,
+        txnID: Data
+    ) -> Data {
+        AuthTranscript.encode(
+            AuthTranscript.Input(
+                action: .accountDelete,
+                accountID: accountID,
+                deviceID: deviceID,
+                publicKey: publicKey,
+                challenge: challengeNonce,
+                expiresAt: expiresAt,
+                txnID: txnID
+            )
+        )
+    }
+
     public static func login(
         accountID: Data,
         deviceID: Data,

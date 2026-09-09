@@ -23,6 +23,12 @@ targets:
     platform: iOS
     sources:
       - Sources
+      # Apple requires PrivacyInfo.xcprivacy at the APP BUNDLE ROOT. It lives outside `Sources/`,
+      # so without this it stays in the repo and never ships — which is how a manifest can look
+      # maintained while being invisible to App Store review (verified: it was absent from the
+      # built .app before this line existed).
+      - path: PrivacyInfo.xcprivacy
+        buildPhase: resources
     dependencies:
       - package: NedwonsKit
         product: NedwonsUI
@@ -51,6 +57,13 @@ targets:
         NSCameraUsageDescription: "Scan a pairing code to securely link another of your devices."
         NedwonsServerURL: ""
         NedwonsTransparencyLogKey: ""
+        # Export compliance. Declared TRUE deliberately: this app's core function is end-to-end
+        # encrypted messaging, so claiming one of the exemptions would be a claim we cannot
+        # substantiate — and it is made to a regulator, not to Apple. Declaring true means export
+        # documentation (self-classification / ERN, possibly CCATS) must be filed BEFORE
+        # submission. That is a legal determination, not an engineering one: see
+        # docs/APP_STORE_PRIVACY.md and get counsel before shipping.
+        ITSAppUsesNonExemptEncryption: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.nedwons.demo
