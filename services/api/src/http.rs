@@ -273,6 +273,10 @@ pub fn build_router_cfg(
         // password change (device-signed + current-password): two stages
         .route("/v1/session/password/begin", post(password_change_begin))
         .route("/v1/session/password/finish", post(password_change_finish))
+        // In-app account deletion (App Store requirement): challenge, then an irreversible
+        // DELETE carrying the device signature and the password.
+        .route("/v1/account/delete/begin", post(account_delete_begin))
+        .route("/v1/account", axum::routing::delete(account_delete))
         // controlled multi-device (ADR-0008): enroll a new device via a trusted device, list, revoke
         .route("/v1/devices", get(list_devices_handler))
         .route("/v1/devices/enroll/begin", post(enroll_begin))
@@ -916,6 +920,69 @@ async fn password_change_finish(
             &body.current_password,
             &body.new_password,
         )
+    })
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ----- account deletion (device-signed + password) ------------------------------------
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountDeleteBody {
+    txn_id: String,
+    /// Device signature over the `AccountDelete` transcript (128 hex chars).
+    signature: String,
+    password: String,
+}
+
+/// Stage 1: issue an `AccountDelete` challenge for the authenticated device to sign.
+async fn account_delete_begin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ChallengeDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let service = state.service.clone();
+    let ch = blocking(move || service.account_delete_begin(&me)).await?;
+    Ok(Json(ChallengeDto {
+        account_id: hex::encode(ch.account_id.as_bytes()),
+        device_id: hex::encode(ch.device_id.as_bytes()),
+        txn_id: hex::encode(ch.txn_id.as_bytes()),
+        nonce: hex::encode(ch.nonce),
+        expires_at: ch.expires_at,
+    }))
+}
+
+/// Stage 2: irreversible. Requires BOTH the device signature and the password, so neither a
+/// stolen access token nor a leaked password alone can destroy an account.
+///
+/// Reauthentication and erasure are separate steps on purpose: the auth service decides *who you
+/// are*, then the erasure runs as ONE cross-store transaction (see `account_deletion`), because an
+/// account's data spans every store and only two tables cascade from `accounts`.
+async fn account_delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AccountDeleteBody>,
+) -> Result<StatusCode, ApiError> {
+    if body.password.len() > 1024 {
+        return Err(bad_request());
+    }
+    let me = authed_device(&state, &headers).await?;
+    let txn_id = txn_from_hex(&body.txn_id)?;
+    let signature = hex_exact(&body.signature, 64)?;
+
+    let service = state.service.clone();
+    let verified_me = me;
+    blocking(move || {
+        service.account_delete_verify(&verified_me, &txn_id, &signature, &body.password)
+    })
+    .await?;
+
+    let pool = state.pool.clone();
+    blocking_store(move || {
+        crate::tx::transaction(&pool, |txn| {
+            crate::account_deletion::delete_account_in_txn(txn, &me.account_id)
+        })
     })
     .await?;
     Ok(StatusCode::NO_CONTENT)

@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod account_deletion;
 pub mod attest;
 pub mod breach_http;
 pub mod groups;

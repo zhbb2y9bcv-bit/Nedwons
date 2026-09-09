@@ -375,6 +375,78 @@ impl AuthService {
         Ok(())
     }
 
+    // ----- Account deletion (reauthentication only) ----------------------------------
+    //
+    // These verify that the caller may delete the account. They deliberately delete NOTHING:
+    // an account's data spans every store (social graph, group membership, routing, key
+    // packages, queued envelopes), so the erasure itself runs as one cross-store transaction in
+    // the API layer. Splitting it that way keeps this module's job — deciding who you are —
+    // separate from deciding what gets erased.
+
+    /// Stage 1: issue a challenge to be signed by the caller's device.
+    pub fn account_delete_begin(&self, account: &AccountDevice) -> Result<RegistrationChallenge> {
+        let txn_id = TxnId::random();
+        let nonce = random_bytes::<32>();
+        let expires_at = self.clock.now_unix() + self.config.challenge_ttl_secs;
+        self.challenges.put(ChallengeRecord {
+            txn_id,
+            account_id: account.account_id,
+            device_id: account.device_id,
+            action: Action::AccountDelete,
+            nonce,
+            expires_at,
+        })?;
+        Ok(RegistrationChallenge {
+            account_id: account.account_id,
+            device_id: account.device_id,
+            txn_id,
+            nonce,
+            expires_at,
+        })
+    }
+
+    /// Stage 2: requires BOTH the device signature and the password, so neither a stolen access
+    /// token nor a leaked password alone can destroy an account. Returns `Ok(())` only when the
+    /// caller is authorized; the caller then performs the erasure.
+    pub fn account_delete_verify(
+        &self,
+        account: &AccountDevice,
+        txn_id: &TxnId,
+        signature: &[u8],
+        password: &str,
+    ) -> Result<()> {
+        let challenge = self.challenges.consume(txn_id)?.ok_or(AuthError::Denied)?;
+        self.check_challenge(&challenge, Action::AccountDelete)?;
+        if challenge.account_id != account.account_id || challenge.device_id != account.device_id {
+            return Err(AuthError::Denied);
+        }
+        let device = self
+            .devices
+            .device(&account.device_id)?
+            .filter(|d| !d.revoked && d.account_id == account.account_id)
+            .ok_or(AuthError::Denied)?;
+        let transcript = Transcript {
+            action: Action::AccountDelete,
+            account_id: &challenge.account_id,
+            device_id: &challenge.device_id,
+            public_key: &device.public_key,
+            challenge: &challenge.nonce,
+            expires_at: challenge.expires_at,
+            txn_id,
+        };
+        if !verify_p256(&device.public_key, &transcript.encode(), signature) {
+            return Err(AuthError::Denied);
+        }
+        let acct = self
+            .creds
+            .find_by_account_id(&account.account_id)?
+            .ok_or(AuthError::Denied)?;
+        if !password::verify_password(&self.argon2, password, &acct.password_phc).unwrap_or(false) {
+            return Err(AuthError::Denied);
+        }
+        Ok(())
+    }
+
     // ----- Trusted-device enrollment (ADR-0008) -------------------------------------
 
     /// Bounds abuse — a compromised trusted device cannot enroll unbounded ghost devices.
