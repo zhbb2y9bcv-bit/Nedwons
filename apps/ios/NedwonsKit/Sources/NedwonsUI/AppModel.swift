@@ -1222,6 +1222,10 @@ public final class AppModel: ObservableObject {
             banner = "Sending files isn't available in this build."
             return
         }
+        guard data.count <= 25 * 1024 * 1024 else {
+            banner = "That file is over the 25 MB limit. Larger transfers are coming; for now, trim or compress it."
+            return
+        }
         isBusy = true
         defer { isBusy = false }
         do {

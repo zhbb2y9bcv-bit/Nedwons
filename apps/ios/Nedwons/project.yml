@@ -55,6 +55,7 @@ targets:
           - remote-notification
         # Pairing to link a device scans a QR code (#8 device linking).
         NSCameraUsageDescription: "Scan QR codes to join groups by invite, verify a contact's safety number, or link another of your devices."
+        NSMicrophoneUsageDescription: "Record voice messages. Audio is end-to-end encrypted before it leaves your device."
         NedwonsServerURL: ""
         NedwonsTransparencyLogKey: ""
         # The provisioned app group (e.g. group.app.nedwons.demo). Empty ⇒ app-private stores and
