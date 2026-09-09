@@ -1021,10 +1021,7 @@ impl<J: Journal> DurableSession<J> {
     /// this device did not send, or one with no wire id — recipients would refuse it anyway
     /// (only the author's delete is honored) and the UI must not pretend otherwise. The local
     /// tombstone lands at encrypt time, when the group is actually told. R-901: best-effort.
-    pub fn enqueue_delete(
-        &mut self,
-        target: [u8; MESSAGE_ID_LEN],
-    ) -> Result<u64, DurableError> {
+    pub fn enqueue_delete(&mut self, target: [u8; MESSAGE_ID_LEN]) -> Result<u64, DurableError> {
         let ours = self.meta.messages.iter().any(|m| {
             m.message_id == target
                 && m.direction == Direction::Outbound

@@ -720,10 +720,7 @@ fn disappearing_timer_applies_and_scrubs() {
     let m_env = alice.encrypt(m).expect("encrypt");
     bob.process_inbound(3, &m_env).expect("process");
     let stamped = |views: Vec<mls_core::durable::MessageView>| {
-        views
-            .iter()
-            .filter(|v| v.expires_at_ms.is_some())
-            .count()
+        views.iter().filter(|v| v.expires_at_ms.is_some()).count()
     };
     assert_eq!(stamped(alice.message_views()), 1);
     assert_eq!(stamped(bob.message_views()), 1);
@@ -791,7 +788,9 @@ fn delete_for_everyone_tombstones_both_sides() {
     assert!(theirs.plaintext.is_empty());
 
     // A delete for an id nobody has: durable no-op.
-    let ghost = alice.enqueue(b"soon deleted locally only").expect("enqueue");
+    let ghost = alice
+        .enqueue(b"soon deleted locally only")
+        .expect("enqueue");
     let _ = alice.encrypt(ghost).expect("encrypt");
     let unknown_target = [9u8; 16];
     assert!(matches!(

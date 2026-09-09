@@ -802,9 +802,7 @@ impl MlsClient {
                 InboundOutcome::Typing { sender, active } => {
                     InboundResult::Typing { sender, active }
                 }
-                InboundOutcome::TimerChanged { seconds } => {
-                    InboundResult::TimerChanged { seconds }
-                }
+                InboundOutcome::TimerChanged { seconds } => InboundResult::TimerChanged { seconds },
                 InboundOutcome::MessageDeleted { target } => InboundResult::MessageDeleted {
                     target: target.to_vec(),
                 },
@@ -864,9 +862,7 @@ impl MlsClient {
                 InboundOutcome::Typing { sender, active } => {
                     InboundResult::Typing { sender, active }
                 }
-                InboundOutcome::TimerChanged { seconds } => {
-                    InboundResult::TimerChanged { seconds }
-                }
+                InboundOutcome::TimerChanged { seconds } => InboundResult::TimerChanged { seconds },
                 InboundOutcome::MessageDeleted { target } => InboundResult::MessageDeleted {
                     target: target.to_vec(),
                 },
