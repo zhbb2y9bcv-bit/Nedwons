@@ -104,11 +104,22 @@ impl Member {
             .map_err(|_| MlsError::Codec)
     }
 
+    /// How many PAST epochs' message secrets each member retains. Without this (the OpenMLS
+    /// default of 0), a member who hasn't yet merged an add/remove commit sends at the old epoch
+    /// and everyone who merged first silently fails to decrypt — a race that real multi-device
+    /// traffic hits constantly (every reconcile-loop add opens the window). Three epochs covers
+    /// several back-to-back membership changes against an offline sender. HONEST TRADE
+    /// (CRYPTOGRAPHY.md): forward secrecy for application messages is delayed by up to this many
+    /// epochs — a device compromised today can read messages from up to 3 epochs back, not 0.
+    /// Standard practice for deployed MLS; the alternative is dropped messages.
+    const MAX_PAST_EPOCHS: usize = 3;
+
     /// New group with this member as the sole initial participant.
     pub fn create_group(&self) -> Result<Conversation> {
         let group = MlsGroup::builder()
             .ciphersuite(CIPHERSUITE)
             .use_ratchet_tree_extension(true) // welcomes carry the ratchet tree
+            .max_past_epochs(Self::MAX_PAST_EPOCHS)
             .build(&self.provider, &self.signer, self.credential.clone())
             .map_err(lib)?;
         Ok(Conversation { group })
@@ -124,6 +135,7 @@ impl Member {
         };
         let config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
+            .max_past_epochs(Self::MAX_PAST_EPOCHS)
             .build();
         let staged =
             StagedWelcome::new_from_welcome(&self.provider, &config, welcome, None).map_err(lib)?;

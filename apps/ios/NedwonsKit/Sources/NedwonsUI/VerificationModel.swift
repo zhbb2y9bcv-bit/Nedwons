@@ -130,7 +130,8 @@ extension AppModel {
                 accessToken: token, inviteToken: inviteToken)
             if accepted.status == "joined" {
                 joined = true
-                banner = "You're in. Messages appear once a member finishes your encryption setup."
+                banner = "You're in. New messages start arriving as soon as a member's app syncs "
+                    + "(usually within moments)."
                 await refreshConversations()
             } else {
                 banner = "Request sent — an admin has to approve you."

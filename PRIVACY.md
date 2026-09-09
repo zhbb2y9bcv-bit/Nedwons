@@ -28,6 +28,7 @@ R-402).
 | Friendship graph & pending requests | Social graph, group gating | Life of relationship | Server (**plaintext**) |
 | Group / conversation membership | Route group messages | Life of membership | Server (**plaintext**) |
 | Group roles, mutes, announcement mode | Group administration; the relay refuses to distribute a muted member's messages | Life of membership (a mute ends with it) | Server (**plaintext**); visible to the group's members |
+| MLS setup state per member device (`mls_added`, V27) | Coordinates which member's device delivers a newcomer's encryption Welcome (multi-device / automatic adds) | Life of membership | Server (**plaintext**); derivable anyway from the relay's own Welcome-delivery timing |
 | Group name | Title the group | On members' devices only | **Never on the server** — it travels inside the MLS ciphertext like a message; the relay has no name field and cannot learn one |
 | Read state / unread counts | Badges | On the device only | **Never on the server** — derived from decrypted local history |
 | Delivery & read receipts | Show a sender that a message arrived / was read | On devices only | **Never on the server** — receipts are E2EE messages between members; the relay sees one more opaque envelope. A device can switch them off entirely, and everything else still works |

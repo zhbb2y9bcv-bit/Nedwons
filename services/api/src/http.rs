@@ -236,7 +236,14 @@ pub fn build_router_with_blobs(
     let relay_routes = Router::new()
         .route("/v1/keypackages", post(publish_key_package))
         .route("/v1/keypackages/claim", post(claim_key_package))
+        .route(
+            "/v1/keypackages/claim-device",
+            post(claim_device_key_package),
+        )
         .route("/v1/keypackages/count", get(key_package_count))
+        .route("/v1/setup/needed", get(setup_needed))
+        .route("/v1/setup/claim", post(setup_claim))
+        .route("/v1/setup/confirm", post(setup_confirm))
         // Device self-group (ADR-0015 option 3): establish + use the account's own-devices MLS group.
         .route("/v1/self-group/register", post(self_group_register))
         .route("/v1/self-group/pending", get(self_group_pending))
@@ -1527,6 +1534,138 @@ async fn claim_key_package(
     }))
 }
 
+/// Every non-revoked device of an account — multi-device membership adds route to ALL of them,
+/// server-side (never client-asserted), so a member's iPad is not a second-class citizen.
+fn active_devices_of(
+    service: &auth_core::AuthService,
+    account: &AccountId,
+) -> auth_core::store::StoreResult<Vec<auth_core::DeviceId>> {
+    Ok(service
+        .list_devices(account)
+        .map_err(|_| auth_core::store::StoreError("device lookup".into()))?
+        .into_iter()
+        .filter(|d| !d.revoked)
+        .map(|d| d.device_id)
+        .collect())
+}
+
+#[derive(Deserialize)]
+struct ClaimDeviceKeyPackageBody {
+    device_id: String,
+}
+
+/// Claim a SPECIFIC device's prekey — what the V27 reconcile loop uses to add a named device
+/// (a member's sibling, an invite joiner's phone) to a group. Authorized by a shared
+/// conversation or same-account ownership; anything else is a uniform 403 (no device oracle).
+async fn claim_device_key_package(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ClaimDeviceKeyPackageBody>,
+) -> Result<Json<ClaimedKeyPackageDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let target = DeviceId(id16_from_hex(&body.device_id)?);
+    let relay = state.relay.clone();
+    let service = state.service.clone();
+    let claimed = blocking_store(move || {
+        let same_account = service
+            .list_devices(&me.account_id)
+            .map_err(|_| auth_core::store::StoreError("device lookup".into()))?
+            .iter()
+            .any(|d| d.device_id.0 == target.0 && !d.revoked);
+        if !same_account && !relay.shares_conversation(&me.device_id, &target)? {
+            return Ok(None);
+        }
+        relay
+            .claim_key_package_for_device(&target, crate::relay::KEY_PACKAGE_TTL_SECS)
+            .map(Some)
+    })
+    .await?
+    .ok_or_else(forbidden)?
+    .ok_or(ApiError(StatusCode::NOT_FOUND, "no_key_package"))?;
+    Ok(Json(ClaimedKeyPackageDto {
+        device_id: hex::encode(claimed.device_id),
+        key_package: hex::encode(claimed.key_package),
+    }))
+}
+
+#[derive(Serialize)]
+struct SetupTargetDto {
+    conversation_id: String,
+    account_id: String,
+    device_id: String,
+}
+
+#[derive(Serialize)]
+struct SetupNeededDto {
+    targets: Vec<SetupTargetDto>,
+}
+
+/// Members of the caller's conversations still awaiting their MLS add (V27). The caller's next
+/// step per row: claim it, claim the device's prekey, add + Welcome, confirm.
+async fn setup_needed(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<SetupNeededDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let relay = state.relay.clone();
+    let targets = blocking_store(move || relay.setup_needed(&me.device_id, 32)).await?;
+    Ok(Json(SetupNeededDto {
+        targets: targets
+            .into_iter()
+            .map(|t| SetupTargetDto {
+                conversation_id: hex::encode(t.conversation_id),
+                account_id: hex::encode(t.account_id),
+                device_id: hex::encode(t.device_id),
+            })
+            .collect(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct SetupRefBody {
+    conversation_id: String,
+    device_id: String,
+}
+
+/// Take the exclusive (expiring) claim on one setup target. `409` = someone else is on it.
+async fn setup_claim(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SetupRefBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&body.conversation_id)?;
+    let target = DeviceId(id16_from_hex(&body.device_id)?);
+    let relay = state.relay.clone();
+    let claimed =
+        blocking_store(move || relay.claim_setup(&me.device_id, &conversation_id, &target)).await?;
+    if claimed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError(StatusCode::CONFLICT, "claimed"))
+    }
+}
+
+/// The Welcome has been delivered (queued): the target is set up. Requires the live claim.
+async fn setup_confirm(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<SetupRefBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&body.conversation_id)?;
+    let target = DeviceId(id16_from_hex(&body.device_id)?);
+    let relay = state.relay.clone();
+    let confirmed =
+        blocking_store(move || relay.confirm_setup(&me.device_id, &conversation_id, &target))
+            .await?;
+    if confirmed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError(StatusCode::CONFLICT, "not_claimed"))
+    }
+}
+
 #[derive(Serialize)]
 struct KeyPackageCountDto {
     /// Non-expired key packages this device still has published.
@@ -1713,7 +1852,15 @@ async fn self_group_register(
     let relay = state.relay.clone();
     let account = me.account_id;
     let device = me.device_id;
-    blocking_store(move || relay.register_self_group_member(&account, &device)).await?;
+    blocking_store(move || {
+        relay.register_self_group_member(&account, &device)?;
+        // Linking IS the trust ceremony: the moment a device is in the self-group it joins all
+        // of its account's conversations, queued for MLS setup (V27) — a set-up device (a
+        // sibling, or any member) delivers its Welcomes on the next sync.
+        relay.seed_linked_device_conversations(&account, &device)?;
+        Ok(())
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2070,17 +2217,13 @@ async fn add_member(
         {
             return Ok(None);
         }
-        // Server-side authority, never client-asserted.
-        let device = service
-            .active_device(&target_account)
-            .map_err(|_| auth_core::store::StoreError("device lookup".into()))?;
-        match device {
-            Some(device_id) => {
-                relay.add_member(&conversation_id, target_account, device_id)?;
-                Ok(Some(()))
-            }
-            None => Ok(Some(())), // no active device: nothing to route to (still success)
+        // Server-side authority, never client-asserted. Every non-revoked device joins the V27
+        // setup queue; none yet ⇒ the add is DEFERRED until they enroll and publish prekeys —
+        // the membership row appears the moment a device does.
+        for device in active_devices_of(&service, &target_account)? {
+            relay.add_pending_member(&conversation_id, target_account, device)?;
         }
+        Ok(Some(()))
     })
     .await?
     .ok_or_else(forbidden)?;
@@ -2332,15 +2475,26 @@ async fn accept_invite(
     let me = authed_device(&state, &headers).await?;
     let token = token32_from_hex(&body.invite_token)?;
     let pool = state.pool.clone();
+    let service = state.service.clone();
     let outcome = blocking_store(move || {
+        // Resolved before the transaction (the auth service owns its own connections).
+        let devices = active_devices_of(&service, &me.account_id)?;
         // Burning the invite use and adding the membership are ONE transaction: separately
         // committed, a failure in between spends the joiner's one chance to join without joining
         // them, and the invite's use budget is corrupted with nothing to show for it.
         crate::tx::transaction(&pool, |txn| {
             let outcome = PgGroups::accept_invite_in_txn(txn, &token, &me.account_id)?;
             if let InviteOutcome::Joined { conversation_id } = &outcome {
-                // The caller's own device only.
-                PgRelay::add_member_in_txn(txn, conversation_id, me.account_id, me.device_id)?;
+                // ALL of the joiner's devices, queued for MLS setup (V27): a current member's
+                // device claims each prekey and delivers the Welcomes on its next sync.
+                for device in &devices {
+                    PgRelay::add_pending_member_in_txn(
+                        txn,
+                        conversation_id,
+                        me.account_id,
+                        *device,
+                    )?;
+                }
             }
             Ok(outcome)
         })
@@ -2394,10 +2548,7 @@ async fn approve_join_request(
         // own connection, so calling it mid-transaction would check out a second one and could
         // deadlock against a saturated pool. A device that disappears between here and the commit
         // is handled below by simply not admitting the target.
-        let device = st
-            .service
-            .active_device(&target)
-            .map_err(|_| auth_core::store::StoreError("device lookup".into()))?;
+        let devices = active_devices_of(&st.service, &target)?;
 
         // Consuming the join request and adding the membership are ONE transaction: separately
         // committed, a failure in between destroys the request without admitting the user, who
@@ -2412,8 +2563,8 @@ async fn approve_join_request(
             if !PgGroups::approve_join_request_in_txn(txn, &conversation_id, &target)? {
                 return Ok(Some(false));
             }
-            if let Some(device_id) = device {
-                PgRelay::add_member_in_txn(txn, &conversation_id, target, device_id)?;
+            for device_id in &devices {
+                PgRelay::add_pending_member_in_txn(txn, &conversation_id, target, *device_id)?;
             }
             Ok(Some(true))
         })
@@ -3836,13 +3987,17 @@ async fn create_group(
         // authoritative groups start empty and grow through /commit.
         relay.create_conversation(conversation_id, me.account_id, me.device_id, false)?;
         groups.bootstrap_admin(&conversation_id, &me.account_id)?;
+        // EVERY device of every member — including the creator's own siblings — lands in the
+        // V27 setup queue; the creator's device (which builds the MLS group) reconciles them.
+        // A member with no devices publishing prekeys yet is simply deferred, not failed.
         for member in &others_for_task {
-            // Server-side, never client-asserted.
-            if let Some(device) = service
-                .active_device(member)
-                .map_err(|_| auth_core::store::StoreError("device lookup".into()))?
-            {
-                relay.add_member(&conversation_id, *member, device)?;
+            for device in active_devices_of(&service, member)? {
+                relay.add_pending_member(&conversation_id, *member, device)?;
+            }
+        }
+        for device in active_devices_of(&service, &me.account_id)? {
+            if device.0 != me.device_id.0 {
+                relay.add_pending_member(&conversation_id, me.account_id, device)?;
             }
         }
         Ok(Ok(conversation_id))

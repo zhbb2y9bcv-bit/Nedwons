@@ -162,6 +162,7 @@ public final class ConversationCoordinator {
                 guard let self, self.token != nil else { return }
                 do {
                     _ = try await self.syncOnce(waitSeconds: 25)
+                    await self.reconcileSetup()
                     await self.retryUnsent()
                 } catch is CancellationError {
                     return
@@ -195,6 +196,7 @@ public final class ConversationCoordinator {
     public func prepare() async {
         for conversationID in index.conversations.keys { refresh(conversationID) }
         await ensureKeyPackages()
+        await reconcileSetup()
         await retryUnsent()
     }
 
@@ -225,11 +227,13 @@ public final class ConversationCoordinator {
 
     // MARK: Bootstrap
 
-    /// Build the MLS group for a conversation the relay has just created. Members whose prekey
-    /// cannot be claimed or whose Welcome cannot be delivered are reported together at the end;
-    /// the group still exists with everyone who succeeded.
+    /// Build the MLS group for a conversation the relay has just created, then drain its setup
+    /// queue: the server has already listed every member DEVICE (V27 — including this account's
+    /// own siblings), so the creator's job is one reconcile pass. Members whose prekeys aren't
+    /// published yet are simply DEFERRED, not failed — a later sync completes them the moment
+    /// they open the app.
     public func bootstrap(conversationID: String, memberAccountIDs: [String]) async throws {
-        guard let token, let identity else { throw CoordinatorError.notSignedIn }
+        guard token != nil, let identity else { throw CoordinatorError.notSignedIn }
         // Idempotent: a second call for a conversation this device already holds does nothing.
         guard index.conversations[conversationID] == nil else { return }
         let storeID = Self.newStoreID()
@@ -238,36 +242,22 @@ public final class ConversationCoordinator {
         index.conversations[conversationID] = storeID
         try saveIndex()
         clients[conversationID] = client
-
-        let failed = await grow(
-            client: client, conversationID: conversationID, accounts: memberAccountIDs, token: token)
+        _ = memberAccountIDs  // membership authority is the relay's queue, not this list
+        await reconcileSetup()
         refresh(conversationID)
-        if !failed.isEmpty {
-            throw CoordinatorError.membersNotSetUp(failed)
-        }
     }
 
-    /// Add people to an EXISTING conversation's MLS group, after the relay has added them to
-    /// routing. Without this they would be routed ciphertext they hold no key for.
-    ///
-    /// The newcomers also need the group's name, which lives only inside the ciphertext: it is
-    /// re-sent after the adds so a new member's list shows the group by name rather than by size.
+    /// Add people to an EXISTING conversation's MLS group after the relay queued their devices
+    /// (V27). One reconcile pass covers what is reachable now; the rest are deferred adds that
+    /// complete on later syncs — including on OTHER members' devices, whoever syncs first.
     public func addMembers(to conversationID: String, memberAccountIDs: [String]) async throws {
-        guard let token else { throw CoordinatorError.notSignedIn }
-        guard let client = activeClient(for: conversationID) else {
+        guard token != nil else { throw CoordinatorError.notSignedIn }
+        guard activeClient(for: conversationID) != nil else {
             throw CoordinatorError.noSessionForConversation
         }
-        let failed = await grow(
-            client: client, conversationID: conversationID, accounts: memberAccountIDs, token: token)
-        if failed.isEmpty, let name = (try? client.groupName()) ?? nil {
-            // Best effort: a group whose name did not reach a newcomer is cosmetic, and the next
-            // rename fixes it. Never fail an add over it.
-            try? await sendGroupName(name, client: client, conversationID: conversationID)
-        }
+        _ = memberAccountIDs
+        await reconcileSetup()
         refresh(conversationID)
-        if !failed.isEmpty {
-            throw CoordinatorError.membersNotSetUp(failed)
-        }
     }
 
     /// Add each account to the MLS group: claim a prekey, add, deliver the Welcome to that device,
@@ -280,29 +270,61 @@ public final class ConversationCoordinator {
     /// too and receives the commit for the epoch it is joining at, which it cannot process — that
     /// envelope is discarded on their side, exactly like any out-of-epoch message, and the Welcome
     /// (sent first) is what actually admits them.
-    private func grow(
-        client: MlsClient, conversationID: String, accounts: [String], token: String
-    ) async -> [String] {
-        var failed: [String] = []
-        for account in accounts {
+    // MARK: Setup reconcile (V27) — the loop behind multi-device + automatic/deferred adds
+
+    /// Drain the relay's MLS setup queue: every routed member device still awaiting its Welcome,
+    /// across all of this device's conversations. For each reachable target — the relay's claim
+    /// makes exactly one member's device do each add — this claims the target DEVICE's prekey,
+    /// adds it to the group, delivers the Welcome, confirms, and fans out the commit so existing
+    /// members reach the new epoch (the newcomer discards the out-of-epoch copy; the Welcome is
+    /// what admits them, exactly as before).
+    ///
+    /// This single loop is what makes invite-link joins, approved join requests, adds of people
+    /// with no prekeys yet (deferred adds), and freshly linked sibling devices all "just start
+    /// working": a target that cannot be served now (no prekey published, no session here) stays
+    /// queued, its claim expires, and someone's next sync picks it up.
+    public func reconcileSetup(limit: Int = 8) async {
+        guard let token else { return }
+        guard let targets = try? await relay.setupNeeded(accessToken: token), !targets.isEmpty
+        else { return }
+        var touched = Set<String>()
+        for target in targets.prefix(limit) {
+            // Only a device that holds this conversation's MLS group can add to it.
+            guard let client = activeClient(for: target.conversationID) else { continue }
+            guard (try? await relay.claimSetup(
+                accessToken: token, conversationID: target.conversationID,
+                deviceID: target.deviceID)) == true
+            else { continue }
             do {
-                let claimed = try await relay.claimKeyPackage(accessToken: token, accountID: account)
+                let claimed = try await relay.claimDeviceKeyPackage(
+                    accessToken: token, deviceID: target.deviceID)
                 guard let keyPackage = Hex.decode(claimed.keyPackage) else {
                     throw CoordinatorError.badKeyPackage
                 }
                 let outcome = try client.addMember(keyPackage: keyPackage)
                 try await relay.sendWelcome(
-                    accessToken: token, conversationID: conversationID,
-                    recipientDevice: claimed.deviceID, ciphertext: outcome.welcome,
+                    accessToken: token, conversationID: target.conversationID,
+                    recipientDevice: target.deviceID, ciphertext: outcome.welcome,
                     idempotencyKey: Self.randomKey())
+                try await relay.confirmSetup(
+                    accessToken: token, conversationID: target.conversationID,
+                    deviceID: target.deviceID)
                 _ = try await relay.sendMessage(
-                    accessToken: token, conversationID: conversationID, ciphertext: outcome.commit,
-                    idempotencyKey: Self.randomKey())
+                    accessToken: token, conversationID: target.conversationID,
+                    ciphertext: outcome.commit, idempotencyKey: Self.randomKey())
+                // The name lives only inside the ciphertext; re-send it so the newcomer's list
+                // shows the group by name. Best-effort — the next rename fixes a miss.
+                if let name = (try? client.groupName()) ?? nil {
+                    try? await sendGroupName(name, client: client, conversationID: target.conversationID)
+                }
+                touched.insert(target.conversationID)
             } catch {
-                failed.append(account)
+                // No prekey yet (deferred add), or a transient failure: the claim expires and the
+                // target is retried on a later sync — here or on another member's device.
+                lastSyncError = error
             }
         }
-        return failed
+        for conversationID in touched { refresh(conversationID) }
     }
 
     // MARK: Group name & read state
