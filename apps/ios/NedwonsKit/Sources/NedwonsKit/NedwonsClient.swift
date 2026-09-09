@@ -450,17 +450,52 @@ public extension NedwonsClient {
         reason: String,
         evidence: String? = nil
     ) async throws -> Int {
+        try await reportContent(
+            accessToken: accessToken, accountID: accountID, reason: reason, evidence: evidence)
+    }
+
+    /// The legality categories the review team triages by (docs/MODERATION.md).
+    static let reportCategories = [
+        "illegal_content", "sexual_exploitation", "threats_violence", "spam_fraud", "other",
+    ]
+
+    /// File a report (docs/MODERATION.md). Identify the reported party by ACCOUNT id, or — for a
+    /// group message, where the client only knows the MLS device identity — by `deviceID`, which
+    /// the server resolves. Everything the review team sees travels HERE, chosen by the reporter:
+    /// the reason, the category, optionally the message text as decrypted on this device, and
+    /// optionally the decrypted media bytes re-uploaded as evidence. Nothing else leaves the chat.
+    func reportContent(
+        accessToken: String,
+        accountID: String? = nil,
+        deviceID: String? = nil,
+        reason: String,
+        category: String? = nil,
+        evidence: String? = nil,
+        conversationID: String? = nil,
+        messageID: String? = nil,
+        evidenceMedia: Data? = nil,
+        evidenceMediaMime: String? = nil
+    ) async throws -> Int {
         struct Body: Encodable {
-            let account_id: String
+            let account_id: String?
+            let device_id: String?
             let reason: String
+            let category: String?
             let evidence: String?
+            let conversation_id: String?
+            let message_id: String?
+            let evidence_media: String?
+            let evidence_media_mime: String?
         }
         struct Res: Decodable { let report_id: Int }
         var request = authed("POST", "/v1/reports", accessToken: accessToken)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(
-            Body(account_id: accountID, reason: reason, evidence: evidence)
-        )
+            Body(
+                account_id: accountID, device_id: deviceID, reason: reason, category: category,
+                evidence: evidence, conversation_id: conversationID, message_id: messageID,
+                evidence_media: evidenceMedia.map(Hex.encode),
+                evidence_media_mime: evidenceMediaMime))
         let res: Res = try decode(await perform(request))
         return res.report_id
     }

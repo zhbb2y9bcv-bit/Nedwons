@@ -819,7 +819,8 @@ public final class ConversationCoordinator {
                 reactions: Self.summarize(message.reactions, me: identity),
                 deliveredCount: Int(message.deliveredCount),
                 readCount: Int(message.readCount),
-                deleted: message.deleted)
+                deleted: message.deleted,
+                senderDeviceID: Hex.encode(message.sender))
         }
         model.threadLines[conversationID] = lines
         // The group's name lives only inside the ciphertext; this is the one place it is read.

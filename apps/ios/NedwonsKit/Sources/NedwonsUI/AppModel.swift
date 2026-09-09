@@ -174,6 +174,10 @@ public final class AppModel: ObservableObject {
         if let refusal = GroupRefusal.from(errorBody: body), refusal != .forbidden {
             return refusal.userFacingText
         }
+        if body.contains("account_banned") {
+            return "This account has been suspended for violating Nedwons' rules on illegal "
+                + "content. If you believe this is a mistake, contact support."
+        }
         return switch status {
         case 401: "Not authorized."
         case 403: "Not allowed. A block between people here may be preventing this."
@@ -631,6 +635,57 @@ public final class AppModel: ObservableObject {
             )
             banner = "Report submitted."
         }
+    }
+
+    /// Report one message (docs/MODERATION.md). The report carries exactly what the reporter
+    /// chose here — the category, their words, optionally the message text as this device
+    /// decrypted it, optionally the decrypted media bytes — and identifies the author by MLS
+    /// device identity (server-resolved) or, failing that, by the 1:1 peer's account.
+    /// Returns true on success so the sheet can also apply "block sender".
+    @discardableResult
+    public func reportMessage(
+        _ line: ThreadLine,
+        in conversationID: String,
+        category: String,
+        note: String,
+        includeText: Bool,
+        media: Data? = nil,
+        mediaMime: String? = nil,
+        fallbackAccountID: String? = nil
+    ) async -> Bool {
+        var ok = false
+        await run { [self] in
+            guard let token else { return }
+            let deviceID = line.senderDeviceID.isEmpty ? nil : line.senderDeviceID
+            let accountID = deviceID == nil ? fallbackAccountID : nil
+            guard deviceID != nil || accountID != nil else {
+                banner = "This message is too old to be reported directly. Report the person from their profile instead."
+                return
+            }
+            _ = try await client.reportContent(
+                accessToken: token,
+                accountID: accountID,
+                deviceID: deviceID,
+                reason: note.isEmpty ? "reported from the conversation" : note,
+                category: category,
+                evidence: includeText ? line.quotableText : nil,
+                conversationID: conversationID,
+                messageID: line.messageID.isEmpty ? nil : line.messageID,
+                evidenceMedia: media,
+                evidenceMediaMime: mediaMime)
+            banner = "Report submitted. Our team reviews reports of illegal content."
+            ok = true
+        }
+        return ok
+    }
+
+    /// Decrypted bytes for an attachment, if this device has (or can fetch) them — what a report
+    /// attaches as media evidence when the reporter opts in.
+    public func attachmentEvidence(_ attachment: AttachmentLine) async -> Data? {
+        if case .loaded(let data) = attachmentState(attachment.blobID) { return data }
+        await loadAttachment(attachment)
+        if case .loaded(let data) = attachmentState(attachment.blobID) { return data }
+        return nil
     }
 
     // MARK: Groups

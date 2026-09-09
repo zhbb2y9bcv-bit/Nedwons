@@ -103,6 +103,8 @@ pub struct StoredMessage {
     pub expires_at_ms: Option<u64>,
     /// Retracted by its author (delete-for-everyone): render "message deleted", body is gone.
     pub deleted: bool,
+    /// The MLS-authenticated sender identity (device id bytes; empty for pre-field history).
+    pub sender: Vec<u8>,
 }
 
 /// Mirrors `mls_core::secret::SecretState`.
@@ -1352,6 +1354,7 @@ fn to_stored(m: &CoreMessageView) -> StoredMessage {
         read_count: m.read_count,
         expires_at_ms: m.expires_at_ms,
         deleted: m.deleted,
+        sender: m.sender.clone(),
     }
 }
 

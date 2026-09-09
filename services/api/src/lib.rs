@@ -11,6 +11,7 @@ pub mod groups;
 pub mod http;
 pub mod membership;
 pub mod metrics;
+pub mod moderation;
 pub mod notify;
 pub mod pgstore;
 pub mod proof;

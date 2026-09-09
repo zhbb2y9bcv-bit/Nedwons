@@ -227,6 +227,32 @@ pub async fn make_app_with_blobs(per_ip_per_minute: u32, blob_dir: std::path::Pa
     .expect("app setup")
 }
 
+/// Build the app with the review-team surface enabled under `token` (docs/MODERATION.md).
+/// Supplied directly rather than via the env var, which is process-global and races in parallel.
+#[allow(dead_code)]
+pub async fn make_app_with_moderation(per_ip_per_minute: u32, token: &str) -> Router {
+    let token = token.to_string();
+    tokio::task::spawn_blocking(move || {
+        let stores = shared_stores();
+        let service = Arc::new(make_service(&stores));
+        nedwons_api::http::build_router_full(
+            service,
+            shared_relay(),
+            shared_social(),
+            shared_groups(),
+            shared_transparency(),
+            shared_membership(),
+            per_ip_per_minute,
+            None,
+            false,
+            None,
+            Some(token),
+        )
+    })
+    .await
+    .expect("app setup")
+}
+
 /// Build the app with DPoP-style proof enforcement ON (ADR-0011, R-308), so tests can exercise
 /// sender-constrained access tokens.
 #[allow(dead_code)]
