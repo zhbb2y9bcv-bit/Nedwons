@@ -15,6 +15,7 @@ pub mod proof;
 pub mod push;
 pub mod relay;
 pub mod social;
+pub mod startup;
 pub mod transparency;
 pub mod tx;
 

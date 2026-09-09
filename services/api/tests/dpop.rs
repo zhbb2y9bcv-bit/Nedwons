@@ -144,3 +144,42 @@ async fn unauthenticated_endpoints_need_no_proof() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// The guarantee the process-local cache could not give: a proof spent against ONE API instance is
+/// refused by every other instance.
+///
+/// The old cache was a per-process HashMap, so a second instance had simply never seen the nonce
+/// and would accept the replay inside the freshness window — the exact hole a load balancer opens.
+/// Two independently built routers over the same database stand in for two instances here; the
+/// replay record now lives in `proof_nonces`, so the primary key settles it.
+#[tokio::test]
+async fn a_proof_spent_on_one_instance_is_refused_by_another() {
+    let instance_a = make_app_with_proof(100_000).await;
+    let instance_b = make_app_with_proof(100_000).await;
+
+    let (device, session) = http_register(&instance_a, &unique_username("dpopmulti")).await;
+    let token = session["access_token"].as_str().unwrap();
+    let path = "/v1/session/whoami";
+
+    let nonce = [0xA7u8; 16];
+    let proof = make_proof(&device, token, "GET", path, now(), nonce);
+
+    assert_eq!(
+        get_status(&instance_a, path, token, Some(&proof)).await,
+        StatusCode::OK,
+        "the first use must be accepted"
+    );
+    assert_eq!(
+        get_status(&instance_b, path, token, Some(&proof)).await,
+        StatusCode::UNAUTHORIZED,
+        "replaying the same proof against a different instance must be refused"
+    );
+
+    // The token itself is unharmed: a fresh nonce still works on the second instance.
+    let fresh = make_proof(&device, token, "GET", path, now(), [0xA8u8; 16]);
+    assert_eq!(
+        get_status(&instance_b, path, token, Some(&fresh)).await,
+        StatusCode::OK,
+        "only the spent proof is dead, not the session"
+    );
+}

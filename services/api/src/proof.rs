@@ -47,10 +47,22 @@ pub fn parse_proof_header(value: &str) -> Option<ParsedProof> {
     })
 }
 
+/// Records a proof nonce as used, returning `false` if it was already spent.
+///
+/// Two implementations, and the difference is not cosmetic. [`ProofReplayCache`] is process-local:
+/// correct for exactly one API instance, and silently wrong for more than one, because a captured
+/// proof replayed against a DIFFERENT instance inside the freshness window meets a cache that has
+/// never seen the nonce. [`PgReplayCache`] shares the record through the database and is what a
+/// multi-instance deployment must use.
+pub trait ReplayGuard: Send + Sync {
+    fn check_and_record(&self, device: &[u8; 16], nonce: &[u8; 16], expiry: u64, now: u64) -> bool;
+}
+
 /// Single-use nonces within the freshness window (ADR-0011), keyed by `(device, nonce)` so one
-/// device cannot burn another's. **Per-instance**: until a multi-instance deployment adds a shared
-/// cache or server-issued nonces, a proof could be replayed against a *different* instance within
-/// the skew window (R-306, tracked honestly in R-308).
+/// device cannot burn another's.
+///
+/// **Per-instance.** Suitable for tests and single-instance deployments only; a multi-instance
+/// deployment must use [`PgReplayCache`], which is what production selects.
 #[derive(Default)]
 pub struct ProofReplayCache {
     inner: Mutex<Inner>,
@@ -92,6 +104,54 @@ impl ProofReplayCache {
         }
         g.seen.insert(key, expiry);
         true
+    }
+}
+
+impl ReplayGuard for ProofReplayCache {
+    fn check_and_record(&self, device: &[u8; 16], nonce: &[u8; 16], expiry: u64, now: u64) -> bool {
+        ProofReplayCache::check_and_record(self, device, nonce, expiry, now)
+    }
+}
+
+/// Replay protection shared across API instances, backed by `proof_nonces`.
+///
+/// The primary key does the work: recording is an `INSERT ... ON CONFLICT DO NOTHING`, so the first
+/// writer wins and every concurrent racer — on any instance — sees zero rows affected and is
+/// refused. There is no read-then-write to race and no lock to take.
+///
+/// Fails CLOSED. If the database is unreachable the proof is refused rather than accepted, because
+/// the alternative is that a database blip silently disables replay protection on the
+/// authentication path.
+pub struct PgReplayCache {
+    pool: crate::pgstore::PgPool,
+}
+
+impl PgReplayCache {
+    pub fn new(pool: crate::pgstore::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+impl ReplayGuard for PgReplayCache {
+    fn check_and_record(&self, device: &[u8; 16], nonce: &[u8; 16], expiry: u64, now: u64) -> bool {
+        let Ok(mut conn) = self.pool.get() else {
+            return false; // unreachable database ⇒ fail closed
+        };
+        // Sweep opportunistically rather than on a timer: bounded by the index on expires_at, and
+        // it keeps the table proportional to the in-flight request rate.
+        let _ = conn.execute(
+            "DELETE FROM proof_nonces WHERE expires_at < to_timestamp($1)",
+            &[&(now as f64)],
+        );
+        match conn.execute(
+            "INSERT INTO proof_nonces (device_id, nonce, expires_at)
+             VALUES ($1, $2, to_timestamp($3)) ON CONFLICT DO NOTHING",
+            &[&device.as_slice(), &nonce.as_slice(), &(expiry as f64)],
+        ) {
+            Ok(1) => true,
+            Ok(_) => false,  // already spent
+            Err(_) => false, // fail closed
+        }
     }
 }
 
