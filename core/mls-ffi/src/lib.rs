@@ -103,6 +103,8 @@ pub struct StoredMessage {
     pub expires_at_ms: Option<u64>,
     /// Retracted by its author (delete-for-everyone): render "message deleted", body is gone.
     pub deleted: bool,
+    /// The author replaced the text after sending; render an "edited" tag.
+    pub edited: bool,
     /// The MLS-authenticated sender identity (device id bytes; empty for pre-field history).
     pub sender: Vec<u8>,
 }
@@ -196,6 +198,10 @@ pub enum InboundResult {
     },
     /// The author retracted a message; the local copy is tombstoned. Redraw the bubble.
     MessageDeleted {
+        target: Vec<u8>,
+    },
+    /// The author replaced a message's text; the copy is updated and marked edited. Redraw.
+    MessageEdited {
         target: Vec<u8>,
     },
 }
@@ -808,6 +814,9 @@ impl MlsClient {
                 InboundOutcome::MessageDeleted { target } => InboundResult::MessageDeleted {
                     target: target.to_vec(),
                 },
+                InboundOutcome::MessageEdited { target } => InboundResult::MessageEdited {
+                    target: target.to_vec(),
+                },
             })
         })
     }
@@ -866,6 +875,9 @@ impl MlsClient {
                 }
                 InboundOutcome::TimerChanged { seconds } => InboundResult::TimerChanged { seconds },
                 InboundOutcome::MessageDeleted { target } => InboundResult::MessageDeleted {
+                    target: target.to_vec(),
+                },
+                InboundOutcome::MessageEdited { target } => InboundResult::MessageEdited {
                     target: target.to_vec(),
                 },
             })
@@ -1091,6 +1103,21 @@ impl MlsClient {
             let mut g = self.lock()?;
             let session = active_mut(&mut g)?;
             session.enqueue_delete(target).map_err(map_durable_input)
+        })
+    }
+
+    /// Replace the text of THIS DEVICE's own message (edit), returning the local id of the
+    /// queued change. Author-only, text-only, and never on a deleted message — recipients
+    /// enforce the same rules independently, and every applied edit is visibly marked.
+    pub fn edit_message(&self, target: Vec<u8>, body: Vec<u8>) -> Result<u64, MlsClientError> {
+        catch(move || {
+            bound(body.len(), MAX_PLAINTEXT_LEN)?;
+            let target = fixed(&target)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session
+                .enqueue_edit(target, &body)
+                .map_err(map_durable_input)
         })
     }
 
@@ -1358,6 +1385,7 @@ fn to_stored(m: &CoreMessageView) -> StoredMessage {
         read_count: m.read_count,
         expires_at_ms: m.expires_at_ms,
         deleted: m.deleted,
+        edited: m.edited,
         sender: m.sender.clone(),
     }
 }

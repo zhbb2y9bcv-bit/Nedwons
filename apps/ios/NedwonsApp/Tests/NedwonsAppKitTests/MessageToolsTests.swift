@@ -106,3 +106,32 @@ final class MessageToolsTests: XCTestCase {
         XCTAssertEqual(alice.model.messageSearchHits.count, 0, "blank query matches nothing")
     }
 }
+
+extension MessageToolsTests {
+    /// Editing end to end: the author's replacement lands on both sides, visibly marked; the
+    /// recipient cannot edit it; a deleted message can't be edited.
+    func testEditPropagatesAndIsAlwaysMarked() async throws {
+        let (_, alice, bob) = try await pairedConversation()
+
+        await alice.model.sendMessage("teh plan", to: conv)
+        _ = try await bob.coordinator.syncOnce()
+        let line = try XCTUnwrap(alice.model.threadLines[conv]?.last)
+
+        // Alice edits through the UI path (startEdit + sendMessageOrReply).
+        alice.model.startEdit(of: line, in: conv)
+        await alice.model.sendMessageOrReply("the plan", to: conv)
+        let mine = try XCTUnwrap(alice.model.threadLines[conv]?.first { $0.id == line.id })
+        XCTAssertEqual(mine.quotableText, "the plan")
+        XCTAssertTrue(mine.edited, "an edit is visible, never silent")
+
+        _ = try await bob.coordinator.syncOnce()
+        let theirs = try XCTUnwrap(
+            bob.model.threadLines[conv]?.first { $0.messageID == line.messageID })
+        XCTAssertEqual(theirs.quotableText, "the plan")
+        XCTAssertTrue(theirs.edited)
+
+        // Bob cannot start an edit of alice's message (mine gate) — nothing changes.
+        bob.model.startEdit(of: theirs, in: conv)
+        XCTAssertNil(bob.model.editDrafts[conv], "only the author may edit")
+    }
+}

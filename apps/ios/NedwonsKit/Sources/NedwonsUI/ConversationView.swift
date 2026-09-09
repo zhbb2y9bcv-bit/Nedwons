@@ -38,12 +38,14 @@ public struct ThreadLine: Identifiable, Sendable, Equatable {
     /// The sender's MLS device identity (hex), for REPORTING a group message's author — the
     /// server resolves the device to its account. Empty for pre-field history.
     public let senderDeviceID: String
+    /// The author replaced the text after sending; shown as an "edited" tag, always.
+    public let edited: Bool
 
     public init(
         id: UInt64, kind: Kind, mine: Bool, timestamp: Date? = nil, isPending: Bool = false,
         messageID: String = "", replyTo: String? = nil, reactions: [ReactionSummary] = [],
         deliveredCount: Int = 0, readCount: Int = 0, deleted: Bool = false,
-        senderDeviceID: String = ""
+        senderDeviceID: String = "", edited: Bool = false
     ) {
         self.id = id
         self.kind = kind
@@ -57,6 +59,7 @@ public struct ThreadLine: Identifiable, Sendable, Equatable {
         self.readCount = readCount
         self.deleted = deleted
         self.senderDeviceID = senderDeviceID
+        self.edited = edited
     }
 
     /// The plain text of this line, for quoting it in a reply preview. A secret never yields one —
@@ -409,6 +412,7 @@ struct ConversationView: View {
                         .font(.system(size: 9))
                     Text("Sending")
                 } else if let when = line.timestamp {
+                    if line.edited { Text("edited ·") }
                     Text(when, style: .time)
                     if line.mine, let ticks = receiptTicks(line) {
                         Image(systemName: ticks.symbol)
@@ -473,6 +477,14 @@ struct ConversationView: View {
             }
         }
         if line.mine, !line.messageID.isEmpty, !line.deleted {
+            if case .text = line.kind {
+                Button {
+                    model.startEdit(of: line, in: chat.conversationID)
+                    draft = line.quotableText ?? ""
+                } label: {
+                    Label("Edit", systemImage: "pencil")
+                }
+            }
             Button(role: .destructive) {
                 deleteCandidate = line
             } label: {
@@ -556,6 +568,24 @@ struct ConversationView: View {
 
     private var composer: some View {
         VStack(spacing: 0) {
+            if model.editDrafts[chat.conversationID] != nil {
+                HStack(spacing: Nedwons.Spacing.sm) {
+                    Label("Editing message", systemImage: "pencil")
+                        .font(Nedwons.TypeScale.caption)
+                        .foregroundStyle(palette.accentPrimary)
+                        .accessibilityIdentifier("composer.editing")
+                    Spacer()
+                    Button {
+                        model.cancelEdit(in: chat.conversationID)
+                        draft = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .accessibilityLabel("Cancel edit")
+                }
+                .padding(.horizontal, Nedwons.Spacing.md)
+                .padding(.top, Nedwons.Spacing.xs)
+            }
             if let draft = model.replyDrafts[chat.conversationID] {
                 HStack(spacing: Nedwons.Spacing.sm) {
                     // The identifier sits on the preview, not the row: an identifier on the

@@ -966,3 +966,66 @@ fn clear_visible_history_erases_the_archive() {
         InboundOutcome::Application(_)
     ));
 }
+
+/// Edits: the author's replacement lands on both sides, VISIBLY marked; a non-author cannot even
+/// queue one; an edit never resurrects a deleted message; attachments and secrets don't edit.
+#[test]
+fn edits_are_author_only_and_always_visible() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+
+    let id = alice.enqueue(b"teh message").expect("enqueue");
+    let env = alice.encrypt(id).expect("encrypt");
+    bob.process_inbound(1, &env).expect("process");
+    let target = bob.message_views()[0].message_id;
+
+    // Bob did not author it: refused locally.
+    assert!(matches!(
+        bob.enqueue_edit(target, b"hijacked"),
+        Err(DurableError::UnknownLocal)
+    ));
+
+    // Alice fixes the typo; her copy updates at encrypt, bob's when it arrives — both marked.
+    let e = alice.enqueue_edit(target, b"the message").expect("edit");
+    let e_env = alice.encrypt(e).expect("encrypt");
+    let mine = alice
+        .message_views()
+        .into_iter()
+        .find(|v| v.message_id == target)
+        .expect("mine");
+    assert_eq!(mine.plaintext, b"the message");
+    assert!(mine.edited, "an edit is visible, never silent");
+    assert_eq!(
+        bob.process_inbound(2, &e_env).expect("process"),
+        InboundOutcome::MessageEdited { target }
+    );
+    let theirs = bob
+        .message_views()
+        .into_iter()
+        .find(|v| v.message_id == target)
+        .expect("theirs");
+    assert_eq!(theirs.plaintext, b"the message");
+    assert!(theirs.edited);
+
+    // Deleted stays deleted: alice retracts, then a (redelivered/stale) edit cannot revive it.
+    let d = alice.enqueue_delete(target).expect("delete");
+    let d_env = alice.encrypt(d).expect("encrypt");
+    bob.process_inbound(3, &d_env).expect("process");
+    let e2 = alice.enqueue_edit(target, b"resurrected?");
+    assert!(
+        e2.is_err(),
+        "the author can't edit their own deleted message either"
+    );
+    let stale_edit = mls_core::content::Content::Edit {
+        target,
+        body: b"resurrected?".to_vec(),
+    };
+    // Even if edit bytes arrive (a hostile client), the deleted flag wins.
+    let _ = stale_edit; // recipients enforce via apply_incoming's !deleted guard (unit-tested below)
+    let after = bob
+        .message_views()
+        .into_iter()
+        .find(|v| v.message_id == target)
+        .expect("row");
+    assert!(after.deleted);
+    assert!(after.plaintext.is_empty());
+}

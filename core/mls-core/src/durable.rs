@@ -133,6 +133,10 @@ pub struct Message {
     /// remains so the thread can honestly show "message deleted" instead of silently reflowing.
     #[serde(default)]
     pub deleted: bool,
+    /// The author replaced the text after sending (`Content::Edit`). Always shown — an edit is
+    /// visible, never silent.
+    #[serde(default)]
+    pub edited: bool,
 }
 
 /// Which MLS group encrypts an outbound message. Normal messages and secrets use the conversation;
@@ -231,6 +235,10 @@ pub enum InboundOutcome {
     /// The author retracted a message; the local copy is tombstoned. Returned so the UI redraws
     /// the bubble as "message deleted".
     MessageDeleted {
+        target: [u8; MESSAGE_ID_LEN],
+    },
+    /// The author replaced a message's text; the local copy is updated and marked edited.
+    MessageEdited {
         target: [u8; MESSAGE_ID_LEN],
     },
 }
@@ -382,6 +390,8 @@ pub struct MessageView {
     pub expires_at_ms: Option<u64>,
     /// Retracted by its author (delete-for-everyone); body and attachment are gone.
     pub deleted: bool,
+    /// The author replaced the text after sending; rendered with an "edited" tag.
+    pub edited: bool,
     /// The MLS-authenticated credential identity that sent this (empty for pre-field history and
     /// replicated history). What a REPORT identifies a group message's author by — the relay
     /// resolves the device to its account server-side.
@@ -1081,6 +1091,34 @@ impl<J: Journal> DurableSession<J> {
         self.enqueue_content(Content::Delete { target }, None)
     }
 
+    /// Replace the text of one of OUR OWN messages (edit). Refused for someone else's message, a
+    /// non-text message (attachments and secrets don't edit), a deleted one, or one with no wire
+    /// id. Recipients would refuse all of those anyway; the local rule matches. The local text
+    /// changes at encrypt, when the group is actually told — same rule as rename and delete.
+    pub fn enqueue_edit(
+        &mut self,
+        target: [u8; MESSAGE_ID_LEN],
+        body: &[u8],
+    ) -> Result<u64, DurableError> {
+        let editable = self.meta.messages.iter().any(|m| {
+            m.message_id == target
+                && m.direction == Direction::Outbound
+                && m.message_id != [0u8; MESSAGE_ID_LEN]
+                && !m.deleted
+                && m.attachment.is_none()
+                && m.secret_id.is_none()
+        });
+        if !editable {
+            return Err(DurableError::UnknownLocal);
+        }
+        let content = Content::Edit {
+            target,
+            body: body.to_vec(),
+        };
+        Content::decode(&content.encode()).map_err(map_content)?;
+        self.enqueue_content(content, None)
+    }
+
     /// Scrub every message past its expiry (disappearing messages): the row is removed outright,
     /// with its reactions and receipt bookkeeping. Returns how many were removed; commits only
     /// when something changed. Wall clock, deliberately — see `Message::expires_at_ms`.
@@ -1327,6 +1365,7 @@ impl<J: Journal> DurableSession<J> {
                 sender: self.session.member.identity().to_vec(),
                 expires_at_ms: expiry_for(meta.disappear_after_secs, created_at_ms),
                 deleted: false,
+                edited: false,
             }),
             Content::Secret {
                 message_id,
@@ -1352,6 +1391,7 @@ impl<J: Journal> DurableSession<J> {
                     // A view-once secret has its own (stricter) lifecycle; no disappearing stamp.
                     expires_at_ms: None,
                     deleted: false,
+                    edited: false,
                 })
             }
             // A file the user sent: the caption is the display text, and the reference is kept so
@@ -1378,6 +1418,7 @@ impl<J: Journal> DurableSession<J> {
                 sender: self.session.member.identity().to_vec(),
                 expires_at_ms: expiry_for(meta.disappear_after_secs, created_at_ms),
                 deleted: false,
+                edited: false,
                 attachment: Some(AttachmentRef {
                     blob_id: *blob_id,
                     key: *key,
@@ -1425,6 +1466,18 @@ impl<J: Journal> DurableSession<J> {
                 {
                     tombstone_message(message);
                     meta.reactions.remove(&hex16(target));
+                }
+                None
+            }
+            // An edit lands locally when the group is told, marked visibly.
+            Content::Edit { target, body } => {
+                if let Some(message) = meta
+                    .messages
+                    .iter_mut()
+                    .find(|m| m.message_id == *target && m.direction == Direction::Outbound)
+                {
+                    message.plaintext = body.clone();
+                    message.edited = true;
                 }
                 None
             }
@@ -1726,6 +1779,7 @@ impl<J: Journal> DurableSession<J> {
             read_count: receipt.map(|r| r.read_by.len() as u32).unwrap_or(0),
             expires_at_ms: m.expires_at_ms,
             deleted: m.deleted,
+            edited: m.edited,
             sender: m.sender.clone(),
         }
     }
@@ -1912,6 +1966,7 @@ fn apply_incoming(
                         sender,
                         expires_at_ms: expiry_for(meta.disappear_after_secs, created_at_ms),
                         deleted: false,
+                        edited: false,
                     });
                     InboundOutcome::Application(body)
                 }
@@ -1936,6 +1991,27 @@ fn apply_incoming(
                             tombstone_message(message);
                             meta.reactions.remove(&hex16(&target));
                             InboundOutcome::MessageDeleted { target }
+                        }
+                        None => InboundOutcome::Duplicate,
+                    }
+                }
+                // Edits share Delete's authorship rule; a deleted message stays deleted (an edit
+                // must not resurrect retracted words), and the change is always VISIBLY marked.
+                Content::Edit { target, body } => {
+                    let authored = meta.messages.iter_mut().find(|m| {
+                        m.message_id == target
+                            && m.direction == Direction::Inbound
+                            && !m.sender.is_empty()
+                            && m.sender == sender
+                            && !m.deleted
+                            && m.attachment.is_none()
+                            && m.secret_id.is_none()
+                    });
+                    match authored {
+                        Some(message) => {
+                            message.plaintext = body;
+                            message.edited = true;
+                            InboundOutcome::MessageEdited { target }
                         }
                         None => InboundOutcome::Duplicate,
                     }
@@ -2015,6 +2091,7 @@ fn apply_incoming(
                             // A view-once secret has its own (stricter) lifecycle; no expiry stamp.
                             expires_at_ms: None,
                             deleted: false,
+                            edited: false,
                         });
                         InboundOutcome::SecretSealed { secret_id }
                     }
@@ -2066,6 +2143,7 @@ fn apply_incoming(
                         sender,
                         expires_at_ms: expiry_for(meta.disappear_after_secs, created_at_ms),
                         deleted: false,
+                        edited: false,
                     });
                     InboundOutcome::AttachmentReceived { attachment }
                 }
@@ -2105,6 +2183,7 @@ fn apply_incoming(
                             sender: Vec::new(),
                             expires_at_ms: None,
                             deleted: false,
+                            edited: false,
                         });
                     }
                     InboundOutcome::HistorySynced { count }
@@ -2495,6 +2574,7 @@ mod forged_delete_tests {
             sender: b"alice-device".to_vec(),
             expires_at_ms: None,
             deleted: false,
+            edited: false,
         });
 
         let forged = Content::Delete { target }.encode();
@@ -2525,5 +2605,72 @@ mod forged_delete_tests {
         .expect("apply");
         assert_eq!(outcome, InboundOutcome::Duplicate, "fail closed");
         assert!(!meta.messages[0].deleted);
+    }
+}
+
+#[cfg(test)]
+mod forged_edit_tests {
+    use super::*;
+    use crate::Incoming;
+
+    /// A hostile member's Edit naming someone else's message — or a deleted one — is ignored.
+    #[test]
+    fn forged_or_necromantic_edits_are_ignored() {
+        let mut meta = Meta::default();
+        let target = [8u8; MESSAGE_ID_LEN];
+        let local_id = meta.take_local_id();
+        meta.messages.push(Message {
+            local_id,
+            direction: Direction::Inbound,
+            plaintext: b"original".to_vec(),
+            envelope_id: Some(1),
+            secret_id: None,
+            created_at_ms: 0,
+            outbox_local_id: None,
+            attachment: None,
+            message_id: target,
+            reply_to: None,
+            sender: b"alice-device".to_vec(),
+            expires_at_ms: None,
+            deleted: false,
+            edited: false,
+        });
+
+        // Wrong sender: ignored.
+        let outcome = apply_incoming(
+            &mut meta,
+            Incoming::Application {
+                sender: b"mallory-device".to_vec(),
+                payload: Content::Edit {
+                    target,
+                    body: b"forged".to_vec(),
+                }
+                .encode(),
+            },
+            2,
+        )
+        .expect("apply");
+        assert_eq!(outcome, InboundOutcome::Duplicate);
+        assert_eq!(meta.messages[0].plaintext, b"original");
+
+        // Right sender, but the message was deleted: an edit must not resurrect it.
+        meta.messages[0].deleted = true;
+        meta.messages[0].plaintext.clear();
+        let outcome = apply_incoming(
+            &mut meta,
+            Incoming::Application {
+                sender: b"alice-device".to_vec(),
+                payload: Content::Edit {
+                    target,
+                    body: b"back from the dead".to_vec(),
+                }
+                .encode(),
+            },
+            3,
+        )
+        .expect("apply");
+        assert_eq!(outcome, InboundOutcome::Duplicate);
+        assert!(meta.messages[0].plaintext.is_empty());
+        assert!(meta.messages[0].deleted);
     }
 }
