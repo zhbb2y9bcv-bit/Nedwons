@@ -1,0 +1,117 @@
+# Release workflow: the gate that CI deliberately does NOT enforce.
+#
+# The split matters. Pull-request CI blocks on things a contributor can fix — a failing test, a
+# fake job, a licence violation. It does NOT block on `R-503` (external penetration test, mobile
+# assessment, infrastructure and cryptographic review), because that risk is open by definition
+# until outside specialists are engaged, and a permanently red CI is a CI everyone learns to
+# ignore. A RELEASE is exactly where that risk must bite: shipping while the project's own register
+# says the crypto has never been externally reviewed is the failure this file exists to prevent.
+#
+# Nothing here is a substitute for those reviews. It refuses to ship until they are recorded as
+# done — it cannot tell whether they were done well.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: release gate (blocking)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Blocking mode: any Critical + OPEN risk, or any placeholder CI job, stops the release.
+      # Downgrading a risk is allowed — but it must be written into RISK_REGISTER.md with the
+      # reasoning, so the decision is recorded rather than made silently by a flag.
+      - name: Gate self-test
+        run: python3 scripts/release_gate.py --self-test
+      - name: Risk register + placeholder gate
+        run: python3 scripts/release_gate.py --explain
+
+  verify:
+    name: full matrix must be green
+    runs-on: ubuntu-latest
+    needs: gate
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: nedwons_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost/nedwons_test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Backend (fmt, clippy, tests against real Postgres)
+        working-directory: services
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace
+      - name: mls-core
+        working-directory: core/mls-core
+        run: cargo test
+      - name: mls-ffi
+        working-directory: core/mls-ffi
+        run: cargo test
+      # Migrations must apply to a genuinely empty database, not only to the one that happens to
+      # already be migrated. A release that cannot bootstrap a fresh database is not releasable.
+      - name: Migration smoke (empty + seeded)
+        working-directory: services
+        run: cargo test -p nedwons-api --test schema_integrity
+
+  artifacts:
+    name: SBOM + signed provenance
+    runs-on: ubuntu-latest
+    needs: verify
+    permissions:
+      contents: read
+      id-token: write        # required to sign the provenance statement
+      attestations: write    # required to record it against the repository
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+      # A release without an SBOM cannot be audited after the fact: when the next advisory lands,
+      # "was this version affected?" has no answer. `if-no-files-found: error` means a silently
+      # empty SBOM fails the release rather than shipping an empty promise.
+      - name: Generate SBOMs
+        run: scripts/generate_sbom.sh
+      - name: Build the release binary
+        working-directory: services
+        run: cargo build --release -p nedwons-api
+      # Signed SLSA provenance binds the artifact to this exact commit, workflow and runner, so a
+      # binary claiming to be this release can be checked rather than trusted.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            services/target/release/nedwons-api
+            sbom/*.cdx.json
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: |
+            services/target/release/nedwons-api
+            sbom/*.cdx.json
+          if-no-files-found: error
