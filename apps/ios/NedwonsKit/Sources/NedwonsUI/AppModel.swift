@@ -461,6 +461,21 @@ public final class AppModel: ObservableObject {
         readReceiptsControl?(enabled)
     }
 
+    /// Whether this device broadcasts a typing indicator while the user composes. ON by default.
+    /// When off, no "…is typing" is ever sent — composing stops being visible to anyone. Persisted;
+    /// the coordinator reads it through `typingIndicatorControl`.
+    @Published public var typingIndicatorsEnabled: Bool = UserDefaults.standard.object(
+        forKey: "nedwons.typingIndicators") as? Bool ?? true
+    /// Set by the coordinator to apply the choice to the typing path.
+    public var typingIndicatorControl: ((Bool) -> Void)?
+
+    /// Turn typing indicators on or off: remember it and tell the coordinator.
+    public func setTypingIndicators(_ enabled: Bool) {
+        typingIndicatorsEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "nedwons.typingIndicators")
+        typingIndicatorControl?(enabled)
+    }
+
     /// Per-chat local presentation preferences (pin / archive / mute). Never sent to the relay.
     @Published public internal(set) var chatPrefs = ChatPrefs()
     public var chatPrefsStore: ChatPrefsStoring = UserDefaultsChatPrefsStore()

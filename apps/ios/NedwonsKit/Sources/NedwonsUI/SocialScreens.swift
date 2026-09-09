@@ -304,6 +304,7 @@ struct SettingsRootView: View {
                 Section {
                     NavigationLink("Blocked") { BlockedUsersView(model: model) }
                     ReadReceiptsToggleRow(model: model)
+                    TypingIndicatorsToggleRow(model: model)
                     DiagnosticsToggleRow(model: model)
                     CoverTrafficToggleRow(model: model)
                 } header: {
@@ -775,6 +776,27 @@ struct ReadReceiptsToggleRow: View {
             Text(
                 "On by default. When off, people you message still see that a message was delivered, "
                     + "but never that you read it. It applies to messages from here on.")
+                .font(Nedwons.TypeScale.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// Typing-indicator control. ON by default, like the big messengers; off means nobody is told
+/// when you are composing.
+struct TypingIndicatorsToggleRow: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Nedwons.Spacing.xxs) {
+            Toggle(
+                "Share typing indicators",
+                isOn: Binding(
+                    get: { model.typingIndicatorsEnabled },
+                    set: { model.setTypingIndicators($0) })
+            )
+            .accessibilityIdentifier("settings.typingIndicators")
+            Text("On by default. When off, people you message won't see when you're typing.")
                 .font(Nedwons.TypeScale.caption)
                 .foregroundStyle(.secondary)
         }
