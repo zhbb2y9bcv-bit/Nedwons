@@ -23,7 +23,10 @@ use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
 use crate::attachment::AttachmentRef;
-use crate::content::{Content, ContentError, HistoryEntry, DELIVERY_KEY_LEN, SECRET_ID_LEN};
+use crate::content::{
+    Content, ContentError, HistoryEntry, ReceiptKind, DELIVERY_KEY_LEN, MESSAGE_ID_LEN,
+    SECRET_ID_LEN,
+};
 use crate::secret::{SecretRecord, SecretSide, SecretState};
 use crate::{Conversation, Incoming, Member};
 
@@ -107,6 +110,14 @@ pub struct Message {
     /// as `None`.
     #[serde(default)]
     pub attachment: Option<AttachmentRef>,
+    /// The sender-chosen id every OTHER device knows this message by — what a reply, a reaction or
+    /// a receipt names. All-zero for messages logged before ids existed; those simply cannot be
+    /// referred to, which is better than pretending an id we never received.
+    #[serde(default)]
+    pub message_id: [u8; MESSAGE_ID_LEN],
+    /// The message this one answers, if any.
+    #[serde(default)]
+    pub reply_to: Option<[u8; MESSAGE_ID_LEN]>,
 }
 
 /// Which MLS group encrypts an outbound message. Normal messages and secrets use the conversation;
@@ -183,6 +194,20 @@ pub enum InboundOutcome {
     AttachmentReceived {
         attachment: AttachmentRef,
     },
+    /// Someone reacted to (or un-reacted from) a message this device holds.
+    ReactionChanged {
+        target: [u8; MESSAGE_ID_LEN],
+    },
+    /// Someone acknowledged `count` of OUR messages. Ids naming anything else were discarded.
+    ReceiptsReceived {
+        kind: ReceiptKind,
+        count: u64,
+    },
+    /// Ephemeral: someone started or stopped typing. Nothing was persisted.
+    Typing {
+        sender: Vec<u8>,
+        active: bool,
+    },
 }
 
 /// Travels in the committed blob alongside the MLS store snapshot.
@@ -220,6 +245,19 @@ struct Meta {
     /// the UI then falls back to describing the group by its members. Never sent to the relay.
     #[serde(default)]
     group_name: Option<String>,
+    /// Reactions, keyed by the hex of the message they are attached to. Bounded per message, and
+    /// only kept for messages this device actually has — see `apply_reaction`.
+    #[serde(default)]
+    reactions: BTreeMap<String, Vec<Reaction>>,
+    /// Who has received/read the messages THIS device sent, keyed by hex message id. Only our own
+    /// outbound messages get an entry: a receipt naming anything else is discarded.
+    #[serde(default)]
+    receipts: BTreeMap<String, ReceiptRecord>,
+    /// Ids we have already sent a delivered/read receipt for, so a sync never re-sends one.
+    #[serde(default)]
+    sent_delivery_receipts: BTreeSet<String>,
+    #[serde(default)]
+    sent_read_receipts: BTreeSet<String>,
     /// The highest local id the user has seen; everything above it that is INBOUND is unread.
     ///
     /// `Option`, not a bare `u64`, because local ids start at **0**: a sentinel of 0 would make the
@@ -244,6 +282,25 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// One person's reaction to one message. The sender is the MLS-authenticated credential identity,
+/// so a member cannot attribute a reaction to someone else.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub struct Reaction {
+    pub emoji: String,
+    pub sender: Vec<u8>,
+}
+
+/// Who acknowledged one of our own messages. Sets, so a redelivered receipt cannot inflate a count.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Eq, Debug)]
+pub struct ReceiptRecord {
+    pub delivered_by: BTreeSet<Vec<u8>>,
+    pub read_by: BTreeSet<Vec<u8>>,
+}
+
+/// A cap on reactions kept per message. A group member who spams distinct emoji must not be able to
+/// grow another device's durable blob without bound; past this, further reactions are dropped.
+const MAX_REACTIONS_PER_MESSAGE: usize = 64;
+
 /// A message plus the delivery state the UI needs, resolved against the outbox at read time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageView {
@@ -258,6 +315,61 @@ pub struct MessageView {
     pub pending: bool,
     /// `Some` when this message is a file; `plaintext` is then its caption.
     pub attachment: Option<AttachmentRef>,
+    pub message_id: [u8; MESSAGE_ID_LEN],
+    /// The message this one answers; the UI resolves it against the log to render a quote.
+    pub reply_to: Option<[u8; MESSAGE_ID_LEN]>,
+    /// Reactions on this message, as currently known.
+    pub reactions: Vec<Reaction>,
+    /// For OUR OWN messages: how many other members have received it, and how many have read it.
+    /// Always (0, 0) for inbound — a receipt is something we send about someone else's message.
+    pub delivered_count: u32,
+    pub read_count: u32,
+}
+
+/// Add or remove one person's reaction, idempotently: reacting twice with the same emoji is one
+/// reaction, and removing one that is not there is a no-op. Bounded per message.
+fn apply_reaction(
+    meta: &mut Meta,
+    target: &[u8; MESSAGE_ID_LEN],
+    emoji: &str,
+    remove: bool,
+    sender: &[u8],
+) {
+    let entry = meta.reactions.entry(hex16(target)).or_default();
+    let existing = entry
+        .iter()
+        .position(|r| r.sender == sender && r.emoji == emoji);
+    match (remove, existing) {
+        (true, Some(i)) => {
+            entry.remove(i);
+        }
+        (false, None) if entry.len() < MAX_REACTIONS_PER_MESSAGE => entry.push(Reaction {
+            emoji: emoji.to_string(),
+            sender: sender.to_vec(),
+        }),
+        _ => {}
+    }
+    if entry.is_empty() {
+        meta.reactions.remove(&hex16(target));
+    }
+}
+
+/// A fresh message id. Random rather than a counter: ids are shared with the group, and a counter
+/// would tell every member how much this device has ever sent.
+fn new_message_id() -> [u8; MESSAGE_ID_LEN] {
+    let mut id = [0u8; MESSAGE_ID_LEN];
+    OsRng.fill_bytes(&mut id);
+    id
+}
+
+/// Hex of a 16-byte id, for JSON map keys.
+fn hex16(id: &[u8; MESSAGE_ID_LEN]) -> String {
+    let mut s = String::with_capacity(MESSAGE_ID_LEN * 2);
+    for b in id {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// JSON object keys must be strings, so the raw `[u8; 16]` can't be one.
@@ -785,12 +897,117 @@ impl<J: Journal> DurableSession<J> {
 
     /// Durable draft; does NOT advance the ratchet.
     pub fn enqueue(&mut self, body: &[u8]) -> Result<u64, DurableError> {
+        self.enqueue_reply(body, None)
+    }
+
+    /// As [`Self::enqueue`], optionally answering another message. A reply carries only the id it
+    /// answers — never a copy of the original's text, which a hostile client could otherwise use to
+    /// display words the quoted person never wrote.
+    pub fn enqueue_reply(
+        &mut self,
+        body: &[u8],
+        reply_to: Option<[u8; MESSAGE_ID_LEN]>,
+    ) -> Result<u64, DurableError> {
         self.enqueue_content(
             Content::Normal {
+                message_id: new_message_id(),
+                reply_to,
                 body: body.to_vec(),
             },
             None,
         )
+    }
+
+    /// React to a message (or, with `remove`, take the reaction back). The local view updates when
+    /// the reaction is encrypted, so what this device shows matches what the group was told.
+    pub fn enqueue_reaction(
+        &mut self,
+        target: [u8; MESSAGE_ID_LEN],
+        emoji: &str,
+        remove: bool,
+    ) -> Result<u64, DurableError> {
+        let content = Content::Reaction {
+            target,
+            emoji: emoji.to_string(),
+            remove,
+        };
+        // Refuse locally what every recipient's decoder would refuse anyway.
+        Content::decode(&content.encode()).map_err(map_content)?;
+        self.enqueue_content(content, None)
+    }
+
+    /// Acknowledge messages: `Delivered` when they decrypted here, `Read` when a person saw them.
+    /// Batched — a device returning from offline acknowledges a backlog in one message.
+    pub fn enqueue_receipt(
+        &mut self,
+        kind: ReceiptKind,
+        message_ids: Vec<[u8; MESSAGE_ID_LEN]>,
+    ) -> Result<u64, DurableError> {
+        let content = Content::Receipt { kind, message_ids };
+        Content::decode(&content.encode()).map_err(map_content)?;
+        self.enqueue_content(content, None)
+    }
+
+    /// A typing indicator. Ephemeral by design: nothing about it is logged on either side, and a
+    /// dropped one costs nothing, so the client is free to throttle hard.
+    pub fn enqueue_typing(&mut self, active: bool) -> Result<u64, DurableError> {
+        self.enqueue_content(Content::Typing { active }, None)
+    }
+
+    /// Reactions on a message, as currently known.
+    pub fn reactions(&self, message_id: &[u8; MESSAGE_ID_LEN]) -> &[Reaction] {
+        self.meta
+            .reactions
+            .get(&hex16(message_id))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Message ids received here that have not been acknowledged to their senders yet, oldest
+    /// first — what a `Delivered` receipt should name. Excludes our own messages and anything with
+    /// no id (logged before ids existed).
+    pub fn unacknowledged_inbound(&self, kind: ReceiptKind) -> Vec<[u8; MESSAGE_ID_LEN]> {
+        let sent = match kind {
+            ReceiptKind::Delivered => &self.meta.sent_delivery_receipts,
+            ReceiptKind::Read => &self.meta.sent_read_receipts,
+        };
+        self.meta
+            .messages
+            .iter()
+            .filter(|m| m.direction == Direction::Inbound && m.message_id != [0u8; MESSAGE_ID_LEN])
+            .filter(|m| match kind {
+                // A read receipt is only owed for something the user has actually seen.
+                ReceiptKind::Read => self
+                    .meta
+                    .last_read_local_id
+                    .is_some_and(|mark| m.local_id <= mark),
+                ReceiptKind::Delivered => true,
+            })
+            .map(|m| m.message_id)
+            .filter(|id| !sent.contains(&hex16(id)))
+            .take(crate::content::MAX_RECEIPT_IDS)
+            .collect()
+    }
+
+    /// Remember that receipts of `kind` were sent for these ids, so they are not sent again on
+    /// every sync — which would turn one delivered message into an unbounded stream of receipts.
+    pub fn record_receipts_sent(
+        &mut self,
+        kind: ReceiptKind,
+        ids: &[[u8; MESSAGE_ID_LEN]],
+    ) -> Result<(), DurableError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let mut meta = self.meta.clone();
+        let set = match kind {
+            ReceiptKind::Delivered => &mut meta.sent_delivery_receipts,
+            ReceiptKind::Read => &mut meta.sent_read_receipts,
+        };
+        for id in ids {
+            set.insert(hex16(id));
+        }
+        self.commit(meta)
     }
 
     /// Wrapping the body in a [`Content::Secret`] envelope encrypts the classification end-to-end,
@@ -803,6 +1020,7 @@ impl<J: Journal> DurableSession<J> {
         OsRng.fill_bytes(&mut secret_id);
         let local_id = self.enqueue_content(
             Content::Secret {
+                message_id: new_message_id(),
                 secret_id,
                 body: body.to_vec(),
             },
@@ -936,7 +1154,11 @@ impl<J: Journal> DurableSession<J> {
             .map(|o| o.created_at_ms)
             .unwrap_or_else(now_ms);
         let display = match &content {
-            Content::Normal { body } => Some(Message {
+            Content::Normal {
+                message_id,
+                reply_to,
+                body,
+            } => Some(Message {
                 local_id: local_id_for_msg,
                 direction: Direction::Outbound,
                 plaintext: body.clone(),
@@ -945,8 +1167,14 @@ impl<J: Journal> DurableSession<J> {
                 created_at_ms,
                 outbox_local_id: Some(local_id),
                 attachment: None,
+                message_id: *message_id,
+                reply_to: *reply_to,
             }),
-            Content::Secret { secret_id, .. } => {
+            Content::Secret {
+                message_id,
+                secret_id,
+                ..
+            } => {
                 meta.secrets.insert(
                     sid_key(secret_id),
                     SecretRecord::tombstone_sender(*secret_id),
@@ -960,11 +1188,14 @@ impl<J: Journal> DurableSession<J> {
                     created_at_ms,
                     outbox_local_id: Some(local_id),
                     attachment: None,
+                    message_id: *message_id,
+                    reply_to: None,
                 })
             }
             // A file the user sent: the caption is the display text, and the reference is kept so
             // this device can reopen the file later without asking anyone.
             Content::Attachment {
+                message_id,
                 blob_id,
                 key,
                 digest,
@@ -980,6 +1211,8 @@ impl<J: Journal> DurableSession<J> {
                 secret_id: None,
                 created_at_ms,
                 outbox_local_id: Some(local_id),
+                message_id: *message_id,
+                reply_to: None,
                 attachment: Some(AttachmentRef {
                     blob_id: *blob_id,
                     key: *key,
@@ -989,6 +1222,22 @@ impl<J: Journal> DurableSession<J> {
                     filename: filename.clone(),
                 }),
             }),
+            // The sender's own reaction shows when the group is told, not before — the same rule
+            // the rename follows, so the local view never runs ahead of what was sent.
+            Content::Reaction {
+                target,
+                emoji,
+                remove,
+            } => {
+                // The IDENTITY, not the public key: this must be the same value recipients derive
+                // from the MLS credential, or a device would not recognise its own reaction — and
+                // the toggle would add a second one instead of taking the first back.
+                let me = self.session.member.identity().to_vec();
+                apply_reaction(&mut meta, target, emoji, *remove, &me);
+                None
+            }
+            // Receipts and typing are about other people's messages, or about nothing at all.
+            Content::Receipt { .. } | Content::Typing { .. } => None,
             // The sender applies its own rename locally, at the moment the group actually learns
             // it — encrypt is the point of no return, so the local name can never run ahead of
             // what the other members were told.
@@ -1215,6 +1464,7 @@ impl<J: Journal> DurableSession<J> {
         caption: &str,
     ) -> Result<u64, DurableError> {
         let content = Content::Attachment {
+            message_id: new_message_id(),
             blob_id,
             key,
             digest,
@@ -1265,6 +1515,10 @@ impl<J: Journal> DurableSession<J> {
     }
 
     fn view(&self, m: &Message) -> MessageView {
+        // Receipts exist only for our own messages: nobody sends us acknowledgements of theirs.
+        let receipt = (m.direction == Direction::Outbound)
+            .then(|| self.meta.receipts.get(&hex16(&m.message_id)))
+            .flatten();
         let pending = m.direction == Direction::Outbound
             && m.outbox_local_id
                 .and_then(|id| self.meta.outbox.get(&id))
@@ -1280,6 +1534,11 @@ impl<J: Journal> DurableSession<J> {
             created_at_ms: m.created_at_ms,
             pending,
             attachment: m.attachment.clone(),
+            message_id: m.message_id,
+            reply_to: m.reply_to,
+            reactions: self.reactions(&m.message_id).to_vec(),
+            delivered_count: receipt.map(|r| r.delivered_by.len() as u32).unwrap_or(0),
+            read_count: receipt.map(|r| r.read_by.len() as u32).unwrap_or(0),
         }
     }
 
@@ -1332,119 +1591,188 @@ fn apply_incoming(
     envelope_id: u64,
 ) -> Result<InboundOutcome, DurableError> {
     Ok(match incoming {
-        Incoming::Application(payload) => match Content::decode(&payload).map_err(map_content)? {
-            Content::Normal { body } => {
-                let local_id = meta.take_local_id();
-                meta.messages.push(Message {
-                    local_id,
-                    direction: Direction::Inbound,
-                    plaintext: body.clone(),
-                    envelope_id: Some(envelope_id),
-                    secret_id: None,
-                    created_at_ms: now_ms(),
-                    outbox_local_id: None,
-                    attachment: None,
-                });
-                InboundOutcome::Application(body)
-            }
-            Content::Secret { secret_id, body } => {
-                if meta.secrets.contains_key(&sid_key(&secret_id)) {
-                    // A distinct envelope replaying a seen secret id: never grant a second
-                    // placeholder or viewing opportunity.
-                    InboundOutcome::Duplicate
-                } else {
+        // `sender` is the MLS-authenticated credential identity — the only trustworthy answer to
+        // "who did this", and what makes a reaction or a receipt attributable rather than claimed.
+        Incoming::Application { sender, payload } => {
+            match Content::decode(&payload).map_err(map_content)? {
+                Content::Normal {
+                    message_id,
+                    reply_to,
+                    body,
+                } => {
                     let local_id = meta.take_local_id();
-                    meta.secrets.insert(
-                        sid_key(&secret_id),
-                        SecretRecord::sealed_recipient(secret_id, body),
-                    );
                     meta.messages.push(Message {
                         local_id,
                         direction: Direction::Inbound,
-                        plaintext: Vec::new(),
+                        plaintext: body.clone(),
                         envelope_id: Some(envelope_id),
-                        secret_id: Some(secret_id),
+                        secret_id: None,
                         created_at_ms: now_ms(),
                         outbox_local_id: None,
                         attachment: None,
+                        message_id,
+                        reply_to,
                     });
-                    InboundOutcome::SecretSealed { secret_id }
+                    InboundOutcome::Application(body)
                 }
-            }
-            // ADR-0015: another device revealed this secret; force-consume our copy so it can never
-            // be opened here. A device that never held it no-ops.
-            Content::SecretConsumed { secret_id } => {
-                if let Some(rec) = meta.secrets.get_mut(&sid_key(&secret_id)) {
-                    rec.consume();
+                // A reaction to a message this device does not have is DROPPED, not stored for later:
+                // keeping it would let any member grow this blob without bound by reacting to ids they
+                // invent. The cost is a reaction that arrives before its message is lost, which is
+                // rare and self-correcting on the next one.
+                Content::Reaction {
+                    target,
+                    emoji,
+                    remove,
+                } => {
+                    let known = meta.messages.iter().any(|m| m.message_id == target);
+                    if known {
+                        apply_reaction(meta, &target, &emoji, remove, &sender);
+                        InboundOutcome::ReactionChanged { target }
+                    } else {
+                        InboundOutcome::Duplicate
+                    }
                 }
-                InboundOutcome::SecretConsumedRemotely { secret_id }
-            }
-            // ADR-0014 Slice 2c: surfaced for the client to store keyed by sender; no log entry.
-            Content::DeliveryKeyGrant { key_r } => InboundOutcome::DeliveryKeyGranted { key_r },
-            // A file: logged now, fetched from the relay when the user opens it (or eagerly by the
-            // client). The reference — including its key — is durable, so a relaunch can still open
-            // it.
-            Content::Attachment {
-                blob_id,
-                key,
-                digest,
-                size,
-                mime,
-                filename,
-                caption,
-            } => {
-                let local_id = meta.take_local_id();
-                let attachment = AttachmentRef {
+                // Receipts are only accepted for messages WE sent; anything else is discarded for the
+                // same bounding reason, and would be meaningless anyway.
+                Content::Receipt { kind, message_ids } => {
+                    let mut applied = 0u64;
+                    for id in message_ids {
+                        let ours = meta
+                            .messages
+                            .iter()
+                            .any(|m| m.direction == Direction::Outbound && m.message_id == id);
+                        if !ours {
+                            continue;
+                        }
+                        let record = meta.receipts.entry(hex16(&id)).or_default();
+                        let set = match kind {
+                            ReceiptKind::Delivered => &mut record.delivered_by,
+                            ReceiptKind::Read => &mut record.read_by,
+                        };
+                        set.insert(sender.clone());
+                        applied += 1;
+                    }
+                    InboundOutcome::ReceiptsReceived {
+                        kind,
+                        count: applied,
+                    }
+                }
+                // Never logged and never persisted beyond the dedup bookkeeping every envelope gets:
+                // a typing indicator is a hint, and a stale one is worse than none.
+                Content::Typing { active } => InboundOutcome::Typing { sender, active },
+                Content::Secret {
+                    message_id,
+                    secret_id,
+                    body,
+                } => {
+                    if meta.secrets.contains_key(&sid_key(&secret_id)) {
+                        // A distinct envelope replaying a seen secret id: never grant a second
+                        // placeholder or viewing opportunity.
+                        InboundOutcome::Duplicate
+                    } else {
+                        let local_id = meta.take_local_id();
+                        meta.secrets.insert(
+                            sid_key(&secret_id),
+                            SecretRecord::sealed_recipient(secret_id, body),
+                        );
+                        meta.messages.push(Message {
+                            local_id,
+                            direction: Direction::Inbound,
+                            plaintext: Vec::new(),
+                            envelope_id: Some(envelope_id),
+                            secret_id: Some(secret_id),
+                            created_at_ms: now_ms(),
+                            outbox_local_id: None,
+                            attachment: None,
+                            message_id,
+                            reply_to: None,
+                        });
+                        InboundOutcome::SecretSealed { secret_id }
+                    }
+                }
+                // ADR-0015: another device revealed this secret; force-consume our copy so it can never
+                // be opened here. A device that never held it no-ops.
+                Content::SecretConsumed { secret_id } => {
+                    if let Some(rec) = meta.secrets.get_mut(&sid_key(&secret_id)) {
+                        rec.consume();
+                    }
+                    InboundOutcome::SecretConsumedRemotely { secret_id }
+                }
+                // ADR-0014 Slice 2c: surfaced for the client to store keyed by sender; no log entry.
+                Content::DeliveryKeyGrant { key_r } => InboundOutcome::DeliveryKeyGranted { key_r },
+                // A file: logged now, fetched from the relay when the user opens it (or eagerly by the
+                // client). The reference — including its key — is durable, so a relaunch can still open
+                // it.
+                Content::Attachment {
+                    message_id,
                     blob_id,
                     key,
                     digest,
                     size,
                     mime,
                     filename,
-                };
-                meta.messages.push(Message {
-                    local_id,
-                    direction: Direction::Inbound,
-                    plaintext: caption.into_bytes(),
-                    envelope_id: Some(envelope_id),
-                    secret_id: None,
-                    created_at_ms: now_ms(),
-                    outbox_local_id: None,
-                    attachment: Some(attachment.clone()),
-                });
-                InboundOutcome::AttachmentReceived { attachment }
-            }
-            // A member renamed the group. Persisted with the rest of this commit, so the name and
-            // the ratchet advance land together or not at all.
-            Content::GroupName { name } => {
-                meta.group_name = Some(name.clone());
-                InboundOutcome::GroupRenamed { name }
-            }
-            // #7: append replicated history to the local log, each with a fresh local id.
-            Content::HistorySync { entries } => {
-                let count = entries.len() as u64;
-                for e in entries {
+                    caption,
+                } => {
                     let local_id = meta.take_local_id();
+                    let attachment = AttachmentRef {
+                        blob_id,
+                        key,
+                        digest,
+                        size,
+                        mime,
+                        filename,
+                    };
                     meta.messages.push(Message {
                         local_id,
-                        direction: if e.outbound {
-                            Direction::Outbound
-                        } else {
-                            Direction::Inbound
-                        },
-                        plaintext: e.body,
-                        envelope_id: None, // synced, not decrypted from a server envelope
+                        direction: Direction::Inbound,
+                        plaintext: caption.into_bytes(),
+                        envelope_id: Some(envelope_id),
                         secret_id: None,
-                        // Stamped on arrival: the sync carries no times, and inventing one would
-                        // be a claim this device cannot support.
                         created_at_ms: now_ms(),
                         outbox_local_id: None,
-                        attachment: None,
+                        attachment: Some(attachment.clone()),
+                        message_id,
+                        reply_to: None,
                     });
+                    InboundOutcome::AttachmentReceived { attachment }
                 }
-                InboundOutcome::HistorySynced { count }
+                // A member renamed the group. Persisted with the rest of this commit, so the name and
+                // the ratchet advance land together or not at all.
+                Content::GroupName { name } => {
+                    meta.group_name = Some(name.clone());
+                    InboundOutcome::GroupRenamed { name }
+                }
+                // #7: append replicated history to the local log, each with a fresh local id.
+                Content::HistorySync { entries } => {
+                    let count = entries.len() as u64;
+                    for e in entries {
+                        let local_id = meta.take_local_id();
+                        meta.messages.push(Message {
+                            local_id,
+                            direction: if e.outbound {
+                                Direction::Outbound
+                            } else {
+                                Direction::Inbound
+                            },
+                            plaintext: e.body,
+                            envelope_id: None, // synced, not decrypted from a server envelope
+                            secret_id: None,
+                            // Stamped on arrival: the sync carries no times, and inventing one would
+                            // be a claim this device cannot support.
+                            created_at_ms: now_ms(),
+                            outbox_local_id: None,
+                            attachment: None,
+                            // Replicated history carries no ids, so these messages cannot be replied
+                            // to or reacted to on the new device. Minting ids here would invent
+                            // handles no other member knows.
+                            message_id: [0u8; MESSAGE_ID_LEN],
+                            reply_to: None,
+                        });
+                    }
+                    InboundOutcome::HistorySynced { count }
+                }
             }
-        },
+        }
         Incoming::StateAdvanced => InboundOutcome::StateAdvanced,
     })
 }

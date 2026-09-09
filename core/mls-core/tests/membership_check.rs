@@ -36,7 +36,7 @@ fn matching_add_commit_is_merged_and_group_advances() {
     let mut group_c = carol.join_from_welcome(&add_carol.welcome).unwrap();
     let envelope = group_a.encrypt(&alice, b"hi all").unwrap();
     match group_c.process(&carol, &envelope).unwrap() {
-        Incoming::Application(pt) => assert_eq!(pt, b"hi all"),
+        Incoming::Application { payload: pt, .. } => assert_eq!(pt, b"hi all"),
         _ => panic!("expected application message"),
     }
 }
@@ -287,7 +287,7 @@ fn discarded_stage_leaves_state_untouched_and_can_be_rebuilt() {
     let mut group_d = dave.join_from_welcome(&staged.welcome).unwrap();
     let envelope = group_a.encrypt(&alice, b"hi dave").unwrap();
     match group_d.process(&dave, &envelope).unwrap() {
-        Incoming::Application(pt) => assert_eq!(pt, b"hi dave"),
+        Incoming::Application { payload: pt, .. } => assert_eq!(pt, b"hi dave"),
         _ => panic!("expected application message"),
     }
 }

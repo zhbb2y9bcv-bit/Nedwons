@@ -372,6 +372,31 @@
             model.renameGroupAction = { [weak model] conversationID, name in
                 model?.groupNames[conversationID] = name
             }
+            // Local stand-ins so the interaction UI is drivable without the MLS core: a reply
+            // appends a line pointing at its target, a reaction toggles on the line it names.
+            model.sendReplyAction = { [weak model] body, replyTo, conversationID in
+                guard let model else { return }
+                let next = UInt64((model.threadLines[conversationID]?.count ?? 0) + 1)
+                model.threadLines[conversationID, default: []].append(
+                    ThreadLine(
+                        id: next, kind: .text(body), mine: true, timestamp: Date(),
+                        messageID: String(format: "%032x", next), replyTo: replyTo))
+            }
+            model.reactAction = { [weak model] messageID, emoji, remove, conversationID in
+                guard let model, let lines = model.threadLines[conversationID],
+                    let index = lines.firstIndex(where: { $0.messageID == messageID })
+                else { return }
+                let line = lines[index]
+                let reactions =
+                    remove
+                    ? line.reactions.filter { $0.emoji != emoji }
+                    : line.reactions + [ReactionSummary(emoji: emoji, count: 1, includesMe: true)]
+                model.threadLines[conversationID]?[index] = ThreadLine(
+                    id: line.id, kind: line.kind, mine: line.mine, timestamp: line.timestamp,
+                    isPending: line.isPending, messageID: line.messageID, replyTo: line.replyTo,
+                    reactions: reactions, deliveredCount: line.deliveredCount,
+                    readCount: line.readCount)
+            }
             model.markConversationReadAction = { [weak model] conversationID in
                 guard let model, let thread = model.localThreads[conversationID] else { return }
                 model.localThreads[conversationID] = AppModel.LocalThreadState(
@@ -387,8 +412,13 @@
                     accessToken: token, conversationID: conversationID, ciphertext: Data(body.utf8),
                     idempotencyKey: Data((0..<16).map { _ in UInt8.random(in: 0...255) }))
                 let next = UInt64((model.threadLines[conversationID]?.count ?? 0) + 1)
+                // A synthetic message id: the harness links no MLS core, but the SCREENS key
+                // reply/react off having an id, so without one the UI under test is a different
+                // UI. Real ids come from the core (`Content` v2) on a real build.
                 model.threadLines[conversationID, default: []].append(
-                    ThreadLine(id: next, kind: .text(body), mine: true, timestamp: Date()))
+                    ThreadLine(
+                        id: next, kind: .text(body), mine: true, timestamp: Date(),
+                        messageID: String(format: "%032x", next)))
             }
             return (model, fixture)
         }

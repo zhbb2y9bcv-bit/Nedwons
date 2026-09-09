@@ -29,7 +29,10 @@ R-402).
 | Group / conversation membership | Route group messages | Life of membership | Server (**plaintext**) |
 | Group roles, mutes, announcement mode | Group administration; the relay refuses to distribute a muted member's messages | Life of membership (a mute ends with it) | Server (**plaintext**); visible to the group's members |
 | Group name | Title the group | On members' devices only | **Never on the server** — it travels inside the MLS ciphertext like a message; the relay has no name field and cannot learn one |
-| Read state / unread counts | Badges | On the device only | **Never on the server** — derived from decrypted local history; no read receipt is sent to anyone (receipts are not implemented yet) |
+| Read state / unread counts | Badges | On the device only | **Never on the server** — derived from decrypted local history |
+| Delivery & read receipts | Show a sender that a message arrived / was read | On devices only | **Never on the server** — receipts are E2EE messages between members; the relay sees one more opaque envelope. A device can switch them off entirely, and everything else still works |
+| Reactions & replies | Interaction | With the conversation, on devices | **Never on the server** — both are E2EE messages. A reply carries only the id of what it answers, never a copy of the quoted text |
+| Typing indicators | Show someone is composing | Nowhere — never persisted on any device | **Never on the server** in readable form; it is an E2EE message, throttled, and expires on the receiver's own clock |
 | Blocks & reports | Abuse defense | Retained per policy | Server (access-controlled) |
 | Password (Argon2id hash) | Auth | Life of account | Server (hash only) |
 | Public device key + metadata | Device binding | Life of device enrollment | Server (public key only) |

@@ -72,6 +72,41 @@ it, cannot process a commit for the epoch it joins at, and discards it like any 
 envelope). The same path adds people to an existing group (`addMembers`), which previously touched
 relay routing only — they were being sent ciphertext they held no key for.
 
+### Replies, reactions, receipts, typing — and message ids (content wire **v2**)
+
+None of these are expressible without a way to say "this message". A local id is local; a server
+envelope id is per-recipient. So `CONTENT_VERSION` went to **2** and every user-visible kind gained
+a sender-chosen random `message_id`. The bump is non-silent by construction: a v1 payload is now
+refused outright rather than guessed at (tested). Random rather than a counter — a counter would
+tell every member how much a device has ever sent.
+
+- **`Incoming::Application` now carries `sender`**, the MLS-authenticated credential identity read
+  from the message the signature check just validated. This is what makes "who reacted" and "who
+  read it" attributable: a group member cannot claim to be someone else, because nothing inside the
+  payload is trusted for identity.
+- **Replies** carry only the target's id. Never a copy of the quoted text — a client that quoted
+  text supplied by the sender could display words the quoted person never wrote. The quote is
+  rendered from the recipient's own copy, found by id, and a reply to something no longer held
+  simply renders as an ordinary message.
+- **Reactions** are attributed and idempotent: re-reacting is one reaction, and `remove` takes it
+  back. Bounded per message (64), and a reaction naming a message this device does not have is
+  **dropped, not stored** — otherwise any member could grow another device's durable blob by
+  reacting to ids they invent. A device records its own reaction under its *identity*, the same
+  value recipients derive from the credential; using the public key instead meant a device did not
+  recognise its own reaction and the toggle added a second one (caught by test).
+- **Receipts** are batched and accepted only for messages **we** sent; anything else is discarded,
+  for the same bounding reason. `Delivered` is owed as soon as a message decrypts, `Read` only once
+  the user has actually seen it (`mark_read`). Sent ids are recorded so one message is acknowledged
+  once, not on every sync. `ConversationCoordinator.sendReceipts = false` tells nobody what this
+  device has seen, and everything else still works.
+- **Typing** is ephemeral: never logged on either side, never counted as unread, and throttled by
+  the coordinator to one signal every 4 seconds (it is a real fanned-out message, so per-keystroke
+  would be dozens of envelopes per recipient per sentence). A "stopped" is always sent, and the
+  receiver expires it on its own clock anyway — a stale "still typing" is worse than none.
+
+`markRead` is `async` and awaits the receipt it triggers, rather than spawning an untracked task:
+"the user read it" and "the sender was told" must not be able to drift apart.
+
 ### Attachments (E2EE files)
 
 `mls_core::attachment` seals a file under a **fresh one-time key** (AES-256-GCM). The nonce is fixed

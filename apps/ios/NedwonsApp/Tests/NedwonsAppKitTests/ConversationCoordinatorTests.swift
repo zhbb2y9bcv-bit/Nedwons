@@ -634,6 +634,139 @@ final class ConversationCoordinatorTests: XCTestCase {
         XCTAssertEqual(relay.blobCount, 0)
     }
 
+    /// A reply points at the original and the UI resolves the quote locally; a reaction is
+    /// attributed to whoever sent it and toggles; both sides agree.
+    func testRepliesAndReactionsRoundTrip() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        await bob.coordinator.ensureKeyPackages()
+        relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
+        try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
+        _ = try await bob.coordinator.syncOnce()
+
+        await alice.model.sendMessage("dinner at 8?", to: conv)
+        _ = try await bob.coordinator.syncOnce()
+        let original = try XCTUnwrap(bob.model.threadLines[conv]?.last)
+        XCTAssertFalse(original.messageID.isEmpty, "a message can be referred to")
+
+        // Reply through the model's compose path: a draft, then a send.
+        bob.model.startReply(to: original, in: conv)
+        XCTAssertEqual(bob.model.replyDrafts[conv]?.messageID, original.messageID)
+        await bob.model.sendMessageOrReply("works for me", to: conv)
+        XCTAssertNil(bob.model.replyDrafts[conv], "sending clears the draft")
+        _ = try await alice.coordinator.syncOnce()
+        let reply = try XCTUnwrap(alice.model.threadLines[conv]?.last)
+        XCTAssertEqual(reply.replyTo, original.messageID)
+        // Alice resolves the quote from her own copy — the reply carried no text of it.
+        let quoted = alice.model.threadLines[conv]?.first { $0.messageID == reply.replyTo }
+        XCTAssertEqual(quoted?.quotableText, "dinner at 8?")
+
+        // React, and see it attributed and toggleable on both sides.
+        await bob.model.toggleReaction("👍", on: original, in: conv)
+        let bobsView = try XCTUnwrap(bob.model.threadLines[conv]?.first { $0.messageID == original.messageID })
+        XCTAssertEqual(bobsView.reactions, [ReactionSummary(emoji: "👍", count: 1, includesMe: true)])
+        _ = try await alice.coordinator.syncOnce()
+        let alicesView = try XCTUnwrap(alice.model.threadLines[conv]?.first { $0.messageID == original.messageID })
+        XCTAssertEqual(
+            alicesView.reactions, [ReactionSummary(emoji: "👍", count: 1, includesMe: false)],
+            "Alice sees Bob's reaction as his, not hers")
+
+        // Tapping the same emoji takes it back.
+        await bob.model.toggleReaction("👍", on: bobsView, in: conv)
+        _ = try await alice.coordinator.syncOnce()
+        let cleared = try XCTUnwrap(alice.model.threadLines[conv]?.first { $0.messageID == original.messageID })
+        XCTAssertTrue(cleared.reactions.isEmpty)
+    }
+
+    /// Delivery receipts are sent when a message decrypts; read receipts only when the user opens
+    /// the conversation. The sender sees one tick, then two.
+    func testReceiptsFollowDeliveryThenReading() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        await bob.coordinator.ensureKeyPackages()
+        relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
+        try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
+        _ = try await bob.coordinator.syncOnce()
+
+        await alice.model.sendMessage("are you there?", to: conv)
+        XCTAssertEqual(alice.model.threadLines[conv]?.last?.deliveredCount, 0, "nothing yet")
+
+        // Bob's sync decrypts it and acknowledges delivery.
+        _ = try await bob.coordinator.syncOnce()
+        print("DBG bob err:", String(describing: bob.coordinator.lastSyncError))
+        _ = try await alice.coordinator.syncOnce()
+        print("DBG alice lines:", alice.model.threadLines[conv]?.map { ($0.messageID, $0.deliveredCount) } ?? [])
+        var mine = try XCTUnwrap(alice.model.threadLines[conv]?.last)
+        XCTAssertEqual(mine.deliveredCount, 1)
+        XCTAssertEqual(mine.readCount, 0, "delivered is not read")
+
+        // Bob opens the conversation: now it is read.
+        await bob.model.markConversationRead(conv)
+        _ = try await alice.coordinator.syncOnce()
+        mine = try XCTUnwrap(alice.model.threadLines[conv]?.last)
+        XCTAssertEqual(mine.readCount, 1)
+
+        // A second sync does not re-acknowledge the same message.
+        let before = relay.deliveries
+        _ = try await bob.coordinator.syncOnce()
+        await bob.model.markConversationRead(conv)
+        XCTAssertEqual(relay.deliveries, before, "one receipt per message, not per sync")
+    }
+
+    /// Receipts are a privacy choice: with them off, this device tells nobody what it has seen and
+    /// everything else still works.
+    func testReceiptsCanBeTurnedOff() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        bob.coordinator.sendReceipts = false
+        await bob.coordinator.ensureKeyPackages()
+        relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
+        try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
+        _ = try await bob.coordinator.syncOnce()
+
+        await alice.model.sendMessage("hello?", to: conv)
+        _ = try await bob.coordinator.syncOnce()
+        await bob.model.markConversationRead(conv)
+        _ = try await alice.coordinator.syncOnce()
+        let mine = try XCTUnwrap(alice.model.threadLines[conv]?.last)
+        XCTAssertEqual(mine.deliveredCount, 0)
+        XCTAssertEqual(mine.readCount, 0)
+        // The message itself still arrived.
+        XCTAssertEqual(bob.texts(in: conv).map(\.0), ["hello?"])
+    }
+
+    /// Typing is throttled — a sentence must not become one envelope per keystroke — and the
+    /// recipient sees who is typing without anything being logged.
+    func testTypingIsThrottledAndEphemeral() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        await bob.coordinator.ensureKeyPackages()
+        relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
+        try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
+        _ = try await bob.coordinator.syncOnce()
+        relay.resetCounters()
+
+        // Ten "keystrokes" produce ONE typing message.
+        for _ in 0..<10 {
+            await bob.model.setTyping(true, in: conv)
+        }
+        XCTAssertEqual(relay.deliveries, 1, "throttled, not one per keystroke")
+
+        _ = try await alice.coordinator.syncOnce()
+        XCTAssertEqual(alice.model.typingBy[conv]?.count, 1, "Alice sees someone typing")
+        XCTAssertTrue(alice.texts(in: conv).isEmpty, "typing is not a message")
+        XCTAssertEqual(alice.model.unreadCount(for: conv), 0)
+
+        // Clearing the field always sends the stop, so the indicator cannot stick.
+        await bob.model.setTyping(false, in: conv)
+        _ = try await alice.coordinator.syncOnce()
+        XCTAssertNil(alice.model.typingBy[conv])
+    }
+
     func testIdempotencyKeyIsDeterministicPerMessage() {
         let a = ConversationCoordinator.idempotencyKey(conversationID: conv, localID: 1)
         XCTAssertEqual(a, ConversationCoordinator.idempotencyKey(conversationID: conv, localID: 1))

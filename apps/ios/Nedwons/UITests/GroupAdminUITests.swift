@@ -254,6 +254,40 @@ final class GroupAdminUITests: XCTestCase {
         wait("exists == false", on: element(app, "chats.unread.\(conversationID)"))
     }
 
+    /// Reply and react are offered on a message, and the reply bar shows what is being answered.
+    /// (The harness has no MLS core, so this covers the interaction UI's own behaviour — the
+    /// end-to-end semantics are proven in ConversationCoordinatorTests against the real core.)
+    func testMessageOffersReplyAndReactions() {
+        let app = launch()
+        openConversation(app)
+
+        // Send something so there is a message to act on.
+        let field = waitFor(element(app, "conversation.composer.field"))
+        field.tap()
+        field.typeText("hello there")
+        app.buttons["arrow.up.circle.fill"].firstMatch.tap()
+        let bubble = waitFor(app.staticTexts["hello there"].firstMatch)
+
+        // Long-press offers Reply and the quick reactions.
+        bubble.press(forDuration: 1.2)
+        let reply = waitFor(app.buttons["Reply"].firstMatch, 5)
+        XCTAssertTrue(app.buttons["👍"].firstMatch.exists, "quick reactions are offered")
+        reply.tap()
+
+        // The reply bar names what is being answered, and cancelling clears it.
+        let bar = waitFor(element(app, "conversation.reply.bar"))
+        XCTAssertTrue(
+            bar.label.localizedCaseInsensitiveContains("hello there"),
+            "the composer names what is being answered, was: \(bar.label)")
+        waitFor(element(app, "conversation.reply.cancel")).tap()
+        wait("exists == false", on: element(app, "conversation.reply.bar"))
+
+        // And a reaction attaches to the message it names.
+        bubble.press(forDuration: 1.2)
+        waitFor(app.buttons["👍"].firstMatch, 5).tap()
+        waitFor(element(app, "thread.reaction.00000000000000000000000000000001.👍"))
+    }
+
     /// An ordinary member gets the read-only panel: members and roles visible, no admin controls.
     func testOrdinaryMemberSeesNoAdminControls() {
         let app = launch(scenario: "member")
