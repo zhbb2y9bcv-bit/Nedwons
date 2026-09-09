@@ -1,26 +1,132 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  Apple Privacy Manifest (DRAFT). Must be reconciled with actual shipped behavior before
-  submission (RISK_REGISTER R-402) and kept in sync with PRIVACY.md. No tracking, no
-  advertising, no data sold. Required-reason API declarations below use placeholder reason
-  codes that MUST be confirmed against Apple's current documentation for the exact APIs the
-  final build calls.
+  Apple Privacy Manifest.
+
+  Every entry below was derived from an AUDIT of this repository (2026-09-08), not from a template.
+  The reasoning for each declaration — and for each deliberate omission — is written up in
+  docs/APP_STORE_PRIVACY.md, which is the document to read before answering App Store Connect's
+  privacy questionnaire.
+
+  What the audit found, and what changed as a result:
+
+  * The previous draft declared NSPrivacyCollectedDataTypeCrashData. The app integrates NO crash
+    or analytics SDK (no Firebase/Crashlytics/Sentry/AppCenter/MetricKit, and no third-party
+    SwiftPM packages at all — only local ones), so it collects no crash data. Declaring collection
+    that does not happen is as wrong as omitting collection that does; removed.
+  * The previous draft declared the UserDefaults and FileTimestamp required-reason API categories
+    with placeholder reason codes. The audit found NO use of either: no UserDefaults, no
+    @AppStorage/@SceneStorage, and no filesystem metadata reads in Swift or in the Rust core (the
+    durable store writes via temp-file + rename and never reads timestamps). Both removed —
+    NSPrivacyAccessedAPITypes is now empty because nothing in the app calls a required-reason API.
+  * The data the app actually transmits and the server actually persists was NOT declared at all.
+    It is declared below, derived from the server schema and the client's API surface.
+
+  IMPORTANT, and stated rather than assumed: Apple's data-type taxonomy, required-reason API list
+  and reason codes change. These declarations MUST be re-verified against Apple's current
+  documentation immediately before submission (RISK_REGISTER R-402). This file reflects what the
+  software does; whether Apple's current rules classify it this way is a separate question that
+  needs a human with Apple's live docs open.
 -->
 <plist version="1.0">
 <dict>
+    <!-- No tracking, no advertising identifiers, no data brokers, no data sold or shared for
+         advertising. There is no third-party SDK in the app to do so even if we wanted to. -->
     <key>NSPrivacyTracking</key>
     <false/>
     <key>NSPrivacyTrackingDomains</key>
     <array/>
+
     <key>NSPrivacyCollectedDataTypes</key>
     <array>
-        <!-- Minimal. Content of messages is E2EE and never collected by the service. -->
+        <!-- Username. Chosen by the user, permanent, and the ONLY discovery mechanism (there is no
+             phone-number or address-book lookup anywhere in the product). Linked to identity
+             because it IS the identity. -->
         <dict>
             <key>NSPrivacyCollectedDataType</key>
-            <string>NSPrivacyCollectedDataTypeCrashData</string>
+            <string>NSPrivacyCollectedDataTypeUserID</string>
             <key>NSPrivacyCollectedDataTypeLinked</key>
+            <true/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
             <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+            </array>
+        </dict>
+
+        <!-- Display name. Optional, user-supplied, shown to other users. -->
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypeName</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <true/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+            </array>
+        </dict>
+
+        <!-- Push token, and the device/account identifiers used to route mail to the right device.
+             The push itself is CONTENTLESS: it carries no message text, only a wake signal. -->
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypeDeviceID</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <true/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+            </array>
+        </dict>
+
+        <!-- Message content. Declared even though the service CANNOT read it: it is end-to-end
+             encrypted with MLS and the relay stores only opaque ciphertext it holds no key for
+             (proven by the relay-blindness tests). It is declared anyway because the app does
+             transmit it and the server does store it until delivery, and under-declaring on the
+             strength of "we cannot read it" is the kind of argument that should be made to Apple
+             explicitly rather than assumed silently. See docs/APP_STORE_PRIVACY.md. -->
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypeOtherUserContent</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <true/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+            </array>
+        </dict>
+
+        <!-- Abuse reports: a reason and optional evidence the reporter chooses to submit. Retained
+             (anonymized) after account deletion so abuse history cannot be laundered by deleting
+             and re-registering. -->
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypeCustomerSupport</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <true/>
+            <key>NSPrivacyCollectedDataTypeTracking</key>
+            <false/>
+            <key>NSPrivacyCollectedDataTypePurposes</key>
+            <array>
+                <string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+            </array>
+        </dict>
+
+        <!-- Social graph and group membership: contacts, pending requests, blocks, and which
+             conversations an account belongs to. This is NOT the device address book — Nedwons
+             never requests Contacts access and has no code path that reads it. -->
+        <dict>
+            <key>NSPrivacyCollectedDataType</key>
+            <string>NSPrivacyCollectedDataTypeOtherDataTypes</string>
+            <key>NSPrivacyCollectedDataTypeLinked</key>
+            <true/>
             <key>NSPrivacyCollectedDataTypeTracking</key>
             <false/>
             <key>NSPrivacyCollectedDataTypePurposes</key>
@@ -29,24 +135,12 @@
             </array>
         </dict>
     </array>
+
+    <!-- Empty because the audit found NO required-reason API in use: no UserDefaults, no
+         @AppStorage, no file-timestamp/disk-space/boot-time/active-keyboard APIs, in either the
+         Swift app or the Rust core. If a future change introduces one — adding @AppStorage for a
+         setting is the most likely — it must be declared here with the correct reason code. -->
     <key>NSPrivacyAccessedAPITypes</key>
-    <array>
-        <dict>
-            <key>NSPrivacyAccessedAPIType</key>
-            <string>NSPrivacyAccessedAPICategoryUserDefaults</string>
-            <key>NSPrivacyAccessedAPITypeReasons</key>
-            <array>
-                <string>CA92.1</string>
-            </array>
-        </dict>
-        <dict>
-            <key>NSPrivacyAccessedAPIType</key>
-            <string>NSPrivacyAccessedAPICategoryFileTimestamp</string>
-            <key>NSPrivacyAccessedAPITypeReasons</key>
-            <array>
-                <string>C617.1</string>
-            </array>
-        </dict>
-    </array>
+    <array/>
 </dict>
 </plist>

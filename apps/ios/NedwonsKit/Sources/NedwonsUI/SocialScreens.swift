@@ -274,6 +274,22 @@ struct SettingsRootView: View {
                 Section {
                     Button("Sign out", role: .destructive) { model.signOut() }
                 }
+
+                // Apple requires an in-app deletion path for any app that creates accounts, and it
+                // must not be a link to a website or a support email.
+                Section {
+                    NavigationLink("Delete account") {
+                        DeleteAccountView(model: model)
+                    }
+                    .foregroundStyle(.red)
+                } footer: {
+                    Text(
+                        """
+                        Deleting removes your account, profile, contacts, group membership and \
+                        anything still queued for delivery. Messages other people already \
+                        received stay on their devices — deleting your account is not an unsend.
+                        """)
+                }
             }
             .navigationTitle("Settings")
         }
@@ -325,5 +341,117 @@ struct PersonRow: View {
                 .font(Nedwons.TypeScale.caption)
                 .foregroundStyle(palette.textSecondary)
         }
+    }
+}
+
+/// In-app account deletion (App Store requirement).
+///
+/// The screen is deliberately slow to get through. Deletion is irreversible and erases across every
+/// store, so it asks for the password, requires an explicit acknowledgement, and confirms once more
+/// — three deliberate acts rather than one destructive tap. The consequences are stated plainly
+/// BEFORE the button, including the one people get wrong: this is not an unsend.
+struct DeleteAccountView: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.colorScheme) private var scheme
+
+    @State private var password = ""
+    @State private var acknowledged = false
+    @State private var confirming = false
+    @State private var working = false
+    @State private var failure: String?
+
+    private var palette: Nedwons.Palette { .forScheme(scheme) }
+
+    private var canDelete: Bool {
+        acknowledged && !password.isEmpty && !working
+    }
+
+    var body: some View {
+        Form {
+            Section {
+                Text("Deleting your account is permanent. It cannot be undone.")
+                    .font(Nedwons.TypeScale.callout)
+                    .foregroundStyle(palette.textPrimary)
+            }
+
+            Section("What is deleted") {
+                Label("Your username and profile", systemImage: "person.crop.circle")
+                Label("Your contacts, requests and blocks", systemImage: "person.2")
+                Label("Your group membership", systemImage: "bubble.left.and.bubble.right")
+                Label("Messages still waiting to reach you", systemImage: "tray")
+                Label("This device's keys and local history", systemImage: "key")
+            }
+
+            Section {
+                Label(
+                    "Messages other people already received stay on their devices.",
+                    systemImage: "exclamationmark.triangle")
+                Label(
+                    "Your username becomes available for someone else to register.",
+                    systemImage: "at")
+            } header: {
+                Text("What is not deleted")
+            } footer: {
+                // Said plainly because it is the expectation people most often have backwards.
+                Text(
+                    "Deleting your account is not an unsend. Nedwons cannot reach into anyone "
+                        + "else's device to remove messages you already sent.")
+            }
+
+            Section {
+                SecureField("Your password", text: $password)
+                    .usernameInput()
+                Toggle("I understand this cannot be undone", isOn: $acknowledged)
+            } footer: {
+                Text(
+                    "Your password and this device's key are both required, so a stolen session "
+                        + "alone cannot delete your account.")
+            }
+
+            if let failure {
+                Section {
+                    Text(failure).foregroundStyle(.red)
+                }
+            }
+
+            Section {
+                Button(role: .destructive) {
+                    confirming = true
+                } label: {
+                    HStack {
+                        Text(working ? "Deleting…" : "Delete my account")
+                        if working {
+                            Spacer()
+                            ProgressView()
+                        }
+                    }
+                }
+                .disabled(!canDelete)
+            }
+        }
+        .navigationTitle("Delete account")
+        .inlineNavigationTitle()
+        .confirmationDialog(
+            "Permanently delete your account?",
+            isPresented: $confirming,
+            titleVisibility: .visible
+        ) {
+            Button("Delete permanently", role: .destructive) {
+                Task { await performDeletion() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This cannot be undone.")
+        }
+    }
+
+    private func performDeletion() async {
+        working = true
+        failure = nil
+        // On success the model transitions to `.unauthenticated`, so the app root swaps this
+        // screen out from underneath us — there is nothing to navigate back to.
+        failure = await model.deleteAccount(password: password)
+        working = false
+        password = ""
     }
 }

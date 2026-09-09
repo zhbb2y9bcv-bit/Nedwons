@@ -69,6 +69,19 @@ public final class ContactAliasStore: @unchecked Sendable {
         try? sealed.write(to: url, options: .atomic)
     }
 
+    /// Erase every alias and remove the backing file.
+    ///
+    /// Aliases are viewer-private and never leave the device, so nothing on the server deletes
+    /// them: account deletion has to erase them HERE or they outlive the account they describe.
+    /// The in-memory cache is cleared first, so a concurrent read after this cannot resurrect a
+    /// name from memory even if the file removal fails.
+    public func eraseAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        cache.removeAll()
+        try? FileManager.default.removeItem(at: url)
+    }
+
     public func alias(for accountID: String) -> String? {
         lock.lock()
         defer { lock.unlock() }

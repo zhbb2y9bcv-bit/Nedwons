@@ -214,6 +214,73 @@ public final class AppModel: ObservableObject {
         phase = .unauthenticated
     }
 
+    /// Permanently delete this account, then erase everything this device still holds.
+    ///
+    /// Order matters and is not interchangeable. The server erasure goes FIRST, because it is the
+    /// step that can fail and that the user can retry: wiping locally first would leave an account
+    /// alive on the server that this device can no longer authenticate to, and therefore can no
+    /// longer delete. Only once the server confirms do we destroy the local state.
+    ///
+    /// The local wipe is the part no server can do for us. Aliases, the MLS store and the enrolled
+    /// device key never leave the device, so if they are not erased here they outlive the account
+    /// they describe — a "deleted" account whose contact names and ratchet state are still sitting
+    /// in the container.
+    ///
+    /// Returns an error message on failure, `nil` on success, so the caller can show the reason
+    /// rather than a generic failure. A wrong password is the expected failure and must be
+    /// recoverable.
+    @discardableResult
+    public func deleteAccount(password: String) async -> String? {
+        guard let token, let session else { return "You are not signed in." }
+        guard let enrolled = try? deviceIdentity.loadEnrolled() else {
+            return "This device's key is unavailable, so deletion cannot be authorized."
+        }
+        do {
+            try await client.deleteAccount(
+                accessToken: token,
+                accountID: session.accountID,
+                password: password,
+                signer: enrolled.signer)
+        } catch {
+            // Deliberately not distinguishing "wrong password" from other refusals in the returned
+            // text: the server answers both with the same status so deletion cannot become a
+            // password oracle for someone holding a stolen token.
+            return "Deletion was refused. Check your password and try again."
+        }
+
+        wipeLocalStateAfterDeletion()
+        return nil
+    }
+
+    /// Erase every local trace of the account. Separate and non-throwing on purpose: once the
+    /// server has deleted the account there is no state worth preserving, so a failure to remove
+    /// one artefact must not stop the others from being removed.
+    private func wipeLocalStateAfterDeletion() {
+        aliasStore?.eraseAll()
+        // NOT `clearHistoryAction`: that clears the visible message log while deliberately
+        // PRESERVING the ratchet, replay watermark and secret records, so a later message still
+        // decrypts. Account deletion wants the opposite — the key material must be destroyed.
+        wipeAllLocalDataAction?()
+        try? deviceIdentity.reset()
+        sessionStore.clear()
+
+        session = nil
+        myProfile = nil
+        friends = []
+        incomingRequests = []
+        searchResults = []
+        blocked = []
+        inbox = []
+        conversations = []
+        devices = []
+        deviceAssurance = nil
+        localThreads = [:]
+        threadLines = [:]
+        locallyDeletedConversationIDs = []
+        usernamesByAccountID = [:]
+        phase = .unauthenticated
+    }
+
     private func loadInitial() async {
         guard let token else { return }
         myProfile = try? await client.myProfile(accessToken: token)
@@ -635,6 +702,14 @@ public final class AppModel: ObservableObject {
     /// Injected by the composition layer holding the `MlsClient` for a conversation. It clears that
     /// conversation's visible message log without touching protocol state. Not `@Sendable`: it
     /// captures the non-`Sendable` `MlsClient` and is only called here on the main actor.
+    /// Destroy the entire on-device MLS store (ratchet state, key material, message log).
+    ///
+    /// Injected by the composition layer, which owns the `MlsClient` instances and their files.
+    /// Distinct from `clearHistoryAction`, which preserves crypto state by design: this is the
+    /// account-deletion path, where preserving it would leave decryptable material behind for an
+    /// account that no longer exists.
+    public var wipeAllLocalDataAction: (() -> Void)?
+
     public var clearHistoryAction: ((String) async throws -> Void)?
 
     /// Local-only deletion. Nothing is sent: no "delete for everyone" event exists, the peer's copy

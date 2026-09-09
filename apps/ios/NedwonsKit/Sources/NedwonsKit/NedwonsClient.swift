@@ -1334,6 +1334,55 @@ extension NedwonsClient {
         return session.model
     }
 
+    /// Permanently delete this account (App Store requirement: an app that creates accounts must
+    /// let you delete one from inside the app).
+    ///
+    /// Two factors, because deletion is irreversible: the server issues a challenge this DEVICE
+    /// signs, and the password is sent alongside it. A stolen access token alone cannot destroy an
+    /// account, and neither can a leaked password without the enrolled device.
+    ///
+    /// Server-side erasure spans every store (see `account_deletion.rs`). The caller is
+    /// responsible for wiping LOCAL state afterwards — Keychain, session and MLS store — because
+    /// this method only speaks to the server.
+    public func deleteAccount(
+        accessToken: String,
+        accountID: String,
+        password: String,
+        signer: DeviceSigner
+    ) async throws {
+        var beginReq = authed("POST", "/v1/account/delete/begin", accessToken: accessToken)
+        beginReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        beginReq.httpBody = try JSONEncoder().encode(EmptyBody())
+        let ch: ChallengeResponse = try decode(await perform(beginReq))
+
+        guard let account = Hex.decode(accountID), let deviceID = Hex.decode(ch.device_id),
+            let nonce = Hex.decode(ch.nonce), let txnID = Hex.decode(ch.txn_id)
+        else { throw ClientError.decoding }
+
+        let transcript = ClientTranscripts.accountDelete(
+            accountID: account,
+            deviceID: deviceID,
+            publicKey: signer.publicKeyX963,
+            challengeNonce: nonce,
+            expiresAt: ch.expires_at,
+            txnID: txnID)
+        let signature = try signer.sign(transcript)
+
+        struct Finish: Encodable {
+            let txn_id: String
+            let signature: String
+            let password: String
+        }
+        var deleteReq = authed("DELETE", "/v1/account", accessToken: accessToken)
+        deleteReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        deleteReq.httpBody = try JSONEncoder().encode(
+            Finish(
+                txn_id: ch.txn_id,
+                signature: Hex.encode(signature),
+                password: password))
+        _ = try await perform(deleteReq)
+    }
+
     /// This account's devices (management list).
     public func listDevices(accessToken: String) async throws -> [DeviceSummary] {
         try decode(await perform(authed("GET", "/v1/devices", accessToken: accessToken)))

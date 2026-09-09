@@ -35,6 +35,30 @@ public final class ConversationCoordinator {
         model.clearHistoryAction = { [weak self] conversationID in
             try self?.clearHistory(in: conversationID)
         }
+        model.wipeAllLocalDataAction = { [weak self] in
+            self?.wipeAllLocalData()
+        }
+    }
+
+    /// Destroy every on-device MLS store for this account (account deletion only).
+    ///
+    /// The opposite of `clearHistory`, and the distinction is load-bearing: `clearHistory` keeps
+    /// the ratchet, replay watermark and secret records so a later message still decrypts and a
+    /// spent secret cannot be re-viewed. Here the account is gone, so leaving decryptable key
+    /// material on the device would mean a "deleted" account whose ratchet state is still sitting
+    /// in the container.
+    ///
+    /// Removes the whole directory rather than iterating known conversations: the model's list can
+    /// be stale or partially loaded, and a store missed here is one that survives deletion.
+    public func wipeAllLocalData() {
+        clients.removeAll()
+        guard
+            let entries = try? FileManager.default.contentsOfDirectory(
+                at: storeDirectory, includingPropertiesForKeys: nil)
+        else { return }
+        for entry in entries where entry.lastPathComponent.hasPrefix("conv-") {
+            try? FileManager.default.removeItem(at: entry)
+        }
     }
 
     private func dbPath(_ conversationID: String) -> String {
