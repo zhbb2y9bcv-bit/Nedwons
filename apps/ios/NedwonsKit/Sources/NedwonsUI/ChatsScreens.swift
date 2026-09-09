@@ -136,6 +136,8 @@ struct ChatsListView: View {
                 NavigationLink(value: chat) {
                     ChatRow(model: model, chat: chat, palette: palette)
                 }
+                // Stable handle for the XCUITest suite (apps/ios/Nedwons/UITests).
+                .accessibilityIdentifier("chats.row.\(chat.conversationID)")
                 .contextMenu {
                     Button("Delete conversation", systemImage: "trash", role: .destructive) {
                         pendingDelete = chat

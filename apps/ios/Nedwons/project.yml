@@ -75,6 +75,25 @@ targets:
         # authorize them are configured in the Apple Developer portal (your side).
         CODE_SIGN_ENTITLEMENTS: Nedwons.entitlements
 
+  # XCUITest suite: drives the REAL app (real @main, AppModel, NedwonsClient, SwiftUI screens) on a
+  # simulator, with only the network replaced by the Debug-only in-process fixture
+  # (NedwonsUI/UITestHarness.swift, selected by launch argument). Before this target existed there
+  # was no test in the repo that instantiated a single SwiftUI view — every screen-level regression
+  # was invisible to CI. Run with scripts/test_ui_sim.sh.
+  NedwonsUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources:
+      - UITests
+    dependencies:
+      - target: Nedwons
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.nedwons.demo.UITests
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "6.0"
+        TEST_TARGET_NAME: Nedwons
+
   # Notification Service Extension (#4): decrypts a contentless wake push on device and rewrites the
   # alert. Links the real MLS core; the decode logic (PushInboxDecoder) is unit-tested in NedwonsApp.
   NotificationService:
@@ -105,3 +124,18 @@ targets:
         SWIFT_VERSION: "6.0"
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: "1"
+
+# An explicit scheme so `xcodebuild test -scheme Nedwons` runs the XCUITest bundle against the app
+# (xcodegen's auto-generated per-target schemes do not attach UI-test bundles to the app scheme).
+schemes:
+  Nedwons:
+    build:
+      targets:
+        Nedwons: all
+        NedwonsUITests: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - NedwonsUITests

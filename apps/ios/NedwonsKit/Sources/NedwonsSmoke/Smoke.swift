@@ -128,6 +128,53 @@ struct NedwonsSmoke {
             }
             try await client.ackInbox(accessToken: bob.accessToken, ids: [inbox[0].id])
 
+            // Moderation (ADR-0009 third slice), live: the admin mutes Bob, the relay refuses Bob's
+            // send with the SPECIFIC code, the panel shows the mute to both, unmute restores him;
+            // then announcement mode silences non-admins the same way.
+            try await client.muteGroupMember(
+                accessToken: registered.accessToken, conversationID: group.conversationID,
+                accountID: bob.accountID)
+            do {
+                _ = try await client.sendMessage(
+                    accessToken: bob.accessToken, conversationID: group.conversationID,
+                    ciphertext: Data("muted-attempt".utf8), idempotencyKey: Data(repeating: 10, count: 16))
+                fail("a muted member's send must be refused")
+            } catch let NedwonsClient.ClientError.http(status, body) {
+                guard status == 403, GroupRefusal.from(errorBody: body) == .muted else {
+                    fail("expected 403 muted, got \(status) \(body)")
+                }
+            }
+            let bobsView = try await client.groupState(
+                accessToken: bob.accessToken, conversationID: group.conversationID)
+            guard bobsView.canSend == false, bobsView.member(bob.accountID)?.muted == true,
+                bobsView.isAdmin == false, bobsView.invites.isEmpty
+            else { fail("muted member's group view is wrong: \(bobsView)") }
+            try await client.unmuteGroupMember(
+                accessToken: registered.accessToken, conversationID: group.conversationID,
+                accountID: bob.accountID)
+            try await client.updateGroupSettings(
+                accessToken: registered.accessToken, conversationID: group.conversationID,
+                announcementsOnly: true)
+            do {
+                _ = try await client.sendMessage(
+                    accessToken: bob.accessToken, conversationID: group.conversationID,
+                    ciphertext: Data("locked-attempt".utf8), idempotencyKey: Data(repeating: 11, count: 16))
+                fail("announcement mode must refuse a non-admin")
+            } catch let NedwonsClient.ClientError.http(status, body) {
+                guard status == 403, GroupRefusal.from(errorBody: body) == .announcementsOnly else {
+                    fail("expected 403 announcements_only, got \(status) \(body)")
+                }
+            }
+            try await client.updateGroupSettings(
+                accessToken: registered.accessToken, conversationID: group.conversationID,
+                announcementsOnly: false)
+            let restored = try await client.sendMessage(
+                accessToken: bob.accessToken, conversationID: group.conversationID,
+                ciphertext: Data("bob-again".utf8), idempotencyKey: Data(repeating: 12, count: 16))
+            guard restored == 1 else { fail("unmuted member's send delivered to \(restored), expected 1") }
+            let restoredInbox = try await client.fetchInbox(accessToken: registered.accessToken)
+            try await client.ackInbox(accessToken: registered.accessToken, ids: restoredInbox.map(\.id))
+
             // The group shows up in both members' conversation lists (Chats tab).
             let aliceConvos = try await client.listConversations(accessToken: registered.accessToken)
             let bobConvos = try await client.listConversations(accessToken: bob.accessToken)

@@ -82,6 +82,11 @@ pub enum FanoutOutcome {
     /// Delivered (or already delivered, on an idempotent retry). Carries the recipient
     /// devices that received a *new* envelope, so only those get woken.
     Delivered { newly_queued: Vec<[u8; 16]> },
+    /// The sender is a member, but an admin has muted them or put the group in announcement mode
+    /// (ADR-0009 moderation). Distinct from `Forbidden` on purpose: a muted member is entitled to
+    /// know why their message did not send, and their client shows that state rather than a
+    /// generic failure.
+    Muted { reason: SendRefusal },
 }
 
 /// Result of a targeted send.
@@ -92,6 +97,29 @@ pub enum SendOutcome {
     IdempotencyMismatch,
     /// Queued (or already queued, on an idempotent retry) under this envelope id.
     Queued(i64),
+    /// Same as [`FanoutOutcome::Muted`]. The targeted path is gated too: it accepts
+    /// caller-supplied ciphertext for a member device, so leaving it open would make a mute
+    /// bypassable by anyone willing to modify their client — which is exactly who gets muted.
+    Muted { reason: SendRefusal },
+}
+
+/// Why a member in good standing was refused a send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendRefusal {
+    /// This member is individually muted.
+    MemberMuted,
+    /// The whole group is in announcement mode and this member is not an admin.
+    AnnouncementsOnly,
+}
+
+impl SendRefusal {
+    /// The stable wire code the client matches on.
+    pub fn code(self) -> &'static str {
+        match self {
+            SendRefusal::MemberMuted => "muted",
+            SendRefusal::AnnouncementsOnly => "announcements_only",
+        }
+    }
 }
 
 fn db_err(e: postgres::Error) -> StoreError {
@@ -122,6 +150,63 @@ fn member_in_txn(
         )
         .map_err(db_err)?;
     Ok(row.is_some())
+}
+
+/// Moderation gate (ADR-0009): may this sender's device put a message into this conversation?
+///
+/// Called inside the send transaction, immediately after [`member_in_txn`] has locked the sender's
+/// routing row, so the permission that is checked is the permission that applies to the write —
+/// the same discipline the membership check uses, for the same reason.
+///
+/// Two locks, in the order every other governance path takes them (members, then conversations):
+///
+///   * the sender's `conversation_members` rows are already held `FOR UPDATE` by the membership
+///     check, and `mute_member` locks those same rows, so a mute and a send by the muted account
+///     serialize against each other instead of interleaving;
+///   * the conversation row is taken `FOR SHARE` here and `FOR UPDATE` by
+///     `set_announcements_only`, so concurrent senders never block each other while a mode flip
+///     still cannot slip between this read and the insert it authorizes.
+///
+/// Returns `None` when the send is permitted.
+fn send_refusal_in_txn(
+    txn: &mut postgres::Transaction<'_>,
+    conversation_id: &[u8; 16],
+    device: &[u8],
+) -> StoreResult<Option<SendRefusal>> {
+    let row = txn
+        .query_opt(
+            "SELECT c.announcements_only,
+                    EXISTS (SELECT 1 FROM group_admins ga
+                             WHERE ga.conversation_id = c.conversation_id
+                               AND ga.account_id = cm.account_id),
+                    EXISTS (SELECT 1 FROM group_mutes gm
+                             WHERE gm.conversation_id = c.conversation_id
+                               AND gm.account_id = cm.account_id
+                               AND (gm.expires_at IS NULL OR gm.expires_at > now()))
+             FROM conversations c
+             JOIN conversation_members cm
+                  ON cm.conversation_id = c.conversation_id AND cm.device_id = $2
+             WHERE c.conversation_id = $1
+             FOR SHARE OF c",
+            &[&conversation_id.as_slice(), &device],
+        )
+        .map_err(db_err)?;
+    // No row means the conversation is gone (the last member left mid-send); the membership check
+    // that runs first is the authority on that, so treat it as permitted here and let the write
+    // fail on its own foreign key rather than reporting a mute that nobody applied.
+    let Some(row) = row else { return Ok(None) };
+    let announcements_only: bool = row.get(0);
+    let is_admin: bool = row.get(1);
+    let is_muted: bool = row.get(2);
+    if is_muted {
+        // Checked before announcement mode so the client can say something true and specific:
+        // "an admin muted you" is different feedback from "the group is locked".
+        return Ok(Some(SendRefusal::MemberMuted));
+    }
+    if announcements_only && !is_admin {
+        return Ok(Some(SendRefusal::AnnouncementsOnly));
+    }
+    Ok(None)
 }
 
 fn id16(bytes: &[u8]) -> StoreResult<[u8; 16]> {
@@ -468,6 +553,11 @@ impl PgRelay {
         if !member_in_txn(&mut txn, conversation_id, sender_device.as_bytes())? {
             return Ok(SendOutcome::Forbidden);
         }
+        if let Some(reason) =
+            send_refusal_in_txn(&mut txn, conversation_id, sender_device.as_bytes())?
+        {
+            return Ok(SendOutcome::Muted { reason });
+        }
         if idem_key_conflicts(
             &mut txn,
             conversation_id,
@@ -529,6 +619,11 @@ impl PgRelay {
         let mut txn = conn.transaction().map_err(db_err)?;
         if !member_in_txn(&mut txn, conversation_id, sender_device.as_bytes())? {
             return Ok(FanoutOutcome::Forbidden);
+        }
+        if let Some(reason) =
+            send_refusal_in_txn(&mut txn, conversation_id, sender_device.as_bytes())?
+        {
+            return Ok(FanoutOutcome::Muted { reason });
         }
         if idem_key_conflicts(
             &mut txn,

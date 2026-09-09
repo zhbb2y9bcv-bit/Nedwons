@@ -73,6 +73,45 @@ pub struct InviteSummary {
     pub uses: i32,
 }
 
+/// Outcome of muting a member.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MuteOutcome {
+    Muted,
+    /// The target is not in this conversation.
+    NotMember,
+    /// The target administers this group. Refused rather than silently demoting them: taking
+    /// someone's role is a separate decision from silencing them, and an admin who could be muted
+    /// by a peer could be locked out of the group they administer.
+    TargetIsAdmin,
+}
+
+/// One member as the group's admin panel renders it. Account-level (roles and mutes are
+/// account-scoped), so an account with several linked devices appears once.
+pub struct MemberSummary {
+    pub account_id: [u8; 16],
+    /// Empty when the account has no profile row yet — never `NULL` to the caller.
+    pub username: String,
+    pub display_name: String,
+    pub is_admin: bool,
+    /// Present iff a mute is in force right now. `None` inside `Some` = indefinite.
+    pub mute: Option<MuteState>,
+}
+
+/// A mute in force, as shown next to a member.
+pub struct MuteState {
+    pub muted_by: [u8; 16],
+    pub muted_at_unix: i64,
+    /// `None` = until an admin lifts it.
+    pub expires_at_unix: Option<i64>,
+}
+
+/// Group-level settings an admin controls.
+pub struct GroupSettings {
+    pub join_approval: bool,
+    pub announcements_only: bool,
+    pub mls_authoritative: bool,
+}
+
 fn db_err(e: postgres::Error) -> StoreError {
     StoreError(format!("groups db: {e}"))
 }
@@ -180,6 +219,199 @@ impl PgGroups {
         )
         .map_err(db_err)?;
         Ok(())
+    }
+
+    // ----- moderation: mutes and announcement mode -----------------------------------
+    //
+    // A mute is a relay-enforced SEND PERMISSION, not a cryptographic one — see the header of
+    // `V25__group_moderation.sql`. The gate that consumes these rows lives in `relay.rs`, on both
+    // paths that accept caller-supplied ciphertext for a conversation.
+
+    /// Toggle announcement mode: when on, only admins may send into the conversation.
+    ///
+    /// `FOR UPDATE` on the conversation row is what makes the flip take effect atomically with
+    /// respect to sends: the send gate reads the same row `FOR SHARE`, so a message that started
+    /// before the flip finishes first and one that starts after sees the new mode. Without the
+    /// lock, a send in flight at READ COMMITTED could read the old value and deliver after the
+    /// admin had been told the group was locked.
+    pub fn set_announcements_only(&self, conversation_id: &[u8; 16], on: bool) -> StoreResult<()> {
+        let mut conn = self.conn()?;
+        let mut txn = conn.transaction().map_err(db_err)?;
+        lock_conversation(&mut txn, conversation_id)?;
+        txn.query_opt(
+            "SELECT 1 FROM conversations WHERE conversation_id = $1 FOR UPDATE",
+            &[&conversation_id.as_slice()],
+        )
+        .map_err(db_err)?;
+        txn.execute(
+            "UPDATE conversations SET announcements_only = $2 WHERE conversation_id = $1",
+            &[&conversation_id.as_slice(), &on],
+        )
+        .map_err(db_err)?;
+        txn.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Mute one member. `expires_in_secs = None` mutes until an admin lifts it. Re-muting an
+    /// already-muted member replaces the expiry, so "extend to 8 hours" needs no unmute first.
+    ///
+    /// Caller must have verified the actor's adminship.
+    pub fn mute_member(
+        &self,
+        conversation_id: &[u8; 16],
+        target: &AccountId,
+        actor: &AccountId,
+        expires_in_secs: Option<i64>,
+    ) -> StoreResult<MuteOutcome> {
+        let mut conn = self.conn()?;
+        let mut txn = conn.transaction().map_err(db_err)?;
+        // The same governance serializer promote/demote/leave use. The membership and adminship
+        // checks below are reads that authorize a write; a concurrent promotion between them and
+        // the INSERT would produce a muted admin, which the schema then rejects with an
+        // exception — a 500 where the honest answer is 409. Holding the lock turns that race into
+        // an ordering.
+        lock_conversation(&mut txn, conversation_id)?;
+        // Lock the target's routing rows too, in the same order `leave_conversation` takes them
+        // (members before conversations), so a message already in flight from this account
+        // completes before the mute lands rather than being half-applied.
+        let member = !txn
+            .query(
+                "SELECT 1 FROM conversation_members
+                 WHERE conversation_id = $1 AND account_id = $2 FOR UPDATE",
+                &[&conversation_id.as_slice(), &target.as_bytes()],
+            )
+            .map_err(db_err)?
+            .is_empty();
+        if !member {
+            return Ok(MuteOutcome::NotMember);
+        }
+        if Self::is_admin_in_txn(&mut txn, conversation_id, target)? {
+            return Ok(MuteOutcome::TargetIsAdmin);
+        }
+        txn.execute(
+            "INSERT INTO group_mutes (conversation_id, account_id, muted_by, expires_at)
+             VALUES ($1, $2, $3, CASE WHEN $4::double precision IS NULL THEN NULL
+                                      ELSE now() + ($4 * interval '1 second') END)
+             ON CONFLICT (conversation_id, account_id) DO UPDATE
+                 SET muted_by = EXCLUDED.muted_by,
+                     muted_at = now(),
+                     expires_at = EXCLUDED.expires_at",
+            &[
+                &conversation_id.as_slice(),
+                &target.as_bytes(),
+                &actor.as_bytes(),
+                &expires_in_secs.map(|s| s as f64),
+            ],
+        )
+        .map_err(db_err)?;
+        txn.commit().map_err(db_err)?;
+        Ok(MuteOutcome::Muted)
+    }
+
+    /// Lift a mute. Idempotent: unmuting someone who is not muted is a no-op, so a retry after a
+    /// lost response cannot fail. Returns whether a mute was actually lifted (for the audit line,
+    /// never for authorization).
+    pub fn unmute_member(
+        &self,
+        conversation_id: &[u8; 16],
+        target: &AccountId,
+    ) -> StoreResult<bool> {
+        let mut conn = self.conn()?;
+        let mut txn = conn.transaction().map_err(db_err)?;
+        lock_conversation(&mut txn, conversation_id)?;
+        let lifted = txn
+            .execute(
+                "DELETE FROM group_mutes WHERE conversation_id = $1 AND account_id = $2",
+                &[&conversation_id.as_slice(), &target.as_bytes()],
+            )
+            .map_err(db_err)?;
+        txn.commit().map_err(db_err)?;
+        Ok(lifted > 0)
+    }
+
+    /// Lift every mute in the conversation ("unmute everyone"). Returns how many were lifted.
+    pub fn unmute_all(&self, conversation_id: &[u8; 16]) -> StoreResult<u64> {
+        let mut conn = self.conn()?;
+        let mut txn = conn.transaction().map_err(db_err)?;
+        lock_conversation(&mut txn, conversation_id)?;
+        let lifted = txn
+            .execute(
+                "DELETE FROM group_mutes WHERE conversation_id = $1",
+                &[&conversation_id.as_slice()],
+            )
+            .map_err(db_err)?;
+        txn.commit().map_err(db_err)?;
+        Ok(lifted)
+    }
+
+    /// Group settings, or `None` if the conversation does not exist.
+    pub fn settings(&self, conversation_id: &[u8; 16]) -> StoreResult<Option<GroupSettings>> {
+        let mut conn = self.conn()?;
+        Ok(conn
+            .query_opt(
+                "SELECT join_approval, announcements_only, mls_authoritative
+                 FROM conversations WHERE conversation_id = $1",
+                &[&conversation_id.as_slice()],
+            )
+            .map_err(db_err)?
+            .map(|r| GroupSettings {
+                join_approval: r.get(0),
+                announcements_only: r.get(1),
+                mls_authoritative: r.get(2),
+            }))
+    }
+
+    /// Every member of a conversation, once per account, with role, live mute state, and the
+    /// profile fields the server already stores in the clear (PRIVACY.md lists both). One query,
+    /// so opening a group's admin panel costs a single round trip rather than one per member.
+    ///
+    /// Expired mutes are filtered here with the same `expires_at > now()` predicate the send gate
+    /// uses, so the panel can never show a mute the gate no longer enforces.
+    pub fn members(&self, conversation_id: &[u8; 16]) -> StoreResult<Vec<MemberSummary>> {
+        let mut conn = self.conn()?;
+        let rows = conn
+            .query(
+                "SELECT DISTINCT ON (cm.account_id)
+                        cm.account_id,
+                        COALESCE(a.username_normalized, ''),
+                        COALESCE(p.display_name, ''),
+                        (ga.account_id IS NOT NULL),
+                        gm.muted_by,
+                        extract(epoch FROM gm.muted_at)::bigint,
+                        extract(epoch FROM gm.expires_at)::bigint
+                 FROM conversation_members cm
+                 LEFT JOIN accounts a ON a.account_id = cm.account_id
+                 LEFT JOIN profiles p ON p.account_id = cm.account_id
+                 LEFT JOIN group_admins ga
+                        ON ga.conversation_id = cm.conversation_id AND ga.account_id = cm.account_id
+                 LEFT JOIN group_mutes gm
+                        ON gm.conversation_id = cm.conversation_id AND gm.account_id = cm.account_id
+                       AND (gm.expires_at IS NULL OR gm.expires_at > now())
+                 WHERE cm.conversation_id = $1
+                 ORDER BY cm.account_id, cm.added_at",
+                &[&conversation_id.as_slice()],
+            )
+            .map_err(db_err)?;
+        rows.into_iter()
+            .map(|r| {
+                let muted_by: Option<&[u8]> = r.get(4);
+                let mute = match muted_by {
+                    Some(by) => Some(MuteState {
+                        muted_by: id16(by)?,
+                        muted_at_unix: r.get::<_, Option<i64>>(5).unwrap_or(0),
+                        expires_at_unix: r.get(6),
+                    }),
+                    None => None,
+                };
+                Ok(MemberSummary {
+                    account_id: id16(r.get::<_, &[u8]>(0))?,
+                    username: r.get(1),
+                    display_name: r.get(2),
+                    is_admin: r.get(3),
+                    mute,
+                })
+            })
+            .collect()
     }
 
     // ----- invites -------------------------------------------------------------------

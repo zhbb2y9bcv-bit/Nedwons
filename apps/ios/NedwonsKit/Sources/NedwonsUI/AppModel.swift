@@ -32,13 +32,19 @@ public final class AppModel: ObservableObject {
     @Published public var searchResults: [ProfileSummary] = []
     @Published public var blocked: [ProfileSummary] = []
     @Published public var conversations: [Conversation] = []
+    /// Group panel state per conversation (roles, mutes, settings), loaded when a conversation or
+    /// its panel opens and refreshed after every admin action. Keyed by conversation id.
+    @Published public var groupStates: [String: GroupState] = [:]
     @Published public var inbox: [InboxEnvelope] = []
     @Published public var isBusy = false
     @Published public var banner: String?
     /// Assurance level of the key backing the current session (hardware vs software fallback).
     @Published public var deviceAssurance: DeviceAssurance?
 
-    private let client: NedwonsClient
+    // Internal (not private) so the group-administration surface can live in its own file
+    // (`GroupAdminModel.swift`) as an extension; extensions cannot add stored state, but they
+    // can share this transport.
+    let client: NedwonsClient
     private let deviceIdentity: DeviceIdentity
     private let sessionStore: SessionStore
 
@@ -54,6 +60,21 @@ public final class AppModel: ObservableObject {
         sessionStore: SessionStore = SessionStore()
     ) {
         client = NedwonsClient(baseURL: baseURL)
+        self.pinnedLogKey = pinnedLogKey
+        self.deviceIdentity = deviceIdentity
+        self.sessionStore = sessionStore
+    }
+
+    /// Inject a preconfigured client — unit tests and the UI-test harness hand in one whose
+    /// `URLSession` is served by an in-process fixture, so the real model + real screens run against
+    /// a deterministic backend with no network at all.
+    public init(
+        client: NedwonsClient,
+        pinnedLogKey: Data? = nil,
+        deviceIdentity: DeviceIdentity = DeviceIdentity(),
+        sessionStore: SessionStore = SessionStore()
+    ) {
+        self.client = client
         self.pinnedLogKey = pinnedLogKey
         self.deviceIdentity = deviceIdentity
         self.sessionStore = sessionStore
@@ -116,16 +137,16 @@ public final class AppModel: ObservableObject {
         }
     }
 
-    private var token: String? { session?.accessToken }
+    var token: String? { session?.accessToken }
 
     /// Run an async action with busy state + error capture, so callers (buttons) stay tiny.
-    private func run(_ action: @escaping () async throws -> Void) async {
+    func run(_ action: @escaping () async throws -> Void) async {
         isBusy = true
         defer { isBusy = false }
         do {
             try await action()
-        } catch let NedwonsClient.ClientError.http(status, _) {
-            banner = errorText(for: status)
+        } catch let NedwonsClient.ClientError.http(status, body) {
+            banner = errorText(for: status, body: body)
         } catch NedwonsClient.ClientError.transport {
             banner = "Can't reach the server. Check your connection."
         } catch DeviceIdentityError.secureHardwareUnavailable {
@@ -140,8 +161,15 @@ public final class AppModel: ObservableObject {
         }
     }
 
-    private func errorText(for status: Int) -> String {
-        switch status {
+    /// Specific refusal codes (`GroupRefusal`) win over the status-only text: "a group needs at
+    /// least one admin" is actionable, "request failed (409)" is not. The generic `forbidden`
+    /// code is deliberately NOT mapped here — it means different things on different endpoints,
+    /// and the group-admin runner supplies its own wording for it.
+    func errorText(for status: Int, body: String = "") -> String {
+        if let refusal = GroupRefusal.from(errorBody: body), refusal != .forbidden {
+            return refusal.userFacingText
+        }
+        return switch status {
         case 401: "Not authorized."
         case 403: "Not allowed. A block between people here may be preventing this."
         case 409: "That username is taken."
@@ -694,6 +722,13 @@ public final class AppModel: ObservableObject {
 
     public func username(forAccountID id: String) -> String? { usernamesByAccountID[id] }
 
+    /// Single-entry form, for callers that learn a username outside a profile lookup (the group
+    /// panel's member list carries usernames for every member).
+    public func rememberUsername(_ username: String, forAccountID id: String) {
+        guard !username.isEmpty else { return }
+        usernamesByAccountID[id] = username
+    }
+
     public func rememberUsernames(_ people: [ProfileSummary]) {
         for person in people { usernamesByAccountID[person.accountID] = person.username }
     }
@@ -740,6 +775,14 @@ public final class AppModel: ObservableObject {
             try await sendMessageAction(trimmed, conversationID)
             // A thread the user deleted returns as soon as they legitimately use it again.
             unhideConversation(conversationID)
+        } catch let NedwonsClient.ClientError.http(_, body)
+            where GroupRefusal.from(errorBody: body).map(\.isSendRefusal) == true
+        {
+            // The composer is normally locked before this can happen; this is the race where an
+            // admin muted you (or locked the group) while you were typing. Say so, and reload the
+            // panel state so the composer locks now rather than after the next send.
+            banner = GroupRefusal.from(errorBody: body)?.userFacingText
+            await refreshGroupState(conversationID)
         } catch {
             banner = "Couldn't send that message. It stays queued and will retry."
         }
