@@ -60,6 +60,37 @@ fn canon(a: [u8; 16], b: [u8; 16]) -> ([u8; 16], [u8; 16]) {
     }
 }
 
+/// A stable advisory-lock key for an account PAIR, derived from the canonical ordering so both
+/// directions map to the same key.
+///
+/// `blocks` and `friendships` are different tables, so no row lock covers the invariant "a pair is
+/// never both blocked and friends". At READ COMMITTED neither transaction sees the other's
+/// uncommitted write, so a block and a friendship can commit concurrently, each blind to the other
+/// — write skew, which only SERIALIZABLE or an explicit lock prevents. Advisory locks are already
+/// this codebase's tool for exactly this shape of problem (`transparency.rs` serializes log
+/// appends the same way).
+///
+/// A 64-bit key over a 256-bit input can collide between unrelated pairs. That is harmless: a
+/// collision only makes two unrelated pairs take turns, it can never let a pair skip the lock.
+fn pair_lock_key(a: [u8; 16], b: [u8; 16]) -> i64 {
+    let (lo, hi) = canon(a, b);
+    let mut buf = [0u8; 32];
+    buf[..16].copy_from_slice(&lo);
+    buf[16..].copy_from_slice(&hi);
+    i64::from_be_bytes(
+        auth_core::crypto::sha256(&buf)[..8]
+            .try_into()
+            .expect("8 bytes"),
+    )
+}
+
+/// Serialize every social mutation for one pair. Held until the transaction ends.
+fn lock_pair(txn: &mut postgres::Transaction<'_>, a: [u8; 16], b: [u8; 16]) -> StoreResult<()> {
+    txn.execute("SELECT pg_advisory_xact_lock($1)", &[&pair_lock_key(a, b)])
+        .map_err(db_err)?;
+    Ok(())
+}
+
 impl PgSocial {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -175,6 +206,9 @@ impl PgSocial {
         let (lo, hi) = canon(from.0, to.0);
         let mut conn = self.conn()?;
         let mut txn = conn.transaction().map_err(db_err)?;
+        // Serialize against a concurrent block(): without this the block check below and the
+        // friendship INSERT straddle a window in which a block can commit unseen.
+        lock_pair(&mut txn, from.0, to.0)?;
 
         // Refuse if either party has blocked the other (dropping the txn rolls back).
         if txn
@@ -243,6 +277,24 @@ impl PgSocial {
         let (lo, hi) = canon(me.0, other.0);
         let mut conn = self.conn()?;
         let mut txn = conn.transaction().map_err(db_err)?;
+        lock_pair(&mut txn, me.0, other.0)?;
+
+        // Blocks MUST be re-checked here. This path previously relied entirely on `block()` having
+        // already deleted the pending request, which is not an invariant: a block committing around
+        // this accept would leave the pair both blocked and friends, and the friendship is a live
+        // authorization credential (`are_friends` gates `add_member`).
+        if txn
+            .query_opt(
+                "SELECT 1 FROM blocks
+                 WHERE (blocker = $1 AND blocked = $2) OR (blocker = $2 AND blocked = $1)",
+                &[&me.as_bytes(), &other.as_bytes()],
+            )
+            .map_err(db_err)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+
         let deleted = txn
             .execute(
                 "DELETE FROM friend_requests WHERE from_account = $1 AND to_account = $2",
@@ -352,6 +404,9 @@ impl PgSocial {
         let (lo, hi) = canon(blocker.0, blocked.0);
         let mut conn = self.conn()?;
         let mut txn = conn.transaction().map_err(db_err)?;
+        // Same pair lock the friendship paths take, so "insert block, then tear down friendship
+        // and requests" cannot interleave with a friendship being created underneath it.
+        lock_pair(&mut txn, blocker.0, blocked.0)?;
         txn.execute(
             "INSERT INTO blocks (blocker, blocked) VALUES ($1, $2) ON CONFLICT DO NOTHING",
             &[&blocker.as_bytes(), &blocked.as_bytes()],

@@ -307,7 +307,12 @@ fn add_active_device_race_never_exceeds_cap() {
     // Registration leaves exactly one active device, so MAX - 1 slots remain. Racing more
     // enrollments than slots means the cap MUST refuse the surplus.
     const RACERS: usize = 16;
-    assert!(RACERS > MAX, "racers must outnumber the cap to test refusal");
+    const {
+        assert!(
+            RACERS > MAX,
+            "racers must outnumber the cap to test refusal"
+        )
+    };
 
     let granted = Arc::new(AtomicUsize::new(0));
     let barrier = Arc::new(std::sync::Barrier::new(RACERS));
@@ -400,7 +405,12 @@ fn fanout_refuses_a_sender_removed_concurrently() {
         let idempotency_key: [u8; 16] = DeviceId::random().as_bytes().try_into().expect("16");
         std::thread::spawn(move || {
             let outcome = relay
-                .fanout_message(&conversation_id, &sender, b"opaque ciphertext", &idempotency_key)
+                .fanout_message(
+                    &conversation_id,
+                    &sender,
+                    b"opaque ciphertext",
+                    &idempotency_key,
+                )
                 .expect("fanout");
             finished.store(true, Ordering::SeqCst);
             outcome
@@ -430,6 +440,59 @@ fn fanout_refuses_a_sender_removed_concurrently() {
         .expect("count envelopes")
         .get(0);
     assert_eq!(queued, 0, "a removed sender must queue no envelopes");
+}
+
+/// A blocked pair must never also be friends. A stale friendship is not cosmetic: it is a live
+/// authorization credential — `add_member` gates group additions on `are_friends`, so a friendship
+/// surviving a block lets the blocked party be pulled into a group.
+///
+/// `blocks` and `friendships` are different tables, so no row lock covers the invariant, and at
+/// READ COMMITTED neither transaction sees the other's uncommitted write — textbook write skew.
+/// `accept_friend_request` makes it worse by never reading `blocks` at all, so it needs no timing
+/// window: it simply relies on `block()` having deleted the pending request first.
+#[test]
+fn block_and_friendship_never_coexist() {
+    let social = common::shared_social();
+    const TRIALS: usize = 40;
+
+    for trial in 0..TRIALS {
+        let a = AccountId::random();
+        let b = AccountId::random();
+
+        // B asks to be A's friend, leaving a pending request for A to accept.
+        social
+            .send_friend_request(&b, &a)
+            .expect("send friend request");
+
+        // A accepts while B blocks A, at maximum contention.
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let accepter = {
+            let social = social.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                social.accept_friend_request(&a, &b).expect("accept");
+            })
+        };
+        let blocker = {
+            let social = social.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                social.block(&b, &a).expect("block");
+            })
+        };
+        accepter.join().expect("accept thread");
+        blocker.join().expect("block thread");
+
+        let blocked = social.is_blocked_between(&a, &b).expect("is_blocked");
+        let friends = social.are_friends(&a, &b).expect("are_friends");
+        assert!(
+            !(blocked && friends),
+            "trial {trial}: pair is simultaneously blocked and friends — the friendship is a \
+             live authorization credential that survived the block"
+        );
+    }
 }
 
 /// Expired-row purge removes old challenges and access tokens (retention hygiene).
