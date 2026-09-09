@@ -125,7 +125,11 @@ struct SelfGroupLiveRun {
             let delivered = try await client.sendMessage(
                 accessToken: s.accessToken, conversationID: group.conversationID,
                 ciphertext: secretEnv, idempotencyKey: rnd(16))
-            guard delivered == 1 else { fail("secret fanned out to \(delivered), expected 1") }
+            // Since the V27 setup queue, membership is per-DEVICE and a new conversation enrolls
+            // every active device of each member account: R's phone AND R's linked tablet both get
+            // the envelope (the tablet holds it undecryptable until a member MLS-adds it via the
+            // setup queue). Pre-V27 this was 1.
+            guard delivered == 2 else { fail("secret fanned out to \(delivered), expected 2 (phone + tablet)") }
 
             // Phone pulls the Welcome (joins S's group) then the secret (holds it sealed).
             let phoneInbox = try await client.fetchInbox(accessToken: r.accessToken)
