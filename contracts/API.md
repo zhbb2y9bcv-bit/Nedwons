@@ -280,18 +280,54 @@ Blocks are re-checked at approval time; a now-blocked requester's request is con
 ### `POST /v1/conversations/{id}/admins/demote` → `204` | `409 last_admin`  `{ account_id }`
 Demoting the last admin is refused. When the last admin **leaves**, the earliest remaining member
 is auto-promoted, so a populated group is never unmanageable.
-### `POST /v1/conversations/{id}/settings` → `204`  `{ "join_approval": <bool> }`
+### `POST /v1/conversations/{id}/settings` → `204`  `{ "join_approval"?: <bool>, "announcements_only"?: <bool> }`
+Partial update: an omitted switch is left exactly as it is, so two admins editing different
+switches never revert each other. `announcements_only` = "mute all": only admins may send.
 
-### `POST /v1/conversations/{id}/messages` → `200` | `403`
+### Moderation: mutes and announcement mode (ADR-0009 third slice)
+
+**What a mute is, precisely.** A mute is a **relay-enforced send permission**. The relay is
+MLS-blind: a muted member still holds the group's MLS keys and could still *encrypt* for the group;
+what they lose is this server's willingness to distribute those bytes — on **both** paths that
+accept ciphertext for a conversation (`/messages` fan-out and targeted `/welcome`). It is an
+availability/moderation control, not a cryptographic one, and mute state is server-visible metadata
+(PRIVACY.md). Mutes are **account-scoped** (roles are too; a person with two devices is one
+participant). An admin is never muted — enforced from both sides by the schema (`V25`).
+
+### `POST /v1/conversations/{id}/mutes` → `204` | `404 not_member` | `409 target_is_admin` | `400`
+`{ "account_id", "duration_secs"?: <60..31536000> }`. Omit `duration_secs` for "until an admin
+unmutes". Re-muting replaces the expiry. Muting yourself is `400`; muting an admin is `409`
+(demote first, deliberately). Admin only.
+### `POST /v1/conversations/{id}/mutes/remove` → `204`  `{ account_id }` — idempotent. Admin only.
+### `POST /v1/conversations/{id}/mutes/clear` → `204` — lift every mute in the group. Admin only.
+
+### `GET /v1/conversations/{id}/group` → `200` | `403`
+Everything the group panel renders, in one round trip. Members only (generic `403` otherwise).
+```
+{ "conversation_id", "is_admin": <caller>, "can_send": <caller, from the same rows the send gate reads>,
+  "join_approval", "announcements_only", "mls_authoritative",
+  "members": [ { "account_id", "username", "display_name", "is_admin", "muted",
+                 "mute_expires_at"?: <unix — absent for indefinite>, "muted_by"?: "<account_id>" }, … ],
+  "join_requests": [ … ],   // admin only; [] for members
+  "invites": [ … ] }        // admin only; [] for members
+```
+A lapsed timed mute is filtered with the same `expires_at > now()` predicate the send gate uses,
+so the panel can never show a mute the gate no longer enforces.
+
+### `POST /v1/conversations/{id}/messages` → `200` | `403` | `403 muted` | `403 announcements_only`
 `{ "ciphertext": "<hex>", "idempotency_key": "<16B hex>" }`. One MLS application ciphertext,
 **fanned out server-side** to every other member device (the client uploads once, not once
 per recipient). Idempotent per key. Returns `{ "delivered": <int> }` — the number of devices
-newly queued (0 on an idempotent retry). Caller must be a member (object-level authz).
+newly queued (0 on an idempotent retry). Caller must be a member (object-level authz). A member
+who is muted, or who is not an admin while the group is in announcement mode, gets the **specific**
+code rather than the generic `403`: they are a member, so naming the reason discloses nothing, and
+their client shows the true state instead of guessing.
 
-### `POST /v1/conversations/{id}/welcome` → `200` | `403`
+### `POST /v1/conversations/{id}/welcome` → `200` | `403` | `403 muted` | `403 announcements_only`
 `{ "recipient_device": "<16B hex>", "ciphertext": "<hex>", "idempotency_key": "<16B hex>" }`.
 Targeted delivery of an MLS Welcome to a specific joining device. Idempotent; returns
-`{ "envelope_id": <int> }`.
+`{ "envelope_id": <int> }`. Gated by the same moderation check as `/messages` — otherwise a mute
+would be bypassable by anyone willing to modify their client, which is exactly who gets muted.
 
 ### `GET /v1/inbox[?wait=N]` → `200`
 **Peeks** the caller's undelivered envelopes **in delivery order** WITHOUT marking them

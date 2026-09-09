@@ -24,6 +24,18 @@ public struct NedwonsClient: Sendable {
         public let accessExpiresAt: UInt64
         public let refreshToken: String
         public let refreshExpiresAt: UInt64
+
+        public init(
+            accountID: String, deviceID: String, accessToken: String, accessExpiresAt: UInt64,
+            refreshToken: String, refreshExpiresAt: UInt64
+        ) {
+            self.accountID = accountID
+            self.deviceID = deviceID
+            self.accessToken = accessToken
+            self.accessExpiresAt = accessExpiresAt
+            self.refreshToken = refreshToken
+            self.refreshExpiresAt = refreshExpiresAt
+        }
     }
 
     private let baseURL: URL
@@ -137,7 +149,7 @@ public struct NedwonsClient: Sendable {
 
     // MARK: Authenticated transport (used by the social/messaging API)
 
-    fileprivate func perform(_ request: URLRequest) async throws -> Data {
+    func perform(_ request: URLRequest) async throws -> Data {
         let (data, response): (Data, URLResponse)
         do {
             (data, response) = try await session.data(for: request)
@@ -151,7 +163,7 @@ public struct NedwonsClient: Sendable {
         return data
     }
 
-    fileprivate func decode<R: Decodable>(_ data: Data) throws -> R {
+    func decode<R: Decodable>(_ data: Data) throws -> R {
         do {
             return try JSONDecoder().decode(R.self, from: data)
         } catch {
@@ -159,14 +171,14 @@ public struct NedwonsClient: Sendable {
         }
     }
 
-    fileprivate func authed(_ method: String, _ path: String, accessToken: String) -> URLRequest {
+    func authed(_ method: String, _ path: String, accessToken: String) -> URLRequest {
         var request = URLRequest(url: baseURL.appendingPathComponent(path))
         request.httpMethod = method
         request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
         return request
     }
 
-    fileprivate func queryURL(_ path: String, _ items: [URLQueryItem]) -> URL {
+    func queryURL(_ path: String, _ items: [URLQueryItem]) -> URL {
         var components = URLComponents(
             url: baseURL.appendingPathComponent(path),
             resolvingAgainstBaseURL: false

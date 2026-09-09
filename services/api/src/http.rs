@@ -32,7 +32,7 @@ use p256::ecdsa::signature::Signer;
 use serde::{Deserialize, Serialize};
 use tower_http::limit::RequestBodyLimitLayer;
 
-use crate::groups::{InviteOutcome, PgGroups};
+use crate::groups::{InviteOutcome, MuteOutcome, PgGroups};
 use crate::membership::{ApplyOutcome, CommitRequest, PgMembership};
 use crate::notify::DeliveryNotifier;
 use crate::relay::{FanoutOutcome, PgRelay, SelfGroupSendOutcome, SendOutcome};
@@ -249,6 +249,13 @@ pub fn build_router_cfg(
         .route("/v1/conversations/{id}/admins", post(promote_admin))
         .route("/v1/conversations/{id}/admins/demote", post(demote_admin))
         .route("/v1/conversations/{id}/settings", post(update_settings))
+        // moderation (ADR-0009): per-member mutes + announcement mode. Relay-enforced send
+        // permission, not a cryptographic control — see V25__group_moderation.sql.
+        .route("/v1/conversations/{id}/mutes", post(mute_member))
+        .route("/v1/conversations/{id}/mutes/remove", post(unmute_member))
+        .route("/v1/conversations/{id}/mutes/clear", post(unmute_all))
+        // One round trip for the whole group panel: settings, members + roles + mutes, requests.
+        .route("/v1/conversations/{id}/group", get(group_admin_state))
         .route("/v1/conversations/{id}/messages", post(send_message))
         .route("/v1/conversations/{id}/welcome", post(send_welcome))
         .route("/v1/inbox", get(fetch_inbox))
@@ -363,6 +370,15 @@ fn idempotency_conflict() -> ApiError {
     // Key reused with a different payload: retry with a fresh one. The original was not
     // overwritten.
     ApiError(StatusCode::CONFLICT, "idempotency_conflict")
+}
+
+/// A member in good standing who is not allowed to speak right now (ADR-0009 moderation).
+///
+/// Specific rather than the generic 403: the caller IS a member, so nothing is disclosed by
+/// naming the reason, and a client that cannot tell "you are muted" from "you are not in this
+/// group" has to guess — which is how a moderation control turns into a support ticket.
+fn muted(reason: crate::relay::SendRefusal) -> ApiError {
+    ApiError(StatusCode::FORBIDDEN, reason.code())
 }
 
 impl From<auth_core::store::StoreError> for ApiError {
@@ -2074,11 +2090,32 @@ struct AcceptInviteDto {
     status: &'static str,
 }
 
+/// Both fields are optional so a client can change one setting without having to know (and
+/// resend) the current value of the other — resending is what turns two admins editing different
+/// switches into one of them silently reverting the other.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SettingsBody {
-    join_approval: bool,
+    #[serde(default)]
+    join_approval: Option<bool>,
+    /// "Mute all": when on, only admins may send.
+    #[serde(default)]
+    announcements_only: Option<bool>,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MuteBody {
+    account_id: String,
+    /// Omitted = until an admin unmutes. Clamped to [`MAX_MUTE_SECS`].
+    #[serde(default)]
+    duration_secs: Option<i64>,
+}
+
+/// A timed mute longer than this is indistinguishable from an indefinite one in practice, and an
+/// unbounded value would let a client write a timestamp Postgres cannot represent.
+const MAX_MUTE_SECS: i64 = 365 * 24 * 3600;
+const MIN_MUTE_SECS: i64 = 60;
 
 fn token32_from_hex(input: &str) -> Result<[u8; 32], ApiError> {
     let bytes = hex_exact(input, 32)?;
@@ -2453,13 +2490,210 @@ async fn update_settings(
         if !is_conversation_admin(&st, &conversation_id, &me)? {
             return Ok(None);
         }
-        st.groups
-            .set_join_approval(&conversation_id, body.join_approval)?;
+        if let Some(join_approval) = body.join_approval {
+            st.groups
+                .set_join_approval(&conversation_id, join_approval)?;
+        }
+        if let Some(announcements_only) = body.announcements_only {
+            st.groups
+                .set_announcements_only(&conversation_id, announcements_only)?;
+        }
         Ok(Some(()))
     })
     .await?
     .ok_or_else(forbidden)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ----- moderation: mute, unmute, mute-all (ADR-0009) ----------------------------------
+//
+// Honest scope, repeated here because it is the thing most easily overclaimed: these controls are
+// enforced by the RELAY, on the paths that accept ciphertext for a conversation. They decide what
+// this server will distribute. They are not cryptographic — a muted member still holds the group's
+// MLS keys — and the store layer's `V25__group_moderation.sql` header says so in full.
+
+/// Mute one member, optionally for a fixed duration. Admin only.
+async fn mute_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+    Json(body): Json<MuteBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let target = AccountId(id16_from_hex(&body.account_id)?);
+    // Muting yourself would silence the admin who did it and, with one admin, lock the group's own
+    // moderation out of its only voice. Refused as a client bug rather than honoured.
+    if target.0 == me.account_id.0 {
+        return Err(bad_request());
+    }
+    let duration = body
+        .duration_secs
+        .map(|secs| secs.clamp(MIN_MUTE_SECS, MAX_MUTE_SECS));
+    let st = state.clone();
+    let outcome = blocking_store(move || {
+        if !is_conversation_admin(&st, &conversation_id, &me)? {
+            return Ok(None);
+        }
+        st.groups
+            .mute_member(&conversation_id, &target, &me.account_id, duration)
+            .map(Some)
+    })
+    .await?
+    .ok_or_else(forbidden)?;
+    match outcome {
+        MuteOutcome::Muted => Ok(StatusCode::NO_CONTENT),
+        MuteOutcome::NotMember => Err(ApiError(StatusCode::NOT_FOUND, "not_member")),
+        // Demote first. Doing it implicitly would let one admin strip another's role through an
+        // endpoint whose name says nothing about roles.
+        MuteOutcome::TargetIsAdmin => Err(ApiError(StatusCode::CONFLICT, "target_is_admin")),
+    }
+}
+
+/// Lift a mute. Admin only. Idempotent — unmuting an unmuted member succeeds.
+async fn unmute_member(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+    Json(body): Json<AccountRefBody>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let target = AccountId(id16_from_hex(&body.account_id)?);
+    let st = state.clone();
+    blocking_store(move || {
+        if !is_conversation_admin(&st, &conversation_id, &me)? {
+            return Ok(None);
+        }
+        st.groups.unmute_member(&conversation_id, &target)?;
+        Ok(Some(()))
+    })
+    .await?
+    .ok_or_else(forbidden)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Lift every mute in the group at once. Admin only; idempotent.
+async fn unmute_all(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let st = state.clone();
+    blocking_store(move || {
+        if !is_conversation_admin(&st, &conversation_id, &me)? {
+            return Ok(None);
+        }
+        st.groups.unmute_all(&conversation_id)?;
+        Ok(Some(()))
+    })
+    .await?
+    .ok_or_else(forbidden)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize)]
+struct GroupMemberDto {
+    account_id: String,
+    username: String,
+    display_name: String,
+    is_admin: bool,
+    muted: bool,
+    /// Absent for an indefinite mute, so a client cannot mistake "no expiry" for "expired".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mute_expires_at: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    muted_by: Option<String>,
+}
+
+#[derive(Serialize)]
+struct GroupAdminStateDto {
+    conversation_id: String,
+    /// Whether the CALLER administers this group — what the client keys its UI off, instead of
+    /// inferring privilege from the presence of data it happens to have been sent.
+    is_admin: bool,
+    /// Whether the CALLER may currently send. Computed from the same rows the relay's send gate
+    /// reads, so the composer's state and the server's answer cannot disagree.
+    can_send: bool,
+    join_approval: bool,
+    announcements_only: bool,
+    mls_authoritative: bool,
+    members: Vec<GroupMemberDto>,
+    /// Admin-only lists; empty for ordinary members rather than absent, so one response shape
+    /// serves both and the client never branches on a missing key.
+    join_requests: Vec<String>,
+    invites: Vec<InviteDto>,
+}
+
+/// Everything the group's admin panel renders, in one round trip: settings, the member list with
+/// roles and live mute state, pending join requests, and active invites.
+///
+/// Members-only. Ordinary members get the same view minus the admin-only lists — they are shown
+/// who administers the group and who is muted, because that is what makes moderation legible to
+/// the people subject to it.
+async fn group_admin_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+) -> Result<Json<GroupAdminStateDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let st = state.clone();
+    let dto = blocking_store(move || {
+        if !st.relay.is_member(&conversation_id, &me.device_id)? {
+            return Ok(None);
+        }
+        let Some(settings) = st.groups.settings(&conversation_id)? else {
+            return Ok(None);
+        };
+        let members = st.groups.members(&conversation_id)?;
+        let caller = members.iter().find(|m| m.account_id == me.account_id.0);
+        let is_admin = caller.map(|m| m.is_admin).unwrap_or(false);
+        let is_muted = caller.map(|m| m.mute.is_some()).unwrap_or(false);
+        let (join_requests, invites) = if is_admin {
+            (
+                st.groups.list_join_requests(&conversation_id)?,
+                st.groups.list_invites(&conversation_id)?,
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Ok(Some(GroupAdminStateDto {
+            conversation_id: hex::encode(conversation_id),
+            is_admin,
+            can_send: !is_muted && (is_admin || !settings.announcements_only),
+            join_approval: settings.join_approval,
+            announcements_only: settings.announcements_only,
+            mls_authoritative: settings.mls_authoritative,
+            members: members
+                .iter()
+                .map(|m| GroupMemberDto {
+                    account_id: hex::encode(m.account_id),
+                    username: m.username.clone(),
+                    display_name: m.display_name.clone(),
+                    is_admin: m.is_admin,
+                    muted: m.mute.is_some(),
+                    mute_expires_at: m.mute.as_ref().and_then(|s| s.expires_at_unix),
+                    muted_by: m.mute.as_ref().map(|s| hex::encode(s.muted_by)),
+                })
+                .collect(),
+            join_requests: join_requests.iter().map(hex::encode).collect(),
+            invites: invites
+                .iter()
+                .map(|i| InviteDto {
+                    invite_token: hex::encode(i.token),
+                    expires_at: i.expires_at_unix,
+                    max_uses: i.max_uses,
+                    uses: i.uses,
+                })
+                .collect(),
+        }))
+    })
+    .await?
+    .ok_or_else(forbidden)?;
+    Ok(Json(dto))
 }
 
 /// ONE ciphertext, fanned out server-side to every other member device, so the client uploads once
@@ -2490,6 +2724,7 @@ async fn send_message(
         // Refusing beats silently deduping, which would drop the new message while reporting
         // success.
         FanoutOutcome::IdempotencyMismatch => Err(idempotency_conflict()),
+        FanoutOutcome::Muted { reason } => Err(muted(reason)),
         FanoutOutcome::Delivered { newly_queued } => {
             // Wake any long-poll waiters for the recipients that just got mail.
             for device in &newly_queued {
@@ -2530,6 +2765,7 @@ async fn send_welcome(
     let envelope_id = match outcome {
         SendOutcome::Forbidden => return Err(forbidden()),
         SendOutcome::IdempotencyMismatch => return Err(idempotency_conflict()),
+        SendOutcome::Muted { reason } => return Err(muted(reason)),
         SendOutcome::Queued(id) => id,
     };
     state.notifier.wake(&recipient_bytes);

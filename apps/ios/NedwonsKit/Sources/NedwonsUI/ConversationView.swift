@@ -31,18 +31,38 @@ struct ConversationView: View {
     @State private var showProfile = false
     @State private var showRenameSheet = false
     @State private var renameText = ""
+    @State private var showGroupInfo = false
     private var palette: Nedwons.Palette { .forScheme(scheme) }
 
     var body: some View {
         VStack(spacing: 0) {
             messages
-            composer
+            if let lock = model.composerLock(for: chat.conversationID) {
+                lockedComposer(lock)
+            } else {
+                composer
+            }
         }
         .background(palette.background)
         .inlineNavigationTitle()
         .toolbar {
             ToolbarItem(placement: .principal) { header }
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    showGroupInfo = true
+                } label: {
+                    Image(systemName: chat.isGroup ? "person.3" : "info.circle")
+                }
+                .accessibilityLabel(chat.isGroup ? "Group info" : "Conversation details")
+                .accessibilityIdentifier(GroupAdminA11y.conversationGroupInfo)
+            }
         }
+        .navigationDestination(isPresented: $showGroupInfo) {
+            GroupAdminView(model: model, chat: chat)
+        }
+        // One round trip on open: the composer locks (or not) from the same rows the relay's send
+        // gate reads, so a muted member finds out here rather than from a refused send.
+        .task { await model.refreshGroupState(chat.conversationID) }
         .sheet(isPresented: $showProfile) {
             if let accountID = chat.peerAccountID {
                 PersonProfileView(
@@ -196,11 +216,31 @@ struct ConversationView: View {
         }
     }
 
+    /// Shown instead of the composer when the relay would refuse this account's messages: an admin
+    /// muted you, or the group is in announcement mode. Reading stays available — a mute is a
+    /// send permission, never a removal.
+    private func lockedComposer(_ lock: ComposerLock) -> some View {
+        HStack(spacing: Nedwons.Spacing.sm) {
+            Image(systemName: "speaker.slash.fill")
+                .foregroundStyle(palette.textSecondary)
+            Text(lock.text)
+                .font(Nedwons.TypeScale.callout)
+                .foregroundStyle(palette.textSecondary)
+                .multilineTextAlignment(.leading)
+            Spacer()
+        }
+        .padding(Nedwons.Spacing.md)
+        .background(palette.surface)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier(GroupAdminA11y.composerLocked)
+    }
+
     private var composer: some View {
         HStack(spacing: Nedwons.Spacing.sm) {
             TextField("Message", text: $draft, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...4)
+                .accessibilityIdentifier(GroupAdminA11y.composerField)
             Button {
                 let body = draft.trimmingCharacters(in: .whitespacesAndNewlines)
                 draft = ""

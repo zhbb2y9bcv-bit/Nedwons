@@ -228,6 +228,11 @@ jobs:
             -scheme Nedwons \
             -destination "id=$DEVICE_ID" \
             CODE_SIGNING_ALLOWED=NO
+      # XCUITest: the real app, driven on the simulator through its screens, with only the network
+      # replaced by the Debug-only in-process fixture. Until this step existed no CI job rendered a
+      # single SwiftUI view, so every screen-level regression was invisible.
+      - name: Run the XCUITest suite on the simulator (group admin flows)
+        run: scripts/test_ui_sim.sh
       # Compile-only for a real device: running needs hardware (R-101), but a device-slice
       # compile failure is a real regression and must not wait for a manual build.
       - name: Compile the device slice (compile-only — running needs hardware, R-101)

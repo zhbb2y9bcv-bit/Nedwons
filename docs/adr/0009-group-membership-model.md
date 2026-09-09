@@ -115,6 +115,35 @@ friends with each target — closing the forced-membership spam hole that pure o
 strangers join only via invite tokens. Verified end to end in the live smoke (direct non-friend
 add refused; stranger joins via invite; leaves).
 
+**Done — third slice (2026-09-08, moderation + the admin UI):** migration **V25** +
+`groups::PgGroups::{mute_member, unmute_member, unmute_all, set_announcements_only, members,
+settings}` + the send gate `relay::send_refusal_in_txn` + `tests/group_moderation.rs` (8, including
+a mute-vs-promote race). Admins can **mute** a member (timed or indefinite; re-mute replaces the
+expiry), **unmute** one or **everyone**, and put the group in **announcement mode** ("mute all":
+only admins may send). Enforcement is at the relay, inside the send transaction, on **both** paths
+that accept ciphertext for a conversation (`/messages` fan-out and targeted `/welcome`), with locks
+ordered members→conversations like every other governance path so a mute or a mode flip cannot
+interleave with an in-flight send. Refusals are specific (`403 muted` / `403 announcements_only`)
+because the caller is a member and deserves to know why. The schema enforces the role/mute
+invariant from both sides (a mute requires membership and is dropped with it; an admin is never
+muted — muting one is `409 target_is_admin`, promoting a muted member lifts the mute). One new read,
+`GET /v1/conversations/{id}/group`, returns the whole panel (settings, members with roles and live
+mute state, requests, invites) in one round trip; `can_send` in it is computed from the same rows the
+gate reads so the composer and the server cannot disagree. **Client:** `NedwonsClient` group-admin
+surface (`GroupAdmin.swift`, tested against a stub), `AppModel` extension (`GroupAdminModel.swift`),
+and the screens (`GroupAdminScreens.swift`: panel, member page with promote/demote/mute/unmute/
+remove, add-members picker, invite links, join requests, leave) plus a locked composer that names
+the reason. **First XCUITest suite in the repo** (`apps/ios/Nedwons/UITests`, `scripts/test_ui_sim.sh`,
+in CI) drives the real app on the simulator against a Debug-only in-process fixture that applies the
+relay's rules; the model tests reuse the same fixture so the two cannot drift.
+
+**Honest scope of a mute (repeat it wherever the feature is described):** the relay is MLS-blind,
+so a muted member still holds the group's keys. A mute removes the server's willingness to
+distribute their ciphertext — the only distribution path the product provides — and nothing more.
+It is not "they cannot encrypt for the group". Mute state is server-visible metadata (PRIVACY.md).
+Also note: a non-admin cannot bypass a mute through `/commit` (membership commits already require
+adminship), and a muted admin cannot exist, so the two gates compose without a gap.
+
 **Not yet done (designed above):** QR rendering of invites (client UI), group system messages,
 per-invite member-list preview, and — the big one — binding routing membership to
 **authenticated MLS Add/Remove commits**. That binding is inherently client-driven because the

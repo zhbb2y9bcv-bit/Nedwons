@@ -27,6 +27,7 @@ R-402).
 | Display name & bio (profile) | Show who you are | Life of account (editable) | Server (**plaintext**) |
 | Friendship graph & pending requests | Social graph, group gating | Life of relationship | Server (**plaintext**) |
 | Group / conversation membership | Route group messages | Life of membership | Server (**plaintext**) |
+| Group roles, mutes, announcement mode | Group administration; the relay refuses to distribute a muted member's messages | Life of membership (a mute ends with it) | Server (**plaintext**); visible to the group's members |
 | Blocks & reports | Abuse defense | Retained per policy | Server (access-controlled) |
 | Password (Argon2id hash) | Auth | Life of account | Server (hash only) |
 | Public device key + metadata | Device binding | Life of device enrollment | Server (public key only) |
@@ -47,8 +48,8 @@ The strong guarantee is about **message and call content**: it is end-to-end enc
 server holds only ciphertext (proven at rest by a direct database query in
 `services/api/tests/relay_e2ee.rs`). It is **not** correct to generalize "the server only stores
 ciphertext" to everything. **Social and routing metadata is server-readable plaintext today** —
-usernames, display names, bios, the friendship graph, group/conversation membership, and message
-timing/size. Username-prefix search inherently requires readable usernames. This distinction must
+usernames, display names, bios, the friendship graph, group/conversation membership, group roles
+and mute state, and message timing/size. Username-prefix search inherently requires readable usernames. This distinction must
 be stated wherever the privacy guarantee is described (App Store label, marketing, in-app copy);
 implying metadata is encrypted would be false.
 

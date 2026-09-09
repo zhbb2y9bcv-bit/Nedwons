@@ -197,6 +197,8 @@ struct NewGroupView: View {
                                 Image(systemName: selected.contains(friend.accountID) ? "checkmark.circle.fill" : "circle")
                                     .foregroundStyle(selected.contains(friend.accountID) ? palette.accentPrimary : palette.textSecondary)
                             }
+                            // Plain-style buttons hit-test only drawn content; make the whole row tappable.
+                            .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
                     }
