@@ -198,7 +198,7 @@ async fn admin_add_via_commit_flows_end_to_end() {
     let mut mail = drain_inbox(&app, bob.token()).await;
     let (_, ct) = mail.remove(0);
     match group_b.process(&bob.mls, &ct).unwrap() {
-        mls_core::Incoming::Application(pt) => assert_eq!(pt, b"welcome aboard"),
+        mls_core::Incoming::Application { payload: pt, .. } => assert_eq!(pt, b"welcome aboard"),
         _ => panic!("expected application message"),
     }
 }
@@ -459,7 +459,7 @@ async fn remove_commit_cuts_delivery_atomically() {
     let carol_mail = drain_inbox(&app, carol.token()).await;
     assert_eq!(carol_mail.len(), 2);
     match group_c.process(&carol.mls, &carol_mail[0].1).unwrap() {
-        mls_core::Incoming::Application(pt) => assert_eq!(pt, b"pre-removal"),
+        mls_core::Incoming::Application { payload: pt, .. } => assert_eq!(pt, b"pre-removal"),
         _ => panic!("expected the pre-removal application message"),
     }
     group_c
@@ -482,7 +482,7 @@ async fn remove_commit_cuts_delivery_atomically() {
     assert_eq!(s, StatusCode::OK);
     let (_, ct) = drain_inbox(&app, carol.token()).await.remove(0);
     match group_c.process(&carol.mls, &ct).unwrap() {
-        mls_core::Incoming::Application(pt) => assert_eq!(pt, b"post-removal"),
+        mls_core::Incoming::Application { payload: pt, .. } => assert_eq!(pt, b"post-removal"),
         _ => panic!("expected application message"),
     }
     assert!(drain_inbox(&app, bob.token()).await.is_empty());

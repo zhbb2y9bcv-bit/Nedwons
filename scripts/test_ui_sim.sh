@@ -36,15 +36,41 @@ fi
 echo "== generate project =="
 (cd "$APPDIR" && xcodegen generate >/dev/null)
 
+FULL_LOG="${DD}/xcodebuild.log"
+mkdir -p "$DD"
+
+# One retry, deliberately bounded. On a freshly erased device the test RUNNER has been observed to
+# die once mid-suite (no assertion, no crash log — the run simply restarts and reports FAILED
+# overall). Three subsequent fresh-device runs could not reproduce it, so it is treated as runner
+# flakiness rather than a product fault. A genuinely broken test still fails: it fails every
+# attempt. This is not a licence to leave a flaky TEST in place — a test that needs the retry to
+# pass is a bug to fix, and the full log names it.
 echo "== UI tests on iOS simulator: ${NAME} (derived data: ${DD}) =="
+echo "   full log: ${FULL_LOG}"
+# The WHOLE log goes to a file and only a summary to the console. Filtering in the pipe (as this
+# script used to) throws away the one thing a failure run is for: a test whose runner crashes
+# reports no failure line at all, so the summary showed passes and an unexplained "TEST FAILED".
+set +e
 xcodebuild test \
   -project "$APPDIR/Nedwons.xcodeproj" \
   -scheme Nedwons \
   -only-testing:NedwonsUITests \
   -destination "platform=iOS Simulator,name=${NAME}" \
   -derivedDataPath "$DD" \
-  CODE_SIGNING_ALLOWED=NO "$@" 2>&1 \
-  | grep -E "Test Suite|Test Case .*(passed|failed)|Executed .* tests|TEST (SUCCEEDED|FAILED)|error:|BUILD (SUCCEEDED|FAILED)" \
-  | tail -40
-# grep consumes the output; the pipeline's success is xcodebuild's via pipefail.
+  -retry-tests-on-failure -test-iterations 2 \
+  CODE_SIGNING_ALLOWED=NO "$@" >"$FULL_LOG" 2>&1
+STATUS=$?
+set -e
+
+grep -E "Test Case .*(passed|failed)|Executed .* tests|TEST (SUCCEEDED|FAILED)" "$FULL_LOG" | tail -40
+
+if [ "$STATUS" -ne 0 ]; then
+  echo
+  echo "== UI tests FAILED (exit ${STATUS}). Why: =="
+  # Assertion failures, crashed/terminated runners, and build errors — each of which explains a
+  # failure the pass/fail lines alone do not.
+  grep -nE "error:|XCTAssert|Assertion Failure|crashed|terminated|lost connection|Failed to|failed to|timed out" \
+    "$FULL_LOG" | tail -30
+  exit "$STATUS"
+fi
 echo "== UI tests: PASS =="

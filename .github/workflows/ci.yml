@@ -232,7 +232,19 @@ jobs:
       # replaced by the Debug-only in-process fixture. Until this step existed no CI job rendered a
       # single SwiftUI view, so every screen-level regression was invisible.
       - name: Run the XCUITest suite on the simulator (group admin flows)
+        # Pin the derived-data path so the artifact step below knows where the results are.
+        env:
+          NEDWONS_SIM_DD: ${{ runner.temp }}/nedwons-ui-simdd
         run: scripts/test_ui_sim.sh
+      # A UI test that fails only on CI is undiagnosable from the console summary alone; the
+      # result bundle carries the failure messages, the view hierarchy and the screenshots.
+      - name: Upload the xcresult bundle when UI tests fail
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xcuitest-results
+          path: ${{ runner.temp }}/nedwons-ui-simdd/Logs/Test
+          if-no-files-found: warn
       # Compile-only for a real device: running needs hardware (R-101), but a device-slice
       # compile failure is a real regression and must not wait for a manual build.
       - name: Compile the device slice (compile-only — running needs hardware, R-101)
@@ -250,9 +262,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust + Apple targets
+        # build_mls_ffi.sh builds ALL THREE slices (host, device, simulator), so the job needs
+        # every target — not just the host one it links its tests against.
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: aarch64-apple-darwin,aarch64-apple-ios,aarch64-apple-ios-sim
       - name: Build the MLS XCFramework (the composition tests drive the real core)
         run: scripts/build_mls_ffi.sh
       - name: Test
@@ -345,7 +359,7 @@ jobs:
       # The image ships a Debian base and a static binary; a base-image CVE is invisible to
       # cargo audit, which only sees Rust crates.
       - name: Scan the image
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.33.1
         with:
           image-ref: nedwons-api:ci
           format: table
@@ -353,7 +367,7 @@ jobs:
           ignore-unfixed: true
           severity: CRITICAL,HIGH
       - name: Scan infrastructure definitions
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@v0.33.1
         with:
           scan-type: config
           scan-ref: infra
