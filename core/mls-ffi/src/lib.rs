@@ -204,6 +204,10 @@ pub enum InboundResult {
     MessageEdited {
         target: Vec<u8>,
     },
+    /// A member set or cleared the group's photo. Already persisted; refresh the header.
+    GroupAvatarChanged {
+        removed: bool,
+    },
 }
 
 /// A file referenced by a message. The bytes live on the relay as ciphertext; this is everything
@@ -817,6 +821,9 @@ impl MlsClient {
                 InboundOutcome::MessageEdited { target } => InboundResult::MessageEdited {
                     target: target.to_vec(),
                 },
+                InboundOutcome::GroupAvatarChanged { removed } => {
+                    InboundResult::GroupAvatarChanged { removed }
+                }
             })
         })
     }
@@ -880,6 +887,9 @@ impl MlsClient {
                 InboundOutcome::MessageEdited { target } => InboundResult::MessageEdited {
                     target: target.to_vec(),
                 },
+                InboundOutcome::GroupAvatarChanged { removed } => {
+                    InboundResult::GroupAvatarChanged { removed }
+                }
             })
         })
     }
@@ -931,6 +941,31 @@ impl MlsClient {
                 ClientState::Pending { .. } => Err(MlsClientError::WrongState),
                 ClientState::Closed => Err(MlsClientError::Closed),
             }
+        })
+    }
+
+    /// The group's photo thumbnail (E2EE, like the name), or `None`.
+    pub fn group_avatar(&self) -> Result<Option<Vec<u8>>, MlsClientError> {
+        catch(move || {
+            let g = self.lock()?;
+            match &*g {
+                ClientState::Active { session } => Ok(session.group_avatar().map(|b| b.to_vec())),
+                ClientState::Pending { .. } => Err(MlsClientError::WrongState),
+                ClientState::Closed => Err(MlsClientError::Closed),
+            }
+        })
+    }
+
+    /// Queue a group-photo change for everyone (empty bytes = remove); `encrypt`/`mark_sent` it
+    /// like any other message. The image is a pre-scaled THUMBNAIL bounded by the content cap.
+    pub fn set_group_avatar(&self, image: Vec<u8>) -> Result<u64, MlsClientError> {
+        catch(move || {
+            bound(image.len(), MAX_PLAINTEXT_LEN)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session
+                .enqueue_group_avatar(&image)
+                .map_err(map_durable_input)
         })
     }
 

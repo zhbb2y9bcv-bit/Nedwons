@@ -241,6 +241,10 @@ pub enum InboundOutcome {
     MessageEdited {
         target: [u8; MESSAGE_ID_LEN],
     },
+    /// A member set (or, with `removed`, cleared) the group's photo. Already persisted; refresh.
+    GroupAvatarChanged {
+        removed: bool,
+    },
 }
 
 /// Travels in the committed blob alongside the MLS store snapshot.
@@ -304,6 +308,9 @@ struct Meta {
     /// keeps the expiry it was stamped with, matching what other members' clients do.
     #[serde(default)]
     disappear_after_secs: u32,
+    /// The group's photo thumbnail, E2EE like the name. `None` = never set / removed.
+    #[serde(default)]
+    group_avatar: Option<Vec<u8>>,
     /// R-105: every message with `local_id` below this lives in the append-only ARCHIVE, not in
     /// this blob. The hot window (`messages`) is what every commit rewrites; the archive is
     /// written once per message and never again — which is the whole fix: the blob stops growing
@@ -1469,6 +1476,15 @@ impl<J: Journal> DurableSession<J> {
                 }
                 None
             }
+            // The photo, like the name, applies when the group is actually told.
+            Content::GroupAvatar { image } => {
+                meta.group_avatar = if image.is_empty() {
+                    None
+                } else {
+                    Some(image.clone())
+                };
+                None
+            }
             // An edit lands locally when the group is told, marked visibly.
             Content::Edit { target, body } => {
                 if let Some(message) = meta
@@ -1671,6 +1687,20 @@ impl<J: Journal> DurableSession<J> {
     /// The group's name as last set by any member, or `None` if it has never been named.
     pub fn group_name(&self) -> Option<&str> {
         self.meta.group_name.as_deref()
+    }
+
+    /// The group's photo thumbnail, or `None`.
+    pub fn group_avatar(&self) -> Option<&[u8]> {
+        self.meta.group_avatar.as_deref()
+    }
+
+    /// Queue a group-photo change (empty = remove); applies at encrypt, like a rename.
+    pub fn enqueue_group_avatar(&mut self, image: &[u8]) -> Result<u64, DurableError> {
+        let content = Content::GroupAvatar {
+            image: image.to_vec(),
+        };
+        Content::decode(&content.encode()).map_err(map_content)?;
+        self.enqueue_content(content, None)
     }
 
     /// Queue a rename for the whole group. Like any message it becomes real when it is encrypted
@@ -2152,6 +2182,11 @@ fn apply_incoming(
                 Content::GroupName { name } => {
                     meta.group_name = Some(name.clone());
                     InboundOutcome::GroupRenamed { name }
+                }
+                Content::GroupAvatar { image } => {
+                    let removed = image.is_empty();
+                    meta.group_avatar = if removed { None } else { Some(image) };
+                    InboundOutcome::GroupAvatarChanged { removed }
                 }
                 // #7: append replicated history to the local log, each with a fresh local id.
                 Content::HistorySync { entries } => {

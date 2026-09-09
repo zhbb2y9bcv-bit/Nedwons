@@ -292,7 +292,13 @@ struct ChatRow: View {
 
     var body: some View {
         HStack(spacing: Nedwons.Spacing.md) {
-            Avatar(label: title, palette: palette, isGroup: chat.isGroup)
+            if chat.isGroup {
+                GroupAvatarView(
+                    model: model, conversationID: chat.conversationID, fallbackLabel: title,
+                    palette: palette)
+            } else {
+                Avatar(label: title, palette: palette, isGroup: false)
+            }
             VStack(alignment: .leading, spacing: Nedwons.Spacing.xxs) {
                 Text(title)
                     .font(Nedwons.TypeScale.body)

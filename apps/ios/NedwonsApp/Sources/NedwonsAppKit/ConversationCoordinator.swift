@@ -95,6 +95,10 @@ public final class ConversationCoordinator {
             guard let self else { throw CoordinatorError.notSignedIn }
             try await self.renameGroup(conversationID, to: name)
         }
+        model.setGroupAvatarAction = { [weak self] thumbnail, conversationID in
+            guard let self else { throw CoordinatorError.notSignedIn }
+            try await self.setGroupAvatar(thumbnail, in: conversationID)
+        }
         model.markConversationReadAction = { [weak self] conversationID in
             await self?.markRead(conversationID)
         }
@@ -316,10 +320,17 @@ public final class ConversationCoordinator {
                 _ = try await relay.sendMessage(
                     accessToken: token, conversationID: target.conversationID,
                     ciphertext: outcome.commit, idempotencyKey: Self.randomKey())
-                // The name lives only inside the ciphertext; re-send it so the newcomer's list
-                // shows the group by name. Best-effort — the next rename fixes a miss.
+                // The name and photo live only inside the ciphertext; re-send them so the
+                // newcomer's list shows the real group. Best-effort — the next change fixes a miss.
                 if let name = (try? client.groupName()) ?? nil {
                     try? await sendGroupName(name, client: client, conversationID: target.conversationID)
+                }
+                if let avatar = (try? client.groupAvatar()) ?? nil, !avatar.isEmpty {
+                    if let localID = try? client.setGroupAvatar(image: avatar) {
+                        try? await upload(
+                            localID: localID, client: client,
+                            conversationID: target.conversationID)
+                    }
                 }
                 touched.insert(target.conversationID)
             } catch {
@@ -345,6 +356,16 @@ public final class ConversationCoordinator {
 
     private func sendGroupName(_ name: String, client: MlsClient, conversationID: String) async throws {
         let localID = try client.setGroupName(name: name)
+        try await upload(localID: localID, client: client, conversationID: conversationID)
+    }
+
+    /// Set (or with nil remove) the group photo for everyone — E2EE, ordinary upload path.
+    public func setGroupAvatar(_ thumbnail: Data?, in conversationID: String) async throws {
+        guard let client = activeClient(for: conversationID) else {
+            throw CoordinatorError.noSessionForConversation
+        }
+        let localID = try client.setGroupAvatar(image: thumbnail ?? Data())
+        defer { refresh(conversationID) }
         try await upload(localID: localID, client: client, conversationID: conversationID)
     }
 
@@ -853,6 +874,11 @@ public final class ConversationCoordinator {
         // The group's name lives only inside the ciphertext; this is the one place it is read.
         if let name = (try? client.groupName()) ?? nil {
             model.groupNames[conversationID] = name
+        }
+        if let avatar = (try? client.groupAvatar()) ?? nil {
+            model.groupAvatars[conversationID] = avatar
+        } else {
+            model.groupAvatars.removeValue(forKey: conversationID)
         }
 
         // A secret never contributes its body to the preview — only that one arrived.

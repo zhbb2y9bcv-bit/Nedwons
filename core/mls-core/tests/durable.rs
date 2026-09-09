@@ -1029,3 +1029,38 @@ fn edits_are_author_only_and_always_visible() {
     assert!(after.deleted);
     assert!(after.plaintext.is_empty());
 }
+
+/// The group photo travels E2EE like the name: set by one member, applied on the other at
+/// receipt, removable, bounded, and never anywhere the relay could read it.
+#[test]
+fn group_avatar_is_set_removed_and_bounded() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+
+    let thumb = vec![0xAB; 4096];
+    let a = alice.enqueue_group_avatar(&thumb).expect("avatar");
+    let env = alice.encrypt(a).expect("encrypt");
+    assert_eq!(
+        alice.group_avatar(),
+        Some(thumb.as_slice()),
+        "sender applies at encrypt"
+    );
+    assert_eq!(
+        bob.process_inbound(1, &env).expect("process"),
+        InboundOutcome::GroupAvatarChanged { removed: false }
+    );
+    assert_eq!(bob.group_avatar(), Some(thumb.as_slice()));
+
+    // Empty = remove.
+    let r = alice.enqueue_group_avatar(&[]).expect("remove");
+    let env = alice.encrypt(r).expect("encrypt");
+    assert_eq!(
+        bob.process_inbound(2, &env).expect("process"),
+        InboundOutcome::GroupAvatarChanged { removed: true }
+    );
+    assert_eq!(bob.group_avatar(), None);
+    assert_eq!(alice.group_avatar(), None);
+
+    // Over-bound refused at the source (a photo goes through the ATTACHMENT pipeline; this is a
+    // thumbnail).
+    assert!(alice.enqueue_group_avatar(&vec![1u8; 20_000]).is_err());
+}

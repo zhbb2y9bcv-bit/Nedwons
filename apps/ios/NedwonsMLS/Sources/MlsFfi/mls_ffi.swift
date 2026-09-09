@@ -630,6 +630,11 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func epoch() throws  -> UInt64
     
     /**
+     * The group's photo thumbnail (E2EE, like the name), or `None`.
+     */
+    func groupAvatar() throws  -> Data?
+    
+    /**
      * The group's name, or `None` if it has never been named. Set by a member over the E2EE
      * channel: the relay stores no name and cannot learn one.
      */
@@ -785,6 +790,12 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
      * the group is actually told. Refuses a timer past the wire cap (90 days).
      */
     func setDisappearTimer(seconds: UInt32) throws  -> UInt64
+    
+    /**
+     * Queue a group-photo change for everyone (empty bytes = remove); `encrypt`/`mark_sent` it
+     * like any other message. The image is a pre-scaled THUMBNAIL bounded by the content cap.
+     */
+    func setGroupAvatar(image: Data) throws  -> UInt64
     
     /**
      * Queue a rename for the whole group, returning its local id — `encrypt`/`mark_sent` it like
@@ -1139,6 +1150,16 @@ open func epoch()throws  -> UInt64  {
 }
     
     /**
+     * The group's photo thumbnail (E2EE, like the name), or `None`.
+     */
+open func groupAvatar()throws  -> Data?  {
+    return try  FfiConverterOptionData.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_group_avatar(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
      * The group's name, or `None` if it has never been named. Set by a member over the E2EE
      * channel: the relay stores no name and cannot learn one.
      */
@@ -1463,6 +1484,18 @@ open func setDisappearTimer(seconds: UInt32)throws  -> UInt64  {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_set_disappear_timer(self.uniffiClonePointer(),
         FfiConverterUInt32.lower(seconds),$0
+    )
+})
+}
+    
+    /**
+     * Queue a group-photo change for everyone (empty bytes = remove); `encrypt`/`mark_sent` it
+     * like any other message. The image is a pre-scaled THUMBNAIL bounded by the content cap.
+     */
+open func setGroupAvatar(image: Data)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_set_group_avatar(self.uniffiClonePointer(),
+        FfiConverterData.lower(image),$0
     )
 })
 }
@@ -2725,6 +2758,11 @@ public enum InboundResult {
      */
     case messageEdited(target: Data
     )
+    /**
+     * A member set or cleared the group's photo. Already persisted; refresh the header.
+     */
+    case groupAvatarChanged(removed: Bool
+    )
 }
 
 
@@ -2783,6 +2821,9 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         )
         
         case 15: return .messageEdited(target: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 16: return .groupAvatarChanged(removed: try FfiConverterBool.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -2866,6 +2907,11 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         case let .messageEdited(target):
             writeInt(&buf, Int32(15))
             FfiConverterData.write(target, into: &buf)
+            
+        
+        case let .groupAvatarChanged(removed):
+            writeInt(&buf, Int32(16))
+            FfiConverterBool.write(removed, into: &buf)
             
         }
     }
@@ -3553,6 +3599,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_epoch() != 12252) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_group_avatar() != 59106) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mls_ffi_checksum_method_mlsclient_group_name() != 25916) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -3635,6 +3684,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_set_disappear_timer() != 9203) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_set_group_avatar() != 38060) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_set_group_name() != 28282) {

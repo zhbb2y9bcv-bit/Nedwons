@@ -1,4 +1,5 @@
 import NedwonsKit
+import PhotosUI
 import SwiftUI
 
 // The group panel (ADR-0009): who is in the group, who administers it, who is muted, and — for
@@ -66,6 +67,8 @@ struct GroupAdminView: View {
     @State private var draftName = ""
     @State private var confirmLeave = false
     @State private var qrInvite: InviteSheetToken?
+    @State private var showAvatarPicker = false
+    @State private var pickedAvatar: PhotosPickerItem?
     private var palette: Nedwons.Palette { .forScheme(scheme) }
 
     private var state: GroupState? { model.groupState(for: chat.conversationID) }
@@ -121,6 +124,21 @@ struct GroupAdminView: View {
                 "You stop receiving messages here immediately. If you are the only admin, the "
                     + "earliest remaining member becomes admin so the group is never left unmanaged.")
         }
+        .photosPicker(isPresented: $showAvatarPicker, selection: $pickedAvatar, matching: .images)
+        .onChange(of: pickedAvatar) { _, item in
+            guard let item else { return }
+            Task {
+                defer { pickedAvatar = nil }
+                guard let data = try? await item.loadTransferable(type: Data.self),
+                    let thumb = AvatarScaler.thumbnail(from: data)
+                else {
+                    model.banner = "Couldn't use that photo."
+                    return
+                }
+                // The photo is downscaled ON DEVICE and travels only inside the ciphertext.
+                await model.setGroupAvatar(thumb, in: chat.conversationID)
+            }
+        }
         .sheet(item: $qrInvite) { sheet in
             // QR + copyable token (roadmap step 4): shown right after minting and from each row.
             InviteQRView(token: sheet.token, groupTitle: model.conversationTitle(for: chat))
@@ -170,9 +188,12 @@ struct GroupAdminView: View {
     private var headerSection: some View {
         Section {
             VStack(spacing: Nedwons.Spacing.sm) {
-                Avatar(label: model.groupName(for: chat.conversationID) ?? "G", palette: palette, isGroup: true)
-                    .scaleEffect(1.4)
-                    .frame(height: 72)
+                GroupAvatarView(
+                    model: model, conversationID: chat.conversationID,
+                    fallbackLabel: model.groupName(for: chat.conversationID) ?? "G",
+                    palette: palette)
+                .scaleEffect(1.4)
+                .frame(height: 72)
                 Text(model.conversationTitle(for: chat))
                     .font(Nedwons.TypeScale.headline)
                     .foregroundStyle(palette.textPrimary)
@@ -192,6 +213,23 @@ struct GroupAdminView: View {
                     }
                     .font(Nedwons.TypeScale.caption)
                     .accessibilityIdentifier(GroupAdminA11y.rename)
+                    HStack(spacing: Nedwons.Spacing.lg) {
+                        Button {
+                            showAvatarPicker = true
+                        } label: {
+                            Label(
+                                model.groupAvatars[chat.conversationID] == nil
+                                    ? "Set photo" : "Change photo",
+                                systemImage: "camera")
+                        }
+                        .accessibilityIdentifier("group.avatar.set")
+                        if model.groupAvatars[chat.conversationID] != nil {
+                            Button("Remove photo", role: .destructive) {
+                                Task { await model.setGroupAvatar(nil, in: chat.conversationID) }
+                            }
+                        }
+                    }
+                    .font(Nedwons.TypeScale.caption)
                 }
                 if let state, state.announcementsOnly {
                     Label("Announcement mode — only admins can send", systemImage: "megaphone.fill")
