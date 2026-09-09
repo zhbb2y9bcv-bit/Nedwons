@@ -879,6 +879,63 @@ public final class AppModel: ObservableObject {
     /// Injected: mark a conversation read on this device.
     public var markConversationReadAction: ((String) async -> Void)?
 
+    /// Injected: encrypt a file, upload the ciphertext, and send the message that references it.
+    public var sendAttachmentAction: ((Data, String, String, String, String) async throws -> Void)?
+
+    /// Injected: fetch and decrypt one attachment's bytes.
+    public var loadAttachmentAction: ((String) async throws -> Data)?
+
+    /// Decrypted attachment bytes for this session, keyed by blob id.
+    ///
+    /// In memory on purpose: a decrypted photo written to a cache directory outlives the moment it
+    /// was shown and survives in backups, which is not what someone sending a picture through an
+    /// E2EE messenger expects. The cost is that they download again next launch.
+    @Published public private(set) var attachments: [String: AttachmentState] = [:]
+
+    public func attachmentState(_ blobID: String) -> AttachmentState {
+        attachments[blobID] ?? .notLoaded
+    }
+
+    /// Encrypt, upload, and send a file. The bytes are encrypted before anything leaves the device.
+    public func sendAttachment(
+        _ data: Data, mime: String, filename: String, caption: String, to conversationID: String
+    ) async {
+        guard let sendAttachmentAction else {
+            banner = "Sending files isn't available in this build."
+            return
+        }
+        isBusy = true
+        defer { isBusy = false }
+        do {
+            try await sendAttachmentAction(data, mime, filename, caption, conversationID)
+            unhideConversation(conversationID)
+        } catch let NedwonsClient.ClientError.http(_, body)
+            where GroupRefusal.from(errorBody: body).map(\.isSendRefusal) == true
+        {
+            banner = GroupRefusal.from(errorBody: body)?.userFacingText
+            await refreshGroupState(conversationID)
+        } catch {
+            banner = "Couldn't send that file."
+        }
+    }
+
+    /// Fetch and decrypt one attachment, remembering the result for this session.
+    public func loadAttachment(_ attachment: AttachmentLine) async {
+        guard let loadAttachmentAction else { return }
+        if case .loading = attachmentState(attachment.blobID) { return }
+        attachments[attachment.blobID] = .loading
+        do {
+            attachments[attachment.blobID] = .loaded(try await loadAttachmentAction(attachment.blobID))
+        } catch let NedwonsClient.ClientError.http(status, _) {
+            // 410 is the relay's honest answer that the bytes aged out of retention; every other
+            // status is something a retry might fix.
+            attachments[attachment.blobID] = .failed(
+                status == 410 ? "No longer available" : "Couldn't download — tap to retry")
+        } catch {
+            attachments[attachment.blobID] = .failed("Couldn't download — tap to retry")
+        }
+    }
+
     public var clearHistoryAction: ((String) async throws -> Void)?
 
     /// Local-only deletion. Nothing is sent: no "delete for everyone" event exists, the peer's copy

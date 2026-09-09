@@ -203,6 +203,30 @@ pub async fn make_app(per_ip_per_minute: u32) -> Router {
     .expect("app setup")
 }
 
+/// Build the app with its own attachment blob directory, so parallel tests never share one.
+#[allow(dead_code)]
+pub async fn make_app_with_blobs(per_ip_per_minute: u32, blob_dir: std::path::PathBuf) -> Router {
+    tokio::task::spawn_blocking(move || {
+        let stores = shared_stores();
+        let service = Arc::new(make_service(&stores));
+        let blobs = nedwons_api::blobs::FsBlobStore::new(&blob_dir).expect("blob dir");
+        nedwons_api::http::build_router_with_blobs(
+            service,
+            shared_relay(),
+            shared_social(),
+            shared_groups(),
+            shared_transparency(),
+            shared_membership(),
+            per_ip_per_minute,
+            None,
+            false,
+            Some(Arc::new(blobs)),
+        )
+    })
+    .await
+    .expect("app setup")
+}
+
 /// Build the app with DPoP-style proof enforcement ON (ADR-0011, R-308), so tests can exercise
 /// sender-constrained access tokens.
 #[allow(dead_code)]

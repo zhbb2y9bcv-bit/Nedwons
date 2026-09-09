@@ -21,6 +21,11 @@ public protocol ConversationRelay: Sendable {
     func sendMessage(
         accessToken: String, conversationID: String, ciphertext: Data, idempotencyKey: Data
     ) async throws -> Int
+    /// Upload encrypted attachment bytes; returns the relay's blob id.
+    func uploadAttachment(accessToken: String, conversationID: String, ciphertext: Data) async throws
+        -> String
+    /// Fetch an attachment's ciphertext by blob id.
+    func downloadAttachment(accessToken: String, blobID: String) async throws -> Data
     func fetchInbox(accessToken: String, waitSeconds: Int) async throws -> [InboxEnvelope]
     func ackInbox(accessToken: String, ids: [Int]) async throws
 }

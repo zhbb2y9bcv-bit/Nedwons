@@ -72,6 +72,28 @@ it, cannot process a commit for the epoch it joins at, and discards it like any 
 envelope). The same path adds people to an existing group (`addMembers`), which previously touched
 relay routing only — they were being sent ciphertext they held no key for.
 
+### Attachments (E2EE files)
+
+`mls_core::attachment` seals a file under a **fresh one-time key** (AES-256-GCM). The nonce is fixed
+at zero and that is safe *only* because a key is used exactly once — re-encrypting the same file
+draws a new key and produces different bytes, so identical files are not recognisable as such. The
+sender uploads the ciphertext, gets a blob id, and sends `Content::Attachment` carrying the key,
+a SHA-256 of the ciphertext, the size, media type, filename and caption — all inside the MLS
+ciphertext. The relay therefore stores bytes it has no key for and cannot tell a photo from a PDF.
+
+The digest is checked **before** decryption, which is what catches a relay that serves a different
+(perfectly valid) object under the same id: GCM alone would just fail, and the client could not say
+which thing went wrong. `seal_attachment`/`open_attachment` are free functions, not methods —
+sealing touches no group state, so a file can be prepared before choosing where to send it, and a
+failed upload never leaves a message pointing at bytes that do not exist.
+
+References are stored in the message log **including the key**, so a file reopens after a relaunch
+without asking the sender; the log lives in the durable blob, encrypted at rest under the same key
+as the ratchet beside it. Bounded at 25 MB because both halves run in memory (plaintext, ciphertext,
+and a copy of each across the FFI) — streaming is the honest next step, and until it exists a cap
+beats an out-of-memory crash on a large video. Decrypted bytes are held in memory for the session
+and never written to disk in the clear.
+
 ### Group name, read state, timestamps (arc: "feels like a messenger")
 
 - **`Content::GroupName`** (kind 5) — the group's name is an ordinary E2EE message: the sender's

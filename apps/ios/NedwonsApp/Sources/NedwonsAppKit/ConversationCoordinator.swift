@@ -86,6 +86,15 @@ public final class ConversationCoordinator {
         model.markConversationReadAction = { [weak self] conversationID in
             self?.markRead(conversationID)
         }
+        model.sendAttachmentAction = { [weak self] data, mime, filename, caption, conversationID in
+            guard let self else { throw CoordinatorError.notSignedIn }
+            try await self.sendAttachment(
+                data, mime: mime, filename: filename, caption: caption, to: conversationID)
+        }
+        model.loadAttachmentAction = { [weak self] blobID in
+            guard let self else { throw CoordinatorError.notSignedIn }
+            return try await self.loadAttachment(blobID)
+        }
         model.clearHistoryAction = { [weak self] conversationID in
             try self?.clearHistory(in: conversationID)
         }
@@ -255,6 +264,66 @@ public final class ConversationCoordinator {
     private func sendGroupName(_ name: String, client: MlsClient, conversationID: String) async throws {
         let localID = try client.setGroupName(name: name)
         try await upload(localID: localID, client: client, conversationID: conversationID)
+    }
+
+    // MARK: Attachments
+
+    /// Encrypt a file, upload the ciphertext, then send the message that references it.
+    ///
+    /// The order is load-bearing. Encryption happens first and locally, so the relay never sees the
+    /// file. The upload happens SECOND and the message THIRD, so a failed upload leaves no message
+    /// pointing at bytes that do not exist — the failure is a file that was never sent, not a
+    /// permanently broken bubble in someone's thread.
+    public func sendAttachment(
+        _ data: Data, mime: String, filename: String, caption: String, to conversationID: String
+    ) async throws {
+        guard let token else { throw CoordinatorError.notSignedIn }
+        guard let client = activeClient(for: conversationID) else {
+            throw CoordinatorError.noSessionForConversation
+        }
+        let sealed = try sealAttachment(plaintext: data)
+        let blobHex = try await relay.uploadAttachment(
+            accessToken: token, conversationID: conversationID, ciphertext: sealed.ciphertext)
+        guard let blobID = Hex.decode(blobHex), blobID.count == 16 else {
+            throw CoordinatorError.badBlobID
+        }
+        let localID = try client.sendAttachment(
+            blobId: blobID, key: sealed.key, digest: sealed.digest, size: UInt64(data.count),
+            mime: mime, filename: filename, caption: caption)
+        defer { refresh(conversationID) }
+        try await upload(localID: localID, client: client, conversationID: conversationID)
+    }
+
+    /// Fetch one attachment's ciphertext and open it with the key that came over MLS.
+    ///
+    /// The digest check inside `openAttachment` is what makes this safe against the relay serving
+    /// different bytes under the same id — it is checked before decryption, so a substitution is
+    /// reported as such rather than as a decryption failure.
+    public func loadAttachment(_ blobID: String) async throws -> Data {
+        guard let token else { throw CoordinatorError.notSignedIn }
+        guard let reference = attachmentReference(blobID) else {
+            throw CoordinatorError.unknownAttachment
+        }
+        let ciphertext = try await relay.downloadAttachment(accessToken: token, blobID: blobID)
+        return try openAttachment(
+            key: reference.key, digest: reference.digest, ciphertext: ciphertext)
+    }
+
+    /// The reference (with its key) as stored in whichever conversation's log carries this blob.
+    /// Read from local state, never from the network: the key must come from the message the group
+    /// sent, not from anything the relay could influence.
+    private func attachmentReference(_ blobID: String) -> AttachmentInfo? {
+        for conversationID in index.conversations.keys {
+            guard let client = activeClient(for: conversationID),
+                let messages = try? client.messages()
+            else { continue }
+            for message in messages {
+                if let attachment = message.attachment, Hex.encode(attachment.blobId) == blobID {
+                    return attachment
+                }
+            }
+        }
+        return nil
     }
 
     /// The user is looking at the conversation: everything in it is read.
@@ -467,6 +536,20 @@ public final class ConversationCoordinator {
                     timestamp: timestamp,
                     isPending: message.pending)
             }
+            if let attachment = message.attachment {
+                return ThreadLine(
+                    id: message.localId,
+                    kind: .attachment(
+                        AttachmentLine(
+                            blobID: Hex.encode(attachment.blobId),
+                            mime: attachment.mime,
+                            filename: attachment.filename,
+                            size: attachment.size,
+                            caption: String(decoding: message.plaintext, as: UTF8.self))),
+                    mine: mine,
+                    timestamp: timestamp,
+                    isPending: message.pending)
+            }
             return ThreadLine(
                 id: message.localId,
                 kind: .text(String(decoding: message.plaintext, as: UTF8.self)),
@@ -482,9 +565,15 @@ public final class ConversationCoordinator {
 
         // A secret never contributes its body to the preview — only that one arrived.
         let preview: String? = stored.last.map { last in
-            last.secretId != nil
-                ? "Secret message"
-                : String(decoding: last.plaintext, as: UTF8.self)
+            if last.secretId != nil { return "Secret message" }
+            let caption = String(decoding: last.plaintext, as: UTF8.self)
+            guard let attachment = last.attachment else { return caption }
+            // A file's preview names what it is; the caption follows when there is one.
+            let kind = AttachmentLine(
+                blobID: "", mime: attachment.mime, filename: attachment.filename,
+                size: attachment.size, caption: caption
+            ).displayName
+            return caption.isEmpty ? kind : "\(kind) · \(caption)"
         }
         model.localThreads[conversationID] = AppModel.LocalThreadState(
             preview: preview,
@@ -538,6 +627,10 @@ public final class ConversationCoordinator {
         case noSessionForConversation
         case notSignedIn
         case badKeyPackage
+        /// The relay returned something that is not a 16-byte blob id.
+        case badBlobID
+        /// No message in local state references this blob, so there is no key to open it with.
+        case unknownAttachment
         /// Account ids that could not be added (no prekey, or delivery failed).
         case membersNotSetUp([String])
     }

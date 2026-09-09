@@ -48,6 +48,11 @@ pub const REPORTS: Quota = Quota::new("report", 30, 86_400);
 /// a spam vector for whole groups.
 pub const GROUP_INVITES: Quota = Quota::new("group_invite", 60, 3600);
 
+/// Attachment uploads. Storage is the one resource a single account can exhaust for everyone, and
+/// unlike a message an attachment is bounded only by the size cap — so this is deliberately tighter
+/// than the message path.
+pub const ATTACHMENT_UPLOADS: Quota = Quota::new("attachment_upload", 120, 3600);
+
 /// Distributed fixed-window counters.
 pub struct Quotas {
     pool: PgPool,

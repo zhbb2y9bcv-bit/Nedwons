@@ -812,6 +812,31 @@ public extension NedwonsClient {
         _ = try await perform(request)
     }
 
+    // ----- attachments (E2EE files) -----
+    //
+    // The relay stores ciphertext it has no key for. The key travels to the group inside the MLS
+    // message that references the blob, so these two calls move opaque bytes and nothing else.
+
+    /// Upload one encrypted attachment for a conversation; returns the relay's blob id (hex).
+    /// The caller must be a member and currently allowed to send there.
+    func uploadAttachment(
+        accessToken: String, conversationID: String, ciphertext: Data
+    ) async throws -> String {
+        struct Res: Decodable { let blob_id: String }
+        var request = authed(
+            "POST", "/v1/conversations/\(conversationID)/attachments", accessToken: accessToken)
+        request.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
+        request.httpBody = ciphertext
+        let res: Res = try decode(await perform(request))
+        return res.blob_id
+    }
+
+    /// Fetch an attachment's ciphertext. Members of its conversation only; `410` once it has aged
+    /// out of the relay's retention window.
+    func downloadAttachment(accessToken: String, blobID: String) async throws -> Data {
+        try await perform(authed("GET", "/v1/attachments/\(blobID)", accessToken: accessToken))
+    }
+
     /// How many of this device's prekeys the relay still holds, and the level below which it asks
     /// the client to replenish (`GET /v1/keypackages/count`).
     public func keyPackageCount(accessToken: String) async throws -> KeyPackageCount {

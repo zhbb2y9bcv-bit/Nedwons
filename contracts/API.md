@@ -329,6 +329,31 @@ Targeted delivery of an MLS Welcome to a specific joining device. Idempotent; re
 `{ "envelope_id": <int> }`. Gated by the same moderation check as `/messages` — otherwise a mute
 would be bypassable by anyone willing to modify their client, which is exactly who gets muted.
 
+### Attachments (E2EE files)
+
+The relay stores **ciphertext it has no key for** and serves it back to the conversation's current
+members. The key, the media type, the filename and the caption travel inside the MLS message that
+references the blob (`Content::Attachment`), so the server cannot tell a photo from a PDF. What it
+does learn — stated precisely, and no more than this — is that an account uploaded an object of a
+given ciphertext size to a given conversation at a given time (`V26__attachments.sql`).
+
+Both routes are disabled (`503 attachments_unavailable`) unless the deployment sets
+`NEDWONS_BLOB_DIR`. Storage is a local directory today; `services/api/src/blobs.rs` is the seam for
+object storage, which a multi-node deployment needs — see `docs/HOSTING.md`.
+
+### `POST /v1/conversations/{id}/attachments` → `200` | `403` | `403 muted` | `400` | `503`
+Body: raw ciphertext (`application/octet-stream`), 1 byte … 26 MB (the client's 25 MB plaintext cap
+plus AEAD overhead). Returns `{ "blob_id": "<16B hex>" }`. Caller must be a member **and** currently
+allowed to send: an upload is the first half of sending a message, so a muted member is refused with
+the same specific code, and nothing is written.
+
+### `GET /v1/attachments/{blob_id}` → `200` (octet-stream) | `403` | `410 attachment_expired` | `503`
+Serves the ciphertext to a current member of the blob's conversation. Authorization is membership,
+re-checked on every fetch — not possession of the id — so leaving a group ends access to its files
+as well as its messages, and a leaked id is not a permanent capability. A non-member and a
+nonexistent blob get the **same** `403`, so this is not an existence oracle. `410` means the object
+aged out of the retention window (same TTL as queued mail, `DATA_RETENTION.md`).
+
 ### `GET /v1/inbox[?wait=N]` → `200`
 **Peeks** the caller's undelivered envelopes **in delivery order** WITHOUT marking them
 delivered: `[ { "id", "conversation_id", "sender_device", "ciphertext" }, … ]`. Ordered
