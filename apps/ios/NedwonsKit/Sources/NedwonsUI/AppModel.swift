@@ -992,6 +992,59 @@ public final class AppModel: ObservableObject {
     /// Injected: on-device search over the decrypted local history.
     public var searchMessagesAction: ((String) -> [MessageSearchHit])?
 
+    /// Injected: seal the message stores + at-rest root under a passphrase (docs/BACKUPS.md).
+    public var createBackupAction: ((String) async throws -> Data)?
+    /// Injected: restore a sealed backup into an empty store (returns files restored).
+    public var restoreBackupAction: ((Data, String) async throws -> Int)?
+
+    /// Create an encrypted backup and hand back a temp file URL for the share sheet. `nil` (with
+    /// a banner) on failure. The passphrase never leaves the device — it seals the file.
+    public func createBackup(passphrase: String) async -> URL? {
+        guard let createBackupAction else {
+            banner = "Backups aren't available in this build."
+            return nil
+        }
+        do {
+            let data = try await createBackupAction(passphrase)
+            let stamp = ISO8601DateFormatter().string(from: Date()).prefix(10)
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent("nedwons-backup-\(stamp).nedwonsbackup")
+            try data.write(to: url, options: .atomic)
+            banner = "Backup created. Store it somewhere safe — it opens only with your passphrase."
+            return url
+        } catch {
+            banner = "Couldn't create the backup."
+            return nil
+        }
+    }
+
+    /// Restore from a backup file. Honest failure modes: wrong passphrase and a damaged file are
+    /// indistinguishable (by design), and restoring over existing conversations is refused.
+    public func restoreBackup(from url: URL, passphrase: String) async -> Bool {
+        guard let restoreBackupAction else {
+            banner = "Restore isn't available in this build."
+            return false
+        }
+        do {
+            let secured = url.startAccessingSecurityScopedResource()
+            defer { if secured { url.stopAccessingSecurityScopedResource() } }
+            let data = try Data(contentsOf: url)
+            let count = try await restoreBackupAction(data, passphrase)
+            banner = "Restored \(count) file\(count == 1 ? "" : "s") of chat history."
+            await refreshConversations()
+            return true
+        } catch Backup.BackupError.cannotOpen {
+            banner = "Wrong passphrase, or the file is damaged. Nothing was restored."
+            return false
+        } catch Backup.BackupError.unsupportedVersion {
+            banner = "This backup was made by a newer version of Nedwons. Update the app first."
+            return false
+        } catch {
+            banner = "Couldn't restore. This device already has chat data, or the file is not a Nedwons backup."
+            return false
+        }
+    }
+
     /// Disappearing-message timer per conversation, in seconds (0/absent = off). Decrypted local
     /// state, published by the composition layer — never a server field.
     @Published public var disappearTimers: [String: UInt32] = [:]

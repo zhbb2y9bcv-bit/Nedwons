@@ -51,6 +51,24 @@ public struct AtRestKeyHierarchy: Sendable {
         try store.delete(account: rootAccount)
     }
 
+    /// The raw root, for inclusion in an ENCRYPTED chat backup (docs/BACKUPS.md) — the one
+    /// sanctioned way it leaves the Keychain, and only ever inside a passphrase-sealed archive.
+    public func exportRoot() throws -> Data {
+        try loadOrCreateRoot()
+    }
+
+    /// Restore a backed-up root — refused when one already exists, so a restore can never
+    /// silently clobber the keys guarding this device's current stores. Returns false (no-op)
+    /// when the existing root is byte-identical (same-device reinstall with a surviving Keychain).
+    public func importRoot(_ root: Data) throws -> Bool {
+        if let existing = try store.load(account: rootAccount) {
+            if existing == root { return false }
+            throw AtRestKeyError.rootAlreadyExists
+        }
+        try store.save(root, account: rootAccount, accessible: Self.rootAccessible)
+        return true
+    }
+
     /// Generates + persists a fresh random root on first use. Idempotent.
     private func loadOrCreateRoot() throws -> Data {
         if let existing = try store.load(account: rootAccount) {
@@ -67,6 +85,8 @@ public struct AtRestKeyHierarchy: Sendable {
 
 public enum AtRestKeyError: Error, Equatable {
     case randomFailure(OSStatus)
+    /// A restore tried to replace a live root with a DIFFERENT one — refused (fail closed).
+    case rootAlreadyExists
 }
 
 /// For tests and non-Keychain contexts such as a CLI harness. NOT for production: it provides no

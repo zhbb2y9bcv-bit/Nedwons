@@ -291,6 +291,7 @@ struct SettingsRootView: View {
                     }
                     NavigationLink("Change password") { ChangePasswordView(model: model) }
                     NavigationLink("Recovery phrase") { RecoverySetupView(model: model) }
+                    NavigationLink("Chat backup") { ChatBackupView(model: model) }
                 }
 
                 Section {
