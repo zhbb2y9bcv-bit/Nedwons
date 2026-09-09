@@ -353,6 +353,85 @@ fn add_active_device_race_never_exceeds_cap() {
     );
 }
 
+/// A sender removed from a conversation must never fan out into it.
+///
+/// `member_in_txn` documents that the check and the dependent write are atomic — "a member
+/// removed concurrently can't slip a message in". At READ COMMITTED that is false without a row
+/// lock, and the fanout INSERT makes it worse: its predicate is `cm.device_id <> $2`, enumerating
+/// the OTHER members, so the sender's own absence never changes the inserted rows. A removal
+/// committing after the check is therefore invisible to the write it was supposed to guard.
+///
+/// Deterministic proof rather than a timing lottery: hold an UNCOMMITTED delete of the sender's
+/// membership row, then fan out from another thread. Correct behavior is to block on that row and,
+/// once the delete commits, observe the removal and refuse. The unlocked version never touches the
+/// locked row, so it sails past and queues envelopes from a non-member.
+#[test]
+fn fanout_refuses_a_sender_removed_concurrently() {
+    use nedwons_api::relay::FanoutOutcome;
+    use std::sync::atomic::AtomicBool;
+
+    let relay = common::shared_relay();
+    let conversation_id: [u8; 16] = DeviceId::random().as_bytes().try_into().expect("16 bytes");
+    let sender = DeviceId::random();
+    let recipient = DeviceId::random();
+
+    relay
+        .create_conversation(conversation_id, AccountId::random(), sender, false)
+        .expect("create conversation (seeds the sender as a member)");
+    relay
+        .add_member(&conversation_id, AccountId::random(), recipient)
+        .expect("add a second member so a fanout has somewhere to go");
+
+    // Hold the sender's membership row in an uncommitted DELETE on a separate connection.
+    let mut blocker =
+        postgres::Client::connect(&common::db_url(), postgres::NoTls).expect("blocker connect");
+    let mut removal = blocker.transaction().expect("removal txn");
+    removal
+        .execute(
+            "DELETE FROM conversation_members WHERE conversation_id = $1 AND device_id = $2",
+            &[&conversation_id.as_slice(), &sender.as_bytes()],
+        )
+        .expect("stage the removal");
+
+    let finished = Arc::new(AtomicBool::new(false));
+    let handle = {
+        let relay = relay.clone();
+        let finished = finished.clone();
+        let idempotency_key: [u8; 16] = DeviceId::random().as_bytes().try_into().expect("16");
+        std::thread::spawn(move || {
+            let outcome = relay
+                .fanout_message(&conversation_id, &sender, b"opaque ciphertext", &idempotency_key)
+                .expect("fanout");
+            finished.store(true, Ordering::SeqCst);
+            outcome
+        })
+    };
+
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    assert!(
+        !finished.load(Ordering::SeqCst),
+        "fanout completed while the sender's removal was still uncommitted: the membership \
+         check took no row lock, so a concurrent removal cannot stop the send"
+    );
+
+    removal.commit().expect("commit the removal");
+    let outcome = handle.join().expect("fanout thread");
+    assert!(
+        matches!(outcome, FanoutOutcome::Forbidden),
+        "once the removal commits the fanout must refuse the non-member sender"
+    );
+
+    let queued: i64 = postgres::Client::connect(&common::db_url(), postgres::NoTls)
+        .expect("verify connect")
+        .query_one(
+            "SELECT count(*) FROM envelopes WHERE conversation_id = $1",
+            &[&conversation_id.as_slice()],
+        )
+        .expect("count envelopes")
+        .get(0);
+    assert_eq!(queued, 0, "a removed sender must queue no envelopes");
+}
+
 /// Expired-row purge removes old challenges and access tokens (retention hygiene).
 #[test]
 fn purge_removes_expired_rows() {

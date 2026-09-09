@@ -98,8 +98,16 @@ fn db_err(e: postgres::Error) -> StoreError {
     StoreError(format!("relay db: {e}"))
 }
 
-/// Membership check inside an open transaction (so the check and the dependent write are
-/// atomic — a member removed concurrently can't slip a message in).
+/// Membership check inside an open transaction, holding the member row until commit so the check
+/// and the dependent write really are atomic — a member removed concurrently can't slip a message
+/// in.
+///
+/// `FOR UPDATE` is load-bearing, not decoration. At READ COMMITTED an unlocked read gives no such
+/// guarantee, and the fanout INSERT cannot self-correct: its predicate is `cm.device_id <> $2`, so
+/// it enumerates the OTHER members and the sender's own removal never changes the rows it inserts.
+/// Locking the sender's row makes a concurrent removal wait for this send to finish, and a removal
+/// that already committed leaves no row to lock, so the caller refuses. Proved by
+/// `fanout_refuses_a_sender_removed_concurrently`.
 fn member_in_txn(
     txn: &mut postgres::Transaction<'_>,
     conversation_id: &[u8; 16],
@@ -107,7 +115,9 @@ fn member_in_txn(
 ) -> StoreResult<bool> {
     let row = txn
         .query_opt(
-            "SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND device_id = $2",
+            "SELECT 1 FROM conversation_members
+             WHERE conversation_id = $1 AND device_id = $2
+             FOR UPDATE",
             &[&conversation_id.as_slice(), &device],
         )
         .map_err(db_err)?;
