@@ -819,13 +819,13 @@ final class ConversationCoordinatorTests: XCTestCase {
         XCTAssertEqual(relay.deliveries, before, "one receipt per message, not per sync")
     }
 
-    /// Receipts are a privacy choice: with them off, this device tells nobody what it has seen and
-    /// everything else still works.
-    func testReceiptsCanBeTurnedOff() async throws {
+    /// Read receipts are a privacy choice (the Settings toggle): with them off, a sender still sees
+    /// their message was DELIVERED, but never that it was READ. Delivery is unaffected.
+    func testReadReceiptsCanBeTurnedOff() async throws {
         let relay = InMemoryRelay()
         let alice = Participant("alice", relay: relay)
         let bob = Participant("bob", relay: relay)
-        bob.coordinator.sendReceipts = false
+        bob.coordinator.sendReadReceipts = false
         await bob.coordinator.ensureKeyPackages()
         relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
         try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
@@ -836,8 +836,9 @@ final class ConversationCoordinatorTests: XCTestCase {
         await bob.model.markConversationRead(conv)
         _ = try await alice.coordinator.syncOnce()
         let mine = try XCTUnwrap(alice.model.threadLines[conv]?.last)
-        XCTAssertEqual(mine.deliveredCount, 0)
-        XCTAssertEqual(mine.readCount, 0)
+        // Delivery still flows; only the READ receipt is withheld.
+        XCTAssertEqual(mine.deliveredCount, 1, "delivery is still acknowledged")
+        XCTAssertEqual(mine.readCount, 0, "reading is not reported when read receipts are off")
         // The message itself still arrived.
         XCTAssertEqual(bob.texts(in: conv).map(\.0), ["hello?"])
     }
