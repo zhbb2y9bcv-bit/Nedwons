@@ -267,9 +267,10 @@ fn process_inbound_rejects_an_unknown_envelope_version() {
     let (alice, bob) = two_party(&tmp("alice"), &tmp("bob"));
     let id = alice.enqueue(b"hi".to_vec()).unwrap();
     let mut env = alice.encrypt(id).unwrap();
-    // Rewrite the 2-byte version prefix to a future, unsupported version.
+    // Rewrite the 2-byte version prefix to a future, unsupported version (v2 is current — the
+    // padded envelope — and v1 is the still-readable legacy).
     env[0] = 0x00;
-    env[1] = 0x02;
+    env[1] = 0x09;
     assert_eq!(
         bob.process_inbound(1, env).unwrap_err(),
         MlsClientError::InvalidMessage

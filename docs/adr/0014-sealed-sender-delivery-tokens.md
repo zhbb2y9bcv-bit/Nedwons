@@ -145,7 +145,13 @@ identified + sealed envelopes; sealed ones carry no sender field.
   app target):** distributing `K_r` to contacts over the E2EE channel, recipient-side block-drop
   after `verifySealedSender`, the block→rotate-and-redistribute policy, and the message-request
   fallback UX for non-holders.
-- **2d — padding / cover traffic** (size/timing) — separate, later; out of scope here.
+- **2d — padding / cover traffic** (size/timing) — **padding half LANDED 2026-09-09**: the
+  client envelope (`mls_core::envelope` v2) pads every message to a size bucket
+  (256B…64KB, then 64KB steps; zero padding outside the MLS ciphertext, stripped before MLS),
+  so the relay and traffic observers see bucketed lengths, not exact ones — "a thumbs-up" and
+  "a paragraph" measure identically. v1 (unpadded) stays readable for pre-upgrade queued mail;
+  writes are v2-only. Honest residual: timing/frequency are NOT hidden — cover traffic remains
+  the open half of 2d.
 
 R-204 stays **OPEN/MITIGATING** until 2a–2c ship and a test demonstrates the relay stores **no**
 sender for a sealed message while a rotated DAK denies a revoked sender.
