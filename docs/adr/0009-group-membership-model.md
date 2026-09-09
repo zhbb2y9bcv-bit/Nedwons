@@ -144,6 +144,14 @@ It is not "they cannot encrypt for the group". Mute state is server-visible meta
 Also note: a non-admin cannot bypass a mute through `/commit` (membership commits already require
 adminship), and a muted admin cannot exist, so the two gates compose without a gap.
 
+**Done — group names (2026-09-09):** a group's name is an E2EE application message
+(`Content::GroupName`), never a server field: the relay cannot learn what a group is called. The
+sender's own name changes when the message is encrypted; every member learns it by decrypting;
+newcomers are sent it again after they are added. Honest limit: MLS has no roles and the relay
+cannot police a message it cannot read, so ANY member can technically rename; the app offers it to
+admins only and the sheet says so. Also landed: on-device unread counts (never a read receipt) and
+per-message time/sending state. See `docs/FFI_BRIDGE.md`.
+
 **Not yet done (designed above):** QR rendering of invites (client UI), group system messages,
 per-invite member-list preview, and — the big one — binding routing membership to
 **authenticated MLS Add/Remove commits**. That binding is inherently client-driven because the

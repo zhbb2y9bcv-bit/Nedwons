@@ -223,6 +223,37 @@ final class GroupAdminUITests: XCTestCase {
         wait("exists == false", on: element(app, "group.member.\(erin)"))
     }
 
+    /// Renaming from the panel retitles the panel, the conversation header, and the chat list —
+    /// the name is one piece of state read everywhere, not three copies.
+    func testAdminRenamesTheGroup() {
+        let app = launch()
+        openGroupPanel(app)
+        XCTAssertEqual(element(app, "group.title").label, "Group · 4 people")
+
+        waitFor(element(app, "group.rename")).tap()
+        let field = waitFor(element(app, "group.rename.field"))
+        field.tap()
+        field.typeText("Weekend Trip")
+        waitFor(app.buttons["Save"].firstMatch).tap()
+        wait("label == 'Weekend Trip'", on: element(app, "group.title"))
+
+        app.navigationBars.buttons.element(boundBy: 0).tap()  // back to the conversation
+        wait("label BEGINSWITH 'Weekend Trip'", on: element(app, "conversation.title"))
+        app.navigationBars.buttons.element(boundBy: 0).tap()  // back to the list
+        XCTAssertTrue(app.staticTexts["Weekend Trip"].firstMatch.waitForExistence(timeout: 5),
+                      "the chat list shows the new name")
+    }
+
+    /// The unread badge reflects local state and clears when the conversation is opened.
+    func testUnreadBadgeClearsWhenTheConversationIsOpened() {
+        let app = launch()
+        let badge = waitFor(element(app, "chats.unread.\(conversationID)"))
+        XCTAssertEqual(badge.label, "3 unread")
+        openConversation(app)
+        app.navigationBars.buttons.element(boundBy: 0).tap()  // back to the list
+        wait("exists == false", on: element(app, "chats.unread.\(conversationID)"))
+    }
+
     /// An ordinary member gets the read-only panel: members and roles visible, no admin controls.
     func testOrdinaryMemberSeesNoAdminControls() {
         let app = launch(scenario: "member")

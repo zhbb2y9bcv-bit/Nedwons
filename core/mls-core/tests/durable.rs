@@ -318,3 +318,195 @@ fn pending_identity_redeems_a_prekey_after_reopen() {
     ));
     DurableSession::open(jb).expect("active session persisted");
 }
+
+/// Group names travel INSIDE the ciphertext: the sender applies the rename when it encrypts (the
+/// point of no return), and the recipient learns it by decrypting. Nothing about the name reaches
+/// the relay, which sees one more opaque envelope.
+#[test]
+fn group_name_is_set_by_an_encrypted_message() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+    assert_eq!(alice.group_name(), None);
+    assert_eq!(bob.group_name(), None);
+
+    let id = alice
+        .enqueue_group_name("Weekend Trip")
+        .expect("enqueue name");
+    assert_eq!(
+        alice.group_name(),
+        None,
+        "not renamed until the group is told"
+    );
+    let envelope = alice.encrypt(id).expect("encrypt");
+    assert_eq!(alice.group_name(), Some("Weekend Trip"));
+    assert_eq!(
+        bob.process_inbound(1, &envelope).expect("process"),
+        InboundOutcome::GroupRenamed {
+            name: "Weekend Trip".into()
+        }
+    );
+    assert_eq!(bob.group_name(), Some("Weekend Trip"));
+    // A rename is not a chat message: neither side gains a log entry.
+    assert!(bob.messages().is_empty());
+    assert!(alice.messages().is_empty());
+
+    // Renaming again replaces it, and the name survives a relaunch.
+    let id = bob.enqueue_group_name("Trip planning").expect("enqueue");
+    let envelope = bob.encrypt(id).expect("encrypt");
+    alice.process_inbound(2, &envelope).expect("process");
+    assert_eq!(alice.group_name(), Some("Trip planning"));
+}
+
+/// A name a peer could not render safely is refused where it is written, not silently dropped by
+/// every recipient: over-long, empty, and bidi-override names are rejected by the sender.
+#[test]
+fn hostile_group_names_are_refused_at_the_source() {
+    let (mut alice, _ja, _bob, _jb) = pair();
+    for bad in [
+        "",
+        "a\u{202E}bcd", // right-to-left override
+        "line\nbreak",  // control character
+        &"x".repeat(mls_core::content::MAX_GROUP_NAME_BYTES + 1),
+    ] {
+        assert!(
+            alice.enqueue_group_name(bad).is_err(),
+            "must refuse {bad:?}"
+        );
+    }
+    assert!(
+        alice.enqueue_group_name("Ok Name 🎒").is_ok(),
+        "emoji are fine"
+    );
+}
+
+/// Unread means "inbound, and newer than what the user has seen". Your own messages are never
+/// unread, and the mark survives a relaunch.
+#[test]
+fn unread_counts_only_inbound_messages_since_the_read_mark() {
+    let (mut alice, ja, mut bob, _jb) = pair();
+    assert_eq!(alice.unread_count(), 0);
+
+    for text in [b"one".as_slice(), b"two".as_slice()] {
+        let id = bob.enqueue(text).expect("enqueue");
+        let env = bob.encrypt(id).expect("encrypt");
+        alice
+            .process_inbound(alice.messages().len() as u64 + 1, &env)
+            .expect("process");
+    }
+    assert_eq!(alice.unread_count(), 2);
+
+    // Alice replying does not clear the backlog, and does not add to it either.
+    let mine = alice.enqueue(b"reply").expect("enqueue");
+    alice.encrypt(mine).expect("encrypt");
+    assert_eq!(alice.unread_count(), 2, "own messages are never unread");
+
+    alice.mark_read().expect("mark read");
+    assert_eq!(alice.unread_count(), 0);
+
+    // One more arrives; only it is unread, and the mark is durable.
+    let id = bob.enqueue(b"three").expect("enqueue");
+    let env = bob.encrypt(id).expect("encrypt");
+    alice.process_inbound(99, &env).expect("process");
+    assert_eq!(alice.unread_count(), 1);
+    drop(alice);
+    let alice = DurableSession::open(ja).expect("reopen");
+    assert_eq!(alice.unread_count(), 1, "the read mark survives a relaunch");
+}
+
+/// Every message carries the time THIS device saw it, and an outbound one is `pending` until the
+/// relay accepts it — which is what lets a thread show "sending" instead of implying delivery.
+#[test]
+fn message_views_carry_time_and_delivery_state() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+    let id = alice.enqueue(b"hello").expect("enqueue");
+    assert!(
+        alice.message_views().is_empty(),
+        "queued, not yet encrypted"
+    );
+
+    let envelope = alice.encrypt(id).expect("encrypt");
+    let views = alice.message_views();
+    assert_eq!(views.len(), 1);
+    assert!(
+        views[0].pending,
+        "encrypted but not accepted by the relay yet"
+    );
+    assert!(
+        views[0].created_at_ms > 1_700_000_000_000,
+        "a real wall-clock stamp"
+    );
+    assert_eq!(views[0].direction, Direction::Outbound);
+
+    alice.mark_sent(id).expect("mark sent");
+    assert!(
+        !alice.message_views()[0].pending,
+        "accepted ⇒ no longer pending"
+    );
+
+    bob.process_inbound(1, &envelope).expect("process");
+    let received = bob.message_views();
+    assert_eq!(received.len(), 1);
+    assert!(!received[0].pending, "inbound is never pending");
+    assert!(received[0].created_at_ms > 1_700_000_000_000);
+}
+
+/// An attachment is a message whose bytes live elsewhere: the reference (including the key) travels
+/// end-to-end and is durable, so the recipient can still open the file after a relaunch — while the
+/// relay holds only ciphertext it has no key for.
+#[test]
+fn attachment_reference_travels_end_to_end_and_survives_reopen() {
+    let (mut alice, _ja, mut bob, jb) = pair();
+    let file = b"pretend this is a photo".repeat(32);
+    let sealed = mls_core::attachment::seal(&file).expect("seal");
+    let blob_id = [7u8; 16];
+
+    let id = alice
+        .enqueue_attachment(
+            blob_id,
+            sealed.key,
+            sealed.digest,
+            file.len() as u64,
+            "image/jpeg",
+            "beach.jpg",
+            "look at this",
+        )
+        .expect("enqueue attachment");
+    let envelope = alice.encrypt(id).expect("encrypt");
+
+    // The sender's own log carries the reference and the caption.
+    let mine = &alice.message_views()[0];
+    assert_eq!(mine.plaintext, b"look at this");
+    let mine_ref = mine.attachment.clone().expect("sender keeps the reference");
+    assert_eq!(mine_ref.filename, "beach.jpg");
+    assert_eq!(mine_ref.size, file.len() as u64);
+
+    match bob.process_inbound(1, &envelope).expect("process") {
+        InboundOutcome::AttachmentReceived { attachment } => {
+            assert_eq!(attachment.blob_id, blob_id);
+            assert_eq!(attachment.mime, "image/jpeg");
+            // The key arrived over MLS, so Bob can open bytes the relay cannot.
+            assert_eq!(
+                mls_core::attachment::open(&attachment.key, &attachment.digest, &sealed.ciphertext)
+                    .expect("open"),
+                file
+            );
+        }
+        other => panic!("expected AttachmentReceived, got {other:?}"),
+    }
+
+    // Durable: after a relaunch Bob still holds everything needed to fetch and decrypt it.
+    drop(bob);
+    let bob = DurableSession::open(jb).expect("reopen");
+    let view = &bob.message_views()[0];
+    assert_eq!(view.plaintext, b"look at this");
+    let reference = view.attachment.clone().expect("reference survived");
+    assert_eq!(
+        mls_core::attachment::open(&reference.key, &reference.digest, &sealed.ciphertext)
+            .expect("open after relaunch"),
+        file
+    );
+    assert_eq!(
+        bob.unread_count(),
+        1,
+        "a file is an unread message like any other"
+    );
+}

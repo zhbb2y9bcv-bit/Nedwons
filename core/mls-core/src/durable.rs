@@ -22,6 +22,7 @@ use aes_gcm::Aes256Gcm;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 
+use crate::attachment::AttachmentRef;
 use crate::content::{Content, ContentError, HistoryEntry, DELIVERY_KEY_LEN, SECRET_ID_LEN};
 use crate::secret::{SecretRecord, SecretSide, SecretState};
 use crate::{Conversation, Incoming, Member};
@@ -65,7 +66,7 @@ fn map_content(_: ContentError) -> DurableError {
     DurableError::Codec
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Direction {
     Inbound,
     Outbound,
@@ -84,6 +85,28 @@ pub struct Message {
     /// state. `#[serde(default)]` ⇒ older blobs load as `None`.
     #[serde(default)]
     pub secret_id: Option<[u8; SECRET_ID_LEN]>,
+    /// Unix milliseconds, stamped by THIS device: when it queued the message (outbound) or
+    /// decrypted it (inbound).
+    ///
+    /// Deliberately not carried on the wire. A sender-claimed timestamp is a value a hostile member
+    /// chooses, and it would be rendered as fact; stamping locally means a peer can never forge when
+    /// something appeared on your device. The cost, stated honestly, is that a message delivered
+    /// after a long offline period is timed when it arrives, not when it was sent.
+    ///
+    /// Advisory and display-only — unlike the secret-reveal timer, which keeps its injected
+    /// monotonic clock precisely because it IS security-relevant and must resist clock changes.
+    /// `#[serde(default)]` ⇒ messages logged before this field load as 0 ("unknown time").
+    #[serde(default)]
+    pub created_at_ms: u64,
+    /// For an outbound message, the `outbox` entry it was created from, so its delivery state can be
+    /// looked up. `None` for inbound and for replicated history.
+    #[serde(default)]
+    pub outbox_local_id: Option<u64>,
+    /// `Some` when this message is a file: `plaintext` then holds the caption (often empty) and the
+    /// bytes are fetched from the relay with this reference. `#[serde(default)]` ⇒ older blobs load
+    /// as `None`.
+    #[serde(default)]
+    pub attachment: Option<AttachmentRef>,
 }
 
 /// Which MLS group encrypts an outbound message. Normal messages and secrets use the conversation;
@@ -121,6 +144,10 @@ struct Outbound {
     /// Which MLS group encrypts this message (ADR-0015 option 3). Defaults to `Conversation`.
     #[serde(default)]
     channel: Channel,
+    /// Unix ms when the user queued it; copied onto the display message so the thread shows when
+    /// it was written, not when it happened to encrypt.
+    #[serde(default)]
+    created_at_ms: u64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -147,6 +174,14 @@ pub enum InboundOutcome {
     /// #7: `count` past messages were replicated here and appended to the local log.
     HistorySynced {
         count: u64,
+    },
+    /// A member renamed the group. The new name is already persisted; returned so the UI refreshes.
+    GroupRenamed {
+        name: String,
+    },
+    /// A file arrived. Its bytes are still on the relay; the reference (with the key) is durable.
+    AttachmentReceived {
+        attachment: AttachmentRef,
     },
 }
 
@@ -181,6 +216,48 @@ struct Meta {
     /// `#[serde(default)]` ⇒ older blobs load with no self-group.
     #[serde(default)]
     self_group_id: Option<Vec<u8>>,
+    /// The group's name, as last set by any member over the E2EE channel. `None` = never named;
+    /// the UI then falls back to describing the group by its members. Never sent to the relay.
+    #[serde(default)]
+    group_name: Option<String>,
+    /// The highest local id the user has seen; everything above it that is INBOUND is unread.
+    ///
+    /// `Option`, not a bare `u64`, because local ids start at **0**: a sentinel of 0 would make the
+    /// very first message in a conversation permanently "already read". `None` = nothing read yet.
+    /// `#[serde(default)]` ⇒ existing blobs load as `None`, so a returning user sees their backlog
+    /// as unread rather than silently zeroed.
+    #[serde(default)]
+    last_read_local_id: Option<u64>,
+}
+
+/// Wall-clock unix milliseconds for a DISPLAY timestamp.
+///
+/// The system clock is used deliberately here and nowhere security-relevant: a message's rendered
+/// time is advisory, and a user who moves their clock only misdates their own history. Every
+/// decision that must resist clock manipulation — the secret-reveal countdown — takes an injected
+/// monotonic clock instead. A clock before the epoch reads as 0 ("unknown time") rather than
+/// panicking.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// A message plus the delivery state the UI needs, resolved against the outbox at read time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MessageView {
+    pub local_id: u64,
+    pub direction: Direction,
+    pub plaintext: Vec<u8>,
+    pub envelope_id: Option<u64>,
+    pub secret_id: Option<[u8; SECRET_ID_LEN]>,
+    pub created_at_ms: u64,
+    /// Outbound only: the relay has not accepted it yet (queued, or encrypted and awaiting upload).
+    /// Always false for inbound, which by definition arrived.
+    pub pending: bool,
+    /// `Some` when this message is a file; `plaintext` is then its caption.
+    pub attachment: Option<AttachmentRef>,
 }
 
 /// JSON object keys must be strings, so the raw `[u8; 16]` can't be one.
@@ -783,6 +860,7 @@ impl<J: Journal> DurableSession<J> {
                 ciphertext: None,
                 secret_id: None,
                 channel: Channel::SelfGroup,
+                created_at_ms: now_ms(),
             },
         );
         self.commit(meta)?;
@@ -805,6 +883,7 @@ impl<J: Journal> DurableSession<J> {
                 ciphertext: None,
                 secret_id,
                 channel: Channel::Conversation,
+                created_at_ms: now_ms(),
             },
         );
         self.commit(meta)?;
@@ -850,6 +929,12 @@ impl<J: Journal> DurableSession<J> {
             entry.ciphertext = Some(ciphertext.clone());
             entry.status = OutboundStatus::Encrypted;
         }
+        // The user wrote it when they queued it, not when it happened to encrypt.
+        let created_at_ms = meta
+            .outbox
+            .get(&local_id)
+            .map(|o| o.created_at_ms)
+            .unwrap_or_else(now_ms);
         let display = match &content {
             Content::Normal { body } => Some(Message {
                 local_id: local_id_for_msg,
@@ -857,6 +942,9 @@ impl<J: Journal> DurableSession<J> {
                 plaintext: body.clone(),
                 envelope_id: None,
                 secret_id: None,
+                created_at_ms,
+                outbox_local_id: Some(local_id),
+                attachment: None,
             }),
             Content::Secret { secret_id, .. } => {
                 meta.secrets.insert(
@@ -869,7 +957,44 @@ impl<J: Journal> DurableSession<J> {
                     plaintext: Vec::new(),
                     envelope_id: None,
                     secret_id: Some(*secret_id),
+                    created_at_ms,
+                    outbox_local_id: Some(local_id),
+                    attachment: None,
                 })
+            }
+            // A file the user sent: the caption is the display text, and the reference is kept so
+            // this device can reopen the file later without asking anyone.
+            Content::Attachment {
+                blob_id,
+                key,
+                digest,
+                size,
+                mime,
+                filename,
+                caption,
+            } => Some(Message {
+                local_id: local_id_for_msg,
+                direction: Direction::Outbound,
+                plaintext: caption.clone().into_bytes(),
+                envelope_id: None,
+                secret_id: None,
+                created_at_ms,
+                outbox_local_id: Some(local_id),
+                attachment: Some(AttachmentRef {
+                    blob_id: *blob_id,
+                    key: *key,
+                    digest: *digest,
+                    size: *size,
+                    mime: mime.clone(),
+                    filename: filename.clone(),
+                }),
+            }),
+            // The sender applies its own rename locally, at the moment the group actually learns
+            // it — encrypt is the point of no return, so the local name can never run ahead of
+            // what the other members were told.
+            Content::GroupName { name } => {
+                meta.group_name = Some(name.clone());
+                None
             }
             // Control messages are not user-visible on the sender — no message-log entry.
             Content::SecretConsumed { .. }
@@ -960,6 +1085,7 @@ impl<J: Journal> DurableSession<J> {
                 ciphertext: None,
                 secret_id: None, // a control message, not a user-visible secret placeholder
                 channel,
+                created_at_ms: now_ms(),
             },
         );
         if let Some(rec) = meta.secrets.get_mut(&sid_key(secret_id)) {
@@ -1055,6 +1181,108 @@ impl<J: Journal> DurableSession<J> {
         &self.meta.messages
     }
 
+    /// The group's name as last set by any member, or `None` if it has never been named.
+    pub fn group_name(&self) -> Option<&str> {
+        self.meta.group_name.as_deref()
+    }
+
+    /// Queue a rename for the whole group. Like any message it becomes real when it is encrypted
+    /// and sent, so the local name changes then — never before the members are told.
+    pub fn enqueue_group_name(&mut self, name: &str) -> Result<u64, DurableError> {
+        let content = Content::GroupName {
+            name: name.to_string(),
+        };
+        // Refuse locally what a recipient's decoder would refuse anyway (over-long, empty, or
+        // unsafe to render), so a bad name fails at the source instead of being silently dropped
+        // by every peer.
+        Content::decode(&content.encode()).map_err(map_content)?;
+        self.enqueue_content(content, None)
+    }
+
+    /// Queue a file that has ALREADY been encrypted and uploaded: `blob_id` is what the relay
+    /// returned, and the key/digest come from [`crate::attachment::seal`]. The reference travels to
+    /// the group inside the MLS ciphertext, so the relay — which holds the bytes — never holds the
+    /// key that opens them.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_attachment(
+        &mut self,
+        blob_id: [u8; 16],
+        key: [u8; 32],
+        digest: [u8; 32],
+        size: u64,
+        mime: &str,
+        filename: &str,
+        caption: &str,
+    ) -> Result<u64, DurableError> {
+        let content = Content::Attachment {
+            blob_id,
+            key,
+            digest,
+            size,
+            mime: mime.to_string(),
+            filename: filename.to_string(),
+            caption: caption.to_string(),
+        };
+        // Refuse here what a recipient's decoder would refuse anyway, so a bad reference fails at
+        // the source rather than being silently dropped by every peer.
+        Content::decode(&content.encode()).map_err(map_content)?;
+        self.enqueue_content(content, None)
+    }
+
+    /// Mark everything currently in the log as read.
+    pub fn mark_read(&mut self) -> Result<(), DurableError> {
+        let Some(highest) = self.meta.messages.last().map(|m| m.local_id) else {
+            return Ok(()); // nothing to read
+        };
+        if self.meta.last_read_local_id >= Some(highest) {
+            return Ok(()); // already current: no write, so opening a quiet thread is free
+        }
+        let mut meta = self.meta.clone();
+        meta.last_read_local_id = Some(highest);
+        self.commit(meta)
+    }
+
+    /// Inbound messages newer than the last read mark. Outbound is never unread — you wrote it.
+    pub fn unread_count(&self) -> u64 {
+        self.meta
+            .messages
+            .iter()
+            .filter(|m| {
+                m.direction == Direction::Inbound
+                    && self
+                        .meta
+                        .last_read_local_id
+                        .is_none_or(|mark| m.local_id > mark)
+            })
+            .count() as u64
+    }
+
+    /// The message log with delivery state resolved, for rendering. An outbound message is
+    /// `pending` until the relay has accepted it, which is what lets the UI show "sending" rather
+    /// than pretending an undelivered message is on its way.
+    pub fn message_views(&self) -> Vec<MessageView> {
+        self.meta.messages.iter().map(|m| self.view(m)).collect()
+    }
+
+    fn view(&self, m: &Message) -> MessageView {
+        let pending = m.direction == Direction::Outbound
+            && m.outbox_local_id
+                .and_then(|id| self.meta.outbox.get(&id))
+                .map(|o| o.status != OutboundStatus::Sent)
+                // No outbox entry (replicated history, or an older blob) ⇒ nothing is in flight.
+                .unwrap_or(false);
+        MessageView {
+            local_id: m.local_id,
+            direction: m.direction,
+            plaintext: m.plaintext.clone(),
+            envelope_id: m.envelope_id,
+            secret_id: m.secret_id,
+            created_at_ms: m.created_at_ms,
+            pending,
+            attachment: m.attachment.clone(),
+        }
+    }
+
     /// Outbound messages the server has NOT yet accepted (`Queued` or `Encrypted`), oldest first.
     /// This is what a relaunch replays: `encrypt` returns the cached ciphertext for an `Encrypted`
     /// entry (no second ratchet advance), the upload is retried, and `mark_sent` closes it.
@@ -1113,6 +1341,9 @@ fn apply_incoming(
                     plaintext: body.clone(),
                     envelope_id: Some(envelope_id),
                     secret_id: None,
+                    created_at_ms: now_ms(),
+                    outbox_local_id: None,
+                    attachment: None,
                 });
                 InboundOutcome::Application(body)
             }
@@ -1133,6 +1364,9 @@ fn apply_incoming(
                         plaintext: Vec::new(),
                         envelope_id: Some(envelope_id),
                         secret_id: Some(secret_id),
+                        created_at_ms: now_ms(),
+                        outbox_local_id: None,
+                        attachment: None,
                     });
                     InboundOutcome::SecretSealed { secret_id }
                 }
@@ -1147,6 +1381,45 @@ fn apply_incoming(
             }
             // ADR-0014 Slice 2c: surfaced for the client to store keyed by sender; no log entry.
             Content::DeliveryKeyGrant { key_r } => InboundOutcome::DeliveryKeyGranted { key_r },
+            // A file: logged now, fetched from the relay when the user opens it (or eagerly by the
+            // client). The reference — including its key — is durable, so a relaunch can still open
+            // it.
+            Content::Attachment {
+                blob_id,
+                key,
+                digest,
+                size,
+                mime,
+                filename,
+                caption,
+            } => {
+                let local_id = meta.take_local_id();
+                let attachment = AttachmentRef {
+                    blob_id,
+                    key,
+                    digest,
+                    size,
+                    mime,
+                    filename,
+                };
+                meta.messages.push(Message {
+                    local_id,
+                    direction: Direction::Inbound,
+                    plaintext: caption.into_bytes(),
+                    envelope_id: Some(envelope_id),
+                    secret_id: None,
+                    created_at_ms: now_ms(),
+                    outbox_local_id: None,
+                    attachment: Some(attachment.clone()),
+                });
+                InboundOutcome::AttachmentReceived { attachment }
+            }
+            // A member renamed the group. Persisted with the rest of this commit, so the name and
+            // the ratchet advance land together or not at all.
+            Content::GroupName { name } => {
+                meta.group_name = Some(name.clone());
+                InboundOutcome::GroupRenamed { name }
+            }
             // #7: append replicated history to the local log, each with a fresh local id.
             Content::HistorySync { entries } => {
                 let count = entries.len() as u64;
@@ -1162,6 +1435,11 @@ fn apply_incoming(
                         plaintext: e.body,
                         envelope_id: None, // synced, not decrypted from a server envelope
                         secret_id: None,
+                        // Stamped on arrival: the sync carries no times, and inventing one would
+                        // be a claim this device cannot support.
+                        created_at_ms: now_ms(),
+                        outbox_local_id: None,
+                        attachment: None,
                     });
                 }
                 InboundOutcome::HistorySynced { count }

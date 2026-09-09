@@ -125,7 +125,8 @@ struct ChatsListView: View {
                     peerUsername: peer.flatMap { model.username(forAccountID: $0) },
                     memberCount: conversation.memberAccountIDs.count,
                     lastMessagePreview: model.localPreview(for: conversation.conversationID),
-                    lastActivity: model.localLastActivity(for: conversation.conversationID)
+                    lastActivity: model.localLastActivity(for: conversation.conversationID),
+                    unreadCount: model.unreadCount(for: conversation.conversationID)
                 )
             })
     }
@@ -190,7 +191,8 @@ struct ChatRow: View {
                     .lineLimit(1)
                 Text(chat.lastMessagePreview ?? "No messages yet")
                     .font(Nedwons.TypeScale.caption)
-                    .foregroundStyle(palette.textSecondary)
+                    .fontWeight(chat.unreadCount > 0 ? .semibold : .regular)
+                    .foregroundStyle(chat.unreadCount > 0 ? palette.textPrimary : palette.textSecondary)
                     .lineLimit(1)
             }
             Spacer()
@@ -207,18 +209,16 @@ struct ChatRow: View {
                         .padding(.vertical, 2)
                         .background(palette.accentPrimary, in: Capsule())
                         .foregroundStyle(.white)
+                        .accessibilityIdentifier("chats.unread.\(chat.conversationID)")
+                        .accessibilityLabel("\(chat.unreadCount) unread")
                 }
             }
         }
         .padding(.vertical, Nedwons.Spacing.xxs)
     }
 
-    /// Alias when the viewer set one, otherwise the real username. Groups show their size.
-    private var title: String {
-        if chat.isGroup { return "Group · \(chat.memberCount) people" }
-        guard let accountID = chat.peerAccountID else { return "Conversation" }
-        return model.displayName(for: accountID, username: chat.peerUsername ?? "Unknown")
-    }
+    /// The group's E2EE name if it has one, else the alias/username for a 1:1 or the group's size.
+    private var title: String { model.conversationTitle(for: chat) }
 }
 
 /// Initial-based placeholder; a real profile image replaces it once avatars ship.

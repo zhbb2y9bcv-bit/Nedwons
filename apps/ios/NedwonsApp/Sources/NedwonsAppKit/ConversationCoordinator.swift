@@ -75,6 +75,17 @@ public final class ConversationCoordinator {
             guard let self else { throw CoordinatorError.notSignedIn }
             try await self.bootstrap(conversationID: conversationID, memberAccountIDs: members)
         }
+        model.addMembersToConversationAction = { [weak self] conversationID, members in
+            guard let self else { throw CoordinatorError.notSignedIn }
+            try await self.addMembers(to: conversationID, memberAccountIDs: members)
+        }
+        model.renameGroupAction = { [weak self] conversationID, name in
+            guard let self else { throw CoordinatorError.notSignedIn }
+            try await self.renameGroup(conversationID, to: name)
+        }
+        model.markConversationReadAction = { [weak self] conversationID in
+            self?.markRead(conversationID)
+        }
         model.clearHistoryAction = { [weak self] conversationID in
             try self?.clearHistory(in: conversationID)
         }
@@ -163,9 +174,52 @@ public final class ConversationCoordinator {
         try saveIndex()
         clients[conversationID] = client
 
-        var priorDevices: [String] = []
+        let failed = await grow(
+            client: client, conversationID: conversationID, accounts: memberAccountIDs, token: token)
+        refresh(conversationID)
+        if !failed.isEmpty {
+            throw CoordinatorError.membersNotSetUp(failed)
+        }
+    }
+
+    /// Add people to an EXISTING conversation's MLS group, after the relay has added them to
+    /// routing. Without this they would be routed ciphertext they hold no key for.
+    ///
+    /// The newcomers also need the group's name, which lives only inside the ciphertext: it is
+    /// re-sent after the adds so a new member's list shows the group by name rather than by size.
+    public func addMembers(to conversationID: String, memberAccountIDs: [String]) async throws {
+        guard let token else { throw CoordinatorError.notSignedIn }
+        guard let client = activeClient(for: conversationID) else {
+            throw CoordinatorError.noSessionForConversation
+        }
+        let failed = await grow(
+            client: client, conversationID: conversationID, accounts: memberAccountIDs, token: token)
+        if failed.isEmpty, let name = (try? client.groupName()) ?? nil {
+            // Best effort: a group whose name did not reach a newcomer is cosmetic, and the next
+            // rename fixes it. Never fail an add over it.
+            try? await sendGroupName(name, client: client, conversationID: conversationID)
+        }
+        refresh(conversationID)
+        if !failed.isEmpty {
+            throw CoordinatorError.membersNotSetUp(failed)
+        }
+    }
+
+    /// Add each account to the MLS group: claim a prekey, add, deliver the Welcome to that device,
+    /// then publish the add's commit so every existing member reaches the new epoch. Returns the
+    /// accounts that could not be added.
+    ///
+    /// The commit is FANNED OUT rather than hand-addressed to each member device. The relay already
+    /// knows the conversation's routing membership, so it can do in one call what would otherwise
+    /// need a per-device list this client has no business assembling. The newcomer is in routing
+    /// too and receives the commit for the epoch it is joining at, which it cannot process — that
+    /// envelope is discarded on their side, exactly like any out-of-epoch message, and the Welcome
+    /// (sent first) is what actually admits them.
+    private func grow(
+        client: MlsClient, conversationID: String, accounts: [String], token: String
+    ) async -> [String] {
         var failed: [String] = []
-        for account in memberAccountIDs {
+        for account in accounts {
             do {
                 let claimed = try await relay.claimKeyPackage(accessToken: token, accountID: account)
                 guard let keyPackage = Hex.decode(claimed.keyPackage) else {
@@ -176,37 +230,54 @@ public final class ConversationCoordinator {
                     accessToken: token, conversationID: conversationID,
                     recipientDevice: claimed.deviceID, ciphertext: outcome.welcome,
                     idempotencyKey: Self.randomKey())
-                // Everyone already in the group needs this commit to reach the new epoch;
-                // targeted, so the newcomer (who joins AT this epoch) never sees a commit it
-                // cannot process.
-                for device in priorDevices {
-                    try await relay.sendWelcome(
-                        accessToken: token, conversationID: conversationID, recipientDevice: device,
-                        ciphertext: outcome.commit, idempotencyKey: Self.randomKey())
-                }
-                priorDevices.append(claimed.deviceID)
+                _ = try await relay.sendMessage(
+                    accessToken: token, conversationID: conversationID, ciphertext: outcome.commit,
+                    idempotencyKey: Self.randomKey())
             } catch {
                 failed.append(account)
             }
         }
-        refresh(conversationID)
-        if !failed.isEmpty {
-            throw CoordinatorError.membersNotSetUp(failed)
+        return failed
+    }
+
+    // MARK: Group name & read state
+
+    /// Rename the group for everyone. The name is an ordinary E2EE message, so it uses the same
+    /// upload path (and the same retry semantics) as anything else the user sends.
+    public func renameGroup(_ conversationID: String, to name: String) async throws {
+        guard let client = activeClient(for: conversationID) else {
+            throw CoordinatorError.noSessionForConversation
         }
+        try await sendGroupName(name, client: client, conversationID: conversationID)
+        refresh(conversationID)
+    }
+
+    private func sendGroupName(_ name: String, client: MlsClient, conversationID: String) async throws {
+        let localID = try client.setGroupName(name: name)
+        try await upload(localID: localID, client: client, conversationID: conversationID)
+    }
+
+    /// The user is looking at the conversation: everything in it is read.
+    public func markRead(_ conversationID: String) {
+        guard let client = activeClient(for: conversationID) else { return }
+        try? client.markRead()
+        refresh(conversationID)
     }
 
     // MARK: Send
 
     /// Enqueue → encrypt → upload → mark sent. A failed upload leaves the message durably unsent
-    /// (visible in the thread, retried later); the error propagates so the UI can say so.
+    /// and the error propagates so the UI can say so — but the thread is re-rendered either way, so
+    /// the message appears as *sending* rather than vanishing until a later retry succeeds. That
+    /// refresh must not be skipped on the failure path; it is the whole difference between "we lost
+    /// your message" and "we're still trying".
     private func send(_ body: String, in conversationID: String) async throws {
         guard let client = activeClient(for: conversationID) else {
             throw CoordinatorError.noSessionForConversation
         }
         let localID = try client.enqueue(plaintext: Data(body.utf8))
-        refresh(conversationID)
+        defer { refresh(conversationID) }
         try await upload(localID: localID, client: client, conversationID: conversationID)
-        refresh(conversationID)
     }
 
     /// Replay every upload the relay has not accepted, oldest first, per conversation. Stops at the
@@ -385,20 +456,29 @@ public final class ConversationCoordinator {
 
         let lines: [ThreadLine] = stored.map { message in
             let mine = message.direction == .outbound
+            let timestamp = Self.timestamp(message.createdAtMs)
             if let secretID = message.secretId {
                 let phase = (try? client.secretPhase(
                     secretId: secretID, nowMs: UptimeClock().nowMs())) ?? .unknown
                 return ThreadLine(
                     id: message.localId,
                     kind: phase == .consumed ? .consumedSecret : .sealedSecret(secretID),
-                    mine: mine)
+                    mine: mine,
+                    timestamp: timestamp,
+                    isPending: message.pending)
             }
             return ThreadLine(
                 id: message.localId,
                 kind: .text(String(decoding: message.plaintext, as: UTF8.self)),
-                mine: mine)
+                mine: mine,
+                timestamp: timestamp,
+                isPending: message.pending)
         }
         model.threadLines[conversationID] = lines
+        // The group's name lives only inside the ciphertext; this is the one place it is read.
+        if let name = (try? client.groupName()) ?? nil {
+            model.groupNames[conversationID] = name
+        }
 
         // A secret never contributes its body to the preview — only that one arrived.
         let preview: String? = stored.last.map { last in
@@ -408,8 +488,15 @@ public final class ConversationCoordinator {
         }
         model.localThreads[conversationID] = AppModel.LocalThreadState(
             preview: preview,
-            lastActivity: stored.isEmpty ? nil : Date(),
-            unreadCount: 0)
+            // The real time of the last message, so the list orders by activity rather than by
+            // whenever this happened to refresh.
+            lastActivity: stored.last.flatMap { Self.timestamp($0.createdAtMs) },
+            unreadCount: Int((try? client.unreadCount()) ?? 0))
+    }
+
+    /// 0 means "logged before timestamps existed" — rendered without a time rather than as 1970.
+    private static func timestamp(_ ms: UInt64) -> Date? {
+        ms == 0 ? nil : Date(timeIntervalSince1970: TimeInterval(ms) / 1000)
     }
 
     // MARK: Helpers

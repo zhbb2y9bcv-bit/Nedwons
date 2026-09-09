@@ -167,6 +167,35 @@ final class GroupAdminModelTests: XCTestCase {
         XCTAssertTrue(fixture.deliveredMessages.isEmpty, "nothing was delivered")
     }
 
+    /// Titles: the E2EE group name wins; without one a group is described by its size and a 1:1
+    /// thread by the other person (alias first, real username otherwise).
+    func testConversationTitlePrefersTheGroupName() async {
+        let (model, _) = await booted()
+        let group = ChatSummary(conversationID: conv, memberCount: 4)
+        XCTAssertEqual(model.conversationTitle(for: group), "Group · 4 people")
+        let renamed = await model.renameGroup(conv, to: "  Weekend Trip ")
+        XCTAssertTrue(renamed)
+        XCTAssertEqual(model.conversationTitle(for: group), "Weekend Trip", "trimmed")
+        XCTAssertEqual(model.banner, "Group renamed.")
+        let empty = await model.renameGroup(conv, to: "   ")
+        XCTAssertFalse(empty, "a blank name is not a rename")
+        XCTAssertEqual(model.groupName(for: conv), "Weekend Trip")
+
+        let direct = ChatSummary(
+            conversationID: "d", peerAccountID: GroupAdminFixture.bob.accountID, peerUsername: "bob",
+            memberCount: 2)
+        XCTAssertEqual(model.conversationTitle(for: direct), "bob")
+    }
+
+    /// Unread counts come from local thread state and clear when the conversation is opened.
+    func testUnreadCountClearsOnRead() async {
+        let (model, _) = await booted()
+        XCTAssertEqual(model.unreadCount(for: conv), 3, "the harness seeds a backlog")
+        await model.markConversationRead(conv)
+        XCTAssertEqual(model.unreadCount(for: conv), 0)
+        XCTAssertEqual(model.localPreview(for: conv), "see you at 6", "reading keeps the preview")
+    }
+
     func testAcceptedSendBecomesALocalLine() async {
         let (model, fixture) = await booted()
         await model.sendMessage("first", to: conv)

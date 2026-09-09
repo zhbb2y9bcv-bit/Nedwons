@@ -27,6 +27,7 @@ serde_json = "1"
 # crypto; same crate family OpenMLS's provider already uses. The key comes from the caller (on
 # device: the Keychain-wrapped local key hierarchy, CRYPTOGRAPHY.md §5).
 aes-gcm = "0.10"
+sha2 = "0.10"
 rand_core = { version = "0.6", features = ["getrandom"] }
 
 # NOTE: this crate deliberately carries NO wasm32 feature opt-ins, even though it is the crate that

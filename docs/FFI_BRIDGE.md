@@ -67,7 +67,32 @@ Three additions made the shipped app's pipeline (`NedwonsAppKit/ConversationCoor
   members. Proven in `core/mls-ffi/tests/client.rs::group_growth_commit_reaches_earlier_members…`.
 
 Bootstrap shape the coordinator uses: Welcome → the newcomer (targeted); that add's commit →
-every member already in (targeted, so the newcomer never sees a commit for the epoch it joined at).
+fanned out to the conversation (the relay already knows the routing set; the newcomer also receives
+it, cannot process a commit for the epoch it joins at, and discards it like any out-of-epoch
+envelope). The same path adds people to an existing group (`addMembers`), which previously touched
+relay routing only — they were being sent ciphertext they held no key for.
+
+### Group name, read state, timestamps (arc: "feels like a messenger")
+
+- **`Content::GroupName`** (kind 5) — the group's name is an ordinary E2EE message: the sender's
+  local name changes when it is *encrypted* (the point of no return), recipients learn it by
+  decrypting (`InboundResult::GroupRenamed`), and `group_name()` reads it from the durable blob.
+  There is no server-side name field at all. The decoder refuses what must never reach a screen
+  (empty, >128 bytes, invalid UTF-8, control characters, bidi overrides/isolates), and
+  `set_group_name` refuses the same at the source. Any member *can* send one — MLS has no roles and
+  the relay cannot police a message it cannot read — the app offers it to admins as a UI-level
+  restriction and says so in the sheet.
+- **`mark_read` / `unread_count`** — a per-conversation read mark stored in the blob; unread =
+  inbound messages above it. The mark is an `Option` because local ids start at 0 (a `0` sentinel
+  made the first message permanently read — caught by the test). The relay never sees a read
+  receipt; it is counting what it cannot read.
+- **`StoredMessage.created_at_ms` / `pending`** — every message is stamped by *this* device
+  (queued, for outbound; decrypted, for inbound) and never on the wire, so a peer cannot forge when
+  a message appeared here; the stated cost is that a long-offline delivery is timed at arrival.
+  Wall-clock is used here deliberately and only here — the secret-reveal timer keeps its injected
+  monotonic clock because that one is security-relevant. `pending` resolves an outbound message
+  against its outbox entry (`Message.outbox_local_id`), which is what lets the thread show
+  "Sending" for a message the relay has not accepted, instead of it vanishing until a retry.
 
 ## Lifetime & safety model
 
