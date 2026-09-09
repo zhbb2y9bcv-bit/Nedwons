@@ -16,13 +16,16 @@ public enum AttachmentState: Sendable, Equatable {
 
 /// How a file appears in a thread. Nothing is downloaded until it is asked for: the relay holds
 /// ciphertext, and fetching it costs bandwidth and battery, so an image shows its size and a tap
-/// target first. Once decrypted, the bytes live in memory for the session and are never written to
-/// disk in the clear — a photo you were shown is not a photo left in a cache directory.
+/// target first. Once decrypted, images render and voice notes play FROM MEMORY. The one stated
+/// exception: viewing a video or document writes a decrypted temp copy (complete file
+/// protection, deleted when the viewer closes) because the OS players require a file — see
+/// `MediaTempFile`.
 struct AttachmentBubble: View {
     @ObservedObject var model: AppModel
     let line: ThreadLine
     let attachment: AttachmentLine
     let palette: Nedwons.Palette
+    @State private var showPreview = false
 
     private var state: AttachmentState { model.attachmentState(attachment.blobID) }
 
@@ -53,10 +56,19 @@ struct AttachmentBubble: View {
                     .frame(maxWidth: 240, maxHeight: 320)
                     .clipShape(RoundedRectangle(cornerRadius: Nedwons.Radius.bubble))
                     .accessibilityLabel(attachment.displayName)
+            } else if attachment.isAudio {
+                VoiceNoteBubbleView(data: data, mine: line.mine, palette: palette)
             } else {
-                // Decrypted, but not something this build renders inline. Saying so plainly beats
-                // showing a broken image: the file is intact, we just do not display this type yet.
-                fileRow(subtitle: "Downloaded · \(attachment.formattedSize)")
+                // Video or document: viewed through the OS previewer over a protected temp copy.
+                Button {
+                    showPreview = true
+                } label: {
+                    fileRow(subtitle: "Tap to view · \(attachment.formattedSize)")
+                }
+                .buttonStyle(.plain)
+                .sheet(isPresented: $showPreview) {
+                    MediaPreviewSheet(data: data, filename: attachment.displayName)
+                }
             }
         case .loading:
             HStack(spacing: Nedwons.Spacing.sm) {

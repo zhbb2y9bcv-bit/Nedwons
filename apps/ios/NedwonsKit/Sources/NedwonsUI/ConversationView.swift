@@ -1,6 +1,7 @@
 import NedwonsKit
 import PhotosUI
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// One rendered line in a thread. Secrets carry no body here — they render as a sealed placeholder
 /// driven by the core's state machine, and are only revealed by a deliberate tap.
@@ -106,6 +107,8 @@ public struct AttachmentLine: Sendable, Equatable {
     }
 
     public var isImage: Bool { mime.hasPrefix("image/") }
+    public var isAudio: Bool { mime.hasPrefix("audio/") }
+    public var isVideo: Bool { mime.hasPrefix("video/") }
 
     /// What to call it when there is no filename — never a guess at the content.
     public var displayName: String {
@@ -134,7 +137,10 @@ struct ConversationView: View {
     @State private var renameText = ""
     @State private var showGroupInfo = false
     @State private var showPhotoPicker = false
+    @State private var pickerFilter: PHPickerFilter = .images
+    @State private var showFileImporter = false
     @State private var pickedItem: PhotosPickerItem?
+    @StateObject private var recorder = VoiceNoteRecorder()
     @State private var deleteCandidate: ThreadLine?
     @State private var forwardCandidate: ThreadLine?
     @State private var reportCandidate: ThreadLine?
@@ -190,19 +196,38 @@ struct ConversationView: View {
         .sheet(item: $reportCandidate) { line in
             ReportMessageSheet(model: model, line: line, chat: chat)
         }
-        // The picker returns the image's own bytes; they are encrypted before anything leaves the
-        // device, so what the relay receives is never the photo.
-        .photosPicker(isPresented: $showPhotoPicker, selection: $pickedItem, matching: .images)
+        // The picker returns the media's own bytes; they are encrypted before anything leaves the
+        // device, so what the relay receives is never the photo or video.
+        .photosPicker(isPresented: $showPhotoPicker, selection: $pickedItem, matching: pickerFilter)
         .onChange(of: pickedItem) { _, item in
             guard let item else { return }
+            let isVideo = pickerFilter == .videos
             Task {
                 defer { pickedItem = nil }
                 guard let data = try? await item.loadTransferable(type: Data.self) else {
-                    model.banner = "Couldn't read that photo."
+                    model.banner = isVideo ? "Couldn't read that video." : "Couldn't read that photo."
                     return
                 }
                 await model.sendAttachment(
-                    data, mime: "image/jpeg", filename: "photo.jpg", caption: "",
+                    data,
+                    mime: isVideo ? "video/mp4" : "image/jpeg",
+                    filename: isVideo ? "video.mp4" : "photo.jpg",
+                    caption: "",
+                    to: chat.conversationID)
+            }
+        }
+        .fileImporter(isPresented: $showFileImporter, allowedContentTypes: [.data]) { result in
+            guard case .success(let url) = result else { return }
+            Task {
+                let secured = url.startAccessingSecurityScopedResource()
+                defer { if secured { url.stopAccessingSecurityScopedResource() } }
+                guard let data = try? Data(contentsOf: url) else {
+                    model.banner = "Couldn't read that file."
+                    return
+                }
+                let mime = ConversationView.mimeType(for: url)
+                await model.sendAttachment(
+                    data, mime: mime, filename: url.lastPathComponent, caption: "",
                     to: chat.conversationID)
             }
         }
@@ -574,15 +599,82 @@ struct ConversationView: View {
         }
     }
 
+    @ViewBuilder
     private var composerRow: some View {
-        HStack(spacing: Nedwons.Spacing.sm) {
+        if recorder.isRecording {
+            recordingRow
+        } else {
+            standardComposerRow
+        }
+    }
+
+    /// Replaces the composer while a voice note records: elapsed time, cancel, send.
+    private var recordingRow: some View {
+        HStack(spacing: Nedwons.Spacing.md) {
+            Image(systemName: "waveform")
+                .foregroundStyle(palette.destructive)
+                .symbolEffect(.variableColor.iterative, isActive: true)
+            Text(VoiceNoteBubbleView.clock(recorder.elapsed))
+                .font(Nedwons.TypeScale.body)
+                .monospacedDigit()
+                .foregroundStyle(palette.textPrimary)
+            Spacer()
+            Button("Cancel", role: .cancel) { recorder.cancel() }
             Button {
-                showPhotoPicker = true
+                let data = recorder.finish()
+                Task {
+                    if let data {
+                        await model.sendAttachment(
+                            data, mime: "audio/mp4", filename: "Voice message.m4a", caption: "",
+                            to: chat.conversationID)
+                    }
+                }
+            } label: {
+                Image(systemName: "arrow.up.circle.fill").imageScale(.large)
+            }
+            .accessibilityLabel("Send voice message")
+        }
+        .padding(Nedwons.Spacing.md)
+        .accessibilityIdentifier("composer.recording")
+    }
+
+    private var standardComposerRow: some View {
+        HStack(spacing: Nedwons.Spacing.sm) {
+            Menu {
+                Button {
+                    pickerFilter = .images
+                    showPhotoPicker = true
+                } label: {
+                    Label("Photo", systemImage: "photo")
+                }
+                Button {
+                    pickerFilter = .videos
+                    showPhotoPicker = true
+                } label: {
+                    Label("Video", systemImage: "film")
+                }
+                Button {
+                    showFileImporter = true
+                } label: {
+                    Label("File", systemImage: "doc")
+                }
             } label: {
                 Image(systemName: "paperclip").imageScale(.large)
             }
-            .accessibilityLabel("Attach a photo")
+            .accessibilityLabel("Attach a photo, video, or file")
             .accessibilityIdentifier(GroupAdminA11y.composerAttach)
+            .disabled(model.isBusy)
+            Button {
+                Task {
+                    if await recorder.start() == false {
+                        model.banner = "Nedwons needs microphone access to record — enable it in iOS Settings."
+                    }
+                }
+            } label: {
+                Image(systemName: "mic").imageScale(.large)
+            }
+            .accessibilityLabel("Record a voice message")
+            .accessibilityIdentifier("composer.mic")
             .disabled(model.isBusy)
             TextField("Message", text: $draft, axis: .vertical)
                 .textFieldStyle(.roundedBorder)
@@ -606,6 +698,19 @@ struct ConversationView: View {
             .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
         }
         .padding(Nedwons.Spacing.md)
+    }
+}
+
+extension ConversationView {
+    /// Best-effort media type from the picked file's extension — advisory only, exactly like
+    /// every sender-chosen mime in the protocol (recipients validate the bytes they decode).
+    static func mimeType(for url: URL) -> String {
+        if let type = UTType(filenameExtension: url.pathExtension),
+            let mime = type.preferredMIMEType
+        {
+            return mime
+        }
+        return "application/octet-stream"
     }
 }
 

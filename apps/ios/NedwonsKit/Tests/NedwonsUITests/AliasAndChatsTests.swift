@@ -244,3 +244,57 @@ final class ConversationDeletionTests: XCTestCase {
         XCTAssertEqual(m.visibleConversations.map(\.conversationID), ["c2"])
     }
 }
+
+/// Media helpers (voice notes + file sending, arc E): small pure pieces of the media surface.
+@MainActor
+final class MediaHelperTests: XCTestCase {
+    func testVoiceClockFormatting() {
+        XCTAssertEqual(VoiceNoteBubbleView.clock(0), "0:00")
+        XCTAssertEqual(VoiceNoteBubbleView.clock(65), "1:05")
+        XCTAssertEqual(VoiceNoteBubbleView.clock(599.9), "9:59")
+    }
+
+    func testAttachmentKindHelpers() {
+        let voice = AttachmentLine(
+            blobID: "b", mime: "audio/mp4", filename: "", size: 10, caption: "")
+        XCTAssertTrue(voice.isAudio)
+        XCTAssertEqual(voice.displayName, "Voice message")
+        let clip = AttachmentLine(
+            blobID: "b", mime: "video/mp4", filename: "", size: 10, caption: "")
+        XCTAssertTrue(clip.isVideo)
+        XCTAssertEqual(clip.displayName, "Video")
+    }
+
+    func testMimeFromExtensionIsAdvisoryButSane() {
+        XCTAssertEqual(
+            ConversationView.mimeType(for: URL(fileURLWithPath: "/tmp/report.pdf")),
+            "application/pdf")
+        XCTAssertEqual(
+            ConversationView.mimeType(for: URL(fileURLWithPath: "/tmp/mystery.zzz9")),
+            "application/octet-stream")
+    }
+
+    /// The temp copy used for viewing is created inside its own directory and fully removed.
+    func testMediaTempFileLifecycle() throws {
+        let file = try XCTUnwrap(
+            MediaTempFile(data: Data([1, 2, 3]), filename: "../sneaky/name.mp4"))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: file.url.path))
+        XCTAssertFalse(file.url.path.contains(".."), "traversal neutralized")
+        file.remove()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.url.path))
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: file.url.deletingLastPathComponent().path))
+    }
+
+    /// The 25 MB cap is refused client-side with honest copy, before any sealing work.
+    func testOversizedAttachmentIsRefusedUpFront() async {
+        let model = AppModel(baseURL: URL(string: "http://127.0.0.1:1")!)
+        model.sendAttachmentAction = { _, _, _, _, _ in
+            XCTFail("must not reach the send path")
+        }
+        await model.sendAttachment(
+            Data(count: 26 * 1024 * 1024), mime: "video/mp4", filename: "big.mp4", caption: "",
+            to: "conv")
+        XCTAssertEqual(model.banner?.contains("25 MB") , true)
+    }
+}
