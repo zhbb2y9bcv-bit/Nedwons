@@ -593,6 +593,13 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func disappearTimer() throws  -> UInt32
     
     /**
+     * Replace the text of THIS DEVICE's own message (edit), returning the local id of the
+     * queued change. Author-only, text-only, and never on a deleted message — recipients
+     * enforce the same rules independently, and every applied edit is visibly marked.
+     */
+    func editMessage(target: Data, body: Data) throws  -> UInt64
+    
+    /**
      * Produces the versioned opaque envelope (`app-envelope v1`). **Idempotent:** a retry returns
      * the same bytes and never advances the ratchet again — no double-spend of a message key.
      */
@@ -1048,6 +1055,20 @@ open func deleteForEveryone(target: Data)throws  -> UInt64  {
 open func disappearTimer()throws  -> UInt32  {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_disappear_timer(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Replace the text of THIS DEVICE's own message (edit), returning the local id of the
+     * queued change. Author-only, text-only, and never on a deleted message — recipients
+     * enforce the same rules independently, and every applied edit is visibly marked.
+     */
+open func editMessage(target: Data, body: Data)throws  -> UInt64  {
+    return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_edit_message(self.uniffiClonePointer(),
+        FfiConverterData.lower(target),
+        FfiConverterData.lower(body),$0
     )
 })
 }
@@ -2340,6 +2361,10 @@ public struct StoredMessage {
      */
     public var deleted: Bool
     /**
+     * The author replaced the text after sending; render an "edited" tag.
+     */
+    public var edited: Bool
+    /**
      * The MLS-authenticated sender identity (device id bytes; empty for pre-field history).
      */
     public var sender: Data
@@ -2380,6 +2405,9 @@ public struct StoredMessage {
          * Retracted by its author (delete-for-everyone): render "message deleted", body is gone.
          */deleted: Bool, 
         /**
+         * The author replaced the text after sending; render an "edited" tag.
+         */edited: Bool, 
+        /**
          * The MLS-authenticated sender identity (device id bytes; empty for pre-field history).
          */sender: Data) {
         self.localId = localId
@@ -2397,6 +2425,7 @@ public struct StoredMessage {
         self.readCount = readCount
         self.expiresAtMs = expiresAtMs
         self.deleted = deleted
+        self.edited = edited
         self.sender = sender
     }
 }
@@ -2453,6 +2482,9 @@ extension StoredMessage: Equatable, Hashable {
         if lhs.deleted != rhs.deleted {
             return false
         }
+        if lhs.edited != rhs.edited {
+            return false
+        }
         if lhs.sender != rhs.sender {
             return false
         }
@@ -2475,6 +2507,7 @@ extension StoredMessage: Equatable, Hashable {
         hasher.combine(readCount)
         hasher.combine(expiresAtMs)
         hasher.combine(deleted)
+        hasher.combine(edited)
         hasher.combine(sender)
     }
 }
@@ -2503,6 +2536,7 @@ public struct FfiConverterTypeStoredMessage: FfiConverterRustBuffer {
                 readCount: FfiConverterUInt32.read(from: &buf), 
                 expiresAtMs: FfiConverterOptionUInt64.read(from: &buf), 
                 deleted: FfiConverterBool.read(from: &buf), 
+                edited: FfiConverterBool.read(from: &buf), 
                 sender: FfiConverterData.read(from: &buf)
         )
     }
@@ -2523,6 +2557,7 @@ public struct FfiConverterTypeStoredMessage: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.readCount, into: &buf)
         FfiConverterOptionUInt64.write(value.expiresAtMs, into: &buf)
         FfiConverterBool.write(value.deleted, into: &buf)
+        FfiConverterBool.write(value.edited, into: &buf)
         FfiConverterData.write(value.sender, into: &buf)
     }
 }
@@ -2685,6 +2720,11 @@ public enum InboundResult {
      */
     case messageDeleted(target: Data
     )
+    /**
+     * The author replaced a message's text; the copy is updated and marked edited. Redraw.
+     */
+    case messageEdited(target: Data
+    )
 }
 
 
@@ -2740,6 +2780,9 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         )
         
         case 14: return .messageDeleted(target: try FfiConverterData.read(from: &buf)
+        )
+        
+        case 15: return .messageEdited(target: try FfiConverterData.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -2817,6 +2860,11 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         
         case let .messageDeleted(target):
             writeInt(&buf, Int32(14))
+            FfiConverterData.write(target, into: &buf)
+            
+        
+        case let .messageEdited(target):
+            writeInt(&buf, Int32(15))
             FfiConverterData.write(target, into: &buf)
             
         }
@@ -3482,6 +3530,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_disappear_timer() != 64338) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_edit_message() != 25383) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_encrypt() != 56956) {

@@ -1161,9 +1161,38 @@ public final class AppModel: ObservableObject {
     }
 
     /// Send `body`, answering the pending reply draft if there is one.
+    /// The message being EDITED, per conversation (mutually exclusive with a reply draft).
+    @Published public var editDrafts: [String: ThreadLine] = [:]
+
+    /// Injected: replace the text of the user's own message (`messageID`, new body, conversation).
+    public var editMessageAction: ((String, String, String) async throws -> Void)?
+
+    public func startEdit(of line: ThreadLine, in conversationID: String) {
+        guard line.mine, !line.messageID.isEmpty, !line.deleted else { return }
+        replyDrafts.removeValue(forKey: conversationID)
+        editDrafts[conversationID] = line
+    }
+
+    public func cancelEdit(in conversationID: String) {
+        editDrafts.removeValue(forKey: conversationID)
+    }
+
     public func sendMessageOrReply(_ body: String, to conversationID: String) async {
         let trimmed = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
+        if let editing = editDrafts[conversationID] {
+            editDrafts.removeValue(forKey: conversationID)
+            guard let editMessageAction else {
+                banner = "Editing isn't available in this build."
+                return
+            }
+            do {
+                try await editMessageAction(editing.messageID, trimmed, conversationID)
+            } catch {
+                banner = "Couldn't edit that message."
+            }
+            return
+        }
         guard let draft = replyDrafts[conversationID], let sendReplyAction else {
             await sendMessage(trimmed, to: conversationID)
             return

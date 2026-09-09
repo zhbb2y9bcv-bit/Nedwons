@@ -132,6 +132,10 @@ public final class ConversationCoordinator {
             guard let self else { throw CoordinatorError.notSignedIn }
             try await self.deleteForEveryone(messageID: messageID, in: conversationID)
         }
+        model.editMessageAction = { [weak self] messageID, newBody, conversationID in
+            guard let self else { throw CoordinatorError.notSignedIn }
+            try await self.editMessage(messageID: messageID, newBody: newBody, in: conversationID)
+        }
         model.forwardMessageAction = { [weak self] lineID, sourceID, destinationID in
             guard let self else { throw CoordinatorError.notSignedIn }
             try await self.forward(lineID: lineID, from: sourceID, to: destinationID)
@@ -365,6 +369,17 @@ public final class ConversationCoordinator {
             let target = Hex.decode(messageID)
         else { throw CoordinatorError.noSessionForConversation }
         let localID = try client.deleteForEveryone(target: target)
+        defer { refresh(conversationID) }
+        try await upload(localID: localID, client: client, conversationID: conversationID)
+    }
+
+    /// Replace the text of the user's OWN message. The core refuses anyone else's message and
+    /// recipients refuse a non-author's edit independently; every applied edit is visibly marked.
+    public func editMessage(messageID: String, newBody: String, in conversationID: String) async throws {
+        guard let client = activeClient(for: conversationID),
+            let target = Hex.decode(messageID)
+        else { throw CoordinatorError.noSessionForConversation }
+        let localID = try client.editMessage(target: target, body: Data(newBody.utf8))
         defer { refresh(conversationID) }
         try await upload(localID: localID, client: client, conversationID: conversationID)
     }
@@ -831,7 +846,8 @@ public final class ConversationCoordinator {
                 deliveredCount: Int(message.deliveredCount),
                 readCount: Int(message.readCount),
                 deleted: message.deleted,
-                senderDeviceID: Hex.encode(message.sender))
+                senderDeviceID: Hex.encode(message.sender),
+                edited: message.edited)
         }
         model.threadLines[conversationID] = lines
         // The group's name lives only inside the ciphertext; this is the one place it is read.
