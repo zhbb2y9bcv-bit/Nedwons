@@ -1,6 +1,11 @@
 //! Nedwons API server binary.
 //!
 //! Configuration (environment):
+//! * `NEDWONS_ENV` — set to `production` to enforce the readiness checks in
+//!   [`nedwons_api::startup`]. In that mode the stable signing keys, the password pepper, App
+//!   Attest, the client-IP source and push configuration all become REQUIRED, device proofs are
+//!   required by default, and the process REFUSES TO START if any are missing — reporting every
+//!   gap at once. Unset (the default) leaves development exactly as it was.
 //! * `DATABASE_URL`  — required, e.g. `postgres://localhost/nedwons_dev`.
 //! * `NEDWONS_BIND` — listen address, default `127.0.0.1:8080`. The dev default binds
 //!   loopback only; production terminates TLS 1.3 at the ingress in front of this service
@@ -63,6 +68,30 @@ fn main() {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // Refuse to start rather than start insecurely. Every security control here was opt-in with a
+    // permissive default, so a production deployment that simply forgot a variable would come up
+    // looking healthy while signing with ephemeral keys, hashing without a pepper, accepting
+    // bearer tokens with no device proof, or keying rate limits on an IP nobody sets. In
+    // production those become requirements; development is untouched.
+    let readiness = nedwons_api::startup::evaluate(&nedwons_api::startup::SystemEnv);
+    for warning in &readiness.warnings {
+        tracing::warn!("{warning}");
+    }
+    if !readiness.is_ready() {
+        eprintln!(
+            "refusing to start: NEDWONS_ENV=production requires {} setting(s) that are missing or \
+             contradictory.",
+            readiness.errors.len()
+        );
+        for error in &readiness.errors {
+            eprintln!("  - {error}");
+        }
+        std::process::exit(2);
+    }
+    if readiness.production {
+        tracing::info!("production readiness checks passed");
+    }
 
     let database_url = match std::env::var("DATABASE_URL") {
         Ok(url) => url,
@@ -169,6 +198,7 @@ fn main() {
     runtime.block_on(serve(
         bind,
         rate_per_min,
+        readiness.require_proof,
         stores,
         service,
         relay,
@@ -183,6 +213,8 @@ fn main() {
 async fn serve(
     bind: SocketAddr,
     rate_per_min: u32,
+    // Decided once by the readiness check, so exactly one place resolves it.
+    require_proof: bool,
     stores: Arc<PgStores>,
     service: Arc<AuthService>,
     relay: Arc<nedwons_api::relay::PgRelay>,
@@ -260,10 +292,8 @@ async fn serve(
         .ok()
         .filter(|s| !s.trim().is_empty())
         .and_then(|s| axum::http::HeaderName::from_bytes(s.trim().as_bytes()).ok());
-    // Sender-constrained access tokens (ADR-0011, R-308): opt-in during migration.
-    let require_proof = std::env::var("NEDWONS_REQUIRE_PROOF")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    // Sender-constrained access tokens (ADR-0011, R-308): opt-in during migration, and ON by
+    // default once NEDWONS_ENV=production. The value is decided by the readiness check in main().
     if require_proof {
         tracing::info!("sender-constrained access tokens (DPoP proofs) REQUIRED");
     }

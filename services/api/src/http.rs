@@ -71,7 +71,9 @@ pub struct AppState {
     /// Require a DPoP-style device proof alongside every `Authorization` token (ADR-0011, R-308).
     /// Off by default during migration.
     require_proof: bool,
-    proof_cache: Arc<crate::proof::ProofReplayCache>,
+    /// Shared across instances in production (`PgReplayCache`), so a captured proof cannot be
+    /// replayed against a different instance inside the freshness window.
+    proof_cache: Arc<dyn crate::proof::ReplayGuard>,
     /// ADR-0012 sender-certificate signing key, distinct from the auth/transparency keys. Its
     /// public key ships with issued certificates; production clients pin it.
     sender_cert_key: Arc<p256::ecdsa::SigningKey>,
@@ -163,6 +165,7 @@ pub fn build_router_cfg(
     // All stores are constructed from one pool, so any of them can hand it back for cross-store
     // transactions; taking it here keeps `build_router_cfg`'s signature unchanged for callers.
     let pool = relay.pool_clone();
+    let relay_pool = relay.pool_clone();
     let state = AppState {
         service,
         pool,
@@ -175,7 +178,9 @@ pub fn build_router_cfg(
         limiter: Arc::new(RateLimiter::keyed(quota)),
         trusted_ip_header,
         require_proof,
-        proof_cache: Arc::new(crate::proof::ProofReplayCache::new()),
+        // Backed by `proof_nonces`, so replay protection holds across instances rather than only
+        // within one process.
+        proof_cache: Arc::new(crate::proof::PgReplayCache::new(relay_pool)),
         sender_cert_key: Arc::new(load_or_generate_sender_cert_key()),
         // Reuse the per-IP quota for the per-recipient sealed-delivery cap.
         sealed_limiter: Arc::new(RateLimiter::keyed(quota)),
@@ -429,13 +434,18 @@ async fn verify_request_proof(
         return Err(denied());
     }
 
-    // Single-use within the freshness window, so a valid proof cannot be replayed.
-    if !state.proof_cache.check_and_record(
-        &account.device_id.0,
-        &parsed.nonce,
-        now + auth_core::request_proof::MAX_SKEW_SECS + 5,
-        now,
-    ) {
+    // Single-use within the freshness window, so a valid proof cannot be replayed. The production
+    // guard is database-backed (shared across instances), and the sync client must therefore run
+    // on a blocking thread — it hosts its own runtime and panics if driven from this one.
+    let cache = state.proof_cache.clone();
+    let device = account.device_id.0;
+    let nonce = parsed.nonce;
+    let expiry = now + auth_core::request_proof::MAX_SKEW_SECS + 5;
+    let fresh =
+        tokio::task::spawn_blocking(move || cache.check_and_record(&device, &nonce, expiry, now))
+            .await
+            .map_err(|_| denied())?;
+    if !fresh {
         return Err(denied());
     }
     Ok(())
