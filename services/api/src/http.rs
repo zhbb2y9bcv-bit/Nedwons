@@ -65,6 +65,10 @@ pub struct AppState {
     pub membership: Arc<PgMembership>,
     notifier: DeliveryNotifier,
     limiter: Arc<IpLimiter>,
+    /// Per-ACCOUNT abuse quotas, shared across instances. The per-IP limiter above is the outer,
+    /// pre-authentication guard; these bound what a known account can do, which is what abuse
+    /// control actually needs (addresses are cheap and shared, accounts are neither).
+    quotas: Arc<crate::quota::Quotas>,
     /// `Some(h)`: take the rate-limit client IP from header `h`, which MUST be set by a trusted
     /// proxy. `None`: use the peer socket IP and ignore such headers, so a client cannot spoof it.
     trusted_ip_header: Option<HeaderName>,
@@ -166,6 +170,7 @@ pub fn build_router_cfg(
     // transactions; taking it here keeps `build_router_cfg`'s signature unchanged for callers.
     let pool = relay.pool_clone();
     let relay_pool = relay.pool_clone();
+    let quota_pool = relay.pool_clone();
     let state = AppState {
         service,
         pool,
@@ -176,6 +181,7 @@ pub fn build_router_cfg(
         membership,
         notifier,
         limiter: Arc::new(RateLimiter::keyed(quota)),
+        quotas: Arc::new(crate::quota::Quotas::new(quota_pool)),
         trusted_ip_header,
         require_proof,
         // Backed by `proof_nonces`, so replay protection holds across instances rather than only
@@ -1981,6 +1987,26 @@ fn token32_from_hex(input: &str) -> Result<[u8; 32], ApiError> {
 }
 
 /// Handlers treat `false` as a generic forbidden, so non-members and non-admins learn nothing.
+/// Consume one unit of a per-account quota, refusing with 429 when it is exhausted.
+///
+/// 429 rather than a generic error on purpose: the caller is legitimately authenticated and the
+/// refusal is temporary, so a well-behaved client should back off rather than treat it as denial.
+async fn enforce_quota(
+    state: &AppState,
+    quota: crate::quota::Quota,
+    account: &auth_core::AccountId,
+) -> Result<(), ApiError> {
+    let quotas = state.quotas.clone();
+    let account = *account;
+    let now = now_unix() as i64;
+    let within = blocking_store(move || quotas.consume_account(quota, &account, now)).await?;
+    if within {
+        Ok(())
+    } else {
+        Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "rate_limited"))
+    }
+}
+
 fn is_conversation_admin(
     state: &AppState,
     conversation_id: &[u8; 16],
@@ -2016,6 +2042,9 @@ async fn create_invite(
     Json(body): Json<CreateInviteBody>,
 ) -> Result<Json<InviteDto>, ApiError> {
     let me = authed_device(&state, &headers).await?;
+    // An invite token is a capability; unbounded minting turns one account into a spam vector for
+    // whole groups.
+    enforce_quota(&state, crate::quota::GROUP_INVITES, &me.account_id).await?;
     let conversation_id = id16_from_hex(&conversation_hex)?;
     // Authoritative conversations grow only through /commit, so minting no invite closes the whole
     // join path at its source: no invite ⇒ no accept ⇒ no join request.
@@ -3065,8 +3094,11 @@ async fn search_profiles(
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<SearchQuery>,
 ) -> Result<Json<Vec<ProfileSummaryDto>>, ApiError> {
-    let _me = authed_device(&state, &headers).await?;
-    // A minimum length keeps this deliberate discovery, not a bulk directory scan (ABUSE_MODEL.md).
+    let me = authed_device(&state, &headers).await?;
+    // Discovery is username-only, so search is the ONLY enumeration surface: the minimum length
+    // keeps a single query deliberate, and the quota stops an account walking prefixes to harvest
+    // the user list (ABUSE_MODEL.md).
+    enforce_quota(&state, crate::quota::PROFILE_SEARCH, &me.account_id).await?;
     let q = query.q.trim().to_lowercase();
     if q.chars().count() < MIN_SEARCH_CHARS || q.len() > 64 {
         return Err(bad_request());
@@ -3102,6 +3134,8 @@ async fn friend_request(
     Json(body): Json<AccountRefBody>,
 ) -> Result<Json<FriendActionDto>, ApiError> {
     let me = authed_device(&state, &headers).await?;
+    // Bounds the harassment pattern of spraying requests at strangers.
+    enforce_quota(&state, crate::quota::FRIEND_REQUESTS, &me.account_id).await?;
     let target = AccountId(id16_from_hex(&body.account_id)?);
     if target.0 == me.account_id.0 {
         return Err(bad_request());
@@ -3179,6 +3213,9 @@ async fn create_report(
     Json(body): Json<ReportBody>,
 ) -> Result<Json<ReportDto>, ApiError> {
     let me = authed_device(&state, &headers).await?;
+    // Reporting stays cheap for real users, but unbounded reporting is itself an abuse vector
+    // (mass false reports to trigger moderation against a target).
+    enforce_quota(&state, crate::quota::REPORTS, &me.account_id).await?;
     let target = AccountId(id16_from_hex(&body.account_id)?);
     if target.0 == me.account_id.0 {
         return Err(bad_request());

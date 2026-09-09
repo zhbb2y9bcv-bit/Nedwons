@@ -13,6 +13,7 @@ pub mod notify;
 pub mod pgstore;
 pub mod proof;
 pub mod push;
+pub mod quota;
 pub mod relay;
 pub mod social;
 pub mod startup;
