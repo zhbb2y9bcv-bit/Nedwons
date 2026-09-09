@@ -445,6 +445,22 @@ public final class AppModel: ObservableObject {
         coverTrafficControl?(enabled)
     }
 
+    /// Whether this device tells senders when the user has READ their message. ON by default (like
+    /// the big messengers). When off, delivery is still acknowledged — a sender still sees a message
+    /// arrived — but never that it was read: reading stops being something anyone else is told.
+    /// Persisted locally; the coordinator reads it through `readReceiptsControl`.
+    @Published public var readReceiptsEnabled: Bool = UserDefaults.standard.object(
+        forKey: "nedwons.readReceipts") as? Bool ?? true
+    /// Set by the coordinator to apply the choice to the send path.
+    public var readReceiptsControl: ((Bool) -> Void)?
+
+    /// Turn read receipts on or off: remember it and tell the coordinator.
+    public func setReadReceipts(_ enabled: Bool) {
+        readReceiptsEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "nedwons.readReceipts")
+        readReceiptsControl?(enabled)
+    }
+
     /// Per-chat local presentation preferences (pin / archive / mute). Never sent to the relay.
     @Published public internal(set) var chatPrefs = ChatPrefs()
     public var chatPrefsStore: ChatPrefsStoring = UserDefaultsChatPrefsStore()

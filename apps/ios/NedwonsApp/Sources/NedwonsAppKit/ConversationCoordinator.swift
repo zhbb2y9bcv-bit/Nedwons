@@ -53,10 +53,11 @@ public final class ConversationCoordinator {
     private var isActive = true
     /// The most recent background failure, for diagnostics; the UI shows banners on user actions.
     public private(set) var lastSyncError: Error?
-    /// Whether this device tells senders what it has received and read. A privacy choice, not a
-    /// protocol requirement: with it off, nothing about what this device has seen is sent to
-    /// anyone, and every other feature still works. (No settings toggle is wired to it yet.)
-    public var sendReceipts = true
+    /// Whether this device tells senders when the user has READ their message. A privacy choice,
+    /// not a protocol requirement. Delivery receipts are always sent (a sender should be able to see
+    /// their message arrived); when this is off, only READ receipts are withheld — reading is no
+    /// longer something anyone else is told. Driven by the Settings toggle via `model`.
+    public var sendReadReceipts = true
 
     public init(
         model: AppModel,
@@ -157,6 +158,11 @@ public final class ConversationCoordinator {
         model.coverTrafficControl = { [weak self] enabled in
             self?.setCoverTraffic(enabled)
         }
+        model.readReceiptsControl = { [weak self] enabled in
+            self?.sendReadReceipts = enabled
+        }
+        // Apply the persisted choice now, before any receipt is owed.
+        sendReadReceipts = model.readReceiptsEnabled
     }
 
     /// Begin the receive loop for the signed-in session. Idempotent.
@@ -603,11 +609,13 @@ public final class ConversationCoordinator {
     /// user has actually seen. Batched and recorded, so one message is acknowledged once and not on
     /// every sync.
     ///
-    /// Receipts are a privacy choice, not a protocol requirement: `sendReceipts` off means this
-    /// device tells nobody what it has seen, and everything else still works.
+    /// Receipts are a privacy choice, not a protocol requirement. Delivery is always acknowledged;
+    /// READ receipts are withheld when the user has turned them off — so a sender can still see a
+    /// message arrived, but never that it was read.
     public func sendPendingReceipts(in conversationID: String) async {
-        guard sendReceipts, let client = activeClient(for: conversationID) else { return }
+        guard let client = activeClient(for: conversationID) else { return }
         for kind in [ReceiptKindFfi.delivered, .read] {
+            if kind == .read && !sendReadReceipts { continue }
             guard let owed = try? client.unacknowledged(kind: kind), !owed.isEmpty else { continue }
             guard let localID = try? client.sendReceipt(kind: kind, messageIds: owed) else { continue }
             do {

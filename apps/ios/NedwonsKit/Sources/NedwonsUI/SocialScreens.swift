@@ -303,6 +303,7 @@ struct SettingsRootView: View {
 
                 Section {
                     NavigationLink("Blocked") { BlockedUsersView(model: model) }
+                    ReadReceiptsToggleRow(model: model)
                     DiagnosticsToggleRow(model: model)
                     CoverTrafficToggleRow(model: model)
                 } header: {
@@ -754,6 +755,29 @@ struct DiagnosticsToggleRow: View {
         }
         .onAppear { on = model.diagnostics.enabled }
         .onChange(of: on) { _, value in model.diagnostics.setEnabled(value) }
+    }
+}
+
+/// The read-receipts control every big messenger has. ON by default. Delivery is unaffected —
+/// this governs only whether the user tells others they have READ a message.
+struct ReadReceiptsToggleRow: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Nedwons.Spacing.xxs) {
+            Toggle(
+                "Send read receipts",
+                isOn: Binding(
+                    get: { model.readReceiptsEnabled },
+                    set: { model.setReadReceipts($0) })
+            )
+            .accessibilityIdentifier("settings.readReceipts")
+            Text(
+                "On by default. When off, people you message still see that a message was delivered, "
+                    + "but never that you read it. It applies to messages from here on.")
+                .font(Nedwons.TypeScale.caption)
+                .foregroundStyle(.secondary)
+        }
     }
 }
 
