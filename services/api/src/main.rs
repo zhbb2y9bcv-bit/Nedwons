@@ -63,10 +63,14 @@ fn env_or(name: &str, default: &str) -> String {
 /// within another runtime. Once the server is async, all store access goes through
 /// `spawn_blocking` (see http.rs).
 fn main() {
+    // The operator's RUST_LOG, then directives that cannot be overridden by it: `tokio_postgres`
+    // logs statement PARAMETERS at debug, which on these paths are search terms, profile fields
+    // and message ciphertext. Turning up verbosity to debug an incident must not silently turn on
+    // user-data capture (INV-8).
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            nedwons_api::redact::log_filter(std::env::var("RUST_LOG").ok().as_deref()),
+        ))
         .init();
 
     // Refuse to start rather than start insecurely. Every security control here was opt-in with a
@@ -275,6 +279,8 @@ async fn serve(
                         .purge_expired_key_packages(nedwons_api::relay::KEY_PACKAGE_TTL_SECS)?;
                     // Abuse-quota windows that can no longer be current (R-306).
                     let counters = quotas.purge_expired(now as i64, 86_400)?;
+                    // Capacity gauges are sampled on the same tick (queue depth, pool usage).
+                    relay.sample_capacity_gauges();
                     Ok::<u64, auth_core::store::StoreError>(
                         auth + mail + sealed + self_group + prekeys + counters,
                     )

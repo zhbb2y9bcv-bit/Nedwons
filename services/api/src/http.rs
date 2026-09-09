@@ -312,6 +312,11 @@ pub fn build_router_cfg(
         .layer(middleware::from_fn_with_state(state.clone(), proof_layer))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit))
         .route("/healthz", get(|| async { "ok" }))
+        // Scrape endpoint: served only when NEDWONS_METRICS_TOKEN is set, and 404 otherwise.
+        .route("/metrics", get(metrics_endpoint))
+        // Outermost of the application layers, so every request — including ones refused by the
+        // rate limiter or the proof layer — gets a request id and exactly one structured line.
+        .layer(middleware::from_fn(request_context))
         .layer(middleware::from_fn(security_headers))
         .with_state(state)
 }
@@ -371,6 +376,8 @@ impl From<auth_core::store::StoreError> for ApiError {
 /// When on, a request carrying an `Authorization` token must ALSO carry a device proof binding
 /// method + path + token + timestamp + single-use nonce, signed by the enrolled key. Requests
 /// without that header are untouched: a bearer token is only honored with proof of possession.
+/// Wraps proof verification so every refusal is counted once, in one place, rather than at each
+/// of the several `denied()` returns inside it (where the next added branch would be forgotten).
 async fn proof_layer(State(state): State<AppState>, request: Request, next: Next) -> Response {
     if state.require_proof && request.headers().contains_key(header::AUTHORIZATION) {
         // Extract owned inputs synchronously: holding `&Request` across an `.await` makes the
@@ -389,6 +396,7 @@ async fn proof_layer(State(state): State<AppState>, request: Request, next: Next
         let method = request.method().as_str().as_bytes().to_vec();
         let path = request.uri().path().as_bytes().to_vec();
         if let Err(e) = verify_request_proof(&state, bearer, proof_hdr, method, path).await {
+            crate::metrics::PROOF_FAILURES.incr();
             return e.into_response();
         }
     }
@@ -462,6 +470,86 @@ fn now_unix() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+// ----- observability ------------------------------------------------------------------
+
+/// Header carrying the per-request correlation id, echoed to the client so a user-reported
+/// problem can be tied to server logs without the user having to describe it.
+pub const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Assign a request id, time the request, and emit ONE structured line per request.
+///
+/// Every field here is allow-listed, and the two that look innocent are the reason this exists:
+///
+/// * the path is recorded as a route SHAPE with the query string removed, because
+///   `/v1/profiles/search?q=alice` is a username somebody typed, and
+///   `/v1/conversations/<id>/messages` is a conversation identifier;
+/// * no headers, no bodies, no account or device ids. A log line says what happened and how long
+///   it took, never to whom (INV-8).
+///
+/// The request id is generated server-side and never taken from the client: an attacker-chosen
+/// value would let a caller forge or collide correlation ids in the operator's own logs.
+async fn request_context(request: Request, next: Next) -> Response {
+    let started = std::time::Instant::now();
+    let request_id = hex::encode(auth_core::crypto::random_bytes::<8>());
+    let method = request.method().clone();
+    let shape = crate::redact::route_shape(crate::redact::path_only(
+        request
+            .uri()
+            .path_and_query()
+            .map(|p| p.as_str())
+            .unwrap_or("/"),
+    ));
+
+    let mut response = next.run(request).await;
+    let status = response.status();
+    let latency_ms = started.elapsed().as_millis();
+
+    if let Ok(value) = axum::http::HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+
+    // Client errors are the caller's problem and are noise at info level; server errors are ours.
+    if status.is_server_error() {
+        tracing::error!(request_id, %method, route = %shape, status = status.as_u16(), latency_ms, "request failed");
+    } else {
+        tracing::info!(request_id, %method, route = %shape, status = status.as_u16(), latency_ms, "request");
+    }
+
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        crate::metrics::RATE_LIMITED_IP.incr();
+    }
+    response
+}
+
+/// Prometheus scrape endpoint, gated on a shared secret.
+///
+/// Metrics describe the health and volume of the whole service; exposing them publicly hands an
+/// attacker a live feed of how their probing is landing (auth failures, rate limits, queue depth).
+/// Unset token ⇒ 404 rather than 401: an unconfigured deployment should not even advertise that
+/// the endpoint exists.
+async fn metrics_endpoint(headers: HeaderMap) -> Response {
+    let Ok(expected) = std::env::var("NEDWONS_METRICS_TOKEN") else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if expected.trim().is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    // Constant-time compare: a scrape token is a credential like any other.
+    if !auth_core::crypto::ct_eq(presented.as_bytes(), expected.as_bytes()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    (
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+        crate::metrics::render(),
+    )
+        .into_response()
 }
 
 // ----- rate limiting ------------------------------------------------------------------
@@ -790,6 +878,7 @@ async fn register_finish(
     })
     .await?;
 
+    crate::metrics::ACCOUNTS_REGISTERED.incr();
     append_binding_best_effort(
         &state,
         session.account_id,
@@ -817,7 +906,10 @@ async fn append_binding_best_effort(
         .await
         .is_err()
     {
+        crate::metrics::KT_APPEND_FAILURES.incr();
         tracing::error!("transparency log append failed at {context} (log gap — must reconcile)");
+    } else {
+        crate::metrics::KT_APPENDS.incr();
     }
 }
 
@@ -850,7 +942,12 @@ async fn login_finish(
     let txn_id = txn_from_hex(&body.txn_id)?;
     let signature = hex_exact(&body.signature, 64)?;
     let service = state.service.clone();
-    let session = blocking(move || service.login_finish(&txn_id, &signature)).await?;
+    // Counted here rather than in the middleware: only this handler knows the difference between
+    // "the caller failed to authenticate" and "the request was malformed".
+    let session = blocking(move || service.login_finish(&txn_id, &signature))
+        .await
+        .inspect_err(|_| crate::metrics::AUTH_FAILURES.incr())?;
+    crate::metrics::AUTH_SUCCESSES.incr();
     Ok(Json(session.into()))
 }
 
@@ -1001,6 +1098,7 @@ async fn account_delete(
         })
     })
     .await?;
+    crate::metrics::ACCOUNTS_DELETED.incr();
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1765,6 +1863,7 @@ async fn attest_submit_handler(
                 cfg,
                 std::time::SystemTime::now(),
             )
+            .inspect_err(|_| crate::metrics::ATTESTATION_FAILURES.incr())
             .map_err(|_| bad_request())?;
             true
         }
@@ -2003,6 +2102,7 @@ async fn enforce_quota(
     if within {
         Ok(())
     } else {
+        crate::metrics::QUOTA_EXHAUSTED.incr();
         Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "rate_limited"))
     }
 }
@@ -2861,6 +2961,23 @@ async fn stream_socket(
     me: AccountDevice,
 ) {
     use axum::extract::ws::Message;
+
+    // A guard rather than a bare incr/decr pair: this function has many exit paths (client
+    // disconnect, send error, ack failure), and a decrement missed on any one of them leaks the
+    // gauge upward until it reads as thousands of phantom connections.
+    struct OpenSocket;
+    impl OpenSocket {
+        fn new() -> Self {
+            crate::metrics::WEBSOCKETS_OPEN.incr();
+            Self
+        }
+    }
+    impl Drop for OpenSocket {
+        fn drop(&mut self) {
+            crate::metrics::WEBSOCKETS_OPEN.decr();
+        }
+    }
+    let _open = OpenSocket::new();
 
     let device = me.device_id;
     let notify = state.notifier.handle(&device.0);

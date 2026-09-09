@@ -11,6 +11,20 @@ pub fn random_bytes<const N: usize>() -> [u8; N] {
     buf
 }
 
+/// Constant-time byte-string equality, for comparing anything an attacker can guess at repeatedly
+/// — a shared scrape token, a MAC, a capability string.
+///
+/// `==` on slices short-circuits at the first differing byte, so response time leaks how long a
+/// guessed prefix was correct, which is enough to recover a secret one byte at a time. Length is
+/// compared first and non-secretly: that is unavoidable, and a secret's length is not the secret.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    if a.len() != b.len() {
+        return false;
+    }
+    a.ct_eq(b).into()
+}
+
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(data);
     let mut out = [0u8; 32];
