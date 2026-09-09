@@ -58,6 +58,9 @@ public final class ConversationCoordinator {
     /// their message arrived); when this is off, only READ receipts are withheld — reading is no
     /// longer something anyone else is told. Driven by the Settings toggle via `model`.
     public var sendReadReceipts = true
+    /// Whether this device broadcasts typing indicators. A privacy choice, driven by the Settings
+    /// toggle via `model`; when off, `setTyping` sends nothing.
+    public var sendTypingIndicators = true
 
     public init(
         model: AppModel,
@@ -161,8 +164,12 @@ public final class ConversationCoordinator {
         model.readReceiptsControl = { [weak self] enabled in
             self?.sendReadReceipts = enabled
         }
-        // Apply the persisted choice now, before any receipt is owed.
+        model.typingIndicatorControl = { [weak self] enabled in
+            self?.sendTypingIndicators = enabled
+        }
+        // Apply the persisted choices now, before any receipt is owed or a keystroke is typed.
         sendReadReceipts = model.readReceiptsEnabled
+        sendTypingIndicators = model.typingIndicatorsEnabled
     }
 
     /// Begin the receive loop for the signed-in session. Idempotent.
@@ -588,6 +595,7 @@ public final class ConversationCoordinator {
     /// dozens of envelopes for every recipient — so a "started" is repeated at most every
     /// `typingInterval`, and a "stopped" is always sent (it is what clears the indicator).
     public func setTyping(_ active: Bool, in conversationID: String) async {
+        guard sendTypingIndicators else { return }
         guard let client = activeClient(for: conversationID) else { return }
         if active {
             let last = lastTypingSent[conversationID] ?? .distantPast

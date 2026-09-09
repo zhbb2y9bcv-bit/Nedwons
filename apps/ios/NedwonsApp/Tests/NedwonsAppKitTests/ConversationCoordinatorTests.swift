@@ -843,6 +843,27 @@ final class ConversationCoordinatorTests: XCTestCase {
         XCTAssertEqual(bob.texts(in: conv).map(\.0), ["hello?"])
     }
 
+    /// Typing indicators are a privacy choice (the Settings toggle): with them off, composing
+    /// broadcasts nothing — the recipient never sees a typing hint.
+    func testTypingIndicatorsCanBeTurnedOff() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        bob.coordinator.sendTypingIndicators = false
+        await bob.coordinator.ensureKeyPackages()
+        relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
+        try await alice.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [bob.accountID])
+        _ = try await bob.coordinator.syncOnce()
+        relay.resetCounters()
+
+        // Bob types, but broadcasts nothing.
+        for _ in 0..<5 { await bob.model.setTyping(true, in: conv) }
+        XCTAssertEqual(relay.deliveries, 0, "no typing is sent when the indicator is off")
+
+        _ = try await alice.coordinator.syncOnce()
+        XCTAssertNil(alice.model.typingBy[conv], "Alice is never told Bob is typing")
+    }
+
     /// Typing is throttled — a sentence must not become one envelope per keystroke — and the
     /// recipient sees who is typing without anything being logged.
     func testTypingIsThrottledAndEphemeral() async throws {
