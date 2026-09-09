@@ -21,6 +21,38 @@ pub struct PgGroups {
     pool: PgPool,
 }
 
+/// A stable advisory-lock key for one conversation's governance state.
+///
+/// The "never zero admins" and "never an orphan conversation" rules are both `count(*)`-then-act,
+/// and at READ COMMITTED a count is not a reservation. Two demotions of two DIFFERENT admins touch
+/// different rows, so no row-level conflict ever arises and both commit against the same stale
+/// count — leaving a populated group unmanageable, permanently, because `promote` itself requires
+/// an existing admin. Row locks cannot fix this: the danger is a phantom (the set changing size),
+/// not one contended row.
+///
+/// So governance mutations serialize per conversation, using the same `pg_advisory_xact_lock`
+/// idiom `transparency.rs` uses for gapless appends. The lock is held until the transaction ends,
+/// and different conversations never contend.
+fn conversation_lock_key(conversation_id: &[u8; 16]) -> i64 {
+    i64::from_be_bytes(
+        auth_core::crypto::sha256(conversation_id)[..8]
+            .try_into()
+            .expect("8 bytes"),
+    )
+}
+
+fn lock_conversation(
+    txn: &mut postgres::Transaction<'_>,
+    conversation_id: &[u8; 16],
+) -> StoreResult<()> {
+    txn.execute(
+        "SELECT pg_advisory_xact_lock($1)",
+        &[&conversation_lock_key(conversation_id)],
+    )
+    .map_err(db_err)?;
+    Ok(())
+}
+
 /// Outcome of presenting an invite token.
 #[derive(Debug, PartialEq, Eq)]
 pub enum InviteOutcome {
@@ -82,6 +114,9 @@ impl PgGroups {
     pub fn promote(&self, conversation_id: &[u8; 16], account: &AccountId) -> StoreResult<bool> {
         let mut conn = self.conn()?;
         let mut txn = conn.transaction().map_err(db_err)?;
+        // Same governance lock as demote/leave: the membership check below and the admin INSERT
+        // must not straddle a concurrent removal, which would leave an admin who is not a member.
+        lock_conversation(&mut txn, conversation_id)?;
         let member = txn
             .query_opt(
                 "SELECT 1 FROM conversation_members WHERE conversation_id = $1 AND account_id = $2",
@@ -107,6 +142,9 @@ impl PgGroups {
     pub fn demote(&self, conversation_id: &[u8; 16], account: &AccountId) -> StoreResult<bool> {
         let mut conn = self.conn()?;
         let mut txn = conn.transaction().map_err(db_err)?;
+        // Without this, concurrent demotions of two different admins both pass the last-admin
+        // guard below and both commit, zeroing the admin set.
+        lock_conversation(&mut txn, conversation_id)?;
         let admins: i64 = txn
             .query_one(
                 "SELECT count(*) FROM group_admins WHERE conversation_id = $1",
@@ -374,6 +412,11 @@ impl PgGroups {
     ) -> StoreResult<()> {
         let mut conn = self.conn()?;
         let mut txn = conn.transaction().map_err(db_err)?;
+        // This function is two count-then-act decisions — delete the conversation when the last
+        // member leaves, and auto-promote when the last admin leaves. Both are phantom-sensitive,
+        // so concurrent leaves could each see the other still present and neither clean up (an
+        // orphan conversation with no members), or race a demotion to zero admins.
+        lock_conversation(&mut txn, conversation_id)?;
         txn.execute(
             "DELETE FROM envelopes
              WHERE conversation_id = $1 AND NOT delivered

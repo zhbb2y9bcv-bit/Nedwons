@@ -495,6 +495,65 @@ fn block_and_friendship_never_coexist() {
     }
 }
 
+/// A populated group must never be left with zero admins. `demote` refuses to remove the LAST
+/// admin, but that guard is a `count(*)` with no lock: two concurrent demotes of two DIFFERENT
+/// admins each read the same count, each conclude they are not removing the last one, and each
+/// delete a different row — so no row-level conflict ever occurs and both commit.
+///
+/// The result is permanent: `promote` requires the caller to already be an admin, and nothing
+/// bootstraps an admin retroactively, so the group becomes unmanageable forever.
+#[test]
+fn concurrent_demotes_never_leave_a_group_without_an_admin() {
+    let groups = common::shared_groups();
+    let relay = common::shared_relay();
+    const TRIALS: usize = 30;
+
+    for trial in 0..TRIALS {
+        let conversation_id: [u8; 16] = DeviceId::random().as_bytes().try_into().expect("16 bytes");
+        let a = AccountId::random();
+        let b = AccountId::random();
+
+        relay
+            .create_conversation(conversation_id, a, DeviceId::random(), false)
+            .expect("create");
+        relay
+            .add_member(&conversation_id, b, DeviceId::random())
+            .expect("add b");
+        groups
+            .bootstrap_admin(&conversation_id, &a)
+            .expect("admin a");
+        assert!(groups.promote(&conversation_id, &b).expect("promote b"));
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for target in [a, b] {
+            let groups = groups.clone();
+            let barrier = barrier.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                groups.demote(&conversation_id, &target).expect("demote");
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread");
+        }
+
+        let admins: i64 = postgres::Client::connect(&common::db_url(), postgres::NoTls)
+            .expect("connect")
+            .query_one(
+                "SELECT count(*) FROM group_admins WHERE conversation_id = $1",
+                &[&conversation_id.as_slice()],
+            )
+            .expect("count admins")
+            .get(0);
+        assert!(
+            admins >= 1,
+            "trial {trial}: populated group left with {admins} admins — it is now permanently \
+             unmanageable, since promote itself requires an existing admin"
+        );
+    }
+}
+
 /// Expired-row purge removes old challenges and access tokens (retention hygiene).
 #[test]
 fn purge_removes_expired_rows() {
