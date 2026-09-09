@@ -618,6 +618,138 @@ fn concurrent_leaves_leave_no_orphan_conversation() {
     }
 }
 
+/// Creating a conversation and bootstrapping its first admin must be ONE transaction.
+///
+/// They used to be two, on two pooled connections: the conversation committed first, so any
+/// failure before the admin insert left a conversation nobody can ever administer — `promote`
+/// requires an existing admin, and only a member LEAVING triggers auto-promotion.
+///
+/// Atomicity is tested the only way that actually proves it: fail deliberately after the first
+/// write and assert the first write did not survive.
+#[test]
+fn create_conversation_rolls_back_when_admin_bootstrap_fails() {
+    use auth_core::store::StoreError;
+    use nedwons_api::relay::PgRelay;
+
+    let pool = common::shared_relay().pool_clone();
+    let conversation_id: [u8; 16] = DeviceId::random().as_bytes().try_into().expect("16 bytes");
+    let creator = AccountId::random();
+
+    let result: auth_core::store::StoreResult<()> = nedwons_api::tx::transaction(&pool, |txn| {
+        PgRelay::create_conversation_in_txn(
+            txn,
+            conversation_id,
+            creator,
+            DeviceId::random(),
+            false,
+        )?;
+        Err(StoreError(
+            "simulated failure before the admin is set".into(),
+        ))
+    });
+    assert!(result.is_err(), "the simulated failure must propagate");
+
+    let mut client =
+        postgres::Client::connect(&common::db_url(), postgres::NoTls).expect("connect");
+    let conversations: i64 = client
+        .query_one(
+            "SELECT count(*) FROM conversations WHERE conversation_id = $1",
+            &[&conversation_id.as_slice()],
+        )
+        .expect("count")
+        .get(0);
+    let members: i64 = client
+        .query_one(
+            "SELECT count(*) FROM conversation_members WHERE conversation_id = $1",
+            &[&conversation_id.as_slice()],
+        )
+        .expect("count")
+        .get(0);
+
+    assert_eq!(
+        conversations, 0,
+        "an adminless conversation must not survive — it would be unadministrable forever"
+    );
+    assert_eq!(members, 0, "its routing membership must not survive either");
+
+    // Contrast, so this test measures the fix rather than merely restating that PostgreSQL rolls
+    // back: the OLD shape is still expressible through the self-committing public method, and it
+    // demonstrably strands exactly the row the transactional path refuses to leave behind.
+    let stranded: [u8; 16] = DeviceId::random().as_bytes().try_into().expect("16 bytes");
+    common::shared_relay()
+        .create_conversation(stranded, AccountId::random(), DeviceId::random(), false)
+        .expect("create via the self-committing method");
+    // ...a failure here (where bootstrap_admin would have run) ends the request.
+    let stranded_rows: i64 = client
+        .query_one(
+            "SELECT count(*) FROM conversations c
+             WHERE c.conversation_id = $1
+               AND NOT EXISTS (SELECT 1 FROM group_admins a
+                               WHERE a.conversation_id = c.conversation_id)",
+            &[&stranded.as_slice()],
+        )
+        .expect("count")
+        .get(0);
+    assert_eq!(
+        stranded_rows, 1,
+        "sanity: the old two-transaction shape is what strands an adminless conversation, which \
+         is precisely what the transactional path above prevents"
+    );
+}
+
+/// Accepting an invite BURNS a use, so the resulting membership must land in the same
+/// transaction. Committed separately, a failure in between spends the joiner's one chance to join
+/// without joining them, and the invite's use budget is corrupted with nothing to show for it.
+#[test]
+fn invite_use_is_not_burned_when_the_membership_write_fails() {
+    use auth_core::store::StoreError;
+    use nedwons_api::groups::PgGroups;
+
+    let groups = common::shared_groups();
+    let relay = common::shared_relay();
+    let pool = relay.pool_clone();
+
+    let conversation_id: [u8; 16] = DeviceId::random().as_bytes().try_into().expect("16 bytes");
+    let owner = AccountId::random();
+    let joiner = AccountId::random();
+    relay
+        .create_conversation(conversation_id, owner, DeviceId::random(), false)
+        .expect("create");
+
+    let mut token = [0u8; 32];
+    token[..16].copy_from_slice(DeviceId::random().as_bytes());
+    token[16..].copy_from_slice(DeviceId::random().as_bytes());
+    groups
+        .create_invite(&conversation_id, &owner, token, 3600, 5)
+        .expect("create invite");
+
+    let result: auth_core::store::StoreResult<()> = nedwons_api::tx::transaction(&pool, |txn| {
+        let outcome = PgGroups::accept_invite_in_txn(txn, &token, &joiner)?;
+        assert!(
+            matches!(outcome, nedwons_api::groups::InviteOutcome::Joined { .. }),
+            "the invite should be accepted before the simulated failure"
+        );
+        Err(StoreError(
+            "simulated failure adding routing membership".into(),
+        ))
+    });
+    assert!(result.is_err(), "the simulated failure must propagate");
+
+    let mut client =
+        postgres::Client::connect(&common::db_url(), postgres::NoTls).expect("connect");
+    let uses: i32 = client
+        .query_one(
+            "SELECT uses FROM group_invites WHERE token = $1",
+            &[&token.as_slice()],
+        )
+        .expect("read uses")
+        .get(0);
+    assert_eq!(
+        uses, 0,
+        "the invite use must be returned when the membership write fails"
+    );
+}
+
 /// Expired-row purge removes old challenges and access tokens (retention hygiene).
 #[test]
 fn purge_removes_expired_rows() {

@@ -15,6 +15,7 @@ pub mod push;
 pub mod relay;
 pub mod social;
 pub mod transparency;
+pub mod tx;
 
 use refinery::embed_migrations;
 
