@@ -170,6 +170,34 @@ final class ChatSortingTests: XCTestCase {
 }
 
 @MainActor
+final class ComposeDraftTests: XCTestCase {
+    private func model() -> AppModel {
+        AppModel(
+            baseURL: URL(string: "http://127.0.0.1:1")!,
+            deviceIdentity: DeviceIdentity(
+                store: InMemoryDeviceKeyStore(), secureEnclaveAvailable: false),
+            sessionStore: SessionStore(store: FakeSecretStore()))
+    }
+
+    /// A draft is remembered per conversation and does not bleed between them.
+    func testDraftsAreRememberedPerConversation() {
+        let m = model()
+        m.setComposeDraft("half a message", for: "c1")
+        m.setComposeDraft("something else", for: "c2")
+        XCTAssertEqual(m.composeDrafts["c1"], "half a message")
+        XCTAssertEqual(m.composeDrafts["c2"], "something else")
+    }
+
+    /// Sending (or clearing) empties the draft rather than leaving a stale one to reappear.
+    func testClearingADraftForgetsIt() {
+        let m = model()
+        m.setComposeDraft("typed then sent", for: "c1")
+        m.setComposeDraft("", for: "c1")
+        XCTAssertNil(m.composeDrafts["c1"], "an emptied draft is forgotten, not stored as empty")
+    }
+}
+
+@MainActor
 final class ConversationDeletionTests: XCTestCase {
     private func model() -> AppModel {
         AppModel(
