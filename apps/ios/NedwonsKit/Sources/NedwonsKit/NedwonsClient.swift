@@ -322,6 +322,21 @@ public struct ClaimedKeyPackage: Decodable, Sendable {
     enum CodingKeys: String, CodingKey {
         case deviceID = "device_id", keyPackage = "key_package"
     }
+
+    public init(deviceID: String, keyPackage: String) {
+        self.deviceID = deviceID
+        self.keyPackage = keyPackage
+    }
+}
+
+/// `GET /v1/keypackages/count`: unexpired prekeys the relay still holds for this device.
+public struct KeyPackageCount: Decodable, Sendable {
+    public let available: Int
+    public let lowWatermark: Int
+
+    enum CodingKeys: String, CodingKey {
+        case available, lowWatermark = "low_watermark"
+    }
 }
 
 public extension NedwonsClient {
@@ -795,6 +810,12 @@ public extension NedwonsClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(Body(key_package: Hex.encode(keyPackage)))
         _ = try await perform(request)
+    }
+
+    /// How many of this device's prekeys the relay still holds, and the level below which it asks
+    /// the client to replenish (`GET /v1/keypackages/count`).
+    public func keyPackageCount(accessToken: String) async throws -> KeyPackageCount {
+        try decode(await perform(authed("GET", "/v1/keypackages/count", accessToken: accessToken)))
     }
 
     /// Claim one key package for a target account's device (`POST /v1/keypackages/claim`), to add

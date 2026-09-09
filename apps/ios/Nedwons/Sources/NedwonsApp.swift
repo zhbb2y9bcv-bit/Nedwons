@@ -1,9 +1,12 @@
+import NedwonsAppKit
 import NedwonsUI
 import SwiftUI
 
-/// The `@main` entry point. It boots the real product shell: `NedwonsAppRoot` runs the launch state
-/// machine (validate a stored session, else show authentication) against the server and pinned log
-/// key configured for this build (`AppConfig`, from `Info.plist`).
+/// The `@main` entry point. It boots the real product: `AppComposition.standard()` builds the
+/// `AppModel` the screens render AND the `ConversationCoordinator` that gives it a messaging
+/// pipeline (prekeys, MLS group bootstrap, upload-with-retry, inbox receive loop), then
+/// `NedwonsAppRoot` runs the launch state machine (validate a stored session, else show
+/// authentication) against the server and pinned log key configured for this build (`AppConfig`).
 ///
 /// This target contains NO demo, seeded conversation, or sample data. Preview/test fixtures live in
 /// test targets so they cannot execute during an ordinary Debug or Release launch.
@@ -15,22 +18,22 @@ import SwiftUI
 @main
 struct NedwonsApp: App {
     // @StateObject defers construction to the first (main-actor) body render, so the @MainActor
-    // AppModel is built safely and its state persists across renders.
-    @StateObject private var model = NedwonsApp.makeModel()
+    // graph is built safely and persists across renders.
+    @StateObject private var composition = NedwonsApp.makeComposition()
 
     var body: some Scene {
         WindowGroup {
-            NedwonsAppRoot(model: model)
+            NedwonsAppRoot(model: composition.model)
         }
     }
 
     @MainActor
-    private static func makeModel() -> AppModel {
+    private static func makeComposition() -> AppComposition {
         #if DEBUG
             if let scenario = UITestLaunch.scenario() {
-                return AppModel.uiTestHarness(scenario: scenario).0
+                return .uiTestHarness(scenario: scenario)
             }
         #endif
-        return AppModel()
+        return .standard()
     }
 }

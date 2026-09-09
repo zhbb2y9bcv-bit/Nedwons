@@ -527,6 +527,11 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     
     /**
      * The grown group is durable before returning.
+     *
+     * `commit` is a versioned app envelope (like `add_self_device`'s), so the members already in
+     * the group apply it through `process_inbound` and advance to the new epoch. Before this
+     * wrap the raw commit was refused by that path, which made every group beyond two people
+     * undecryptable for its earlier members. `welcome` stays raw: `join_group` takes it directly.
      */
     func addMember(keyPackage: Data) throws  -> AddOutcome
     
@@ -610,6 +615,11 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
      * Up to `max` recent non-secret messages, for replication to a newly-linked device (#7).
      */
     func historyEntries(max: UInt32) throws  -> [HistoryEntry]
+    
+    /**
+     * Whether this client is still a joiner awaiting its Welcome (no conversation yet).
+     */
+    func isPending() throws  -> Bool
     
     /**
      * `Pending` → `Active`, persisted. On a bad Welcome the client stays `Pending` (retryable).
@@ -720,6 +730,12 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
      */
     func storageFormatVersion() throws  -> UInt32
     
+    /**
+     * Local ids of outbound messages the server has not accepted yet, oldest first — the upload
+     * retry set after a relaunch. `encrypt` on one of these returns the cached ciphertext.
+     */
+    func unsentLocalIds() throws  -> [UInt64]
+    
 }
 /**
  * One identity + one conversation, owned by Swift as an `Arc<MlsClient>`.
@@ -789,8 +805,9 @@ public static func createGroup(identity: Data, dbPath: String, atRestKey: Data)t
     
     /**
      * Create a fresh identity that will JOIN an existing group. Call `key_package()` to publish a
-     * prekey, then `join_group(welcome)` once added. The pending identity is not yet durable — if
-     * the process dies before joining, request a fresh key package.
+     * prekey, then `join_group(welcome)` once added. The pending identity IS durable: `open` on
+     * the same path after a relaunch returns it still Pending, and every prekey it published
+     * stays redeemable.
      */
 public static func newJoiner(identity: Data, dbPath: String, atRestKey: Data)throws  -> MlsClient  {
     return try  FfiConverterTypeMlsClient_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -803,7 +820,8 @@ public static func newJoiner(identity: Data, dbPath: String, atRestKey: Data)thr
 }
     
     /**
-     * Reopen the last durably-committed session (relaunch / crash recovery).
+     * Reopen the last durably-committed state (relaunch / crash recovery): an Active session, or
+     * a still-Pending joiner whose published prekeys remain redeemable.
      */
 public static func `open`(dbPath: String, atRestKey: Data)throws  -> MlsClient  {
     return try  FfiConverterTypeMlsClient_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -828,6 +846,11 @@ open func ackEligible()throws  -> [UInt64]  {
     
     /**
      * The grown group is durable before returning.
+     *
+     * `commit` is a versioned app envelope (like `add_self_device`'s), so the members already in
+     * the group apply it through `process_inbound` and advance to the new epoch. Before this
+     * wrap the raw commit was refused by that path, which made every group beyond two people
+     * undecryptable for its earlier members. `welcome` stays raw: `join_group` takes it directly.
      */
 open func addMember(keyPackage: Data)throws  -> AddOutcome  {
     return try  FfiConverterTypeAddOutcome_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
@@ -998,6 +1021,16 @@ open func historyEntries(max: UInt32)throws  -> [HistoryEntry]  {
     return try  FfiConverterSequenceTypeHistoryEntry.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_history_entries(self.uniffiClonePointer(),
         FfiConverterUInt32.lower(max),$0
+    )
+})
+}
+    
+    /**
+     * Whether this client is still a joiner awaiting its Welcome (no conversation yet).
+     */
+open func isPending()throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_is_pending(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -1220,6 +1253,17 @@ open func stageRemove(identity: Data)throws  -> Data  {
 open func storageFormatVersion()throws  -> UInt32  {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_storage_format_version(self.uniffiClonePointer(),$0
+    )
+})
+}
+    
+    /**
+     * Local ids of outbound messages the server has not accepted yet, oldest first — the upload
+     * retry set after a relaunch. `encrypt` on one of these returns the cached ciphertext.
+     */
+open func unsentLocalIds()throws  -> [UInt64]  {
+    return try  FfiConverterSequenceUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_unsent_local_ids(self.uniffiClonePointer(),$0
     )
 })
 }
@@ -2449,7 +2493,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_ack_eligible() != 21709) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_add_member() != 27587) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_add_member() != 64779) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_add_self_device() != 1966) {
@@ -2498,6 +2542,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_history_entries() != 5238) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_is_pending() != 3499) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_join_group() != 20582) {
@@ -2557,13 +2604,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_storage_format_version() != 65410) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_unsent_local_ids() != 39780) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_mls_ffi_checksum_constructor_mlsclient_create_group() != 42599) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_constructor_mlsclient_new_joiner() != 33443) {
+    if (uniffi_mls_ffi_checksum_constructor_mlsclient_new_joiner() != 39689) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_constructor_mlsclient_open() != 33444) {
+    if (uniffi_mls_ffi_checksum_constructor_mlsclient_open() != 44743) {
         return InitializationResult.apiChecksumMismatch
     }
 

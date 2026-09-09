@@ -290,6 +290,109 @@ pub trait Journal {
     fn load(&self) -> Result<Option<Vec<u8>>, DurableError>;
 }
 
+/// A joiner identity awaiting its Welcome, **persisted from the moment it exists**.
+///
+/// A key package is only redeemable by the provider store that generated its private key. Before
+/// this type, a joiner lived only in memory: a Welcome that arrived after a relaunch — a group
+/// created for you while the app was closed, which is the common case — could never be joined.
+/// Every `key_package` re-commits the store, so each published prekey stays redeemable until the
+/// identity joins (at which point [`DurableSession::adopt`] overwrites the blob with the session).
+///
+/// The blob is distinguishable from an Active session blob by construction: it carries
+/// `pending_format_version` and no `meta`, so neither loader can mistake one for the other.
+#[derive(Serialize, Deserialize)]
+struct PendingBlob {
+    pending_format_version: u32,
+    identity: Vec<u8>,
+    public_key: Vec<u8>,
+    store: Vec<u8>,
+}
+
+const PENDING_BLOB_FORMAT_VERSION: u32 = 1;
+
+pub struct PendingIdentity<J: Journal> {
+    member: Member,
+    journal: J,
+}
+
+/// Why a join did not produce a session.
+pub enum PendingJoinError<J: Journal> {
+    /// The Welcome was not for this identity (or malformed). The identity is handed back intact so
+    /// the caller can try the next one — a lobby of joiners tries each until one fits.
+    BadWelcome(Box<PendingIdentity<J>>, crate::MlsError),
+    /// The first commit of the new session failed; nothing durable exists for it.
+    Commit(DurableError),
+}
+
+impl<J: Journal> std::fmt::Debug for PendingJoinError<J> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadWelcome(_, e) => write!(f, "BadWelcome({e:?})"),
+            Self::Commit(e) => write!(f, "Commit({e:?})"),
+        }
+    }
+}
+
+impl<J: Journal> PendingIdentity<J> {
+    /// A fresh identity, persisted before returning.
+    pub fn create(identity: &[u8], journal: J) -> Result<Self, DurableError> {
+        let member = Member::new(identity)?;
+        let mut this = Self { member, journal };
+        this.persist()?;
+        Ok(this)
+    }
+
+    /// Reopen a pending identity. A blob holding an Active session is `Codec` here (and vice
+    /// versa), so a caller that does not know which it has tries both.
+    pub fn open(journal: J) -> Result<Self, DurableError> {
+        let bytes = journal.load()?.ok_or(DurableError::NoSession)?;
+        let blob: PendingBlob = serde_json::from_slice(&bytes).map_err(|_| DurableError::Codec)?;
+        if blob.pending_format_version != PENDING_BLOB_FORMAT_VERSION {
+            return Err(DurableError::Codec);
+        }
+        let member = Member::restore(&blob.identity, &blob.store, &blob.public_key)?;
+        Ok(Self { member, journal })
+    }
+
+    pub fn identity(&self) -> &[u8] {
+        self.member.identity()
+    }
+
+    /// A one-time prekey. The provider store now holds its private key, so the identity is
+    /// re-committed before the package is handed out: a prekey that reaches the relay is always
+    /// one this store can redeem after a relaunch.
+    pub fn key_package(&mut self) -> Result<Vec<u8>, DurableError> {
+        let kp = self.member.key_package_bytes()?;
+        self.persist()?;
+        Ok(kp)
+    }
+
+    /// Join with a Welcome addressed to one of this identity's prekeys. On success the Active
+    /// session overwrites the pending blob.
+    pub fn join(self, welcome: &[u8]) -> Result<DurableSession<J>, PendingJoinError<J>> {
+        let Self { member, journal } = self;
+        match member.join_from_welcome(welcome) {
+            Ok(conversation) => DurableSession::adopt(member, conversation, journal)
+                .map_err(PendingJoinError::Commit),
+            Err(e) => Err(PendingJoinError::BadWelcome(
+                Box::new(Self { member, journal }),
+                e,
+            )),
+        }
+    }
+
+    fn persist(&mut self) -> Result<(), DurableError> {
+        let blob = PendingBlob {
+            pending_format_version: PENDING_BLOB_FORMAT_VERSION,
+            identity: self.member.identity().to_vec(),
+            public_key: self.member.public_key(),
+            store: self.member.export_store()?,
+        };
+        let bytes = serde_json::to_vec(&blob).map_err(|_| DurableError::Codec)?;
+        self.journal.commit(&bytes)
+    }
+}
+
 /// A conversation with crash-safe local persistence.
 pub struct DurableSession<J: Journal> {
     session: Session,
@@ -950,6 +1053,18 @@ impl<J: Journal> DurableSession<J> {
     /// Inbound decrypted + outbound, in order.
     pub fn messages(&self) -> &[Message] {
         &self.meta.messages
+    }
+
+    /// Outbound messages the server has NOT yet accepted (`Queued` or `Encrypted`), oldest first.
+    /// This is what a relaunch replays: `encrypt` returns the cached ciphertext for an `Encrypted`
+    /// entry (no second ratchet advance), the upload is retried, and `mark_sent` closes it.
+    pub fn unsent_outbound(&self) -> Vec<u64> {
+        self.meta
+            .outbox
+            .iter()
+            .filter(|(_, o)| o.status != OutboundStatus::Sent)
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// Drop the user-visible message log ONLY. Every protocol input a future message depends on is

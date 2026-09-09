@@ -2,6 +2,7 @@ import Foundation
 import MlsFfi
 import NedwonsAppKit
 import NedwonsKit
+import NedwonsUI
 
 // Live end-to-end run (ADR-0015 option 3): the REAL Swift app stack — `NedwonsClient` over real
 // HTTP + `MlsClient` over the real Rust MLS core — driven against a running `nedwons-api` server.
@@ -196,9 +197,70 @@ struct SelfGroupLiveRun {
                 fail("the sender received a self-group message it must never see")
             }
 
+            // --- 7. The app's own pipeline over the live relay ---------------------------------
+            // Everything above drove `NedwonsClient` + `MlsClient` by hand. This drives the EXACT
+            // objects the shipped app composes — `AppModel` + `ConversationCoordinator` — so the
+            // prekey lobby, MLS bootstrap, upload-with-idempotency and inbox receive loop are
+            // proven against the real server, not only the in-memory relay of the unit tests.
+            try await coordinatorRun(client: client)
+
             print("LIVE_OK")
         } catch {
             fail("\(error)")
         }
+    }
+
+    @MainActor
+    static func coordinatorRun(client: NedwonsClient) async throws {
+        let aliceSigner = SoftwareDeviceSigner()
+        let alice = try await client.register(username: name("livea"), password: password, signer: aliceSigner)
+        let bobSigner = SoftwareDeviceSigner()
+        let bob = try await client.register(username: name("liveb"), password: password, signer: bobSigner)
+        _ = try await client.sendFriendRequest(accessToken: alice.accessToken, accountID: bob.accountID)
+        try await client.acceptFriend(accessToken: bob.accessToken, accountID: alice.accountID)
+
+        func participant(_ session: NedwonsClient.Session, _ tag: String) -> (AppModel, ConversationCoordinator) {
+            let model = AppModel(client: client)
+            model.session = session
+            let dir = URL(fileURLWithPath: tmpDB("coord-\(tag)"), isDirectory: true)
+            let coordinator = ConversationCoordinator(
+                model: model, relay: client, storeDirectory: dir,
+                keyProvider: { storeID in try keys.atRestKey(forStore: storeID) }, minimumKeyPackages: 2)
+            coordinator.attach(aliasStore: nil)
+            return (model, coordinator)
+        }
+        let (aliceModel, aliceCoord) = participant(alice, "alice")
+        let (bobModel, bobCoord) = participant(bob, "bob")
+
+        // Bob publishes prekeys through the coordinator; the relay reports them.
+        await bobCoord.ensureKeyPackages()
+        guard try await client.keyPackageCount(accessToken: bob.accessToken).available >= 2 else {
+            fail("coordinator did not publish Bob's prekeys")
+        }
+        // Alice creates the conversation the way the app does: server routing, then MLS bootstrap
+        // through the model's injected action.
+        guard let conversationID = await aliceModel.createGroup(memberAccountIDs: [bob.accountID]) else {
+            fail("createGroup failed: \(aliceModel.banner ?? "?")")
+        }
+        guard aliceModel.banner == "Group created." else {
+            fail("bootstrap did not complete cleanly: \(aliceModel.banner ?? "?")")
+        }
+        await aliceModel.sendMessage("hello over the live relay", to: conversationID)
+        guard aliceModel.banner == nil || aliceModel.banner == "Group created." else {
+            fail("send failed: \(aliceModel.banner ?? "?")")
+        }
+        // Bob's receive pass: Welcome (joined via the persisted lobby) + the message.
+        _ = try await bobCoord.syncOnce()
+        guard let bobLines = bobModel.threadLines[conversationID],
+            bobLines.contains(where: { if case .text("hello over the live relay") = $0.kind { return true }; return false })
+        else { fail("Bob did not decrypt Alice's message via the coordinator: \(String(describing: bobModel.threadLines[conversationID])) err=\(String(describing: bobCoord.lastSyncError))") }
+        // And back: Bob's send lands in Alice's thread.
+        await bobModel.sendMessage("received, thanks", to: conversationID)
+        _ = try await aliceCoord.syncOnce()
+        guard let aliceLines = aliceModel.threadLines[conversationID],
+            aliceLines.contains(where: { if case .text("received, thanks") = $0.kind { return !$0.mine }; return false })
+        else { fail("Alice did not decrypt Bob's reply via the coordinator") }
+        aliceCoord.stop()
+        bobCoord.stop()
     }
 }

@@ -814,6 +814,11 @@ public final class AppModel: ObservableObject {
     /// account that no longer exists.
     public var wipeAllLocalDataAction: (() -> Void)?
 
+    /// Injected by the composition layer: after the relay has created a conversation, set up its
+    /// MLS group — claim each member's prekey, add them, deliver their Welcomes. Without it a
+    /// conversation exists for routing but nothing can be encrypted into it.
+    public var bootstrapConversationAction: ((String, [String]) async throws -> Void)?
+
     public var clearHistoryAction: ((String) async throws -> Void)?
 
     /// Local-only deletion. Nothing is sent: no "delete for everyone" event exists, the peer's copy
@@ -853,6 +858,17 @@ public final class AppModel: ObservableObject {
             conversationID = group.conversationID
             conversations = try await client.listConversations(accessToken: token)
             banner = "Group created."
+            if let bootstrapConversationAction {
+                do {
+                    try await bootstrapConversationAction(group.conversationID, memberAccountIDs)
+                } catch {
+                    // The conversation exists for routing; the MLS setup did not finish for
+                    // everyone (typically: a member has never opened the app, so no prekey).
+                    // Said plainly rather than pretending the group is ready.
+                    banner = "Group created, but secure setup didn't finish for everyone. "
+                        + "Ask them to open Nedwons, then add them again."
+                }
+            }
         }
         return conversationID
     }
