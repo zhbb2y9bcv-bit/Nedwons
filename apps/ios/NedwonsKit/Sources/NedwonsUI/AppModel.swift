@@ -426,6 +426,9 @@ public final class AppModel: ObservableObject {
     /// tests; the default keeps it in `UserDefaults` (it holds no secrets — account ids only).
     public var verifiedPeersStore: VerifiedPeersStoring = UserDefaultsVerifiedPeersStore()
 
+    /// Opt-in crash/hang diagnostics (MetricKit). Constructed lazily so the shared client is used.
+    public lazy var diagnostics = DiagnosticsReporter(client: client)
+
     /// Per-chat local presentation preferences (pin / archive / mute). Never sent to the relay.
     @Published public internal(set) var chatPrefs = ChatPrefs()
     public var chatPrefsStore: ChatPrefsStoring = UserDefaultsChatPrefsStore()

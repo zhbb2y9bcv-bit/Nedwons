@@ -296,6 +296,7 @@ struct SettingsRootView: View {
 
                 Section {
                     NavigationLink("Blocked") { BlockedUsersView(model: model) }
+                    DiagnosticsToggleRow(model: model)
                 } header: {
                     Text("Privacy")
                 } footer: {
@@ -727,5 +728,23 @@ struct ChangePasswordView: View {
             updated = ""
             confirmation = ""
         }
+    }
+}
+
+/// The opt-in diagnostics toggle, with the honest description of exactly what leaves the device.
+struct DiagnosticsToggleRow: View {
+    @ObservedObject var model: AppModel
+    @State private var on = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Nedwons.Spacing.xxs) {
+            Toggle("Share crash reports", isOn: $on)
+                .accessibilityIdentifier("settings.diagnostics")
+            Text("Off by default. When on, crash and hang reports (stack traces and app/OS versions — never messages, never your account) are sent anonymously to help fix bugs.")
+                .font(Nedwons.TypeScale.caption)
+                .foregroundStyle(.secondary)
+        }
+        .onAppear { on = model.diagnostics.enabled }
+        .onChange(of: on) { _, value in model.diagnostics.setEnabled(value) }
     }
 }

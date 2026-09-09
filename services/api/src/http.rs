@@ -371,6 +371,7 @@ pub fn build_router_full(
         .route("/v1/profile/{account_id}", get(get_profile_by_id))
         .route("/v1/profiles/search", get(search_profiles))
         .route("/v1/usernames/available", get(username_available))
+        .route("/v1/diagnostics", post(submit_diagnostics))
         .route("/v1/friends", get(list_friends))
         .route("/v1/friends/requests", get(list_friend_requests))
         .route("/v1/friends/request", post(friend_request))
@@ -3840,6 +3841,29 @@ async fn get_profile_by_id(
         .await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))?;
     Ok(Json(profile_dto(profile)))
+}
+
+const MAX_DIAGNOSTIC_BYTES: usize = 256 * 1024;
+
+#[derive(Deserialize)]
+struct DiagnosticsBody {
+    /// MetricKit diagnostic JSON, as produced on device. Stack traces + versions, no content.
+    payload: String,
+}
+
+/// Opt-in crash/hang diagnostics. UNAUTHENTICATED and stored without any account linkage —
+/// a crash report must not double as a tracking record — bounded, per-IP rate-limited like
+/// everything else, and swept after 30 days.
+async fn submit_diagnostics(
+    State(state): State<AppState>,
+    Json(body): Json<DiagnosticsBody>,
+) -> Result<StatusCode, ApiError> {
+    if body.payload.is_empty() || body.payload.len() > MAX_DIAGNOSTIC_BYTES {
+        return Err(bad_request());
+    }
+    let relay = state.relay.clone();
+    blocking_store(move || relay.store_diagnostic(&body.payload)).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
