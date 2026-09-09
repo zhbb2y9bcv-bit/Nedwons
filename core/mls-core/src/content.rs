@@ -31,6 +31,12 @@ const KIND_ATTACHMENT: u8 = 6;
 const KIND_REACTION: u8 = 7;
 const KIND_RECEIPT: u8 = 8;
 const KIND_TYPING: u8 = 9;
+const KIND_TIMER_CHANGE: u8 = 10;
+const KIND_DELETE: u8 = 11;
+
+/// Longest allowed disappearing-message timer: 90 days. A cap bounds the arithmetic every client
+/// does with it and refuses nonsense values a hostile member might encode.
+pub const MAX_DISAPPEAR_SECS: u32 = 90 * 24 * 60 * 60;
 
 /// Sender-chosen random, used for placeholder tracking + recipient-side replay rejection.
 pub const SECRET_ID_LEN: usize = 16;
@@ -127,6 +133,17 @@ pub enum Content {
     /// and a modified client could ignore it. Renaming is not destructive, and every member sees the
     /// change, so this is a deliberate trade rather than an oversight.
     GroupName { name: String },
+    /// Sets the conversation's disappearing-message timer (0 = off). Carried E2EE like the group
+    /// name, so the relay never learns a conversation disappears. Any member can send one for the
+    /// same reason any member can technically rename (no roles in MLS); the app offers it to
+    /// admins in groups. HONEST LIMIT (R-901): expiry is enforced by each member's *client* on its
+    /// own copy — best-effort, never a cryptographic guarantee that other devices deleted theirs.
+    TimerChange { seconds: u32 },
+    /// The author retracts their own message everywhere. A pointer, like a reply; recipients
+    /// tombstone their local copy ONLY when the deleter is the message's original sender —
+    /// otherwise anyone could erase anyone. Same R-901 honesty: a recipient's client honors this;
+    /// nothing can force it to.
+    Delete { target: [u8; MESSAGE_ID_LEN] },
     /// A file. The bytes live on the relay as opaque ciphertext; everything that makes them
     /// meaningful — the key, what kind of file it is, what it was called, how big it is — is in
     /// here, inside the MLS ciphertext. The relay can tell that an account uploaded *something* of
@@ -172,7 +189,9 @@ impl Content {
             | Content::Attachment { .. }
             | Content::Reaction { .. }
             | Content::Receipt { .. }
-            | Content::Typing { .. } => &[],
+            | Content::Typing { .. }
+            | Content::TimerChange { .. }
+            | Content::Delete { .. } => &[],
         }
     }
 
@@ -250,6 +269,14 @@ impl Content {
                 out.push(KIND_GROUP_NAME);
                 out.extend_from_slice(&(name.len() as u32).to_be_bytes());
                 out.extend_from_slice(name.as_bytes());
+            }
+            Content::TimerChange { seconds } => {
+                out.push(KIND_TIMER_CHANGE);
+                out.extend_from_slice(&seconds.to_be_bytes());
+            }
+            Content::Delete { target } => {
+                out.push(KIND_DELETE);
+                out.extend_from_slice(target);
             }
             Content::Attachment {
                 message_id,
@@ -399,6 +426,23 @@ impl Content {
             KIND_HISTORY_SYNC => Ok(Content::HistorySync {
                 entries: decode_history(rest)?,
             }),
+            KIND_TIMER_CHANGE => {
+                if rest.len() != 4 {
+                    return Err(ContentError::Malformed); // exactly a u32, no trailer
+                }
+                let seconds = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+                if seconds > MAX_DISAPPEAR_SECS {
+                    return Err(ContentError::TooLarge);
+                }
+                Ok(Content::TimerChange { seconds })
+            }
+            KIND_DELETE => {
+                let (target, rest) = split_id(rest)?;
+                if !rest.is_empty() {
+                    return Err(ContentError::Malformed);
+                }
+                Ok(Content::Delete { target })
+            }
             other => Err(ContentError::UnknownKind(other)),
         }
     }

@@ -691,3 +691,111 @@ fn typing_is_reported_but_never_logged() {
         }
     );
 }
+
+/// Disappearing messages: the timer travels E2EE, applies to messages logged AFTER it (on both
+/// sides), and `scrub_expired` removes expired rows with their bookkeeping. Wall-clock based and
+/// local — R-901's honest best-effort, which is exactly what these assertions cover.
+#[test]
+fn disappearing_timer_applies_and_scrubs() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+
+    // Before any timer: messages keep forever.
+    let pre = alice.enqueue(b"kept").expect("enqueue");
+    let pre_env = alice.encrypt(pre).expect("encrypt");
+    bob.process_inbound(1, &pre_env).expect("process");
+    assert_eq!(bob.message_views()[0].expires_at_ms, None);
+
+    // Alice turns on a 1-second timer; bob learns it from the ciphertext.
+    let t = alice.enqueue_timer_change(1).expect("timer");
+    let t_env = alice.encrypt(t).expect("encrypt");
+    assert_eq!(alice.disappear_after_secs(), 1, "sender applies at encrypt");
+    assert_eq!(
+        bob.process_inbound(2, &t_env).expect("process"),
+        InboundOutcome::TimerChanged { seconds: 1 }
+    );
+    assert_eq!(bob.disappear_after_secs(), 1);
+
+    // A message sent now is stamped on both ends; the pre-timer message is untouched.
+    let m = alice.enqueue(b"fleeting").expect("enqueue");
+    let m_env = alice.encrypt(m).expect("encrypt");
+    bob.process_inbound(3, &m_env).expect("process");
+    let stamped = |views: Vec<mls_core::durable::MessageView>| {
+        views
+            .iter()
+            .filter(|v| v.expires_at_ms.is_some())
+            .count()
+    };
+    assert_eq!(stamped(alice.message_views()), 1);
+    assert_eq!(stamped(bob.message_views()), 1);
+
+    // Nothing has expired yet; then the second passes and the stamped message is scrubbed —
+    // with its reactions — while the pre-timer message stays.
+    assert_eq!(bob.scrub_expired().expect("scrub"), 0);
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    assert_eq!(bob.scrub_expired().expect("scrub"), 1);
+    let left = bob.message_views();
+    assert_eq!(left.len(), 1);
+    assert_eq!(left[0].plaintext, b"kept");
+
+    // The cap is enforced at the source, like every other bounded input.
+    assert!(alice
+        .enqueue_timer_change(mls_core::content::MAX_DISAPPEAR_SECS + 1)
+        .is_err());
+}
+
+/// Delete-for-everyone: the author's retraction tombstones both copies; a non-author cannot even
+/// queue one, and a delete naming an unknown message is a durable no-op.
+#[test]
+fn delete_for_everyone_tombstones_both_sides() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+
+    let id = alice.enqueue(b"regretted").expect("enqueue");
+    let envelope = alice.encrypt(id).expect("encrypt");
+    bob.process_inbound(1, &envelope).expect("process");
+    let target = bob.message_views()[0].message_id;
+
+    // Bob reacts, so there is bookkeeping to clean up.
+    let r = bob.enqueue_reaction(target, "😀", false).expect("react");
+    let r_env = bob.encrypt(r).expect("encrypt");
+    alice.process_inbound(2, &r_env).expect("process");
+
+    // Bob did not author it: refused locally, before anything is sent.
+    assert!(matches!(
+        bob.enqueue_delete(target),
+        Err(DurableError::UnknownLocal)
+    ));
+
+    // Alice retracts. Her copy tombstones at encrypt (when the group is told), not before.
+    let d = alice.enqueue_delete(target).expect("delete");
+    let d_env = alice.encrypt(d).expect("encrypt");
+    let mine = alice
+        .message_views()
+        .into_iter()
+        .find(|v| v.message_id == target)
+        .expect("still listed");
+    assert!(mine.deleted);
+    assert!(mine.plaintext.is_empty());
+    assert!(mine.reactions.is_empty(), "reactions went with the body");
+
+    // Bob's copy tombstones when the delete arrives.
+    assert_eq!(
+        bob.process_inbound(3, &d_env).expect("process"),
+        InboundOutcome::MessageDeleted { target }
+    );
+    let theirs = bob
+        .message_views()
+        .into_iter()
+        .find(|v| v.message_id == target)
+        .expect("row remains");
+    assert!(theirs.deleted);
+    assert!(theirs.plaintext.is_empty());
+
+    // A delete for an id nobody has: durable no-op.
+    let ghost = alice.enqueue(b"soon deleted locally only").expect("enqueue");
+    let _ = alice.encrypt(ghost).expect("encrypt");
+    let unknown_target = [9u8; 16];
+    assert!(matches!(
+        alice.enqueue_delete(unknown_target),
+        Err(DurableError::UnknownLocal)
+    ));
+}

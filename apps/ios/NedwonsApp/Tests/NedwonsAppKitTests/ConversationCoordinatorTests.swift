@@ -176,7 +176,7 @@ final class InMemoryRelay: ConversationRelay, @unchecked Sendable {
 
 /// One participant: a model with a session, and a coordinator over its own store directory.
 @MainActor
-private struct Participant {
+struct Participant {
     let name: String
     let accountID: String
     let deviceID: String

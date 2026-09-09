@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import NedwonsKit
+import NedwonsPush
 import NedwonsUI
 
 /// The shipped app's object graph: the `AppModel` the screens render, and the
@@ -33,17 +34,49 @@ public final class AppComposition: ObservableObject {
             }
     }
 
-    /// Production wiring: Keychain-rooted at-rest keys, stores under Application Support, the
-    /// server from `AppConfig`.
+    /// Foreground/background transitions from the scene. Backgrounding releases every open store
+    /// and the cross-process lock so the Notification Service Extension can decrypt while we're
+    /// away (ADR-0007 single-writer); foregrounding re-opens and picks up whatever it committed.
+    public func sceneDidEnterBackground() {
+        guard model.phase == .authenticated else { return }
+        coordinator?.stop()
+    }
+
+    public func sceneDidBecomeActive() {
+        guard model.phase == .authenticated else { return }
+        coordinator?.start()
+    }
+
+    /// Production wiring: Keychain-rooted at-rest keys, the server from `AppConfig`, and MLS
+    /// stores in the **app-group container** when the build is provisioned for one
+    /// (`NedwonsAppGroup` in Info.plist) so the notification extension can decrypt — falling back
+    /// to Application Support otherwise. An existing app-private store tree is migrated into the
+    /// container once, so provisioning the group later doesn't strand history.
     public static func standard() -> AppComposition {
         let model = AppModel()
         let keys = AtRestKeyHierarchy(store: KeychainStore(service: "app.nedwons.at-rest"))
         let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Nedwons", isDirectory: true)
+        let privateStores = support.appendingPathComponent("mls", isDirectory: true)
+        let storeDirectory: URL
+        if let group = SharedStoreLayout.configuredAppGroup(),
+            let shared = SharedStoreLayout.storeDirectory(appGroup: group)
+        {
+            if FileManager.default.fileExists(atPath: privateStores.path),
+                !FileManager.default.fileExists(atPath: shared.path)
+            {
+                try? FileManager.default.createDirectory(
+                    at: shared.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try? FileManager.default.moveItem(at: privateStores, to: shared)
+            }
+            storeDirectory = shared
+        } else {
+            storeDirectory = privateStores
+        }
         let coordinator = ConversationCoordinator(
             model: model,
             relay: NedwonsClient(baseURL: AppConfig.serverURL),
-            storeDirectory: support.appendingPathComponent("mls", isDirectory: true),
+            storeDirectory: storeDirectory,
             keyProvider: { storeID in try keys.atRestKey(forStore: storeID) })
         // Aliases are encrypted at rest under their own derived key. If the Keychain is unusable
         // the feature is simply absent rather than falling back to plaintext.

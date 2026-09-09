@@ -11,15 +11,17 @@ import Foundation
 ///
 /// Plain JSON on purpose: it holds only ids the relay already knows (conversation ids) and random
 /// store ids — never key material, which lives inside the encrypted stores.
-struct MlsStoreIndex: Codable, Equatable {
+public struct MlsStoreIndex: Codable, Equatable, Sendable {
     /// conversation id → store id
-    var conversations: [String: String] = [:]
+    public var conversations: [String: String] = [:]
     /// store ids awaiting a Welcome, oldest first
-    var lobbies: [String] = []
+    public var lobbies: [String] = []
 
-    static let fileName = "index.json"
+    public static let fileName = "index.json"
 
-    static func load(from url: URL) -> MlsStoreIndex {
+    public init() {}
+
+    public static func load(from url: URL) -> MlsStoreIndex {
         guard let data = try? Data(contentsOf: url),
             let index = try? JSONDecoder().decode(MlsStoreIndex.self, from: data)
         else { return MlsStoreIndex() }
@@ -27,7 +29,7 @@ struct MlsStoreIndex: Codable, Equatable {
     }
 
     /// Atomic replace, so a crash mid-write leaves the previous index rather than a torn one.
-    func save(to url: URL) throws {
+    public func save(to url: URL) throws {
         let data = try JSONEncoder().encode(self)
         try data.write(to: url, options: .atomic)
     }

@@ -118,6 +118,21 @@ pub struct Message {
     /// The message this one answers, if any.
     #[serde(default)]
     pub reply_to: Option<[u8; MESSAGE_ID_LEN]>,
+    /// The MLS-authenticated credential identity that sent this (ours, for outbound). What a
+    /// delete-for-everyone is checked against: only the author may retract. Empty for messages
+    /// logged before this field existed — those can never be remotely deleted (fail closed).
+    #[serde(default)]
+    pub sender: Vec<u8>,
+    /// Wall-clock unix ms after which this message is scrubbed locally (disappearing messages).
+    /// Stamped when the message is logged, from the timer then in force. Advisory-grade clock use,
+    /// like `created_at_ms`: honesty in R-901 — expiry is each client deleting its OWN copy;
+    /// nothing forces another device to. `None` = keeps forever.
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
+    /// Tombstoned by the author's delete-for-everyone: body and attachment are gone, the row
+    /// remains so the thread can honestly show "message deleted" instead of silently reflowing.
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 /// Which MLS group encrypts an outbound message. Normal messages and secrets use the conversation;
@@ -208,6 +223,16 @@ pub enum InboundOutcome {
         sender: Vec<u8>,
         active: bool,
     },
+    /// A member changed the conversation's disappearing-message timer (0 = off). Already
+    /// persisted; returned so the UI refreshes.
+    TimerChanged {
+        seconds: u32,
+    },
+    /// The author retracted a message; the local copy is tombstoned. Returned so the UI redraws
+    /// the bubble as "message deleted".
+    MessageDeleted {
+        target: [u8; MESSAGE_ID_LEN],
+    },
 }
 
 /// Travels in the committed blob alongside the MLS store snapshot.
@@ -266,6 +291,11 @@ struct Meta {
     /// as unread rather than silently zeroed.
     #[serde(default)]
     last_read_local_id: Option<u64>,
+    /// Disappearing-messages timer in seconds; 0 = off. Set over the E2EE channel
+    /// (`Content::TimerChange`) and applied to messages logged AFTER the change — existing history
+    /// keeps the expiry it was stamped with, matching what other members' clients do.
+    #[serde(default)]
+    disappear_after_secs: u32,
 }
 
 /// Wall-clock unix milliseconds for a DISPLAY timestamp.
@@ -280,6 +310,20 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// The expiry a message logged now should carry, given the timer currently in force.
+fn expiry_for(disappear_after_secs: u32, created_at_ms: u64) -> Option<u64> {
+    (disappear_after_secs > 0)
+        .then(|| created_at_ms.saturating_add(u64::from(disappear_after_secs) * 1000))
+}
+
+/// Erase a message's content in place, leaving an honest tombstone row.
+fn tombstone_message(message: &mut Message) {
+    message.plaintext = Vec::new();
+    message.attachment = None;
+    message.secret_id = None;
+    message.deleted = true;
 }
 
 /// One person's reaction to one message. The sender is the MLS-authenticated credential identity,
@@ -324,6 +368,11 @@ pub struct MessageView {
     /// Always (0, 0) for inbound — a receipt is something we send about someone else's message.
     pub delivered_count: u32,
     pub read_count: u32,
+    /// Wall-clock ms after which this device scrubs its copy (disappearing messages); `None` =
+    /// keeps forever. Display-grade, like `created_at_ms`.
+    pub expires_at_ms: Option<u64>,
+    /// Retracted by its author (delete-for-everyone); body and attachment are gone.
+    pub deleted: bool,
 }
 
 /// Add or remove one person's reaction, idempotently: reacting twice with the same emoji is one
@@ -954,6 +1003,67 @@ impl<J: Journal> DurableSession<J> {
         self.enqueue_content(Content::Typing { active }, None)
     }
 
+    /// The disappearing-message timer currently in force (seconds; 0 = off).
+    pub fn disappear_after_secs(&self) -> u32 {
+        self.meta.disappear_after_secs
+    }
+
+    /// Change the conversation's disappearing-message timer (0 = off). Like a rename, the local
+    /// timer applies when the change is ENCRYPTED — the moment the group is actually told.
+    pub fn enqueue_timer_change(&mut self, seconds: u32) -> Result<u64, DurableError> {
+        let content = Content::TimerChange { seconds };
+        // Refuse locally what every recipient's decoder would refuse (an over-cap timer).
+        Content::decode(&content.encode()).map_err(map_content)?;
+        self.enqueue_content(content, None)
+    }
+
+    /// Retract one of OUR OWN messages everywhere (delete-for-everyone). Refused for a message
+    /// this device did not send, or one with no wire id — recipients would refuse it anyway
+    /// (only the author's delete is honored) and the UI must not pretend otherwise. The local
+    /// tombstone lands at encrypt time, when the group is actually told. R-901: best-effort.
+    pub fn enqueue_delete(
+        &mut self,
+        target: [u8; MESSAGE_ID_LEN],
+    ) -> Result<u64, DurableError> {
+        let ours = self.meta.messages.iter().any(|m| {
+            m.message_id == target
+                && m.direction == Direction::Outbound
+                && m.message_id != [0u8; MESSAGE_ID_LEN]
+        });
+        if !ours {
+            return Err(DurableError::UnknownLocal);
+        }
+        self.enqueue_content(Content::Delete { target }, None)
+    }
+
+    /// Scrub every message past its expiry (disappearing messages): the row is removed outright,
+    /// with its reactions and receipt bookkeeping. Returns how many were removed; commits only
+    /// when something changed. Wall clock, deliberately — see `Message::expires_at_ms`.
+    pub fn scrub_expired(&mut self) -> Result<u64, DurableError> {
+        let now = now_ms();
+        let expired: Vec<[u8; MESSAGE_ID_LEN]> = self
+            .meta
+            .messages
+            .iter()
+            .filter(|m| m.expires_at_ms.is_some_and(|at| at <= now))
+            .map(|m| m.message_id)
+            .collect();
+        if expired.is_empty() {
+            return Ok(0);
+        }
+        let mut meta = self.meta.clone();
+        let before = meta.messages.len();
+        meta.messages
+            .retain(|m| !m.expires_at_ms.is_some_and(|at| at <= now));
+        for id in &expired {
+            meta.reactions.remove(&hex16(id));
+            meta.receipts.remove(&hex16(id));
+        }
+        let removed = (before - meta.messages.len()) as u64;
+        self.commit(meta)?;
+        Ok(removed)
+    }
+
     /// Reactions on a message, as currently known.
     pub fn reactions(&self, message_id: &[u8; MESSAGE_ID_LEN]) -> &[Reaction] {
         self.meta
@@ -1169,6 +1279,9 @@ impl<J: Journal> DurableSession<J> {
                 attachment: None,
                 message_id: *message_id,
                 reply_to: *reply_to,
+                sender: self.session.member.identity().to_vec(),
+                expires_at_ms: expiry_for(meta.disappear_after_secs, created_at_ms),
+                deleted: false,
             }),
             Content::Secret {
                 message_id,
@@ -1190,6 +1303,10 @@ impl<J: Journal> DurableSession<J> {
                     attachment: None,
                     message_id: *message_id,
                     reply_to: None,
+                    sender: self.session.member.identity().to_vec(),
+                    // A view-once secret has its own (stricter) lifecycle; no disappearing stamp.
+                    expires_at_ms: None,
+                    deleted: false,
                 })
             }
             // A file the user sent: the caption is the display text, and the reference is kept so
@@ -1213,6 +1330,9 @@ impl<J: Journal> DurableSession<J> {
                 outbox_local_id: Some(local_id),
                 message_id: *message_id,
                 reply_to: None,
+                sender: self.session.member.identity().to_vec(),
+                expires_at_ms: expiry_for(meta.disappear_after_secs, created_at_ms),
+                deleted: false,
                 attachment: Some(AttachmentRef {
                     blob_id: *blob_id,
                     key: *key,
@@ -1243,6 +1363,24 @@ impl<J: Journal> DurableSession<J> {
             // what the other members were told.
             Content::GroupName { name } => {
                 meta.group_name = Some(name.clone());
+                None
+            }
+            // Same rule for the disappearing timer: applied when the group is actually told.
+            Content::TimerChange { seconds } => {
+                meta.disappear_after_secs = *seconds;
+                None
+            }
+            // And for a retraction: the sender's own copy tombstones when the delete is sealed
+            // into the group — never before, so the local view can't run ahead of the send.
+            Content::Delete { target } => {
+                if let Some(message) = meta
+                    .messages
+                    .iter_mut()
+                    .find(|m| m.message_id == *target && m.direction == Direction::Outbound)
+                {
+                    tombstone_message(message);
+                    meta.reactions.remove(&hex16(target));
+                }
                 None
             }
             // Control messages are not user-visible on the sender — no message-log entry.
@@ -1539,6 +1677,8 @@ impl<J: Journal> DurableSession<J> {
             reactions: self.reactions(&m.message_id).to_vec(),
             delivered_count: receipt.map(|r| r.delivered_by.len() as u32).unwrap_or(0),
             read_count: receipt.map(|r| r.read_by.len() as u32).unwrap_or(0),
+            expires_at_ms: m.expires_at_ms,
+            deleted: m.deleted,
         }
     }
 
@@ -1601,19 +1741,48 @@ fn apply_incoming(
                     body,
                 } => {
                     let local_id = meta.take_local_id();
+                    let created_at_ms = now_ms();
                     meta.messages.push(Message {
                         local_id,
                         direction: Direction::Inbound,
                         plaintext: body.clone(),
                         envelope_id: Some(envelope_id),
                         secret_id: None,
-                        created_at_ms: now_ms(),
+                        created_at_ms,
                         outbox_local_id: None,
                         attachment: None,
                         message_id,
                         reply_to,
+                        sender,
+                        expires_at_ms: expiry_for(meta.disappear_after_secs, created_at_ms),
+                        deleted: false,
                     });
                     InboundOutcome::Application(body)
+                }
+                // The conversation's disappearing-message timer. Applied to messages logged from
+                // now on; history keeps the expiry it was stamped with (R-901: local, best-effort).
+                Content::TimerChange { seconds } => {
+                    meta.disappear_after_secs = seconds;
+                    InboundOutcome::TimerChanged { seconds }
+                }
+                // Delete-for-everyone. Honored ONLY when the deleter authored the message —
+                // otherwise any member could erase anyone's words. A target this device does not
+                // hold (or was logged before senders were recorded) is a durable no-op.
+                Content::Delete { target } => {
+                    let authored = meta.messages.iter_mut().find(|m| {
+                        m.message_id == target
+                            && m.direction == Direction::Inbound
+                            && !m.sender.is_empty()
+                            && m.sender == sender
+                    });
+                    match authored {
+                        Some(message) => {
+                            tombstone_message(message);
+                            meta.reactions.remove(&hex16(&target));
+                            InboundOutcome::MessageDeleted { target }
+                        }
+                        None => InboundOutcome::Duplicate,
+                    }
                 }
                 // A reaction to a message this device does not have is DROPPED, not stored for later:
                 // keeping it would let any member grow this blob without bound by reacting to ids they
@@ -1686,6 +1855,10 @@ fn apply_incoming(
                             attachment: None,
                             message_id,
                             reply_to: None,
+                            sender,
+                            // A view-once secret has its own (stricter) lifecycle; no expiry stamp.
+                            expires_at_ms: None,
+                            deleted: false,
                         });
                         InboundOutcome::SecretSealed { secret_id }
                     }
@@ -1722,17 +1895,21 @@ fn apply_incoming(
                         mime,
                         filename,
                     };
+                    let created_at_ms = now_ms();
                     meta.messages.push(Message {
                         local_id,
                         direction: Direction::Inbound,
                         plaintext: caption.into_bytes(),
                         envelope_id: Some(envelope_id),
                         secret_id: None,
-                        created_at_ms: now_ms(),
+                        created_at_ms,
                         outbox_local_id: None,
                         attachment: Some(attachment.clone()),
                         message_id,
                         reply_to: None,
+                        sender,
+                        expires_at_ms: expiry_for(meta.disappear_after_secs, created_at_ms),
+                        deleted: false,
                     });
                     InboundOutcome::AttachmentReceived { attachment }
                 }
@@ -1767,6 +1944,11 @@ fn apply_incoming(
                             // handles no other member knows.
                             message_id: [0u8; MESSAGE_ID_LEN],
                             reply_to: None,
+                            // The sync says which SIDE sent each entry, not which member device —
+                            // and no sender means no remote delete can ever target it (fail closed).
+                            sender: Vec::new(),
+                            expires_at_ms: None,
+                            deleted: false,
                         });
                     }
                     InboundOutcome::HistorySynced { count }
@@ -2021,5 +2203,65 @@ mod dedup_tests {
         // ...and forcing the watermark up only ever marks OLDER ids as seen (never un-sees a newer
         // one): the watermark never exceeds the highest processed id.
         assert!(meta.dedup_watermark <= highest);
+    }
+}
+
+#[cfg(test)]
+mod forged_delete_tests {
+    use super::*;
+    use crate::Incoming;
+
+    /// The authorship check, exercised directly: a member who did NOT write a message sends a
+    /// `Delete` naming it. A modified client can always emit such bytes — `enqueue_delete`'s
+    /// refusal is UX, this check is the security property — so the recipient must ignore it.
+    #[test]
+    fn a_forged_delete_from_a_non_author_is_ignored() {
+        let mut meta = Meta::default();
+        let local_id = meta.take_local_id();
+        let target = [7u8; MESSAGE_ID_LEN];
+        meta.messages.push(Message {
+            local_id,
+            direction: Direction::Inbound,
+            plaintext: b"alice wrote this".to_vec(),
+            envelope_id: Some(1),
+            secret_id: None,
+            created_at_ms: 0,
+            outbox_local_id: None,
+            attachment: None,
+            message_id: target,
+            reply_to: None,
+            sender: b"alice-device".to_vec(),
+            expires_at_ms: None,
+            deleted: false,
+        });
+
+        let forged = Content::Delete { target }.encode();
+        let outcome = apply_incoming(
+            &mut meta,
+            Incoming::Application {
+                sender: b"mallory-device".to_vec(),
+                payload: forged,
+            },
+            2,
+        )
+        .expect("apply");
+        assert_eq!(outcome, InboundOutcome::Duplicate, "not honored");
+        assert!(!meta.messages[0].deleted);
+        assert_eq!(meta.messages[0].plaintext, b"alice wrote this");
+
+        // And a message logged before senders were recorded (empty sender) can never be remotely
+        // deleted, even by a sender who ALSO claims an empty identity.
+        meta.messages[0].sender = Vec::new();
+        let outcome = apply_incoming(
+            &mut meta,
+            Incoming::Application {
+                sender: Vec::new(),
+                payload: Content::Delete { target }.encode(),
+            },
+            3,
+        )
+        .expect("apply");
+        assert_eq!(outcome, InboundOutcome::Duplicate, "fail closed");
+        assert!(!meta.messages[0].deleted);
     }
 }

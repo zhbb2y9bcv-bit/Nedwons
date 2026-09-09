@@ -593,3 +593,48 @@ fn interaction_layer_crosses_the_boundary() {
         "typing is not a message"
     );
 }
+
+/// Disappearing messages + delete-for-everyone across the FFI surface: the timer round-trips,
+/// stamps expiry on stored messages, and the author's retraction tombstones the recipient's copy.
+#[test]
+fn disappearing_and_delete_cross_the_ffi() {
+    let (alice, bob) = two_party(&tmp("disap-a"), &tmp("disap-b"));
+
+    let t = alice.set_disappear_timer(3600).unwrap();
+    let t_env = alice.encrypt(t).unwrap();
+    assert_eq!(alice.disappear_timer().unwrap(), 3600);
+    assert!(matches!(
+        bob.process_inbound(1, t_env).unwrap(),
+        InboundResult::TimerChanged { seconds: 3600 }
+    ));
+    assert_eq!(bob.disappear_timer().unwrap(), 3600);
+
+    let m = alice.enqueue(b"burns in an hour".to_vec()).unwrap();
+    let m_env = alice.encrypt(m).unwrap();
+    bob.process_inbound(2, m_env).unwrap();
+    let stored = bob.messages_page(0, 10).unwrap();
+    let msg = stored.last().unwrap();
+    assert!(msg.expires_at_ms.is_some());
+    assert!(!msg.deleted);
+    assert_eq!(bob.scrub_expired().unwrap(), 0, "not expired for an hour");
+
+    // Author deletes; recipient's copy tombstones. A non-author cannot queue one.
+    let target = msg.message_id.clone();
+    assert!(matches!(
+        bob.delete_for_everyone(target.clone()),
+        Err(MlsClientError::NotFound)
+    ));
+    let d = alice.delete_for_everyone(target.clone()).unwrap();
+    let d_env = alice.encrypt(d).unwrap();
+    assert!(matches!(
+        bob.process_inbound(3, d_env).unwrap(),
+        InboundResult::MessageDeleted { .. }
+    ));
+    let after = bob.messages_page(0, 10).unwrap();
+    let gone = after
+        .iter()
+        .find(|s| s.message_id == target)
+        .expect("row remains");
+    assert!(gone.deleted);
+    assert!(gone.plaintext.is_empty());
+}

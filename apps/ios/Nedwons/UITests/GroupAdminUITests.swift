@@ -216,7 +216,8 @@ final class GroupAdminUITests: XCTestCase {
         waitForRow(app, "group.member.\(erin)")
 
         openMember(app, erin)
-        waitFor(element(app, "group.member.remove")).tap()
+        // Below the fold since the member page gained verify + encryption-setup sections.
+        waitForRow(app, "group.member.remove").tap()
         confirm(app, "Remove")
         // Removal pops back to the panel, where the row is gone.
         waitFor(element(app, "group.panel"))

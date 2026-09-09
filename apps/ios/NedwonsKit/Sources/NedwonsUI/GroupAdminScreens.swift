@@ -41,6 +41,7 @@ public enum GroupAdminA11y {
     public static func memberRow(_ accountID: String) -> String { "group.member.\(accountID)" }
     public static func addMemberRow(_ accountID: String) -> String { "group.addMembers.row.\(accountID)" }
     public static func inviteRevoke(_ token: String) -> String { "group.invite.revoke.\(token.prefix(8))" }
+    public static func inviteQR(_ token: String) -> String { "group.invite.qr.\(token.prefix(8))" }
     public static func requestApprove(_ accountID: String) -> String { "group.request.approve.\(accountID)" }
     public static func requestDeny(_ accountID: String) -> String { "group.request.deny.\(accountID)" }
     public static let conversationGroupInfo = "conversation.groupInfo"
@@ -64,7 +65,7 @@ struct GroupAdminView: View {
     @State private var showRename = false
     @State private var draftName = ""
     @State private var confirmLeave = false
-    @State private var newInviteToken: String?
+    @State private var qrInvite: InviteSheetToken?
     private var palette: Nedwons.Palette { .forScheme(scheme) }
 
     private var state: GroupState? { model.groupState(for: chat.conversationID) }
@@ -120,22 +121,9 @@ struct GroupAdminView: View {
                 "You stop receiving messages here immediately. If you are the only admin, the "
                     + "earliest remaining member becomes admin so the group is never left unmanaged.")
         }
-        .alert(
-            "Invite link", isPresented: Binding(
-                get: { newInviteToken != nil }, set: { if !$0 { newInviteToken = nil } })
-        ) {
-            Button("Copy") {
-                #if canImport(UIKit)
-                    UIPasteboard.general.string = newInviteToken
-                #endif
-                newInviteToken = nil
-            }
-            Button("Done", role: .cancel) { newInviteToken = nil }
-        } message: {
-            Text(
-                "Anyone with this token can join"
-                    + ((state?.joinApproval ?? false) ? " after an admin approves them" : "")
-                    + ". It expires in 7 days.\n\n\(newInviteToken ?? "")")
+        .sheet(item: $qrInvite) { sheet in
+            // QR + copyable token (roadmap step 4): shown right after minting and from each row.
+            InviteQRView(token: sheet.token, groupTitle: model.conversationTitle(for: chat))
         }
     }
 
@@ -245,20 +233,54 @@ struct GroupAdminView: View {
             }
             .accessibilityIdentifier(GroupAdminA11y.toggleJoinApproval)
             .disabled(model.isBusy || state.mlsAuthoritative)
+
+            disappearingPicker
         } header: {
             Text("Group settings")
         } footer: {
             Text(
                 "\"Only admins can send\" mutes everyone else at once and lifts the moment you turn it "
                     + "off. Mutes are enforced by the Nedwons server, which refuses to deliver a muted "
-                    + "member's messages; it cannot read them.")
+                    + "member's messages; it cannot read them. Disappearing messages are different: the "
+                    + "timer travels encrypted, and each member's app deletes its own copy when time is "
+                    + "up — best-effort, not a guarantee someone didn't keep a screenshot.")
         }
     }
 
+    /// The disappearing-message timer: a member-visible setting that never touches the server
+    /// (the relay cannot know a conversation disappears). Applies to NEW messages only.
+    private var disappearingPicker: some View {
+        Picker(
+            selection: Binding(
+                get: { model.disappearTimer(for: chat.conversationID) },
+                set: { seconds in
+                    Task { await model.setDisappearTimer(seconds, in: chat.conversationID) }
+                }
+            )
+        ) {
+            Text("Off").tag(UInt32(0))
+            Text("1 hour").tag(UInt32(3600))
+            Text("1 day").tag(UInt32(86400))
+            Text("1 week").tag(UInt32(604_800))
+        } label: {
+            Label("Disappearing messages", systemImage: "timer")
+        }
+        .accessibilityIdentifier("group.disappearing")
+        .disabled(model.isBusy)
+    }
+
     private func readOnlySettings(_ state: GroupState) -> some View {
-        Section("Group settings") {
+        Section {
             LabeledContent("Who can send", value: state.announcementsOnly ? "Admins only" : "Everyone")
             LabeledContent("New members", value: state.joinApproval ? "Need admin approval" : "Join by invite")
+            LabeledContent(
+                "Disappearing messages",
+                value: model.disappearTimer(for: chat.conversationID) == 0
+                    ? "Off" : AppModel.timerLabel(model.disappearTimer(for: chat.conversationID)))
+        } header: {
+            Text("Group settings")
+        } footer: {
+            Text("When on, each member's app deletes its own copy after the timer — best-effort by design.")
         }
     }
 
@@ -340,7 +362,11 @@ struct GroupAdminView: View {
     private func invitesSection(_ state: GroupState) -> some View {
         Section {
             Button {
-                Task { newInviteToken = await model.createGroupInvite(in: chat.conversationID) }
+                Task {
+                    if let token = await model.createGroupInvite(in: chat.conversationID) {
+                        qrInvite = InviteSheetToken(token: token)
+                    }
+                }
             } label: {
                 Label("Create invite link", systemImage: "link.badge.plus")
             }
@@ -356,6 +382,14 @@ struct GroupAdminView: View {
                             .foregroundStyle(palette.textSecondary)
                     }
                     Spacer()
+                    Button {
+                        qrInvite = InviteSheetToken(token: invite.inviteToken)
+                    } label: {
+                        Image(systemName: "qrcode")
+                    }
+                    .buttonStyle(.bordered)
+                    .accessibilityLabel("Show invite QR code")
+                    .accessibilityIdentifier(GroupAdminA11y.inviteQR(invite.inviteToken))
                     Button("Revoke", role: .destructive) {
                         Task { await model.revokeGroupInvite(invite.inviteToken, in: chat.conversationID) }
                     }
@@ -366,7 +400,7 @@ struct GroupAdminView: View {
         } header: {
             Text("Invite links")
         } footer: {
-            Text("An invite is the joiner's own consent: nobody is force-added by a link. Links expire, are use-limited, and can be revoked here.")
+            Text("An invite is the joiner's own consent: nobody is force-added by a link. Links expire, are use-limited, and can be revoked here. Show the QR for someone standing next to you.")
         }
     }
 
@@ -380,6 +414,12 @@ struct GroupAdminView: View {
     private func shortID(_ id: String) -> String {
         id.count > 8 ? String(id.prefix(8)) + "…" : id
     }
+}
+
+/// Wraps a minted invite token so `.sheet(item:)` can present it.
+private struct InviteSheetToken: Identifiable {
+    let token: String
+    var id: String { token }
 }
 
 /// One member line: name, then the badges that make moderation legible — admin, muted, you.
@@ -496,9 +536,12 @@ struct GroupMemberDetailView: View {
                 .frame(maxWidth: .infinity)
             }
 
+            if !isMe { verifySection }
+
             if isAdmin && !isMe {
                 roleSection
                 muteSection
+                encryptionSetupSection
                 if membershipEditable { removeSection }
             } else if isMe {
                 Section {
@@ -523,6 +566,46 @@ struct GroupMemberDetailView: View {
             Button("Cancel", role: .cancel) {}
         } message: {
             Text("They stop receiving messages here immediately and can only return by invitation.")
+        }
+    }
+
+    /// Safety-number verification (roadmap step 4) — reachable for every member who isn't you.
+    private var verifySection: some View {
+        Section {
+            NavigationLink {
+                SafetyNumberView(
+                    model: model, peerAccountID: member.accountID,
+                    peerLabel: "@\(current.username)")
+            } label: {
+                Label(
+                    model.isPeerVerified(member.accountID)
+                        ? "Verified · view safety number" : "Verify safety number",
+                    systemImage: model.isPeerVerified(member.accountID)
+                        ? "checkmark.shield.fill" : "checkmark.shield"
+                )
+                .foregroundStyle(
+                    model.isPeerVerified(member.accountID) ? palette.verified : palette.textPrimary)
+            }
+            .accessibilityIdentifier("member.verify")
+        } footer: {
+            Text("Compare safety numbers to confirm nobody — including the server — sits between you.")
+        }
+    }
+
+    /// The admin-side close of the invite-link loop: someone who joined by link is in the group's
+    /// routing but not yet in its encryption, so nothing decrypts for them. This runs the same MLS
+    /// add used for direct adds. Harmless when they're already set up (it reports the failure).
+    private var encryptionSetupSection: some View {
+        Section {
+            Button {
+                Task { await model.completeMemberEncryption(member.accountID, in: conversationID) }
+            } label: {
+                Label("Finish encryption setup", systemImage: "key.radiowaves.forward")
+            }
+            .accessibilityIdentifier("member.encryption.setup")
+            .disabled(model.isBusy)
+        } footer: {
+            Text("Use this when someone joined by invite link and new messages aren't reaching them yet.")
         }
     }
 

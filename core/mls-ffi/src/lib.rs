@@ -98,6 +98,11 @@ pub struct StoredMessage {
     /// For our own messages: how many other members have received / read it.
     pub delivered_count: u32,
     pub read_count: u32,
+    /// Wall-clock ms after which this device scrubs its copy (disappearing messages); `None` =
+    /// keeps forever.
+    pub expires_at_ms: Option<u64>,
+    /// Retracted by its author (delete-for-everyone): render "message deleted", body is gone.
+    pub deleted: bool,
 }
 
 /// Mirrors `mls_core::secret::SecretState`.
@@ -182,6 +187,14 @@ pub enum InboundResult {
     Typing {
         sender: Vec<u8>,
         active: bool,
+    },
+    /// A member changed the disappearing-message timer (0 = off). Already persisted; refresh.
+    TimerChanged {
+        seconds: u32,
+    },
+    /// The author retracted a message; the local copy is tombstoned. Redraw the bubble.
+    MessageDeleted {
+        target: Vec<u8>,
     },
 }
 
@@ -789,6 +802,12 @@ impl MlsClient {
                 InboundOutcome::Typing { sender, active } => {
                     InboundResult::Typing { sender, active }
                 }
+                InboundOutcome::TimerChanged { seconds } => {
+                    InboundResult::TimerChanged { seconds }
+                }
+                InboundOutcome::MessageDeleted { target } => InboundResult::MessageDeleted {
+                    target: target.to_vec(),
+                },
             })
         })
     }
@@ -845,6 +864,12 @@ impl MlsClient {
                 InboundOutcome::Typing { sender, active } => {
                     InboundResult::Typing { sender, active }
                 }
+                InboundOutcome::TimerChanged { seconds } => {
+                    InboundResult::TimerChanged { seconds }
+                }
+                InboundOutcome::MessageDeleted { target } => InboundResult::MessageDeleted {
+                    target: target.to_vec(),
+                },
             })
         })
     }
@@ -1028,6 +1053,56 @@ impl MlsClient {
             let mut g = self.lock()?;
             let session = active_mut(&mut g)?;
             session.enqueue_typing(active).map_err(map_durable_input)
+        })
+    }
+
+    // --- Disappearing messages & delete-for-everyone ----------------------------------------------
+
+    /// The conversation's disappearing-message timer in seconds (0 = off).
+    pub fn disappear_timer(&self) -> Result<u32, MlsClientError> {
+        catch(move || {
+            let g = self.lock()?;
+            match &*g {
+                ClientState::Active { session } => Ok(session.disappear_after_secs()),
+                ClientState::Pending { .. } => Err(MlsClientError::WrongState),
+                ClientState::Closed => Err(MlsClientError::Closed),
+            }
+        })
+    }
+
+    /// Queue a timer change for the whole conversation (0 = off), returning its local id —
+    /// `encrypt`/`mark_sent` it like any other message. The local timer changes on encrypt, when
+    /// the group is actually told. Refuses a timer past the wire cap (90 days).
+    pub fn set_disappear_timer(&self, seconds: u32) -> Result<u64, MlsClientError> {
+        catch(move || {
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session
+                .enqueue_timer_change(seconds)
+                .map_err(map_durable_input)
+        })
+    }
+
+    /// Retract one of THIS DEVICE's own messages everywhere (delete-for-everyone), returning the
+    /// local id of the queued retraction. Refused for anyone else's message — recipients only
+    /// honor the author's delete. Honest limit (R-901): recipients' clients tombstone their
+    /// copies; nothing can force a modified client to.
+    pub fn delete_for_everyone(&self, target: Vec<u8>) -> Result<u64, MlsClientError> {
+        catch(move || {
+            let target = fixed(&target)?;
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session.enqueue_delete(target).map_err(map_durable_input)
+        })
+    }
+
+    /// Remove every message past its disappearing-message expiry, returning how many went. Call
+    /// on open and periodically (the coordinator does, each sync).
+    pub fn scrub_expired(&self) -> Result<u64, MlsClientError> {
+        catch(move || {
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            session.scrub_expired().map_err(map_durable)
         })
     }
 
@@ -1279,6 +1354,8 @@ fn to_stored(m: &CoreMessageView) -> StoredMessage {
             .collect(),
         delivered_count: m.delivered_count,
         read_count: m.read_count,
+        expires_at_ms: m.expires_at_ms,
+        deleted: m.deleted,
     }
 }
 

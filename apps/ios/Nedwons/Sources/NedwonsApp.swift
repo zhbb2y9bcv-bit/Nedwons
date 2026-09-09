@@ -20,10 +20,22 @@ struct NedwonsApp: App {
     // @StateObject defers construction to the first (main-actor) body render, so the @MainActor
     // graph is built safely and persists across renders.
     @StateObject private var composition = NedwonsApp.makeComposition()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
             NedwonsAppRoot(model: composition.model)
+        }
+        // Single-writer handoff (ADR-0007): backgrounding closes every MLS store and releases the
+        // cross-process lock so a push can be decrypted by the Notification Service Extension;
+        // foregrounding re-opens and picks up whatever the extension committed. `.inactive`
+        // (control centre, incoming call) deliberately changes nothing.
+        .onChange(of: scenePhase) { _, phase in
+            switch phase {
+            case .background: composition.sceneDidEnterBackground()
+            case .active: composition.sceneDidBecomeActive()
+            default: break
+            }
         }
     }
 

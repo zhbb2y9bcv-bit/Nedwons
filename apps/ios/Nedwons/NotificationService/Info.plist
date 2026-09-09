@@ -27,5 +27,9 @@
 		<key>NSExtensionPrincipalClass</key>
 		<string>$(PRODUCT_MODULE_NAME).NotificationService</string>
 	</dict>
+	<key>NedwonsAppGroup</key>
+	<string></string>
+	<key>NedwonsServerURL</key>
+	<string></string>
 </dict>
 </plist>
