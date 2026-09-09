@@ -54,14 +54,27 @@ public func sortedByRecency(_ chats: [ChatSummary]) -> [ChatSummary] {
 struct ChatsListView: View {
     @ObservedObject var model: AppModel
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.horizontalSizeClass) private var sizeClass
     @State private var path = NavigationPath()
     @State private var showCompose = false
     @State private var showJoin = false
     @State private var pendingDelete: ChatSummary?
     @State private var searchQuery = ""
+    /// Regular-width (iPad) detail selection. Unused on compact, where navigation is a push stack.
+    @State private var selectedChat: ChatSummary?
     private var palette: Nedwons.Palette { .forScheme(scheme) }
 
     var body: some View {
+        // iPad (regular width) gets a two-column list+conversation layout; iPhone (compact) keeps
+        // the push stack unchanged — same screens, same behaviour, same test handles.
+        if sizeClass == .regular {
+            regularBody
+        } else {
+            compactBody
+        }
+    }
+
+    private var compactBody: some View {
         NavigationStack(path: $path) {
             Group {
                 if !searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
@@ -130,6 +143,178 @@ struct ChatsListView: View {
         }
     }
 
+    // MARK: Regular width (iPad)
+
+    /// Two columns: the conversation list as a selectable sidebar, the selected thread as detail.
+    /// The list content, search, compose and delete affordances are the SAME as compact — only the
+    /// container and the row's navigation mechanism (selection vs. push) differ.
+    private var regularBody: some View {
+        NavigationSplitView {
+            Group {
+                if !searchQuery.trimmingCharacters(in: .whitespaces).isEmpty {
+                    regularSearchResults
+                } else if model.isBusy && model.conversations.isEmpty {
+                    ProgressView("Loading conversations…")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if chats.isEmpty {
+                    emptyState
+                } else {
+                    regularList
+                }
+            }
+            .background(palette.background)
+            .navigationTitle("Chats")
+            .searchable(text: $searchQuery, prompt: "Search messages")
+            .onChange(of: searchQuery) { _, q in model.searchMessages(q) }
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button { showCompose = true } label: { Image(systemName: "square.and.pencil") }
+                        .accessibilityLabel("New message")
+                }
+                ToolbarItem(placement: .secondaryAction) {
+                    Button { showJoin = true } label: {
+                        Label("Join with invite", systemImage: "qrcode.viewfinder")
+                    }
+                    .accessibilityIdentifier("chats.join")
+                }
+            }
+        } detail: {
+            if let selectedChat {
+                // A stack per detail so the conversation's own pushes (group panel, profile) have
+                // somewhere to go, and re-selecting swaps the thread by identity.
+                NavigationStack { ConversationView(model: model, chat: selectedChat) }
+                    .id(selectedChat.conversationID)
+            } else {
+                detailPlaceholder
+            }
+        }
+        .task { await model.refreshConversations() }
+        .sheet(isPresented: $showCompose) {
+            NewMessageView(model: model) { chat in
+                showCompose = false
+                selectedChat = chat
+            }
+        }
+        .sheet(isPresented: $showJoin) {
+            NavigationStack { JoinByInviteView(model: model) }
+        }
+        .confirmationDialog(
+            "Delete conversation?",
+            isPresented: Binding(
+                get: { pendingDelete != nil },
+                set: { if !$0 { pendingDelete = nil } }),
+            titleVisibility: .visible
+        ) {
+            Button("Delete conversation", role: .destructive) {
+                if let chat = pendingDelete {
+                    if selectedChat?.conversationID == chat.conversationID { selectedChat = nil }
+                    Task { await model.deleteConversationLocally(chat.conversationID) }
+                }
+                pendingDelete = nil
+            }
+            Button("Cancel", role: .cancel) { pendingDelete = nil }
+        } message: {
+            Text("""
+                This removes the conversation history from this device. It does not delete it \
+                from the other person's device.
+                """)
+        }
+    }
+
+    private var regularList: some View {
+        List(selection: $selectedChat) {
+            ForEach(chats) { chat in
+                selectableChatRow(chat).tag(chat)
+            }
+            if !archivedChats.isEmpty {
+                NavigationLink {
+                    ArchivedChatsView(model: model)
+                } label: {
+                    Label("Archived (\(archivedChats.count))", systemImage: "archivebox")
+                        .foregroundStyle(palette.textSecondary)
+                }
+                .accessibilityIdentifier("chats.archived")
+            }
+        }
+        .listStyle(.sidebar)
+    }
+
+    private var regularSearchResults: some View {
+        List {
+            if model.messageSearchHits.isEmpty {
+                Text("No messages match.")
+                    .foregroundStyle(palette.textSecondary)
+            }
+            ForEach(model.messageSearchHits) { hit in
+                Button {
+                    if let chat = model.chatSummaries.first(where: {
+                        $0.conversationID == hit.conversationID
+                    }) {
+                        model.pendingScrollTarget[hit.conversationID] = hit.localID
+                        searchQuery = ""
+                        selectedChat = chat
+                    }
+                } label: {
+                    searchHitLabel(hit)
+                }
+                .accessibilityIdentifier("search.hit.\(hit.id)")
+            }
+        }
+        .listStyle(.plain)
+    }
+
+    private var detailPlaceholder: some View {
+        VStack(spacing: Nedwons.Spacing.md) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 40))
+                .foregroundStyle(palette.accentPrimary)
+            Text("Select a conversation")
+                .font(Nedwons.TypeScale.headline)
+                .foregroundStyle(palette.textPrimary)
+            Text("Messages here are end-to-end encrypted.")
+                .font(Nedwons.TypeScale.callout)
+                .foregroundStyle(palette.textSecondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(palette.background)
+    }
+
+    /// The same row content and affordances as `chatRow`, but tappable via List selection instead
+    /// of a `NavigationLink` (selection is what drives the detail column).
+    @ViewBuilder
+    private func selectableChatRow(_ chat: ChatSummary) -> some View {
+        chatRowLabel(chat)
+            .accessibilityIdentifier("chats.row.\(chat.conversationID)")
+            .contextMenu {
+                Button("Delete conversation", systemImage: "trash", role: .destructive) {
+                    pendingDelete = chat
+                }
+            }
+            .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                Button { model.togglePinned(chat.conversationID) } label: {
+                    Label(
+                        model.chatPrefs.pinned.contains(chat.conversationID) ? "Unpin" : "Pin",
+                        systemImage: "pin")
+                }
+                .tint(.orange)
+            }
+            .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                Button(role: .destructive) { pendingDelete = chat } label: {
+                    Label("Delete", systemImage: "trash")
+                }
+                Button { model.toggleArchived(chat.conversationID) } label: {
+                    Label("Archive", systemImage: "archivebox")
+                }
+                .tint(.indigo)
+                Button { model.toggleMuted(chat.conversationID) } label: {
+                    Label(
+                        model.chatPrefs.muted.contains(chat.conversationID) ? "Unmute" : "Mute",
+                        systemImage: "bell.slash")
+                }
+                .tint(.gray)
+            }
+    }
+
     /// Derived from the server's conversation list (routing metadata only) joined with local
     /// display state. Previews come from decrypted on-device history, never from the relay.
     private var chats: [ChatSummary] {
@@ -159,28 +344,33 @@ struct ChatsListView: View {
                         path.append(chat)
                     }
                 } label: {
-                    VStack(alignment: .leading, spacing: Nedwons.Spacing.xxs) {
-                        HStack {
-                            Text(titleFor(conversationID: hit.conversationID))
-                                .font(Nedwons.TypeScale.caption)
-                                .foregroundStyle(palette.accentPrimary)
-                            Spacer()
-                            if let when = hit.timestamp {
-                                Text(when, style: .date)
-                                    .font(Nedwons.TypeScale.caption)
-                                    .foregroundStyle(palette.textSecondary)
-                            }
-                        }
-                        Text((hit.mine ? "You: " : "") + hit.snippet)
-                            .font(Nedwons.TypeScale.callout)
-                            .foregroundStyle(palette.textPrimary)
-                            .lineLimit(2)
-                    }
+                    searchHitLabel(hit)
                 }
                 .accessibilityIdentifier("search.hit.\(hit.id)")
             }
         }
         .listStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func searchHitLabel(_ hit: MessageSearchHit) -> some View {
+        VStack(alignment: .leading, spacing: Nedwons.Spacing.xxs) {
+            HStack {
+                Text(titleFor(conversationID: hit.conversationID))
+                    .font(Nedwons.TypeScale.caption)
+                    .foregroundStyle(palette.accentPrimary)
+                Spacer()
+                if let when = hit.timestamp {
+                    Text(when, style: .date)
+                        .font(Nedwons.TypeScale.caption)
+                        .foregroundStyle(palette.textSecondary)
+                }
+            }
+            Text((hit.mine ? "You: " : "") + hit.snippet)
+                .font(Nedwons.TypeScale.callout)
+                .foregroundStyle(palette.textPrimary)
+                .lineLimit(2)
+        }
     }
 
     private func titleFor(conversationID: String) -> String {
@@ -206,24 +396,30 @@ struct ChatsListView: View {
         .listStyle(.plain)
     }
 
+    /// The row's visible content — shared by the compact push row and the regular selectable row.
+    @ViewBuilder
+    private func chatRowLabel(_ chat: ChatSummary) -> some View {
+        HStack(spacing: Nedwons.Spacing.xs) {
+            ChatRow(model: model, chat: chat, palette: palette)
+            if model.chatPrefs.pinned.contains(chat.conversationID) {
+                Image(systemName: "pin.fill")
+                    .imageScale(.small)
+                    .foregroundStyle(palette.textSecondary)
+                    .accessibilityLabel("Pinned")
+            }
+            if model.chatPrefs.muted.contains(chat.conversationID) {
+                Image(systemName: "bell.slash.fill")
+                    .imageScale(.small)
+                    .foregroundStyle(palette.textSecondary)
+                    .accessibilityLabel("Muted")
+            }
+        }
+    }
+
     @ViewBuilder
     private func chatRow(_ chat: ChatSummary) -> some View {
         NavigationLink(value: chat) {
-            HStack(spacing: Nedwons.Spacing.xs) {
-                ChatRow(model: model, chat: chat, palette: palette)
-                if model.chatPrefs.pinned.contains(chat.conversationID) {
-                    Image(systemName: "pin.fill")
-                        .imageScale(.small)
-                        .foregroundStyle(palette.textSecondary)
-                        .accessibilityLabel("Pinned")
-                }
-                if model.chatPrefs.muted.contains(chat.conversationID) {
-                    Image(systemName: "bell.slash.fill")
-                        .imageScale(.small)
-                        .foregroundStyle(palette.textSecondary)
-                        .accessibilityLabel("Muted")
-                }
-            }
+            chatRowLabel(chat)
         }
         // Stable handle for the XCUITest suite (apps/ios/Nedwons/UITests).
         .accessibilityIdentifier("chats.row.\(chat.conversationID)")
