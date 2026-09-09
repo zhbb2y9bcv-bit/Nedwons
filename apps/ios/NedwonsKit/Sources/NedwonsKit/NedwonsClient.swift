@@ -1389,6 +1389,56 @@ extension NedwonsClient {
     }
 
     /// Revoke one of this account's devices (cascades tokens + refresh families).
+    /// Change the account password.
+    ///
+    /// Two factors, like every other sensitive change: the server issues a challenge this DEVICE
+    /// signs, and the CURRENT password is sent with it. A stolen access token alone cannot lock the
+    /// owner out of their own account by changing the password.
+    ///
+    /// Existing device-bound sessions keep working — they are not password-derived — so this does
+    /// not sign other devices out. The new password governs future logins.
+    public func changePassword(
+        accessToken: String,
+        accountID: String,
+        currentPassword: String,
+        newPassword: String,
+        signer: DeviceSigner
+    ) async throws {
+        var beginReq = authed("POST", "/v1/session/password/begin", accessToken: accessToken)
+        beginReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        beginReq.httpBody = try JSONEncoder().encode(EmptyBody())
+        let ch: ChallengeResponse = try decode(await perform(beginReq))
+
+        guard let account = Hex.decode(accountID), let deviceID = Hex.decode(ch.device_id),
+            let nonce = Hex.decode(ch.nonce), let txnID = Hex.decode(ch.txn_id)
+        else { throw ClientError.decoding }
+
+        let transcript = ClientTranscripts.passwordChange(
+            accountID: account,
+            deviceID: deviceID,
+            publicKey: signer.publicKeyX963,
+            challengeNonce: nonce,
+            expiresAt: ch.expires_at,
+            txnID: txnID)
+        let signature = try signer.sign(transcript)
+
+        struct Finish: Encodable {
+            let txn_id: String
+            let signature: String
+            let current_password: String
+            let new_password: String
+        }
+        var finishReq = authed("POST", "/v1/session/password/finish", accessToken: accessToken)
+        finishReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        finishReq.httpBody = try JSONEncoder().encode(
+            Finish(
+                txn_id: ch.txn_id,
+                signature: Hex.encode(signature),
+                current_password: currentPassword,
+                new_password: newPassword))
+        _ = try await perform(finishReq)
+    }
+
     public func revokeDevice(accessToken: String, deviceID: String) async throws {
         struct Body: Encodable { let device_id: String }
         var request = authed("POST", "/v1/devices/revoke", accessToken: accessToken)
