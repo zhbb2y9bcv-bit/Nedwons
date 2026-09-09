@@ -36,10 +36,101 @@ final class InMemoryRelay: ConversationRelay, @unchecked Sendable {
         devices[token] = Device(accountID: accountID, deviceID: deviceID)
     }
 
-    /// What `POST /v1/groups` does server-side: routing membership for every member device.
+    /// What `POST /v1/groups` does server-side since V27: routing membership for every member
+    /// device, with everyone but the CREATOR (the first device listed) queued for MLS setup —
+    /// the creator's reconcile pass delivers their Welcomes.
     func createConversation(_ id: String, memberDevices: [String]) {
         lock.lock(); defer { lock.unlock() }
         members[id] = Set(memberDevices)
+        for device in memberDevices.dropFirst() {
+            let account = devices.values.first { $0.deviceID == device }?.accountID ?? "?"
+            pendingSetup.append(.init(conversation: id, account: account, device: device))
+        }
+    }
+
+    // ----- MLS setup queue (V27) ------------------------------------------------------------
+
+    struct PendingSetup: Equatable {
+        let conversation: String
+        let account: String
+        let device: String
+    }
+    private var pendingSetup: [PendingSetup] = []
+    private var setupClaims: [String: String] = [:]  // "conv/device" → claimer device
+
+    /// Test hook mirroring the server's queue inserts (invite joins, linked siblings, deferred
+    /// adds): the device becomes a routed member awaiting its MLS add.
+    func queueSetup(conversation: String, account: String, device: String) {
+        lock.lock(); defer { lock.unlock() }
+        members[conversation, default: []].insert(device)
+        pendingSetup.append(
+            .init(conversation: conversation, account: account, device: device))
+    }
+
+    var pendingSetupCount: Int { sync { pendingSetup.count } }
+
+    private func isSetUpMember(_ device: String, in conversation: String) -> Bool {
+        members[conversation]?.contains(device) == true
+            && !pendingSetup.contains { $0.conversation == conversation && $0.device == device }
+    }
+
+    func setupNeeded(accessToken: String) async throws -> [SetupTarget] {
+        try sync {
+            let d = try device(accessToken)
+            return pendingSetup
+                .filter { isSetUpMember(d.deviceID, in: $0.conversation) && $0.device != d.deviceID }
+                .map {
+                    SetupTarget(
+                        conversationID: $0.conversation, accountID: $0.account,
+                        deviceID: $0.device)
+                }
+        }
+    }
+
+    func claimSetup(accessToken: String, conversationID: String, deviceID: String) async throws
+        -> Bool
+    {
+        try sync {
+            let d = try device(accessToken)
+            guard isSetUpMember(d.deviceID, in: conversationID),
+                pendingSetup.contains(where: {
+                    $0.conversation == conversationID && $0.device == deviceID
+                })
+            else { return false }
+            let key = "\(conversationID)/\(deviceID)"
+            guard setupClaims[key] == nil || setupClaims[key] == d.deviceID else { return false }
+            setupClaims[key] = d.deviceID
+            return true
+        }
+    }
+
+    func confirmSetup(accessToken: String, conversationID: String, deviceID: String) async throws {
+        try sync {
+            let d = try device(accessToken)
+            let key = "\(conversationID)/\(deviceID)"
+            guard setupClaims[key] == d.deviceID else {
+                throw NedwonsClient.ClientError.http(status: 409, body: #"{"error":"not_claimed"}"#)
+            }
+            setupClaims[key] = nil
+            pendingSetup.removeAll { $0.conversation == conversationID && $0.device == deviceID }
+        }
+    }
+
+    func claimDeviceKeyPackage(accessToken: String, deviceID: String) async throws
+        -> ClaimedKeyPackage
+    {
+        try sync {
+            _ = try device(accessToken)
+            for (account, var queue) in prekeys {
+                if let i = queue.firstIndex(where: { $0.device == deviceID }) {
+                    let claimed = queue.remove(at: i)
+                    prekeys[account] = queue
+                    return ClaimedKeyPackage(
+                        deviceID: claimed.device, keyPackage: Hex.encode(claimed.keyPackage))
+                }
+            }
+            throw NedwonsClient.ClientError.http(status: 404, body: #"{"error":"no_key_package"}"#)
+        }
     }
 
     private func device(_ token: String) throws -> Device {
@@ -397,23 +488,36 @@ final class ConversationCoordinatorTests: XCTestCase {
 
     /// A member with no prekey cannot be added; the group still forms with everyone else and the
     /// failure names who was left out.
-    func testBootstrapReportsMembersWithoutPrekeys() async throws {
+    /// V27 deferred adds: a member with no prekeys does not fail the bootstrap — they stay in
+    /// the setup queue, and the moment they publish, the next reconcile pass admits them. From
+    /// then on they receive new messages (history from before their join is cryptographically
+    /// theirs-never, by MLS forward secrecy — stated, not hidden).
+    func testMemberWithoutPrekeysIsDeferredThenAdmitted() async throws {
         let relay = InMemoryRelay()
         let alice = Participant("alice", relay: relay)
         let bob = Participant("bob", relay: relay)
-        let carol = Participant("carol", relay: relay)  // never publishes
+        let carol = Participant("carol", relay: relay)  // hasn't opened the app yet
         await bob.coordinator.ensureKeyPackages()
         relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID, carol.deviceID])
-        do {
-            try await alice.coordinator.bootstrap(
-                conversationID: conv, memberAccountIDs: [bob.accountID, carol.accountID])
-            XCTFail("expected a partial-setup error")
-        } catch let ConversationCoordinator.CoordinatorError.membersNotSetUp(failed) {
-            XCTAssertEqual(failed, [carol.accountID])
-        }
-        await alice.model.sendMessage("still works for bob", to: conv)
+        try await alice.coordinator.bootstrap(
+            conversationID: conv, memberAccountIDs: [bob.accountID, carol.accountID])
+        XCTAssertEqual(relay.pendingSetupCount, 1, "carol is queued, not failed")
+
+        await alice.model.sendMessage("early message", to: conv)
         _ = try await bob.coordinator.syncOnce()
-        XCTAssertEqual(bob.texts(in: conv).map(\.0), ["still works for bob"])
+        XCTAssertEqual(bob.texts(in: conv).map(\.0), ["early message"])
+
+        // Carol opens the app: prekeys go up, and ANY set-up member's sync completes her add.
+        await carol.coordinator.ensureKeyPackages()
+        await alice.coordinator.reconcileSetup()
+        XCTAssertEqual(relay.pendingSetupCount, 0, "deferred add completed")
+        _ = try await carol.coordinator.syncOnce()  // Welcome redeemed via her lobby
+
+        await alice.model.sendMessage("carol sees this one", to: conv)
+        _ = try await carol.coordinator.syncOnce()
+        XCTAssertEqual(
+            carol.texts(in: conv).map(\.0), ["carol sees this one"],
+            "post-join messages arrive; pre-join history honestly does not")
     }
 
     /// A rename reaches the other side through the ordinary message path, titles both clients, and

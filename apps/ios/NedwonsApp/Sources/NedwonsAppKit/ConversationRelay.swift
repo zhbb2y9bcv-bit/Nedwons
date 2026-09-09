@@ -28,6 +28,15 @@ public protocol ConversationRelay: Sendable {
     func downloadAttachment(accessToken: String, blobID: String) async throws -> Data
     func fetchInbox(accessToken: String, waitSeconds: Int) async throws -> [InboxEnvelope]
     func ackInbox(accessToken: String, ids: [Int]) async throws
+
+    // MLS setup queue (V27): the reconcile loop that gives invite joiners, deferred adds, and
+    // freshly linked sibling devices their Welcomes automatically.
+    func setupNeeded(accessToken: String) async throws -> [SetupTarget]
+    func claimSetup(accessToken: String, conversationID: String, deviceID: String) async throws
+        -> Bool
+    func confirmSetup(accessToken: String, conversationID: String, deviceID: String) async throws
+    func claimDeviceKeyPackage(accessToken: String, deviceID: String) async throws
+        -> ClaimedKeyPackage
 }
 
 extension NedwonsClient: ConversationRelay {

@@ -116,3 +116,57 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         .windows(needle.len())
         .any(|window| window == needle)
 }
+
+/// The cross-epoch race real multi-device traffic hits constantly: bob sends BEFORE processing
+/// the commit that added carol, so his message is encrypted at the old epoch. Members who already
+/// merged must still decrypt it (`MAX_PAST_EPOCHS`) — with the default of zero past epochs the
+/// message would be silently lost, which is exactly what the reconcile loop must never cause.
+#[test]
+fn message_from_a_member_one_epoch_behind_still_decrypts() {
+    let alice = Member::new(b"alice").expect("alice");
+    let bob = Member::new(b"bob").expect("bob");
+    let carol = Member::new(b"carol").expect("carol");
+
+    let mut alice_group = alice.create_group().expect("group");
+    let add_bob = alice_group
+        .add_member(&alice, &bob.key_package_bytes().unwrap())
+        .expect("add bob");
+    let mut bob_group = bob.join_from_welcome(&add_bob.welcome).expect("bob joins");
+
+    // Alice adds carol and merges (epoch N+1). Bob has NOT seen that commit yet.
+    let add_carol = alice_group
+        .add_member(&alice, &carol.key_package_bytes().unwrap())
+        .expect("add carol");
+    let mut carol_group = carol
+        .join_from_welcome(&add_carol.welcome)
+        .expect("carol joins");
+    let stale_envelope = bob_group
+        .encrypt(&bob, b"sent while one epoch behind")
+        .expect("encrypt at old epoch");
+
+    // Alice (merged) decrypts bob's old-epoch message thanks to the retained window.
+    match alice_group
+        .process(&alice, &stale_envelope)
+        .expect("alice reads")
+    {
+        Incoming::Application { payload, .. } => {
+            assert_eq!(payload, b"sent while one epoch behind")
+        }
+        Incoming::StateAdvanced => panic!("expected application message"),
+    }
+    // Carol joined at N+1 and never had epoch-N keys: for her the message is honestly
+    // undecryptable — pre-join history is never readable, window or no window.
+    assert!(carol_group.process(&carol, &stale_envelope).is_err());
+
+    // Bob catches up and future messages flow normally at the shared epoch.
+    bob_group
+        .process(&bob, &add_carol.commit)
+        .expect("bob merges the add");
+    let fresh = alice_group
+        .encrypt(&alice, b"all caught up")
+        .expect("encrypt");
+    match bob_group.process(&bob, &fresh).expect("bob reads") {
+        Incoming::Application { payload, .. } => assert_eq!(payload, b"all caught up"),
+        Incoming::StateAdvanced => panic!("expected application message"),
+    }
+}

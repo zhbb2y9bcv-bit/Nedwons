@@ -34,6 +34,14 @@ CycloneDX **SBOM** is generated per build (R-501, `scripts/generate_sbom.sh`).
 - Replay, duplicate, out-of-order, skipped-key, and state-rollback handling.
 - Authenticated group membership with **epoch changes after add/remove** — a removed
   member cannot decrypt future epochs.
+- **Bounded past-epoch window (deliberate trade, 2026-09-09):** each member retains message
+  secrets for the last **3 epochs** (`Member::MAX_PAST_EPOCHS`), so a message sent by someone who
+  has not yet merged a membership commit still decrypts — with real multi-device traffic (the V27
+  reconcile loop adds devices continuously) the OpenMLS default of 0 silently drops such messages.
+  The honest cost: forward secrecy for application messages trails by up to 3 epochs; a device
+  compromised now can read up to 3 epochs of recent history rather than none. A *joiner* still
+  reads nothing from before their join — the window holds only epochs a member actually lived
+  through. Proven by `e2ee.rs::message_from_a_member_one_epoch_behind_still_decrypts`.
 - Cryptographic binding of conversation, sender device, recipient device/group epoch,
   message type, protocol version, and counters as associated data.
 - Cryptographic agility via **explicit versioning** — never silent negotiation to a

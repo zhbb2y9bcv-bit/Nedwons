@@ -326,6 +326,26 @@ public struct InboxEnvelope: Decodable, Sendable, Identifiable {
 }
 
 /// `keyPackage` is the hex-encoded opaque MLS key package the relay stored verbatim.
+/// One routed member still awaiting its MLS add (the V27 setup queue) — the reconcile loop's
+/// unit of work.
+public struct SetupTarget: Decodable, Sendable, Equatable {
+    public let conversationID: String
+    public let accountID: String
+    public let deviceID: String
+
+    enum CodingKeys: String, CodingKey {
+        case conversationID = "conversation_id"
+        case accountID = "account_id"
+        case deviceID = "device_id"
+    }
+
+    public init(conversationID: String, accountID: String, deviceID: String) {
+        self.conversationID = conversationID
+        self.accountID = accountID
+        self.deviceID = deviceID
+    }
+}
+
 public struct ClaimedKeyPackage: Decodable, Sendable {
     public let deviceID: String
     public let keyPackage: String
@@ -915,6 +935,69 @@ public extension NedwonsClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONEncoder().encode(Body(account_id: accountID))
         return try decode(await perform(request))
+    }
+
+    // ----- MLS setup queue (V27): multi-device + automatic/deferred adds -----
+    //
+    // The relay tracks which routed members still need an MLS add; any set-up member's device
+    // claims one target at a time (expiring claim ⇒ no double adds), claims that DEVICE's
+    // prekey, delivers the Welcome, fans out the commit, and confirms. The coordinator drives
+    // this every sync — this is what makes invite joins, deferred adds, and a freshly linked
+    // sibling device "just start working" with nobody tapping anything.
+
+    /// Claim one key package for a SPECIFIC device (a setup target). 403 unless the caller
+    /// shares a conversation with it or owns it; 404 when it has no prekey published yet.
+    public func claimDeviceKeyPackage(
+        accessToken: String, deviceID: String
+    ) async throws -> ClaimedKeyPackage {
+        struct Body: Encodable { let device_id: String }
+        var request = authed("POST", "/v1/keypackages/claim-device", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(Body(device_id: deviceID))
+        return try decode(await perform(request))
+    }
+
+    /// Members of the caller's conversations still awaiting their MLS add.
+    public func setupNeeded(accessToken: String) async throws -> [SetupTarget] {
+        struct Res: Decodable { let targets: [SetupTarget] }
+        let request = authed("GET", "/v1/setup/needed", accessToken: accessToken)
+        let res: Res = try decode(await perform(request))
+        return res.targets
+    }
+
+    /// Take the exclusive, expiring claim on one setup target. `false` = someone else is on it.
+    public func claimSetup(
+        accessToken: String, conversationID: String, deviceID: String
+    ) async throws -> Bool {
+        struct Body: Encodable {
+            let conversation_id: String
+            let device_id: String
+        }
+        var request = authed("POST", "/v1/setup/claim", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            Body(conversation_id: conversationID, device_id: deviceID))
+        do {
+            _ = try await perform(request)
+            return true
+        } catch ClientError.http(409, _) {
+            return false
+        }
+    }
+
+    /// Mark a setup target done (the Welcome is queued for it). Requires holding the claim.
+    public func confirmSetup(
+        accessToken: String, conversationID: String, deviceID: String
+    ) async throws {
+        struct Body: Encodable {
+            let conversation_id: String
+            let device_id: String
+        }
+        var request = authed("POST", "/v1/setup/confirm", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(
+            Body(conversation_id: conversationID, device_id: deviceID))
+        _ = try await perform(request)
     }
 
     /// Deliver an MLS Welcome to a specific joining device of a conversation

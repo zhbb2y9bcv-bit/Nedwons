@@ -127,10 +127,11 @@ extension AppModel {
             do {
                 try await addMembersToConversationAction(conversationID, accountIDs)
             } catch {
-                banner = "Added, but secure setup didn't finish for everyone. "
-                    + "Ask them to open Nedwons, then try again."
+                // Deferred, not failed (V27): the add completes on a later sync — theirs or any
+                // member's — the moment they publish a prekey.
+                banner = "Added. Anyone who hasn't opened Nedwons yet joins automatically when they do."
                 await refreshGroupState(conversationID)
-                return false
+                return true
             }
         }
         banner = accountIDs.count == 1 ? "Added to the group." : "Added \(accountIDs.count) people."
@@ -152,7 +153,8 @@ extension AppModel {
             banner = "Encryption setup finished — new messages reach them now."
             return true
         } catch {
-            banner = "Setup didn't complete. They may already be set up, or they haven't opened Nedwons yet."
+            banner = "Nothing to finish — they're either already set up, or they'll be added "
+                + "automatically when they next open Nedwons."
             return false
         }
     }

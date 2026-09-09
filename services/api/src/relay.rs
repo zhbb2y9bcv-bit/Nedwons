@@ -65,6 +65,18 @@ pub struct ClaimedKeyPackage {
     pub key_package: Vec<u8>,
 }
 
+/// How long a reconcile claim on a setup target lives before another device may take over
+/// (migration V27). Long enough to claim a prekey + deliver a Welcome; short enough that a
+/// crashed reconciler delays a join by seconds, not forever.
+pub const SETUP_CLAIM_TTL_SECS: u64 = 60;
+
+/// One routing member still awaiting its MLS add (V27 setup queue).
+pub struct SetupTarget {
+    pub conversation_id: [u8; 16],
+    pub account_id: [u8; 16],
+    pub device_id: [u8; 16],
+}
+
 /// A conversation the caller belongs to, with its member accounts (for the Chats list).
 pub struct ConversationSummary {
     pub conversation_id: [u8; 16],
@@ -469,6 +481,170 @@ impl PgRelay {
         )
         .map_err(db_err)?;
         Ok(())
+    }
+
+    /// As [`Self::add_member`], but the new row lands in the **MLS setup queue** (`mls_added =
+    /// FALSE`): the device is routed mail from now on, and some current member's device will
+    /// claim it, deliver a Welcome, and confirm (migration V27). This is the entry point for
+    /// every path where the adder is NOT the device performing the MLS add — invite joins,
+    /// join approvals, direct adds, deferred adds, newly linked siblings.
+    pub fn add_pending_member(
+        &self,
+        conversation_id: &[u8; 16],
+        account: AccountId,
+        device: DeviceId,
+    ) -> StoreResult<()> {
+        let mut conn = self.conn()?;
+        let mut txn = conn.transaction().map_err(db_err)?;
+        Self::add_pending_member_in_txn(&mut txn, conversation_id, account, device)?;
+        txn.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    pub fn add_pending_member_in_txn(
+        txn: &mut postgres::Transaction<'_>,
+        conversation_id: &[u8; 16],
+        account: AccountId,
+        device: DeviceId,
+    ) -> StoreResult<()> {
+        txn.execute(
+            "INSERT INTO conversation_members (conversation_id, account_id, device_id, mls_added)
+             VALUES ($1, $2, $3, FALSE) ON CONFLICT (conversation_id, device_id) DO NOTHING",
+            &[
+                &conversation_id.as_slice(),
+                &account.as_bytes(),
+                &device.as_bytes(),
+            ],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    // ----- MLS setup queue (V27): multi-device + automatic/deferred adds ----------------------
+
+    /// Setup work visible to `caller`: members of the caller's conversations that still need an
+    /// MLS add, unclaimed (or whose claim expired — a reconciler that crashed or found no prekey
+    /// must not wedge its target forever). Only a caller that has itself COMPLETED setup for a
+    /// conversation sees its queue — a device with no group keys cannot add anyone.
+    pub fn setup_needed(&self, caller: &DeviceId, limit: i64) -> StoreResult<Vec<SetupTarget>> {
+        let mut conn = self.conn()?;
+        let rows = conn
+            .query(
+                "SELECT t.conversation_id, t.account_id, t.device_id
+                 FROM conversation_members t
+                 JOIN conversation_members me
+                   ON me.conversation_id = t.conversation_id
+                 WHERE me.device_id = $1 AND me.mls_added
+                   AND NOT t.mls_added AND t.device_id <> $1
+                   AND (t.setup_claimed_at IS NULL
+                        OR t.setup_claimed_at < now() - make_interval(secs => $2))
+                 ORDER BY t.conversation_id
+                 LIMIT $3",
+                &[&caller.as_bytes(), &(SETUP_CLAIM_TTL_SECS as f64), &limit],
+            )
+            .map_err(db_err)?;
+        rows.into_iter()
+            .map(|r| {
+                Ok(SetupTarget {
+                    conversation_id: id16(r.get::<_, &[u8]>(0))?,
+                    account_id: id16(r.get::<_, &[u8]>(1))?,
+                    device_id: id16(r.get::<_, &[u8]>(2))?,
+                })
+            })
+            .collect()
+    }
+
+    /// Atomically claim one setup target so exactly ONE member's device performs the add — two
+    /// reconcilers double-adding the same device would fork the group. Returns false when someone
+    /// else holds a live claim, the target is already set up, or the caller isn't a set-up member.
+    pub fn claim_setup(
+        &self,
+        claimer: &DeviceId,
+        conversation_id: &[u8; 16],
+        target_device: &DeviceId,
+    ) -> StoreResult<bool> {
+        let mut conn = self.conn()?;
+        let updated = conn
+            .execute(
+                "UPDATE conversation_members t SET setup_claimed_by = $1, setup_claimed_at = now()
+                 WHERE t.conversation_id = $2 AND t.device_id = $3 AND NOT t.mls_added
+                   AND (t.setup_claimed_at IS NULL
+                        OR t.setup_claimed_at < now() - make_interval(secs => $4)
+                        OR t.setup_claimed_by = $1)
+                   AND EXISTS (SELECT 1 FROM conversation_members me
+                               WHERE me.conversation_id = $2 AND me.device_id = $1 AND me.mls_added)",
+                &[
+                    &claimer.as_bytes(),
+                    &conversation_id.as_slice(),
+                    &target_device.as_bytes(),
+                    &(SETUP_CLAIM_TTL_SECS as f64),
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(updated == 1)
+    }
+
+    /// The Welcome is on its way: the target now holds (or is one queued envelope away from
+    /// holding) the conversation's keys. Requires the confirmer to hold the live claim, so a
+    /// stale reconciler cannot confirm over a newer one's work.
+    pub fn confirm_setup(
+        &self,
+        confirmer: &DeviceId,
+        conversation_id: &[u8; 16],
+        target_device: &DeviceId,
+    ) -> StoreResult<bool> {
+        let mut conn = self.conn()?;
+        let updated = conn
+            .execute(
+                "UPDATE conversation_members SET mls_added = TRUE,
+                        setup_claimed_by = NULL, setup_claimed_at = NULL
+                 WHERE conversation_id = $1 AND device_id = $2 AND NOT mls_added
+                   AND setup_claimed_by = $3",
+                &[
+                    &conversation_id.as_slice(),
+                    &target_device.as_bytes(),
+                    &confirmer.as_bytes(),
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(updated == 1)
+    }
+
+    /// Whether `caller` shares at least one conversation with `target` — the authorization for
+    /// claiming a SPECIFIC device's prekey (a reconciler adding that device to a shared group).
+    pub fn shares_conversation(&self, caller: &DeviceId, target: &DeviceId) -> StoreResult<bool> {
+        let mut conn = self.conn()?;
+        Ok(conn
+            .query_opt(
+                "SELECT 1 FROM conversation_members a
+                 JOIN conversation_members b ON a.conversation_id = b.conversation_id
+                 WHERE a.device_id = $1 AND b.device_id = $2 LIMIT 1",
+                &[&caller.as_bytes(), &target.as_bytes()],
+            )
+            .map_err(db_err)?
+            .is_some())
+    }
+
+    /// A freshly linked sibling joins all of its account's conversations — queued for MLS setup,
+    /// which the account's OWN other device (or any member) completes on its next sync. Called
+    /// when the device registers self-group membership: linking is the trust ceremony, so an
+    /// enrolled-but-unlinked device deliberately gets no conversation routing.
+    pub fn seed_linked_device_conversations(
+        &self,
+        account: &AccountId,
+        device: &DeviceId,
+    ) -> StoreResult<u64> {
+        let mut conn = self.conn()?;
+        let inserted = conn
+            .execute(
+                "INSERT INTO conversation_members (conversation_id, account_id, device_id, mls_added)
+                 SELECT DISTINCT cm.conversation_id, $1::bytea, $2::bytea, FALSE
+                 FROM conversation_members cm WHERE cm.account_id = $1
+                 ON CONFLICT (conversation_id, device_id) DO NOTHING",
+                &[&account.as_bytes(), &device.as_bytes()],
+            )
+            .map_err(db_err)?;
+        Ok(inserted)
     }
 
     /// Membership by ACCOUNT (any of its devices), inside a caller-owned transaction. Used by the

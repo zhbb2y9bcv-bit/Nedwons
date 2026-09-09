@@ -1189,11 +1189,11 @@ public final class AppModel: ObservableObject {
                 do {
                     try await bootstrapConversationAction(group.conversationID, memberAccountIDs)
                 } catch {
-                    // The conversation exists for routing; the MLS setup did not finish for
-                    // everyone (typically: a member has never opened the app, so no prekey).
-                    // Said plainly rather than pretending the group is ready.
-                    banner = "Group created, but secure setup didn't finish for everyone. "
-                        + "Ask them to open Nedwons, then add them again."
+                    // The conversation exists for routing; anyone not reachable yet (never opened
+                    // the app, so no prekey) is queued and joins automatically on a later sync
+                    // (V27 deferred adds) — said plainly, without a manual chore.
+                    banner = "Group created. Anyone who hasn't opened Nedwons yet joins "
+                        + "automatically when they do."
                 }
             }
         }
