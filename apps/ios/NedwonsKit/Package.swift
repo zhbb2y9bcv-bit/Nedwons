@@ -8,6 +8,7 @@ import PackageDescription
 // live in the separate Xcode project under apps/ios/Nedwons and consume this package.
 let package = Package(
     name: "NedwonsKit",
+    defaultLocalization: "en",
     platforms: [.iOS(.v17), .macOS(.v14)],
     products: [
         .library(name: "NedwonsKit", targets: ["NedwonsKit"]),

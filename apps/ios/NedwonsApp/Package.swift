@@ -9,6 +9,7 @@ import PackageDescription
 // integration tests on the macOS slice of the xcframework (no simulator required for CI).
 let package = Package(
     name: "NedwonsApp",
+    defaultLocalization: "en",
     platforms: [.iOS(.v17), .macOS(.v14)],
     products: [
         .library(name: "NedwonsAppKit", targets: ["NedwonsAppKit"]),
@@ -26,7 +27,8 @@ let package = Package(
         .target(
             name: "NedwonsPush",
             dependencies: [
-                .product(name: "NedwonsKit", package: "NedwonsKit"),
+                .product(name: "NedwonsKit",
+    defaultLocalization: "en", package: "NedwonsKit"),
                 .product(name: "MlsFfi", package: "NedwonsMLS"),
             ]),
         .target(

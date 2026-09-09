@@ -761,10 +761,14 @@ struct AddGroupMembersView: View {
                                 Spacer()
                                 Image(systemName: selected.contains(friend.accountID) ? "checkmark.circle.fill" : "circle")
                                     .foregroundStyle(selected.contains(friend.accountID) ? palette.accentPrimary : palette.textSecondary)
+                                    .accessibilityHidden(true)
                             }
                             // A plain-style button hit-tests only its drawn content; without this
                             // a tap in the empty middle of the row (where a thumb lands) is lost.
                             .contentShape(Rectangle())
+                            .accessibilityElement(children: .combine)
+                            .accessibilityAddTraits(
+                                selected.contains(friend.accountID) ? .isSelected : [])
                         }
                         .buttonStyle(.plain)
                         .accessibilityIdentifier(GroupAdminA11y.addMemberRow(friend.accountID))

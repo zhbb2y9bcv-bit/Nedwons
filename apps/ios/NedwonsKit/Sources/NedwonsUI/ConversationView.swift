@@ -772,6 +772,7 @@ struct ConversationView: View {
             } label: {
                 Image(systemName: "arrow.up.circle.fill").imageScale(.large)
             }
+            .accessibilityLabel("Send message")
             .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
         }
         .padding(Nedwons.Spacing.md)
