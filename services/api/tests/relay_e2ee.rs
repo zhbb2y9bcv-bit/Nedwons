@@ -163,7 +163,7 @@ async fn mls_message_routed_through_relay_leaves_no_plaintext() {
         .process(&bob_mls, &message_bytes)
         .expect("process")
     {
-        Incoming::Application(bytes) => assert_eq!(bytes, plaintext),
+        Incoming::Application { payload: bytes, .. } => assert_eq!(bytes, plaintext),
         Incoming::StateAdvanced => panic!("expected the application message"),
     }
 
