@@ -972,6 +972,18 @@ public extension NedwonsClient {
         return try decode(await perform(request))
     }
 
+    /// Pre-registration availability check (unauthenticated; the account doesn't exist yet).
+    func usernameAvailable(_ candidate: String) async throws -> Bool {
+        struct Res: Decodable { let available: Bool }
+        var components = URLComponents(
+            url: baseURL.appendingPathComponent("/v1/usernames/available"),
+            resolvingAgainstBaseURL: false)!
+        components.queryItems = [URLQueryItem(name: "u", value: candidate)]
+        let request = URLRequest(url: components.url!)
+        let res: Res = try decode(await perform(request))
+        return res.available
+    }
+
     // ----- MLS setup queue (V27): multi-device + automatic/deferred adds -----
     //
     // The relay tracks which routed members still need an MLS add; any set-up member's device

@@ -147,6 +147,8 @@ struct ConversationView: View {
     @State private var deleteCandidate: ThreadLine?
     @State private var forwardCandidate: ThreadLine?
     @State private var reportCandidate: ThreadLine?
+    @State private var flashedLineID: UInt64?
+    @State private var reactionSheetLine: ThreadLine?
     private var palette: Nedwons.Palette { .forScheme(scheme) }
 
     var body: some View {
@@ -198,6 +200,10 @@ struct ConversationView: View {
         }
         .sheet(item: $reportCandidate) { line in
             ReportMessageSheet(model: model, line: line, chat: chat)
+        }
+        .sheet(item: $reactionSheetLine) { line in
+            ReactionPickerSheet(model: model, line: line, conversationID: chat.conversationID)
+                .presentationDetents([.height(320)])
         }
         // The picker returns the media's own bytes; they are encrypted before anything leaves the
         // device, so what the relay receives is never the photo or video.
@@ -370,6 +376,12 @@ struct ConversationView: View {
                             VStack(alignment: line.mine ? .trailing : .leading, spacing: 2) {
                                 if let quoted = quotedLine(for: line) {
                                     QuotedPreview(line: quoted, palette: palette, compact: true)
+                                        .onTapGesture {
+                                            model.pendingScrollTarget[chat.conversationID] =
+                                                quoted.id
+                                        }
+                                        .accessibilityAddTraits(.isButton)
+                                        .accessibilityHint("Jump to the original message")
                                 }
                                 row(line)
                                 if !line.reactions.isEmpty {
@@ -388,13 +400,31 @@ struct ConversationView: View {
                                 maxWidth: .infinity,
                                 alignment: line.mine ? .trailing : .leading)
                             .id(line.id)
+                            .background(
+                                RoundedRectangle(cornerRadius: Nedwons.Radius.bubble)
+                                    .fill(
+                                        flashedLineID == line.id
+                                            ? palette.accentPrimary.opacity(0.18) : .clear)
+                                    .animation(.easeOut(duration: 0.6), value: flashedLineID)
+                            )
                             .contextMenu { messageActions(line) }
                         }
                     }
                     .padding(Nedwons.Spacing.md)
                 }
                 .onChange(of: lines.count) {
-                    if let last = lines.last { proxy.scrollTo(last.id, anchor: .bottom) }
+                    // A pending jump (search hit, reply-quote tap) wins over follow-the-bottom.
+                    if model.pendingScrollTarget[chat.conversationID] == nil,
+                        let last = lines.last
+                    {
+                        proxy.scrollTo(last.id, anchor: .bottom)
+                    }
+                }
+                .onChange(of: model.pendingScrollTarget[chat.conversationID]) { _, target in
+                    jump(to: target, proxy: proxy)
+                }
+                .onAppear {
+                    jump(to: model.pendingScrollTarget[chat.conversationID], proxy: proxy)
                 }
             }
         }
@@ -453,6 +483,18 @@ struct ConversationView: View {
         return lines.first { $0.messageID == target }
     }
 
+    /// Scroll to a specific line (search hit / reply-quote tap), flash it, consume the request.
+    private func jump(to target: UInt64?, proxy: ScrollViewProxy) {
+        guard let target, lines.contains(where: { $0.id == target }) else { return }
+        withAnimation { proxy.scrollTo(target, anchor: .center) }
+        flashedLineID = target
+        model.pendingScrollTarget.removeValue(forKey: chat.conversationID)
+        Task {
+            try? await Task.sleep(nanoseconds: 900_000_000)
+            if flashedLineID == target { flashedLineID = nil }
+        }
+    }
+
     /// Long-press actions. Reply and react need the message to HAVE an id — older messages predate
     /// ids and honestly cannot be referred to, so the actions are not offered for them.
     @ViewBuilder
@@ -467,6 +509,11 @@ struct ConversationView: View {
                 Button(emoji) {
                     Task { await model.toggleReaction(emoji, on: line, in: chat.conversationID) }
                 }
+            }
+            Button {
+                reactionSheetLine = line
+            } label: {
+                Label("More reactions…", systemImage: "face.smiling")
             }
         }
         if !line.deleted, line.quotableText != nil || lineIsForwardableAttachment(line) {

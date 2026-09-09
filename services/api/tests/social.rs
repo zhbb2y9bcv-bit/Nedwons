@@ -625,3 +625,24 @@ async fn leave_group_withdraws_membership_and_purges_queue() {
     .await
     .expect("db inspection");
 }
+
+/// Pre-registration availability (unauthenticated): free vs taken vs invalid, revealing nothing
+/// registration's own 409 doesn't already reveal.
+#[tokio::test]
+async fn username_availability_answers_before_registration() {
+    let app = common::make_app(100_000).await;
+    let name = unique_username("avail");
+
+    let (status, free) = common::get_json(&app, &format!("/v1/usernames/available?u={name}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(free["available"], true, "{free}");
+
+    let _ = http_register(&app, &name).await;
+    let (_, taken) = common::get_json(&app, &format!("/v1/usernames/available?u={name}")).await;
+    assert_eq!(taken["available"], false);
+    assert_eq!(taken["reason"], "taken");
+
+    let (_, invalid) = common::get_json(&app, "/v1/usernames/available?u=x").await;
+    assert_eq!(invalid["available"], false);
+    assert_eq!(invalid["reason"], "invalid");
+}
