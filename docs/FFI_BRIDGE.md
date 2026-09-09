@@ -171,3 +171,12 @@ compiles the simulator + device slices.
 
 Building/packaging/compiling for device is done and verified headlessly. Running the slices on a
 physical iPhone, the Enclave-wrapped at-rest key, and App Attest remain device-only.
+
+## Bounded history storage (R-105, 2026-09-09)
+
+`messages()` returns the HOT window (most recent ≤512); `message_count()` is the TOTAL, and
+`messages_page(offset, limit)` pages the full history — offsets inside the hot window never read
+the archive, so live rendering stays cheap. Older messages live in an append-only encrypted
+archive file (`<store>.archive`) written write-ahead of the blob commit that drops them; the
+crash-safety contract (one atomic blob commit, reopen-recovers) is unchanged. See RISK_REGISTER
+R-105 for the exclusions (disappearing/unsent stay hot; hot-window-only deletes/reactions).

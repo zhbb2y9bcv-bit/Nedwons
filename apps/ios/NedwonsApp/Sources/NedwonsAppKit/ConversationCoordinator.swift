@@ -405,9 +405,8 @@ public final class ConversationCoordinator {
         guard !query.isEmpty else { return [] }
         var hits: [SearchHit] = []
         for conversationID in index.conversations.keys {
-            guard let client = activeClient(for: conversationID),
-                let messages = try? client.messages()
-            else { continue }
+            guard let client = activeClient(for: conversationID) else { continue }
+            let messages = allMessages(in: client)
             for message in messages where !message.deleted && message.secretId == nil {
                 let text = String(decoding: message.plaintext, as: UTF8.self)
                 let name = message.attachment?.filename ?? ""
@@ -470,14 +469,26 @@ public final class ConversationCoordinator {
             key: reference.key, digest: reference.digest, ciphertext: ciphertext)
     }
 
+    /// The FULL history of one conversation, paged out of the core (hot window + R-105 archive).
+    /// Used by scans that must see everything — attachment-key lookup, search. Live rendering
+    /// never calls this; it reads the hot window.
+    private func allMessages(in client: MlsClient) -> [StoredMessage] {
+        var out: [StoredMessage] = []
+        var offset: UInt64 = 0
+        while let page = try? client.messagesPage(offset: offset, limit: 256), !page.isEmpty {
+            out.append(contentsOf: page)
+            offset += UInt64(page.count)
+        }
+        return out
+    }
+
     /// The reference (with its key) as stored in whichever conversation's log carries this blob.
     /// Read from local state, never from the network: the key must come from the message the group
     /// sent, not from anything the relay could influence.
     private func attachmentReference(_ blobID: String) -> AttachmentInfo? {
         for conversationID in index.conversations.keys {
-            guard let client = activeClient(for: conversationID),
-                let messages = try? client.messages()
-            else { continue }
+            guard let client = activeClient(for: conversationID) else { continue }
+            let messages = allMessages(in: client)
             for message in messages {
                 if let attachment = message.attachment, Hex.encode(attachment.blobId) == blobID {
                     return attachment

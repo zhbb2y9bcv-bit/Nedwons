@@ -296,6 +296,15 @@ struct Meta {
     /// keeps the expiry it was stamped with, matching what other members' clients do.
     #[serde(default)]
     disappear_after_secs: u32,
+    /// R-105: every message with `local_id` below this lives in the append-only ARCHIVE, not in
+    /// this blob. The hot window (`messages`) is what every commit rewrites; the archive is
+    /// written once per message and never again — which is the whole fix: the blob stops growing
+    /// with history. `#[serde(default)]` ⇒ pre-archive blobs load with everything hot.
+    #[serde(default)]
+    archived_below_local_id: u64,
+    /// How many messages the archive holds (kept here so counting needs no archive read).
+    #[serde(default)]
+    archived_count: u64,
 }
 
 /// Wall-clock unix milliseconds for a DISPLAY timestamp.
@@ -530,6 +539,30 @@ impl Session {
 pub trait Journal {
     fn commit(&mut self, blob: &[u8]) -> Result<(), DurableError>;
     fn load(&self) -> Result<Option<Vec<u8>>, DurableError>;
+
+    /// Append one immutable, already-serialized archived message (R-105). MUST be durable when it
+    /// returns: the archive write happens BEFORE the blob commit that drops the message from the
+    /// hot window (write-ahead), so a crash between the two leaves a harmless duplicate, never a
+    /// lost message. The default refuses — a journal that cannot archive fails the spill closed
+    /// rather than silently discarding history.
+    fn archive_append(&mut self, record: &[u8]) -> Result<(), DurableError> {
+        let _ = record;
+        Err(DurableError::Journal)
+    }
+
+    /// Every archive record, in append order. Duplicated `local_id`s are possible after a crash
+    /// between archive-append and blob-commit; readers collapse them (last write wins — the
+    /// records are identical by construction, since messages are immutable once spilled).
+    fn archive_load(&self) -> Result<Vec<Vec<u8>>, DurableError> {
+        Ok(Vec::new())
+    }
+
+    /// Drop the archive (local history erase). Best-effort by contract; called AFTER the blob
+    /// commit that zeroes the archive counters, so a crash in between leaves only invisible
+    /// stale records (their ids sit above the reset watermark).
+    fn archive_clear(&mut self) -> Result<(), DurableError> {
+        Ok(())
+    }
 }
 
 /// A joiner identity awaiting its Welcome, **persisted from the moment it exists**.
@@ -636,10 +669,18 @@ impl<J: Journal> PendingIdentity<J> {
 }
 
 /// A conversation with crash-safe local persistence.
+/// Default hot-window size (R-105): messages beyond this spill to the append-only archive. Large
+/// enough that ordinary scrollback never touches the archive; small enough that the per-commit
+/// blob rewrite stays O(window), not O(history).
+pub const MAX_HOT_MESSAGES: usize = 512;
+
 pub struct DurableSession<J: Journal> {
     session: Session,
     meta: Meta,
     journal: J,
+    /// Spill threshold; [`MAX_HOT_MESSAGES`] in production, small in tests that exercise the
+    /// archive without generating hundreds of messages.
+    hot_limit: usize,
 }
 
 impl<J: Journal> DurableSession<J> {
@@ -660,6 +701,7 @@ impl<J: Journal> DurableSession<J> {
             session,
             meta,
             journal,
+            hot_limit: MAX_HOT_MESSAGES,
         })
     }
 
@@ -685,6 +727,7 @@ impl<J: Journal> DurableSession<J> {
             session,
             meta,
             journal,
+            hot_limit: MAX_HOT_MESSAGES,
         })
     }
 
@@ -701,6 +744,7 @@ impl<J: Journal> DurableSession<J> {
             session,
             meta: blob.meta,
             journal,
+            hot_limit: MAX_HOT_MESSAGES,
         };
         let mut changed = false;
         for rec in this.meta.secrets.values_mut() {
@@ -1564,7 +1608,9 @@ impl<J: Journal> DurableSession<J> {
         crate::secret::TOMBSTONE_TEXT
     }
 
-    /// Inbound decrypted + outbound, in order.
+    /// The HOT window: the most recent messages (up to the spill threshold), in order. Older
+    /// history lives in the archive — page it with [`Self::message_views_page`]. Everything the
+    /// UI renders live comes from here.
     pub fn messages(&self) -> &[Message] {
         &self.meta.messages
     }
@@ -1703,7 +1749,12 @@ impl<J: Journal> DurableSession<J> {
     pub fn clear_visible_history(&mut self) -> Result<(), DurableError> {
         let mut meta = self.meta.clone();
         meta.messages.clear();
-        self.commit(meta)
+        meta.archived_below_local_id = 0;
+        meta.archived_count = 0;
+        self.commit(meta)?;
+        // AFTER the counters land: a crash in between leaves stale records whose ids sit above
+        // the reset watermark — invisible, and harmlessly re-collapsed if ids recur.
+        self.journal.archive_clear()
     }
 
     pub fn epoch(&self) -> u64 {
@@ -1717,10 +1768,113 @@ impl<J: Journal> DurableSession<J> {
 
     /// Snapshots the MLS store together with `meta` in one atomic commit, adopting `meta` only on
     /// success. Per the recovery contract, a failure means the caller must discard and `open` again.
-    fn commit(&mut self, meta: Meta) -> Result<(), DurableError> {
+    fn commit(&mut self, mut meta: Meta) -> Result<(), DurableError> {
+        self.spill_history(&mut meta)?;
         commit_blob(&mut self.journal, &self.session, &meta)?;
         self.meta = meta;
         Ok(())
+    }
+
+    /// R-105: move the oldest hot messages into the append-only archive when the window
+    /// overflows, WRITE-AHEAD — archive records land (durably) before the blob commit that drops
+    /// them, so a crash between the two duplicates a record (collapsed on read via the
+    /// watermark + last-write-wins) and can never lose one.
+    ///
+    /// Only a CONTIGUOUS oldest prefix spills, so `archived_below_local_id` stays a true
+    /// watermark. A message still owed work stays hot and blocks the prefix behind it:
+    /// a disappearing message (the expiry scrub owns its deletion — the archive is immutable)
+    /// or an outbound not yet accepted by the relay (retry state must remain visible).
+    fn spill_history(&mut self, meta: &mut Meta) -> Result<(), DurableError> {
+        let mut spill = 0usize;
+        while meta.messages.len() - spill > self.hot_limit {
+            let m = &meta.messages[spill];
+            let sent = m
+                .outbox_local_id
+                .map(|id| {
+                    meta.outbox
+                        .get(&id)
+                        .map(|o| o.status == OutboundStatus::Sent)
+                        .unwrap_or(true)
+                })
+                .unwrap_or(true);
+            if m.expires_at_ms.is_some() || !sent {
+                break;
+            }
+            spill += 1;
+        }
+        if spill == 0 {
+            return Ok(());
+        }
+        for m in &meta.messages[..spill] {
+            let record = serde_json::to_vec(m).map_err(|_| DurableError::Codec)?;
+            self.journal.archive_append(&record)?;
+        }
+        let last_id = meta.messages[spill - 1].local_id;
+        for m in meta.messages.drain(..spill) {
+            // A spilled outbound's delivery is settled; its cached ciphertext (the other
+            // whole-blob growth vector) goes with it.
+            if let Some(oid) = m.outbox_local_id {
+                meta.outbox.remove(&oid);
+            }
+        }
+        meta.archived_below_local_id = last_id + 1;
+        meta.archived_count += spill as u64;
+        Ok(())
+    }
+
+    /// Archived history, oldest first, decoded and deduplicated (see [`Journal::archive_load`]).
+    /// Loads the whole archive: callers page rarely (scrollback past the hot window, search) and
+    /// the hot path never comes here.
+    fn archived_messages(&self) -> Result<Vec<Message>, DurableError> {
+        let records = self.journal.archive_load()?;
+        let mut by_id: std::collections::BTreeMap<u64, Message> = std::collections::BTreeMap::new();
+        for record in records {
+            let m: Message = serde_json::from_slice(&record).map_err(|_| DurableError::Codec)?;
+            // Records at/above the watermark are crash leftovers whose message is still hot.
+            if m.local_id < self.meta.archived_below_local_id {
+                by_id.insert(m.local_id, m);
+            }
+        }
+        Ok(by_id.into_values().collect())
+    }
+
+    /// Total history: archive + hot window.
+    pub fn total_message_count(&self) -> u64 {
+        self.meta.archived_count + self.meta.messages.len() as u64
+    }
+
+    /// One page of the FULL history (archive + hot), oldest first. Offsets inside the hot window
+    /// never touch the archive — the common path (rendering recent messages) stays cheap.
+    pub fn message_views_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<MessageView>, DurableError> {
+        let archived = self.meta.archived_count as usize;
+        if offset >= archived {
+            let hot = &self.meta.messages;
+            let start = (offset - archived).min(hot.len());
+            let end = start.saturating_add(limit).min(hot.len());
+            return Ok(hot[start..end].iter().map(|m| self.view(m)).collect());
+        }
+        let mut out: Vec<MessageView> = self
+            .archived_messages()?
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|m| self.view(m))
+            .collect();
+        if out.len() < limit {
+            let want = limit - out.len();
+            out.extend(self.meta.messages.iter().take(want).map(|m| self.view(m)));
+        }
+        Ok(out)
+    }
+
+    /// Test hook: exercise the spill without generating [`MAX_HOT_MESSAGES`] messages.
+    #[doc(hidden)]
+    pub fn set_hot_limit(&mut self, limit: usize) {
+        self.hot_limit = limit.max(1);
     }
 }
 
@@ -1981,6 +2135,7 @@ fn commit_blob<J: Journal>(
 
 #[derive(Default)]
 struct JournalInner {
+    archive: Vec<Vec<u8>>,
     blob: Option<Vec<u8>>,
     fail_next: bool,
     panic_next: bool,
@@ -2031,6 +2186,23 @@ impl Journal for InMemoryJournal {
         let g = self.inner.lock().map_err(|_| DurableError::Journal)?;
         Ok(g.blob.clone())
     }
+
+    fn archive_append(&mut self, record: &[u8]) -> Result<(), DurableError> {
+        let mut g = self.inner.lock().map_err(|_| DurableError::Journal)?;
+        g.archive.push(record.to_vec());
+        Ok(())
+    }
+
+    fn archive_load(&self) -> Result<Vec<Vec<u8>>, DurableError> {
+        let g = self.inner.lock().map_err(|_| DurableError::Journal)?;
+        Ok(g.archive.clone())
+    }
+
+    fn archive_clear(&mut self) -> Result<(), DurableError> {
+        let mut g = self.inner.lock().map_err(|_| DurableError::Journal)?;
+        g.archive.clear();
+        Ok(())
+    }
 }
 
 // --------------------------------------------------------------------------------------------
@@ -2066,6 +2238,16 @@ impl FileJournal {
         let mut p = self.path.clone();
         let mut name = p.file_name().map(|n| n.to_os_string()).unwrap_or_default();
         name.push(".tmp");
+        p.set_file_name(name);
+        p
+    }
+}
+
+impl FileJournal {
+    fn archive_path(&self) -> PathBuf {
+        let mut p = self.path.clone();
+        let mut name = p.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+        name.push(".archive");
         p.set_file_name(name);
         p
     }
@@ -2112,6 +2294,63 @@ impl Journal for FileJournal {
             .map_err(|_| DurableError::Journal)?; // fails closed on tamper / wrong key
         Ok(Some(plaintext))
     }
+
+    /// R-105 archive: an append-only sibling file (`<blob>.archive`) of records, each
+    /// `u32-BE(len) || nonce(12) || AES-256-GCM ciphertext` under the SAME at-rest key. Appended
+    /// with fsync before the blob commit that relies on it (write-ahead).
+    fn archive_append(&mut self, record: &[u8]) -> Result<(), DurableError> {
+        let mut nonce_bytes = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce_bytes);
+        let ciphertext = self
+            .cipher
+            .encrypt(&nonce_bytes.into(), record)
+            .map_err(|_| DurableError::Journal)?;
+        let mut out = Vec::with_capacity(4 + 12 + ciphertext.len());
+        out.extend_from_slice(&((12 + ciphertext.len()) as u32).to_be_bytes());
+        out.extend_from_slice(&nonce_bytes);
+        out.extend_from_slice(&ciphertext);
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.archive_path())
+            .map_err(|_| DurableError::Journal)?;
+        f.write_all(&out).map_err(|_| DurableError::Journal)?;
+        f.sync_all().map_err(|_| DurableError::Journal)?;
+        Ok(())
+    }
+
+    fn archive_load(&self) -> Result<Vec<Vec<u8>>, DurableError> {
+        let data = match std::fs::read(self.archive_path()) {
+            Ok(d) => d,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(_) => return Err(DurableError::Journal),
+        };
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while at + 4 <= data.len() {
+            let len = u32::from_be_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+            let end = at + 4 + len;
+            if len < 12 || end > data.len() {
+                break; // a torn tail from a crash mid-append: everything before it is intact
+            }
+            let nonce: [u8; 12] = data[at + 4..at + 16].try_into().unwrap();
+            let plaintext = self
+                .cipher
+                .decrypt(&nonce.into(), &data[at + 16..end])
+                .map_err(|_| DurableError::Journal)?; // tamper of a COMPLETE record fails closed
+            out.push(plaintext);
+            at = end;
+        }
+        Ok(out)
+    }
+
+    fn archive_clear(&mut self) -> Result<(), DurableError> {
+        match std::fs::remove_file(self.archive_path()) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(DurableError::Journal),
+        }
+    }
 }
 
 // A `uniffi::Object` cannot be generic, but `DurableSession<J>` is — so the FFI wraps
@@ -2129,6 +2368,27 @@ impl Journal for JournalKind {
         match self {
             JournalKind::File(j) => j.commit(blob),
             JournalKind::Memory(j) => j.commit(blob),
+        }
+    }
+
+    fn archive_append(&mut self, record: &[u8]) -> Result<(), DurableError> {
+        match self {
+            JournalKind::File(j) => j.archive_append(record),
+            JournalKind::Memory(j) => j.archive_append(record),
+        }
+    }
+
+    fn archive_load(&self) -> Result<Vec<Vec<u8>>, DurableError> {
+        match self {
+            JournalKind::File(j) => j.archive_load(),
+            JournalKind::Memory(j) => j.archive_load(),
+        }
+    }
+
+    fn archive_clear(&mut self) -> Result<(), DurableError> {
+        match self {
+            JournalKind::File(j) => j.archive_clear(),
+            JournalKind::Memory(j) => j.archive_clear(),
         }
     }
 
