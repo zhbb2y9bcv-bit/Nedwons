@@ -27,8 +27,7 @@ let package = Package(
         .target(
             name: "NedwonsPush",
             dependencies: [
-                .product(name: "NedwonsKit",
-    defaultLocalization: "en", package: "NedwonsKit"),
+                .product(name: "NedwonsKit", package: "NedwonsKit"),
                 .product(name: "MlsFfi", package: "NedwonsMLS"),
             ]),
         .target(
