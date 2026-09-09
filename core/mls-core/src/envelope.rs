@@ -101,11 +101,7 @@ mod tests {
         let short = wrap(&[1u8; 10]);
         let alsoshort = wrap(&[2u8; 200]);
         assert_eq!(short.len(), alsoshort.len());
-        assert_ne!(
-            short.len(),
-            wrap(&[3u8; 3000]).len(),
-            "different bucket"
-        );
+        assert_ne!(short.len(), wrap(&[3u8; 3000]).len(), "different bucket");
     }
 
     /// Pre-upgrade queued mail (v1, unpadded) still unwraps.
