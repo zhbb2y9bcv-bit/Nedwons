@@ -47,6 +47,28 @@ Every mutating call commits one encrypted blob (MLS store snapshot + message/que
 the single `DurableSession`/`Journal` authority **before returning**. On `Err`, the caller discards
 the object and `open()`s again (reloads the last durable state).
 
+### What the app layer builds on top (2026-09-09)
+
+Three additions made the shipped app's pipeline (`NedwonsAppKit/ConversationCoordinator`) real:
+
+- **`unsent_local_ids()`** — the outbox status (`Queued`/`Encrypted`/`Sent`) was durable but never
+  exposed, so a relaunch could not find an interrupted upload. Now it replays them: `encrypt`
+  returns the cached ciphertext, the upload uses an idempotency key derived from
+  (conversation, local id), `mark_sent` closes it — delivered exactly once.
+- **Durable pending identities** (`mls_core::durable::PendingIdentity`) — a joiner used to live only
+  in memory ("if the process dies before joining, request a fresh key package"), which meant a
+  group created for you while the app was closed was unjoinable. A joiner is now committed on
+  creation and after every `key_package()`, `open()` returns it still Pending (`is_pending()`), and
+  `join_group` overwrites the blob with the Active session. The app keeps a *lobby* of such
+  identities, one per outstanding prekey, and tries a Welcome against each.
+- **`add_member`'s commit is a versioned app envelope** (as `add_self_device`'s already was) so the
+  members already in a group apply it through `process_inbound` → `StateAdvanced`. Before this the
+  raw commit was refused by that path and no group beyond two people could decrypt for its earlier
+  members. Proven in `core/mls-ffi/tests/client.rs::group_growth_commit_reaches_earlier_members…`.
+
+Bootstrap shape the coordinator uses: Welcome → the newcomer (targeted); that add's commit →
+every member already in (targeted, so the newcomer never sees a commit for the epoch it joined at).
+
 ## Lifetime & safety model
 
 - Swift owns an `Arc<MlsClient>` (UniFFI object) — **no shared `u64` handle registry**, so stale /

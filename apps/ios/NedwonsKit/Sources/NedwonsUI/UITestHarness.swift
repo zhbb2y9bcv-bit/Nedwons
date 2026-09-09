@@ -46,31 +46,7 @@
         }
     }
 
-    /// An in-memory `SecretStore`, so the harness never touches the device Keychain.
-    public final class InMemorySecretStore: SecretStore, @unchecked Sendable {
-        private var items: [String: Data] = [:]
-        private let lock = NSLock()
-
-        public init() {}
-
-        public func save(_ data: Data, account: String, accessible: CFString) throws {
-            lock.lock()
-            defer { lock.unlock() }
-            items[account] = data
-        }
-
-        public func load(account: String) throws -> Data? {
-            lock.lock()
-            defer { lock.unlock() }
-            return items[account]
-        }
-
-        public func delete(account: String) throws {
-            lock.lock()
-            defer { lock.unlock() }
-            items.removeValue(forKey: account)
-        }
-    }
+    // The harness never touches the device Keychain: it uses `NedwonsKit.InMemorySecretStore`.
 
     /// The fixture's mutable world: one account ("me") in one group with three others. Thread-safe;
     /// `URLProtocol` calls arrive on a background queue.

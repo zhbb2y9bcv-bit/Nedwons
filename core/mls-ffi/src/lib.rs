@@ -24,9 +24,10 @@ use mls_core::client::{
 use mls_core::content::{HistoryEntry as CoreHistoryEntry, SECRET_ID_LEN};
 use mls_core::durable::{
     Direction as CoreDirection, DurableError, DurableSession, FileJournal, InMemoryJournal,
-    InboundOutcome, JournalKind, Message as CoreMessage, BLOB_FORMAT_VERSION,
+    InboundOutcome, JournalKind, Message as CoreMessage, PendingIdentity, PendingJoinError,
+    BLOB_FORMAT_VERSION,
 };
-use mls_core::{Member, MlsError, CIPHERSUITE_NAME, VERSION as CORE_VERSION};
+use mls_core::{MlsError, CIPHERSUITE_NAME, VERSION as CORE_VERSION};
 
 /// Bounds per-call FFI marshalling.
 pub const MAX_PAGE_MESSAGES: u32 = 256;
@@ -163,8 +164,7 @@ enum ClientState {
     // Boxed: both carry heap-heavy MLS payloads next to the zero-size `Closed`
     // (clippy::large_enum_variant).
     Pending {
-        member: Box<Member>,
-        journal: JournalKind,
+        pending: Box<PendingIdentity<JournalKind>>,
     },
     Active {
         session: Box<DurableSession<JournalKind>>,
@@ -200,8 +200,9 @@ impl MlsClient {
     }
 
     /// Create a fresh identity that will JOIN an existing group. Call `key_package()` to publish a
-    /// prekey, then `join_group(welcome)` once added. The pending identity is not yet durable — if
-    /// the process dies before joining, request a fresh key package.
+    /// prekey, then `join_group(welcome)` once added. The pending identity IS durable: `open` on
+    /// the same path after a relaunch returns it still Pending, and every prekey it published
+    /// stays redeemable.
     #[uniffi::constructor]
     pub fn new_joiner(
         identity: Vec<u8>,
@@ -211,38 +212,61 @@ impl MlsClient {
         catch(move || {
             bound(identity.len(), MAX_IDENTITY_LEN)?;
             let journal = file_journal(&db_path, &at_rest_key)?;
-            let member = Member::new(&identity).map_err(map_mls_local)?;
+            let pending = PendingIdentity::create(&identity, journal).map_err(map_durable)?;
             Ok(Arc::new(Self {
                 inner: Mutex::new(ClientState::Pending {
-                    member: Box::new(member),
-                    journal,
+                    pending: Box::new(pending),
                 }),
             }))
         })
     }
 
-    /// Reopen the last durably-committed session (relaunch / crash recovery).
+    /// Reopen the last durably-committed state (relaunch / crash recovery): an Active session, or
+    /// a still-Pending joiner whose published prekeys remain redeemable.
     #[uniffi::constructor]
     pub fn open(db_path: String, at_rest_key: Vec<u8>) -> Result<Arc<Self>, MlsClientError> {
         catch(move || {
             let journal = file_journal(&db_path, &at_rest_key)?;
-            let session = DurableSession::open(journal).map_err(map_durable)?;
-            Ok(Arc::new(Self {
-                inner: Mutex::new(ClientState::Active {
-                    session: Box::new(session),
-                }),
-            }))
+            match DurableSession::open(journal) {
+                Ok(session) => Ok(Arc::new(Self {
+                    inner: Mutex::new(ClientState::Active {
+                        session: Box::new(session),
+                    }),
+                })),
+                // Not an Active blob: a Pending one decodes here. Any other failure is reported
+                // as the ACTIVE loader saw it, so a corrupt session is never mislabelled.
+                Err(DurableError::Codec) => {
+                    let journal = file_journal(&db_path, &at_rest_key)?;
+                    let pending = PendingIdentity::open(journal).map_err(map_durable)?;
+                    Ok(Arc::new(Self {
+                        inner: Mutex::new(ClientState::Pending {
+                            pending: Box::new(pending),
+                        }),
+                    }))
+                }
+                Err(e) => Err(map_durable(e)),
+            }
+        })
+    }
+
+    /// Whether this client is still a joiner awaiting its Welcome (no conversation yet).
+    pub fn is_pending(&self) -> Result<bool, MlsClientError> {
+        catch(move || {
+            let g = self.lock()?;
+            match &*g {
+                ClientState::Pending { .. } => Ok(true),
+                ClientState::Active { .. } => Ok(false),
+                ClientState::Closed => Err(MlsClientError::Closed),
+            }
         })
     }
 
     /// A one-time prekey to publish so others can add this client.
     pub fn key_package(&self) -> Result<Vec<u8>, MlsClientError> {
         catch(move || {
-            let g = self.lock()?;
-            match &*g {
-                ClientState::Pending { member, .. } => {
-                    member.key_package_bytes().map_err(map_mls_local)
-                }
+            let mut g = self.lock()?;
+            match &mut *g {
+                ClientState::Pending { pending } => pending.key_package().map_err(map_durable),
                 ClientState::Active { session } => session.key_package().map_err(map_durable),
                 ClientState::Closed => Err(MlsClientError::Closed),
             }
@@ -255,27 +279,22 @@ impl MlsClient {
             bound(welcome.len(), MAX_WELCOME_LEN)?;
             let mut g = self.lock()?;
             match std::mem::replace(&mut *g, ClientState::Closed) {
-                ClientState::Pending { member, journal } => {
-                    match member.join_from_welcome(&welcome) {
-                        Ok(conversation) => {
-                            match DurableSession::adopt(*member, conversation, journal) {
-                                Ok(session) => {
-                                    *g = ClientState::Active {
-                                        session: Box::new(session),
-                                    };
-                                    Ok(())
-                                }
-                                // First commit failed: nothing durable to recover, client is dead → Closed.
-                                Err(e) => Err(map_durable(e)),
-                            }
-                        }
-                        Err(e) => {
-                            // Restore so the caller can retry with a correct Welcome.
-                            *g = ClientState::Pending { member, journal };
-                            Err(map_mls_input(e))
-                        }
+                ClientState::Pending { pending } => match pending.join(&welcome) {
+                    Ok(session) => {
+                        *g = ClientState::Active {
+                            session: Box::new(session),
+                        };
+                        Ok(())
                     }
-                }
+                    // Restore so the caller can retry with a correct Welcome (or a different
+                    // lobby identity can try this one).
+                    Err(PendingJoinError::BadWelcome(pending, e)) => {
+                        *g = ClientState::Pending { pending };
+                        Err(map_mls_input(e))
+                    }
+                    // First commit failed: nothing durable to recover, client is dead → Closed.
+                    Err(PendingJoinError::Commit(e)) => Err(map_durable(e)),
+                },
                 ClientState::Active { session } => {
                     *g = ClientState::Active { session };
                     Err(MlsClientError::WrongState)
@@ -286,6 +305,11 @@ impl MlsClient {
     }
 
     /// The grown group is durable before returning.
+    ///
+    /// `commit` is a versioned app envelope (like `add_self_device`'s), so the members already in
+    /// the group apply it through `process_inbound` and advance to the new epoch. Before this
+    /// wrap the raw commit was refused by that path, which made every group beyond two people
+    /// undecryptable for its earlier members. `welcome` stays raw: `join_group` takes it directly.
     pub fn add_member(&self, key_package: Vec<u8>) -> Result<AddOutcome, MlsClientError> {
         catch(move || {
             bound(key_package.len(), MAX_KEY_PACKAGE_LEN)?;
@@ -294,7 +318,10 @@ impl MlsClient {
             let (commit, welcome) = session
                 .add_member(&key_package)
                 .map_err(map_durable_input)?;
-            Ok(AddOutcome { commit, welcome })
+            Ok(AddOutcome {
+                commit: mls_core::envelope::wrap(&commit),
+                welcome,
+            })
         })
     }
 
@@ -742,6 +769,19 @@ impl MlsClient {
         })
     }
 
+    /// Local ids of outbound messages the server has not accepted yet, oldest first — the upload
+    /// retry set after a relaunch. `encrypt` on one of these returns the cached ciphertext.
+    pub fn unsent_local_ids(&self) -> Result<Vec<u64>, MlsClientError> {
+        catch(move || {
+            let g = self.lock()?;
+            match &*g {
+                ClientState::Active { session } => Ok(session.unsent_outbound()),
+                ClientState::Pending { .. } => Err(MlsClientError::WrongState),
+                ClientState::Closed => Err(MlsClientError::Closed),
+            }
+        })
+    }
+
     /// Erase this device's visible message log when the user deletes the conversation. Protocol
     /// state (ratchet, replay watermark, outbox, secret records) is retained, so later messages
     /// still decrypt and a replayed secret still cannot be re-revealed. Local only — nothing is
@@ -959,13 +999,6 @@ fn map_durable_input(e: DurableError) -> MlsClientError {
         DurableError::Journal => MlsClientError::Journal,
         DurableError::SelfGroup => MlsClientError::WrongState,
         DurableError::Mls | DurableError::Codec => MlsClientError::InvalidMessage,
-    }
-}
-
-fn map_mls_local(e: MlsError) -> MlsClientError {
-    match e {
-        MlsError::MemberNotFound => MlsClientError::NotFound,
-        MlsError::Codec | MlsError::Lib(_) | MlsError::ManifestMismatch => MlsClientError::Internal,
     }
 }
 

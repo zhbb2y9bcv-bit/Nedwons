@@ -282,3 +282,93 @@ fn process_inbound_rejects_an_unknown_envelope_version() {
         InboundResult::Application { .. }
     );
 }
+
+/// `unsent_local_ids` is the relaunch retry set: queued/encrypted until `mark_sent`, and a retry
+/// `encrypt` replays the cached ciphertext rather than advancing the ratchet again.
+#[test]
+fn unsent_local_ids_follow_the_upload_lifecycle() {
+    let path = tmp("unsent");
+    let alice = MlsClient::create_group(b"alice".to_vec(), path.clone(), key()).expect("create");
+    assert!(alice.unsent_local_ids().expect("unsent").is_empty());
+    let a = alice.enqueue(b"a".to_vec()).expect("enqueue");
+    let b = alice.enqueue(b"b".to_vec()).expect("enqueue");
+    let bytes = alice.encrypt(b).expect("encrypt");
+    assert_eq!(alice.unsent_local_ids().expect("unsent"), vec![a, b]);
+    alice.close();
+
+    let reopened = MlsClient::open(path, key()).expect("reopen");
+    assert_eq!(reopened.unsent_local_ids().expect("unsent"), vec![a, b]);
+    assert_eq!(reopened.encrypt(b).expect("retry"), bytes);
+    reopened.mark_sent(b).expect("mark sent");
+    assert_eq!(reopened.unsent_local_ids().expect("unsent"), vec![a]);
+}
+
+/// Across the FFI: a joiner created, its prekey published, the process "dies", the identity is
+/// reopened from disk still Pending, and the Welcome made for that prekey joins it.
+#[test]
+fn pending_joiner_survives_relaunch_and_joins() {
+    let bob_path = tmp("pending-bob");
+    let bob = MlsClient::new_joiner(b"bob".to_vec(), bob_path.clone(), key()).expect("joiner");
+    assert!(bob.is_pending().expect("pending"));
+    let kp = bob.key_package().expect("kp");
+    bob.close();
+
+    let alice =
+        MlsClient::create_group(b"alice".to_vec(), tmp("pending-alice"), key()).expect("alice");
+    let add = alice.add_member(kp).expect("add");
+
+    let bob = MlsClient::open(bob_path, key()).expect("reopen pending");
+    assert!(bob.is_pending().expect("still pending after relaunch"));
+    bob.join_group(add.welcome).expect("join");
+    assert!(!bob.is_pending().expect("active"));
+
+    let id = alice.enqueue(b"hello bob".to_vec()).expect("enqueue");
+    let env = alice.encrypt(id).expect("encrypt");
+    assert!(matches!(
+        bob.process_inbound(1, env).expect("process"),
+        InboundResult::Application { plaintext } if plaintext == b"hello bob"
+    ));
+}
+
+/// A group grows past two: the member who joined first applies the later add's commit through the
+/// ordinary inbound path and every pair can then decrypt each other — the shape the app's
+/// bootstrap relies on (Welcome to the newcomer, commit to everyone already in).
+#[test]
+fn group_growth_commit_reaches_earlier_members_through_process_inbound() {
+    let alice = MlsClient::create_group(b"alice".to_vec(), tmp("g-alice"), key()).expect("alice");
+    let bob = MlsClient::new_joiner(b"bob".to_vec(), tmp("g-bob"), key()).expect("bob");
+    let carol = MlsClient::new_joiner(b"carol".to_vec(), tmp("g-carol"), key()).expect("carol");
+    let add_bob = alice
+        .add_member(bob.key_package().expect("kp"))
+        .expect("add bob");
+    bob.join_group(add_bob.welcome).expect("bob joins");
+    let add_carol = alice
+        .add_member(carol.key_package().expect("kp"))
+        .expect("add carol");
+    assert!(matches!(
+        bob.process_inbound(1, add_carol.commit)
+            .expect("bob applies the commit"),
+        InboundResult::StateAdvanced
+    ));
+    carol.join_group(add_carol.welcome).expect("carol joins");
+
+    let say = |from: &MlsClient, text: &[u8]| {
+        let id = from.enqueue(text.to_vec()).expect("enqueue");
+        let env = from.encrypt(id).expect("encrypt");
+        from.mark_sent(id).expect("sent");
+        env
+    };
+    let hear = |to: &MlsClient, id: u64, env: Vec<u8>| match to.process_inbound(id, env) {
+        Ok(InboundResult::Application { plaintext }) => plaintext,
+        other => panic!("expected application, got {other:?}"),
+    };
+    let from_carol = say(&carol, b"hello all");
+    assert_eq!(hear(&alice, 2, from_carol.clone()), b"hello all");
+    assert_eq!(hear(&bob, 3, from_carol), b"hello all");
+    let from_bob = say(&bob, b"hey");
+    assert_eq!(hear(&alice, 4, from_bob.clone()), b"hey");
+    assert_eq!(hear(&carol, 5, from_bob), b"hey");
+    let from_alice = say(&alice, b"welcome both");
+    assert_eq!(hear(&bob, 6, from_alice.clone()), b"welcome both");
+    assert_eq!(hear(&carol, 7, from_alice), b"welcome both");
+}

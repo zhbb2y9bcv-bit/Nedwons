@@ -254,3 +254,67 @@ fn clear_visible_history_keeps_replay_protection() {
     let bob = DurableSession::open(jb).expect("reopen");
     assert!(bob.messages().is_empty());
 }
+
+/// The retry set: a queued or encrypted message is "unsent" until `mark_sent`, and it survives a
+/// reopen — which is what lets a relaunch resume an interrupted upload with the SAME ciphertext.
+#[test]
+fn unsent_outbound_tracks_the_upload_lifecycle_across_reopen() {
+    let (mut alice, ja, _bob, _jb) = pair();
+    assert!(alice.unsent_outbound().is_empty());
+
+    let queued = alice.enqueue(b"one").expect("enqueue");
+    let encrypted = alice.enqueue(b"two").expect("enqueue");
+    let sent = alice.enqueue(b"three").expect("enqueue");
+    let bytes = alice.encrypt(encrypted).expect("encrypt");
+    let sent_bytes = alice.encrypt(sent).expect("encrypt");
+    alice.mark_sent(sent).expect("mark sent");
+    assert_eq!(alice.unsent_outbound(), vec![queued, encrypted]);
+
+    // Reopen: the set is durable, and the encrypted entry replays byte-identically.
+    drop(alice);
+    let mut reopened = DurableSession::open(ja).expect("reopen alice");
+    assert_eq!(reopened.unsent_outbound(), vec![queued, encrypted]);
+    assert_eq!(reopened.encrypt(encrypted).expect("retry"), bytes);
+    assert_ne!(bytes, sent_bytes);
+    reopened.mark_sent(encrypted).expect("mark sent");
+    assert_eq!(reopened.unsent_outbound(), vec![queued]);
+}
+
+/// A joiner's prekeys must survive a relaunch: the common case is a group created for you while
+/// the app is closed. The pending blob is committed on creation and after every key package.
+#[test]
+fn pending_identity_redeems_a_prekey_after_reopen() {
+    use mls_core::durable::{PendingIdentity, PendingJoinError};
+    let jb = InMemoryJournal::new();
+    let mut bob = PendingIdentity::create(b"bob-device", jb.clone()).expect("create pending");
+    let kp = bob.key_package().expect("key package");
+    drop(bob);
+
+    // Alice adds Bob with the prekey while Bob's process is "dead".
+    let alice = Member::new(b"alice-device").expect("alice");
+    let mut alice_group = alice.create_group().expect("group");
+    let add = alice_group.add_member(&alice, &kp).expect("add bob");
+
+    // Bob relaunches from the journal — still pending, still holding the private key — and joins.
+    let bob = PendingIdentity::open(jb.clone()).expect("reopen pending");
+    assert_eq!(bob.identity(), b"bob-device");
+    // A Welcome for someone else is refused and hands the identity back intact.
+    let stranger = Member::new(b"stranger").expect("stranger");
+    let stranger_kp = stranger.key_package_bytes().expect("kp");
+    let other = alice_group
+        .add_member(&alice, &stranger_kp)
+        .expect("add stranger");
+    let bob = match bob.join(&other.welcome) {
+        Err(PendingJoinError::BadWelcome(bob, _)) => *bob,
+        _ => panic!("a Welcome for another identity must be refused"),
+    };
+    let bob_session = bob.join(&add.welcome).expect("join with the right welcome");
+    drop(bob_session);
+
+    // The blob is now an Active session: the pending loader refuses it, the session loader works.
+    assert!(matches!(
+        PendingIdentity::open(jb.clone()),
+        Err(mls_core::durable::DurableError::Codec)
+    ));
+    DurableSession::open(jb).expect("active session persisted");
+}
