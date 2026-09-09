@@ -348,3 +348,20 @@ final class ChatPrefsTests: XCTestCase {
         XCTAssertEqual(model.chatPrefs, ChatPrefs())
     }
 }
+
+/// Diagnostics are OFF by default and the toggle persists (arc K).
+@MainActor
+final class DiagnosticsPrefTests: XCTestCase {
+    func testOffByDefaultAndTogglePersists() {
+        let suite = "diag-test-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        let client = NedwonsClient(baseURL: URL(string: "http://127.0.0.1:1")!)
+        let reporter = DiagnosticsReporter(client: client, defaults: defaults)
+        XCTAssertFalse(reporter.enabled, "opt-IN means off until the user says otherwise")
+        reporter.setEnabled(true)
+        XCTAssertTrue(DiagnosticsReporter(client: client, defaults: defaults).enabled)
+        reporter.setEnabled(false)
+        XCTAssertFalse(DiagnosticsReporter(client: client, defaults: defaults).enabled)
+        defaults.removePersistentDomain(forName: suite)
+    }
+}

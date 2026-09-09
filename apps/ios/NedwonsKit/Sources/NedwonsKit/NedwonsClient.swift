@@ -972,6 +972,16 @@ public extension NedwonsClient {
         return try decode(await perform(request))
     }
 
+    /// Submit an opt-in diagnostic payload (unauthenticated by design — see DiagnosticsReporter).
+    func submitDiagnostics(_ payload: String) async throws {
+        struct Body: Encodable { let payload: String }
+        var request = URLRequest(url: baseURL.appendingPathComponent("/v1/diagnostics"))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(Body(payload: payload))
+        _ = try await perform(request)
+    }
+
     /// Pre-registration availability check (unauthenticated; the account doesn't exist yet).
     func usernameAvailable(_ candidate: String) async throws -> Bool {
         struct Res: Decodable { let available: Bool }

@@ -646,3 +646,26 @@ async fn username_availability_answers_before_registration() {
     assert_eq!(invalid["available"], false);
     assert_eq!(invalid["reason"], "invalid");
 }
+
+/// Opt-in diagnostics land unauthenticated, bounded, with no account linkage.
+#[tokio::test]
+async fn diagnostics_are_stored_bounded_and_anonymous() {
+    let app = common::make_app(100_000).await;
+    let (status, _) = common::post_json(
+        &app,
+        "/v1/diagnostics",
+        json!({ "payload": "{\"crash\":\"stack\"}" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "no auth header required");
+
+    let (status, _) = common::post_json(&app, "/v1/diagnostics", json!({ "payload": "" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = common::post_json(
+        &app,
+        "/v1/diagnostics",
+        json!({ "payload": "x".repeat(300 * 1024) }),
+    )
+    .await;
+    assert_ne!(status, StatusCode::NO_CONTENT, "over-cap refused");
+}

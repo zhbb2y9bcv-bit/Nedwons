@@ -663,6 +663,26 @@ impl PgRelay {
             .is_some())
     }
 
+    /// Store one opt-in diagnostic payload (crash/hang report). No account linkage, on purpose.
+    pub fn store_diagnostic(&self, payload: &str) -> StoreResult<()> {
+        let mut conn = self.conn()?;
+        conn.execute("INSERT INTO diagnostics (payload) VALUES ($1)", &[&payload])
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Sweep diagnostics past the retention TTL (they are debugging aids, not records).
+    pub fn purge_stale_diagnostics(&self, ttl: std::time::Duration) -> StoreResult<u64> {
+        let mut conn = self.conn()?;
+        let n = conn
+            .execute(
+                "DELETE FROM diagnostics WHERE created_at < now() - make_interval(secs => $1)",
+                &[&ttl.as_secs_f64()],
+            )
+            .map_err(db_err)?;
+        Ok(n)
+    }
+
     /// The shared pool. Every store is built from it, so cross-store work can run in ONE
     /// transaction via [`crate::tx::transaction`].
     pub fn pool_clone(&self) -> PgPool {

@@ -298,10 +298,20 @@ async fn serve(
                         .purge_expired_key_packages(nedwons_api::relay::KEY_PACKAGE_TTL_SECS)?;
                     // Abuse-quota windows that can no longer be current (R-306).
                     let counters = quotas.purge_expired(now as i64, 86_400)?;
+                    // Opt-in diagnostics are debugging aids, not records: 30-day sweep.
+                    let diags = relay.purge_stale_diagnostics(std::time::Duration::from_secs(
+                        30 * 24 * 60 * 60,
+                    ))?;
                     // Capacity gauges are sampled on the same tick (queue depth, pool usage).
                     relay.sample_capacity_gauges();
                     Ok::<u64, auth_core::store::StoreError>(
-                        auth + mail + sealed + self_group + prekeys + counters + attachments,
+                        auth + mail
+                            + sealed
+                            + self_group
+                            + prekeys
+                            + counters
+                            + attachments
+                            + diags,
                     )
                 })
                 .await;
