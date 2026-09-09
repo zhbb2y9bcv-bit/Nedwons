@@ -1,0 +1,58 @@
+# Supply-chain policy for every Rust workspace (`cargo deny check`).
+#
+# Two questions this answers that `cargo audit` does not:
+#
+#   * LICENCES. An App Store binary that links a copyleft dependency creates an obligation the
+#     project has not agreed to. Advisories say nothing about this, so it needs its own gate, and
+#     an allow-list is the only version that fails closed: a dependency arriving under an unlisted
+#     licence stops the build rather than being absorbed silently.
+#   * SOURCES. Dependencies must come from crates.io. A git dependency — however convenient — is a
+#     mutable reference to somebody's branch, and a `[patch]` or path override slipping into a
+#     lockfile is exactly how a supply-chain substitution goes unnoticed.
+#
+# Advisories stay with `cargo audit` (already wired into CI with per-ID exceptions documented in
+# docs/SECURITY_AUDIT_EXCEPTIONS.md); duplicating them here would mean two lists to keep in step.
+
+[graph]
+all-features = false
+
+[licenses]
+# Permissive only. Everything here allows static linking into a closed-source binary without
+# imposing source-disclosure obligations on the app.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "Unlicense",
+    "MPL-2.0",           # file-level copyleft: fine to link, obligations attach per-file if modified
+    "OpenSSL",
+    "BSL-1.0",
+    # `webpki-roots` ships Mozilla's CA root bundle under the Community Data License Agreement.
+    # It licenses DATA (the certificate set), not code, and is permissive: it imposes no
+    # source-disclosure obligation on a binary that embeds it. Allowed deliberately rather than by
+    # widening the list to "anything permissive-looking".
+    "CDLA-Permissive-2.0",
+]
+# A crate whose licence cannot be determined must be looked at by a person, not defaulted.
+unused-allowed-license = "allow"
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"   # duplicates bloat the binary; not worth failing a build over
+wildcards = "deny"           # `*` version requirements make the lockfile the only spec
+# ...except for this repo's own crates. A `{ path = ... }` dependency has no version requirement,
+# so cargo records it as `*`, but nothing is resolved from a registry and there is no substitution
+# to defend against. Registry wildcards remain denied, which is the case that actually matters.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

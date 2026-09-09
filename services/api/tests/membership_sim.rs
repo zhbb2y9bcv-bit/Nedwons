@@ -598,7 +598,7 @@ async fn governance_signature_and_idempotency_rules_hold() {
         &[add_bob.welcome],
     )
     .await;
-    assert_eq!(s, StatusCode::OK);
+    assert_eq!(s, StatusCode::OK, "unexpected status; body: {receipt}");
     assert_eq!(receipt["applied"], false);
     // ...and reusing its key for a DIFFERENT manifest conflicts.
     let (s, body) = post_commit(
