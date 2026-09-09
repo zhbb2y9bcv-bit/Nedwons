@@ -78,6 +78,20 @@ public final class AppComposition: ObservableObject {
             relay: NedwonsClient(baseURL: AppConfig.serverURL),
             storeDirectory: storeDirectory,
             keyProvider: { storeID in try keys.atRestKey(forStore: storeID) })
+        // Encrypted chat backups (docs/BACKUPS.md): sealing reads the live store files, which is
+        // safe alongside the coordinator (commits are atomic renames); RESTORE stops it first so
+        // no store is open while files land, and start() re-reads the index after.
+        let backups = BackupManager(storeDirectory: storeDirectory, keys: keys)
+        model.createBackupAction = { passphrase in
+            try backups.createBackup(passphrase: passphrase)
+        }
+        model.restoreBackupAction = { [weak model, weak coordinator] data, passphrase in
+            coordinator?.stop()
+            defer {
+                if model?.phase == .authenticated { coordinator?.start() }
+            }
+            return try backups.restoreBackup(data, passphrase: passphrase)
+        }
         // Aliases are encrypted at rest under their own derived key. If the Keychain is unusable
         // the feature is simply absent rather than falling back to plaintext.
         let aliasStore = (try? keys.atRestKey(forStore: "aliases")).map { key in
