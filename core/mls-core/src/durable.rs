@@ -245,6 +245,9 @@ pub enum InboundOutcome {
     GroupAvatarChanged {
         removed: bool,
     },
+    /// A cover-traffic decoy (R-204). Nothing was stored or shown; the caller still acks the
+    /// envelope so it leaves the queue. Indistinguishable from a real message to the relay.
+    Cover,
 }
 
 /// Travels in the committed blob alongside the MLS store snapshot.
@@ -1068,6 +1071,17 @@ impl<J: Journal> DurableSession<J> {
         self.enqueue_content(Content::Typing { active }, None)
     }
 
+    /// A cover-traffic decoy (R-204): a message that means nothing, sent so the wire shows activity
+    /// whether or not the user is really messaging. `padding` is caller-supplied random bytes; the
+    /// client varies its length so a decoy lands in the same envelope size bucket as a real message
+    /// (the two are then indistinguishable to the relay). Refused if it would exceed the body bound.
+    /// Like typing, it advances the ratchet and leaves no local message row.
+    pub fn enqueue_cover(&mut self, padding: Vec<u8>) -> Result<u64, DurableError> {
+        let content = Content::Cover { padding };
+        Content::decode(&content.encode()).map_err(map_content)?;
+        self.enqueue_content(content, None)
+    }
+
     /// The disappearing-message timer currently in force (seconds; 0 = off).
     pub fn disappear_after_secs(&self) -> u32 {
         self.meta.disappear_after_secs
@@ -1497,10 +1511,12 @@ impl<J: Journal> DurableSession<J> {
                 }
                 None
             }
-            // Control messages are not user-visible on the sender — no message-log entry.
+            // Control messages are not user-visible on the sender — no message-log entry. A cover
+            // decoy is the same: it means nothing here either, only on the wire.
             Content::SecretConsumed { .. }
             | Content::DeliveryKeyGrant { .. }
-            | Content::HistorySync { .. } => None,
+            | Content::HistorySync { .. }
+            | Content::Cover { .. } => None,
         };
         if let Some(display) = display {
             meta.messages.push(display);
@@ -2091,6 +2107,10 @@ fn apply_incoming(
                 // Never logged and never persisted beyond the dedup bookkeeping every envelope gets:
                 // a typing indicator is a hint, and a stale one is worse than none.
                 Content::Typing { active } => InboundOutcome::Typing { sender, active },
+                // A decoy. Discarded the instant it is recognised — the padding is meaningless and
+                // is never even looked at. Only the dedup/ack bookkeeping (shared by every envelope)
+                // runs, so it leaves the queue like anything else.
+                Content::Cover { .. } => InboundOutcome::Cover,
                 Content::Secret {
                     message_id,
                     secret_id,

@@ -67,6 +67,31 @@ fn two_clients_exchange_a_real_mls_message() {
 }
 
 #[test]
+fn cover_decoy_crosses_the_bridge_and_is_discarded() {
+    let (alice, bob) = two_party(&tmp("alice"), &tmp("bob"));
+
+    // A decoy encrypts and "sends" like any message…
+    let id = alice.send_cover(vec![7u8; 128]).unwrap();
+    let envelope = alice.encrypt(id).unwrap();
+    assert_eq!(alice.messages().unwrap().len(), 0, "no sender-side row");
+
+    // …but the recipient recognises it and stores nothing.
+    match bob.process_inbound(1, envelope).unwrap() {
+        InboundResult::Cover => {}
+        other => panic!("expected Cover, got {other:?}"),
+    }
+    assert_eq!(bob.messages().unwrap().len(), 0, "a decoy is never stored");
+
+    // Ratchet intact: a real message right after still decrypts.
+    let id2 = alice.enqueue(b"real".to_vec()).unwrap();
+    let env2 = alice.encrypt(id2).unwrap();
+    assert!(matches!(
+        bob.process_inbound(2, env2).unwrap(),
+        InboundResult::Application { .. }
+    ));
+}
+
+#[test]
 fn retry_encrypt_returns_same_ciphertext_and_does_not_advance() {
     let (alice, _bob) = two_party(&tmp("alice"), &tmp("bob"));
     let id = alice.enqueue(b"once".to_vec()).unwrap();

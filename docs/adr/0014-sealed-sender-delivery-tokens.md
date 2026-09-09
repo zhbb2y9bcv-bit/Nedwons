@@ -145,13 +145,22 @@ identified + sealed envelopes; sealed ones carry no sender field.
   app target):** distributing `K_r` to contacts over the E2EE channel, recipient-side block-drop
   after `verifySealedSender`, the block→rotate-and-redistribute policy, and the message-request
   fallback UX for non-holders.
-- **2d — padding / cover traffic** (size/timing) — **padding half LANDED 2026-09-09**: the
-  client envelope (`mls_core::envelope` v2) pads every message to a size bucket
-  (256B…64KB, then 64KB steps; zero padding outside the MLS ciphertext, stripped before MLS),
-  so the relay and traffic observers see bucketed lengths, not exact ones — "a thumbs-up" and
-  "a paragraph" measure identically. v1 (unpadded) stays readable for pre-upgrade queued mail;
-  writes are v2-only. Honest residual: timing/frequency are NOT hidden — cover traffic remains
-  the open half of 2d.
+- **2d — padding / cover traffic** (size/timing) — **BOTH halves now landed**:
+  - *padding* (2026-09-09): the client envelope (`mls_core::envelope` v2) pads every message to a
+    size bucket (256B…64KB, then 64KB steps; zero padding outside the MLS ciphertext, stripped
+    before MLS), so the relay and traffic observers see bucketed lengths, not exact ones — "a
+    thumbs-up" and "a paragraph" measure identically. v1 (unpadded) stays readable for pre-upgrade
+    queued mail; writes are v2-only.
+  - *cover traffic* (2026-09-09, opt-in): a `Content::Cover` decoy kind (14) — random padding,
+    stored/shown/receipted nowhere, decrypts to `InboundResult::Cover` and is discarded. When a
+    user turns on **Settings → Privacy → Cover traffic** (OFF by default), the coordinator sends a
+    decoy into a random unlocked conversation on a randomized 90–420 s cadence; the decoy's padding
+    length is drawn so it shares a size bucket with real chatter, making it indistinguishable to the
+    relay. **HONEST SCOPE:** this raises the cost of timing analysis for the sending device; it does
+    **not** defeat a global passive adversary (the cadence is coarse, not constant-rate), and it is
+    only as effective as its adoption. It also costs extra data/battery — the sender's *and* the
+    recipients' (a decoy fans out to a conversation like any message). A constant-rate mix would be
+    stronger and is deliberately not attempted here; the coarse opt-in trade is the honest middle.
 
 R-204 stays **OPEN/MITIGATING** until 2a–2c ship and a test demonstrates the relay stores **no**
 sender for a sealed message while a rotated DAK denies a revoked sender.
