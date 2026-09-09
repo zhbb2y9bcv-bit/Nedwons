@@ -145,9 +145,12 @@ fn challenge_consume_race_exactly_one_winner() {
 fn refresh_rotate_race_at_most_one_winner() {
     let (stores, _service) = setup();
 
+    // V22 added a foreign key from refresh_families to accounts, so the family must belong to a
+    // real account rather than an invented id.
+    let (account_id, device_id) = common::seed_account();
     let account = AccountDevice {
-        account_id: AccountId::random(),
-        device_id: DeviceId::random(),
+        account_id,
+        device_id,
     };
     // All hashes are randomized per run: the test database persists across runs (tests use
     // unique data instead of truncation), so fixed bytes would collide on the PK.
@@ -377,14 +380,14 @@ fn fanout_refuses_a_sender_removed_concurrently() {
 
     let relay = common::shared_relay();
     let conversation_id: [u8; 16] = DeviceId::random().as_bytes().try_into().expect("16 bytes");
-    let sender = DeviceId::random();
-    let recipient = DeviceId::random();
+    let (sender_account, sender) = common::seed_account();
+    let (recipient_account, recipient) = common::seed_account();
 
     relay
-        .create_conversation(conversation_id, AccountId::random(), sender, false)
+        .create_conversation(conversation_id, sender_account, sender, false)
         .expect("create conversation (seeds the sender as a member)");
     relay
-        .add_member(&conversation_id, AccountId::random(), recipient)
+        .add_member(&conversation_id, recipient_account, recipient)
         .expect("add a second member so a fanout has somewhere to go");
 
     // Hold the sender's membership row in an uncommitted DELETE on a separate connection.
@@ -456,8 +459,8 @@ fn block_and_friendship_never_coexist() {
     const TRIALS: usize = 40;
 
     for trial in 0..TRIALS {
-        let a = AccountId::random();
-        let b = AccountId::random();
+        let (a, _) = common::seed_account();
+        let (b, _) = common::seed_account();
 
         // B asks to be A's friend, leaving a pending request for A to accept.
         social
@@ -510,14 +513,14 @@ fn concurrent_demotes_never_leave_a_group_without_an_admin() {
 
     for trial in 0..TRIALS {
         let conversation_id: [u8; 16] = DeviceId::random().as_bytes().try_into().expect("16 bytes");
-        let a = AccountId::random();
-        let b = AccountId::random();
+        let (a, a_device) = common::seed_account();
+        let (b, b_device) = common::seed_account();
 
         relay
-            .create_conversation(conversation_id, a, DeviceId::random(), false)
+            .create_conversation(conversation_id, a, a_device, false)
             .expect("create");
         relay
-            .add_member(&conversation_id, b, DeviceId::random())
+            .add_member(&conversation_id, b, b_device)
             .expect("add b");
         groups
             .bootstrap_admin(&conversation_id, &a)
@@ -567,14 +570,14 @@ fn concurrent_leaves_leave_no_orphan_conversation() {
 
     for trial in 0..TRIALS {
         let conversation_id: [u8; 16] = DeviceId::random().as_bytes().try_into().expect("16 bytes");
-        let a = AccountId::random();
-        let b = AccountId::random();
+        let (a, a_device) = common::seed_account();
+        let (b, b_device) = common::seed_account();
 
         relay
-            .create_conversation(conversation_id, a, DeviceId::random(), false)
+            .create_conversation(conversation_id, a, a_device, false)
             .expect("create");
         relay
-            .add_member(&conversation_id, b, DeviceId::random())
+            .add_member(&conversation_id, b, b_device)
             .expect("add b");
 
         let barrier = Arc::new(std::sync::Barrier::new(2));
@@ -633,16 +636,10 @@ fn create_conversation_rolls_back_when_admin_bootstrap_fails() {
 
     let pool = common::shared_relay().pool_clone();
     let conversation_id: [u8; 16] = DeviceId::random().as_bytes().try_into().expect("16 bytes");
-    let creator = AccountId::random();
+    let (creator, creator_device) = common::seed_account();
 
     let result: auth_core::store::StoreResult<()> = nedwons_api::tx::transaction(&pool, |txn| {
-        PgRelay::create_conversation_in_txn(
-            txn,
-            conversation_id,
-            creator,
-            DeviceId::random(),
-            false,
-        )?;
+        PgRelay::create_conversation_in_txn(txn, conversation_id, creator, creator_device, false)?;
         Err(StoreError(
             "simulated failure before the admin is set".into(),
         ))
@@ -676,8 +673,9 @@ fn create_conversation_rolls_back_when_admin_bootstrap_fails() {
     // back: the OLD shape is still expressible through the self-committing public method, and it
     // demonstrably strands exactly the row the transactional path refuses to leave behind.
     let stranded: [u8; 16] = DeviceId::random().as_bytes().try_into().expect("16 bytes");
+    let (stranded_account, stranded_device) = common::seed_account();
     common::shared_relay()
-        .create_conversation(stranded, AccountId::random(), DeviceId::random(), false)
+        .create_conversation(stranded, stranded_account, stranded_device, false)
         .expect("create via the self-committing method");
     // ...a failure here (where bootstrap_admin would have run) ends the request.
     let stranded_rows: i64 = client
@@ -710,10 +708,10 @@ fn invite_use_is_not_burned_when_the_membership_write_fails() {
     let pool = relay.pool_clone();
 
     let conversation_id: [u8; 16] = DeviceId::random().as_bytes().try_into().expect("16 bytes");
-    let owner = AccountId::random();
-    let joiner = AccountId::random();
+    let (owner, owner_device) = common::seed_account();
+    let (joiner, _) = common::seed_account();
     relay
-        .create_conversation(conversation_id, owner, DeviceId::random(), false)
+        .create_conversation(conversation_id, owner, owner_device, false)
         .expect("create");
 
     let mut token = [0u8; 32];

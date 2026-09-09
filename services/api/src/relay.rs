@@ -858,7 +858,19 @@ impl PgRelay {
         token: &str,
     ) -> StoreResult<()> {
         let mut conn = self.conn()?;
-        conn.execute(
+        let mut txn = conn.transaction().map_err(db_err)?;
+        // A push token identifies ONE device. APNs really does reassign a token to a reinstalled
+        // app, and the previous owner's row would otherwise keep it: that device then receives
+        // wake pushes meant for the new one, leaking "this other account has mail" to whoever now
+        // holds the token. Registering therefore TRANSFERS ownership — the old claim is released
+        // first, which is also what keeps the `device_push_tokens_one_owner` index satisfied.
+        txn.execute(
+            "DELETE FROM device_push_tokens
+             WHERE platform = $2 AND token = $3 AND device_id <> $1",
+            &[&device.as_bytes(), &platform, &token],
+        )
+        .map_err(db_err)?;
+        txn.execute(
             "INSERT INTO device_push_tokens (device_id, platform, token, updated_at)
              VALUES ($1, $2, $3, now())
              ON CONFLICT (device_id, platform)
@@ -866,6 +878,7 @@ impl PgRelay {
             &[&device.as_bytes(), &platform, &token],
         )
         .map_err(db_err)?;
+        txn.commit().map_err(db_err)?;
         Ok(())
     }
 

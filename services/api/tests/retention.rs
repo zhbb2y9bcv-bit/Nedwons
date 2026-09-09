@@ -7,7 +7,8 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use common::{
-    befriend, db_url, http_register, make_app, post_json_auth, shared_relay, unique_username,
+    befriend, db_url, http_register, make_app, post_json_auth, seed_account, shared_relay,
+    unique_username,
 };
 use serde_json::json;
 
@@ -144,9 +145,13 @@ fn purge_drains_old_envelopes_in_bounded_batches() {
     let mut client = postgres::Client::connect(&db_url(), postgres::NoTls).expect("db");
 
     // A private conversation with three 40-day-old envelopes and one fresh envelope.
+    // V22 gave `envelopes.recipient_device` a foreign key, so these must be REAL devices; seeding
+    // per run also removes the fixed-id collisions the old "clean slate" delete worked around.
     let conv = [0xEEu8; 16];
-    let dev_a = [0xE1u8; 16];
-    let dev_b = [0xE2u8; 16];
+    let (_a_account, a_device) = seed_account();
+    let (_b_account, b_device) = seed_account();
+    let dev_a = a_device.0;
+    let dev_b = b_device.0;
     client
         .execute(
             "INSERT INTO conversations (conversation_id) VALUES ($1) ON CONFLICT DO NOTHING",
@@ -254,12 +259,11 @@ fn pool_connections_carry_statement_timeout() {
 /// MLS key-package hygiene: a stale (expired) prekey is never claimed or counted, and is purged.
 #[test]
 fn key_package_hygiene_expires_stale_prekeys() {
-    use auth_core::ids::{AccountId, DeviceId};
     let relay = shared_relay();
     let mut client = postgres::Client::connect(&db_url(), postgres::NoTls).expect("db");
 
-    let account = AccountId([0xC1u8; 16]);
-    let device = DeviceId([0xC2u8; 16]);
+    // V22 gave key_packages foreign keys to accounts and devices, so these must be real rows.
+    let (account, device) = seed_account();
     let acct = account.0;
     let dev = device.0;
     client

@@ -376,6 +376,51 @@ pub async fn post_json(app: &Router, path: &str, body: Value) -> (StatusCode, Va
 }
 
 /// Authenticated POST/GET with a Bearer access token.
+/// Insert a real account + device row directly, returning their ids.
+///
+/// V21 added foreign keys from the social graph, group membership, key packages and queued mail
+/// back to `accounts`/`devices`, so tests can no longer invent ids with `AccountId::random()` and
+/// expect writes to land. This is the cheap way to satisfy those keys: it skips the password
+/// hashing and challenge ceremony that `register` performs, because these accounts exist only to
+/// be referenced, never to authenticate.
+pub fn seed_account() -> (AccountId, DeviceId) {
+    let account = AccountId::random();
+    let device = DeviceId::random();
+    let mut client = postgres::Client::connect(&db_url(), postgres::NoTls).expect("seed connect");
+    client
+        .execute(
+            "INSERT INTO accounts (account_id, username_normalized, password_phc)
+             VALUES ($1, $2, 'x')",
+            &[
+                &account.as_bytes(),
+                &format!("seed{}", hex::encode(&account.as_bytes()[..8])),
+            ],
+        )
+        .expect("seed account");
+    client
+        .execute(
+            "INSERT INTO devices (device_id, account_id, public_key, revoked, assurance)
+             VALUES ($1, $2, $3, FALSE, 'software')",
+            &[&device.as_bytes(), &account.as_bytes(), &vec![0x04u8; 65]],
+        )
+        .expect("seed device");
+    (account, device)
+}
+
+/// A second device on an existing seeded account.
+pub fn seed_device_for(account: &AccountId) -> DeviceId {
+    let device = DeviceId::random();
+    let mut client = postgres::Client::connect(&db_url(), postgres::NoTls).expect("seed connect");
+    client
+        .execute(
+            "INSERT INTO devices (device_id, account_id, public_key, revoked, assurance)
+             VALUES ($1, $2, $3, FALSE, 'software')",
+            &[&device.as_bytes(), &account.as_bytes(), &vec![0x04u8; 65]],
+        )
+        .expect("seed device");
+    device
+}
+
 /// Authenticated DELETE carrying a JSON body (account deletion sends its reauth proof this way).
 pub async fn delete_json_auth(
     app: &Router,
