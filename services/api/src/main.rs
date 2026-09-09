@@ -239,12 +239,14 @@ async fn serve(
         tracing::info!("envelope retention TTL: {ttl_days} days");
         let stores = stores.clone();
         let relay = relay.clone();
+        let quotas = Arc::new(nedwons_api::quota::Quotas::new(relay.pool_clone()));
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 tick.tick().await;
                 let stores = stores.clone();
                 let relay = relay.clone();
+                let quotas = quotas.clone();
                 let purged = tokio::task::spawn_blocking(move || {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
@@ -271,8 +273,10 @@ async fn serve(
                     // MLS prekey hygiene: drop key packages past their TTL.
                     let prekeys = relay
                         .purge_expired_key_packages(nedwons_api::relay::KEY_PACKAGE_TTL_SECS)?;
+                    // Abuse-quota windows that can no longer be current (R-306).
+                    let counters = quotas.purge_expired(now as i64, 86_400)?;
                     Ok::<u64, auth_core::store::StoreError>(
-                        auth + mail + sealed + self_group + prekeys,
+                        auth + mail + sealed + self_group + prekeys + counters,
                     )
                 })
                 .await;
