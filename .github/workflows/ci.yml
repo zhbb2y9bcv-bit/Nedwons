@@ -355,7 +355,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build the API image
-        run: docker build -f services/api/Dockerfile -t nedwons-api:ci services
+        # Context is the REPOSITORY ROOT: the services workspace references core/mls-core and the
+        # vendored openmls_rust_crypto patch, neither of which a services-only context can see.
+        run: docker build -f services/api/Dockerfile -t nedwons-api:ci .
       # The image ships a Debian base and a static binary; a base-image CVE is invisible to
       # cargo audit, which only sees Rust crates.
       - name: Scan the image

@@ -24,10 +24,37 @@ title = "Nedwons gitleaks config"
 [extend]
 useDefault = true
 
-[allowlist]
+# `[[allowlists]]` (plural) throughout: gitleaks 8.30 refuses a config that mixes the deprecated
+# singular `[allowlist]` with the plural form.
+[[allowlists]]
 description = "Manually vetted false positives from the generic-api-key heuristic (see header)."
 regexTarget = "match"
 regexes = [
   '''libcrux-sha3''',
   '''P256\.Signing\.PrivateKey''',
+]
+
+# One historical commit, one line, by exact fingerprint.
+#
+# `redact.rs`'s unit test proved the log scrubber removes hex-looking tokens by passing it a
+# 32-character hex literal. To a scanner that is indistinguishable from a real credential, and it
+# was reported as a leak. The literal is gone from the working tree (the test now builds the same
+# string at runtime), but history is immutable and already published, so the historical occurrence
+# is suppressed HERE — by fingerprint, not by pattern or path.
+#
+# Deliberately not done: adding the string to `regexes` above. Every entry there is a low-entropy
+# public identifier; teaching this allowlist to ignore a high-entropy hex string would weaken the
+# heuristic that is most likely to catch a real credential. A fingerprint suppresses exactly one
+# line of one file in one commit and nothing else — including the same string appearing anywhere
+# new, which would still fail the scan.
+[[allowlists]]
+description = "Fake hex token in a redaction unit test (commit d642710); rewritten in the tree."
+targetRules = ["generic-api-key"]
+# Scoped three ways at once — this commit, this path, this exact finding. gitleaks requires at
+# least one of commits/paths/regexes/stopwords, so the fingerprint alone is not accepted; pinning
+# the commit and path as well keeps the suppression from ever widening.
+commits = ["d6427101be2ec4ac36c1bdaf906d100053c30db0"]
+paths = ['''services/api/src/redact\.rs''']
+fingerprints = [
+  "d6427101be2ec4ac36c1bdaf906d100053c30db0:services/api/src/redact.rs:generic-api-key:252",
 ]
