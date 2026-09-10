@@ -387,42 +387,49 @@ jobs:
         run: docker build -f services/api/Dockerfile -t nedwons-api:ci .
       # The image ships a Debian base and a static binary; a base-image CVE is invisible to
       # cargo audit, which only sees Rust crates.
-      # Pull the vulnerability DB from the ECR mirror. The default GHCR endpoint rate-limits
-      # GitHub-hosted runners (TOOMANYREQUESTS), which fails this step with no finding to show —
-      # indistinguishable, from the outside, from a real CVE. Same database, different mirror: the
-      # scan's strictness is unchanged.
+      # Run a pinned, checksum-verified trivy binary directly rather than the action — the same
+      # reasoning as the gitleaks step below. The action swallowed its own failure output, so a run
+      # that died before scanning (annotated on 2026-09-10 as "failed WITHOUT producing a report")
+      # was indistinguishable from a CVE finding to anyone without repo-admin rights on the logs.
+      # Invoking trivy here means this step owns its stdout and can say exactly what happened.
+      #
+      # The DB comes from the ECR mirror: the default GHCR endpoint rate-limits GitHub-hosted
+      # runners (TOOMANYREQUESTS). Same database, different mirror — strictness is unchanged, and
+      # `--scanners vuln,secret` keeps the action's default coverage rather than quietly narrowing it.
       - name: Scan the image
-        id: image_scan
-        continue-on-error: true
-        uses: aquasecurity/trivy-action@v0.33.1
-        env:
-          TRIVY_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-db:2
-          TRIVY_JAVA_DB_REPOSITORY: public.ecr.aws/aquasecurity/trivy-java-db:1
-        with:
-          image-ref: nedwons-api:ci
-          format: table
-          output: trivy-image.txt
-          exit-code: '1'
-          ignore-unfixed: true
-          severity: CRITICAL,HIGH
-      # Reading a failed job's raw log needs repo-ADMIN rights; the run summary does not. Echo the
-      # reason as an annotation so a failure here is diagnosable without them, then re-impose the
-      # gate: `continue-on-error` above only defers the failure to this step, it never forgives it.
-      # It also separates the two cases that look identical today — a real finding, versus the scan
-      # itself erroring before it could produce one.
-      - name: Report the image scan, then enforce it
         run: |
           set -uo pipefail
+          TV=0.74.0
+          SHA=2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a
+          curl -sSfL "https://github.com/aquasecurity/trivy/releases/download/v${TV}/trivy_${TV}_Linux-64bit.tar.gz" -o trivy.tgz
+          echo "${SHA}  trivy.tgz" | sha256sum -c -
+          tar xzf trivy.tgz trivy
+          ./trivy image \
+            --db-repository public.ecr.aws/aquasecurity/trivy-db:2 \
+            --scanners vuln,secret \
+            --ignore-unfixed \
+            --severity CRITICAL,HIGH \
+            --format table \
+            --output trivy-image.txt \
+            --exit-code 1 \
+            nedwons-api:ci >trivy-run.log 2>&1
+          STATUS=$?
+          cat trivy-run.log
           if [ -s trivy-image.txt ]; then cat trivy-image.txt; fi
-          if [ "${{ steps.image_scan.outcome }}" = "success" ]; then exit 0; fi
-          if [ -s trivy-image.txt ]; then
-            grep -E "CRITICAL|HIGH" trivy-image.txt | head -10 | while IFS= read -r line; do
-              printf '::error title=Trivy image finding::%s\n' "$(printf '%s' "$line" | cut -c1-400)"
-            done
-          else
-            printf '::error title=Trivy image scan::the step failed WITHOUT producing a report, so this is the scanner erroring (e.g. vulnerability-DB download), not a CVE finding\n'
+          if [ "$STATUS" -ne 0 ]; then
+            # Reading a failed job's raw log needs repo-ADMIN rights; the run summary does not. Put
+            # the reason where anyone can see it, and distinguish a real finding from a broken scan.
+            if [ -s trivy-image.txt ] && grep -qE "CRITICAL|HIGH" trivy-image.txt; then
+              grep -E "CRITICAL|HIGH" trivy-image.txt | head -10 | while IFS= read -r line; do
+                printf '::error title=Trivy finding::%s\n' "$(printf '%s' "$line" | cut -c1-400)"
+              done
+            else
+              tail -15 trivy-run.log | while IFS= read -r line; do
+                printf '::error title=Trivy scanner error::%s\n' "$(printf '%s' "$line" | tr -d '\r' | cut -c1-400)"
+              done
+            fi
           fi
-          exit 1
+          exit $STATUS
       - name: Scan infrastructure definitions
         uses: aquasecurity/trivy-action@v0.33.1
         with:
