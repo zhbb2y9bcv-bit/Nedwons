@@ -257,8 +257,11 @@ jobs:
       # single SwiftUI view, so every screen-level regression was invisible.
       - name: Run the XCUITest suite on the simulator (group admin flows)
         # Pin the derived-data path so the artifact step below knows where the results are.
+        # NEDWONS_UI_DD, not NEDWONS_SIM_DD: the latter is test_mls_sim.sh's variable, so setting it
+        # here pinned nothing. The UI run fell back to $TMPDIR while the upload step below looked in
+        # $RUNNER_TEMP, which is why a failing UI test has never produced a result bundle to read.
         env:
-          NEDWONS_SIM_DD: ${{ runner.temp }}/nedwons-ui-simdd
+          NEDWONS_UI_DD: ${{ runner.temp }}/nedwons-ui-simdd
         run: scripts/test_ui_sim.sh
       # A UI test that fails only on CI is undiagnosable from the console summary alone; the
       # result bundle carries the failure messages, the view hierarchy and the screenshots.

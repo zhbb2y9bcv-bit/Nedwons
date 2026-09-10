@@ -20,6 +20,14 @@ WORKDIR /build/services
 RUN cargo build --release -p nedwons-api
 
 FROM debian:bookworm-slim AS runtime
+# Apply the distribution's current security patches before anything else. A base image is a
+# periodic snapshot, so every CVE fixed after it was cut still ships in it — and those are exactly
+# the ones the CI container scan reports, since it runs with `ignore-unfixed`, which reports a
+# finding only when the distro already has a fixed package available. Installing them here is
+# therefore the direct remedy rather than a suppression.
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get upgrade -y \
+ && rm -rf /var/lib/apt/lists/*
 # Non-root user; read-only-friendly layout.
 RUN useradd --system --uid 10001 --home /nonexistent --shell /usr/sbin/nologin nedwons
 COPY --from=builder /build/services/target/release/nedwons-api /usr/local/bin/nedwons-api
