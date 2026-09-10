@@ -69,8 +69,17 @@ if [ "$STATUS" -ne 0 ]; then
   echo "== UI tests FAILED (exit ${STATUS}). Why: =="
   # Assertion failures, crashed/terminated runners, and build errors — each of which explains a
   # failure the pass/fail lines alone do not.
-  grep -nE "error:|XCTAssert|Assertion Failure|crashed|terminated|lost connection|Failed to|failed to|timed out" \
-    "$FULL_LOG" | tail -30
+  REASONS="$(grep -nE "error:|XCTAssert|Assertion Failure|crashed|terminated|lost connection|Failed to|failed to|timed out" \
+    "$FULL_LOG" | tail -30)"
+  printf '%s\n' "$REASONS"
+  # Under GitHub Actions, repeat the reason as workflow annotations. Reading a failed job's raw log
+  # requires repo-ADMIN rights and the result bundle is likewise gated, but the run SUMMARY is not —
+  # so without this a CI-only failure is invisible to anyone who does not own the repository.
+  if [ -n "${GITHUB_ACTIONS:-}" ] && [ -n "$REASONS" ]; then
+    printf '%s\n' "$REASONS" | tail -8 | while IFS= read -r line; do
+      printf '::error title=UI test failure::%s\n' "$(printf '%s' "$line" | tr -d '\r' | cut -c1-400)"
+    done
+  fi
   exit "$STATUS"
 fi
 echo "== UI tests: PASS =="
