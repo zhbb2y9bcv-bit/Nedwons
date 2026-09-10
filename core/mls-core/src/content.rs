@@ -47,6 +47,14 @@ pub const SECRET_ID_LEN: usize = 16;
 /// Sealed-sender delivery access key `K_r` (ADR-0014), granted over the E2EE channel.
 pub const DELIVERY_KEY_LEN: usize = 32;
 
+/// A device id, as the relay addresses one.
+pub const DEVICE_ID_LEN: usize = 16;
+
+/// Bounds the device list a grant may carry. A grant names the granter's OWN devices so the holder
+/// can fan a sealed message out to each of them; an account with more devices than this is refused
+/// rather than allocated for.
+pub const MAX_GRANT_DEVICES: usize = 16;
+
 /// Bounds a hostile payload; longer histories sync across several batches.
 pub const MAX_HISTORY_ENTRIES: usize = 500;
 
@@ -124,7 +132,15 @@ pub enum Content {
     SecretConsumed { secret_id: [u8; SECRET_ID_LEN] },
     /// ADR-0014 Slice 2c: shares `K_r` with an approved contact. The relay never sees it — the grant
     /// travels inside the MLS ciphertext.
-    DeliveryKeyGrant { key_r: [u8; DELIVERY_KEY_LEN] },
+    /// Shares the granter's delivery access key `K_r` AND the granter's own device ids, so the
+    /// holder can fan a sealed message out to each of them. The relay must never learn either, and
+    /// it never does: this travels inside the MLS ciphertext. Carrying the device list here — rather
+    /// than adding an endpoint that lists someone's devices — keeps sealed sending from creating a
+    /// new enumeration surface; the granter re-sends when their devices change.
+    DeliveryKeyGrant {
+        key_r: [u8; DELIVERY_KEY_LEN],
+        device_ids: Vec<[u8; DEVICE_ID_LEN]>,
+    },
     /// #7: replicates past messages to a newly-linked device over the account's self-group.
     HistorySync { entries: Vec<HistoryEntry> },
     /// The group's name, set by a member and carried INSIDE the MLS ciphertext — so the relay never
@@ -287,9 +303,13 @@ impl Content {
                 out.push(KIND_SECRET_CONSUMED);
                 out.extend_from_slice(secret_id);
             }
-            Content::DeliveryKeyGrant { key_r } => {
+            Content::DeliveryKeyGrant { key_r, device_ids } => {
                 out.push(KIND_DELIVERY_KEY_GRANT);
                 out.extend_from_slice(key_r);
+                out.extend_from_slice(&(device_ids.len() as u16).to_be_bytes());
+                for id in device_ids {
+                    out.extend_from_slice(id);
+                }
             }
             Content::GroupName { name } => {
                 out.push(KIND_GROUP_NAME);
@@ -451,12 +471,30 @@ impl Content {
                 Ok(Content::SecretConsumed { secret_id })
             }
             KIND_DELIVERY_KEY_GRANT => {
-                if rest.len() != DELIVERY_KEY_LEN {
-                    return Err(ContentError::Malformed); // exactly the 32-byte key, no trailer
+                // key(32) || u16(count) || count * id(16), consumed exactly.
+                if rest.len() < DELIVERY_KEY_LEN + 2 {
+                    return Err(ContentError::Malformed);
                 }
+                let (key_bytes, rest) = rest.split_at(DELIVERY_KEY_LEN);
                 let mut key_r = [0u8; DELIVERY_KEY_LEN];
-                key_r.copy_from_slice(rest);
-                Ok(Content::DeliveryKeyGrant { key_r })
+                key_r.copy_from_slice(key_bytes);
+                let count = u16::from_be_bytes([rest[0], rest[1]]) as usize;
+                if count > MAX_GRANT_DEVICES {
+                    return Err(ContentError::TooLarge); // refused on the count alone
+                }
+                let ids = &rest[2..];
+                if ids.len() != count * DEVICE_ID_LEN {
+                    return Err(ContentError::Malformed); // no trailer, no short list
+                }
+                let device_ids = ids
+                    .chunks_exact(DEVICE_ID_LEN)
+                    .map(|c| {
+                        let mut id = [0u8; DEVICE_ID_LEN];
+                        id.copy_from_slice(c);
+                        id
+                    })
+                    .collect();
+                Ok(Content::DeliveryKeyGrant { key_r, device_ids })
             }
             KIND_GROUP_NAME => Ok(Content::GroupName {
                 name: decode_group_name(rest)?,
@@ -753,17 +791,39 @@ mod tests {
 
     #[test]
     fn delivery_key_grant_round_trips_and_is_exact() {
-        let c = Content::DeliveryKeyGrant {
-            key_r: [0x9c; DELIVERY_KEY_LEN],
-        };
-        let decoded = Content::decode(&c.encode()).unwrap();
-        assert_eq!(decoded, c);
-        assert!(decoded.body().is_empty());
-        let mut over = c.encode();
-        over.push(0);
-        assert_eq!(Content::decode(&over), Err(ContentError::Malformed));
-        let short = &c.encode()[..c.encode().len() - 1];
-        assert_eq!(Content::decode(short), Err(ContentError::Malformed));
+        // A grant carries the key AND the granter's own devices, so the holder can fan a sealed
+        // message out to each of them.
+        for devices in [0usize, 1, 3] {
+            let c = Content::DeliveryKeyGrant {
+                key_r: [0x9c; DELIVERY_KEY_LEN],
+                device_ids: (0..devices).map(|i| [i as u8; DEVICE_ID_LEN]).collect(),
+            };
+            let decoded = Content::decode(&c.encode()).unwrap();
+            assert_eq!(decoded, c);
+            assert!(decoded.body().is_empty(), "a grant is not a readable message");
+
+            let mut over = c.encode();
+            over.push(0);
+            assert_eq!(Content::decode(&over), Err(ContentError::Malformed), "no trailer");
+            let short = &c.encode()[..c.encode().len() - 1];
+            assert_eq!(Content::decode(short), Err(ContentError::Malformed), "no short list");
+        }
+    }
+
+    /// A hostile grant must be refused on the COUNT alone — before anything is allocated for it.
+    #[test]
+    fn delivery_key_grant_device_count_is_bounded() {
+        let mut bytes = CONTENT_VERSION.to_be_bytes().to_vec();
+        bytes.push(KIND_DELIVERY_KEY_GRANT);
+        bytes.extend_from_slice(&[0x9c; DELIVERY_KEY_LEN]);
+        bytes.extend_from_slice(&((MAX_GRANT_DEVICES as u16) + 1).to_be_bytes());
+        assert_eq!(Content::decode(&bytes), Err(ContentError::TooLarge));
+
+        // Truncated before the count is malformed, not a panic.
+        let mut truncated = CONTENT_VERSION.to_be_bytes().to_vec();
+        truncated.push(KIND_DELIVERY_KEY_GRANT);
+        truncated.extend_from_slice(&[0x9c; DELIVERY_KEY_LEN]);
+        assert_eq!(Content::decode(&truncated), Err(ContentError::Malformed));
     }
 
     #[test]

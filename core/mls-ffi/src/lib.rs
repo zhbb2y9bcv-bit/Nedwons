@@ -161,9 +161,12 @@ pub enum InboundResult {
     SecretConsumedRemotely {
         secret_id: Vec<u8>,
     },
-    /// ADR-0014 Slice 2c: store `K_r` keyed by the sender for future sealed sends.
+    /// ADR-0014 Slice 2c: store `K_r` keyed by the sender for future sealed sends, together with
+    /// the granter's own device ids — sealed delivery is per-device client-side fan-out, and this
+    /// is how the sender learns where to send without any endpoint that lists someone's devices.
     DeliveryKeyGranted {
         key_r: Vec<u8>,
+        device_ids: Vec<Vec<u8>>,
     },
     /// #7: `count` past messages were appended to this device's log.
     HistorySynced {
@@ -613,16 +616,28 @@ impl MlsClient {
 
     /// ADR-0014 Slice 2c: share `K_r` (exactly 32 bytes) over the E2EE channel — the relay never
     /// sees it. `encrypt`/`mark_sent` then proceed as for a normal message.
-    pub fn enqueue_delivery_key_grant(&self, key_r: Vec<u8>) -> Result<u64, MlsClientError> {
+    pub fn enqueue_delivery_key_grant(
+        &self,
+        key_r: Vec<u8>,
+        device_ids: Vec<Vec<u8>>,
+    ) -> Result<u64, MlsClientError> {
         catch(move || {
             let key: [u8; 32] = key_r
                 .as_slice()
                 .try_into()
                 .map_err(|_| MlsClientError::InvalidMessage)?;
+            let ids: Vec<[u8; 16]> = device_ids
+                .iter()
+                .map(|d| {
+                    d.as_slice()
+                        .try_into()
+                        .map_err(|_| MlsClientError::InvalidMessage)
+                })
+                .collect::<Result<_, _>>()?;
             let mut g = self.lock()?;
             let session = active_mut(&mut g)?;
             session
-                .enqueue_delivery_key_grant(&key)
+                .enqueue_delivery_key_grant(&key, &ids)
                 .map_err(map_durable)
         })
     }
@@ -1390,9 +1405,12 @@ fn to_inbound_result(outcome: InboundOutcome) -> InboundResult {
                 secret_id: secret_id.to_vec(),
             }
         }
-        InboundOutcome::DeliveryKeyGranted { key_r } => InboundResult::DeliveryKeyGranted {
-            key_r: key_r.to_vec(),
-        },
+        InboundOutcome::DeliveryKeyGranted { key_r, device_ids } => {
+            InboundResult::DeliveryKeyGranted {
+                key_r: key_r.to_vec(),
+                device_ids: device_ids.iter().map(|d| d.to_vec()).collect(),
+            }
+        }
         InboundOutcome::HistorySynced { count } => InboundResult::HistorySynced { count },
         InboundOutcome::GroupRenamed { name } => InboundResult::GroupRenamed { name },
         InboundOutcome::AttachmentReceived { attachment } => InboundResult::AttachmentReceived {

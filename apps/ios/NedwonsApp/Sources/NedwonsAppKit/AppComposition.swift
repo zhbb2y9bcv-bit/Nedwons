@@ -99,6 +99,13 @@ public final class AppComposition: ObservableObject {
             }
             return try backups.restoreBackup(data, passphrase: passphrase)
         }
+        // Sealed sender (ADR-0014 2c): our delivery access key and the grants contacts gave us,
+        // encrypted at rest under their own derived key. If the Keychain is unusable the feature is
+        // simply absent — every message then goes by the identified path, which still works.
+        coordinator.deliveryKeys = (try? keys.atRestKey(forStore: "delivery-keys")).map { key in
+            DeliveryKeyStore(
+                fileURL: support.appendingPathComponent("delivery-keys.bin"), atRestKey: key)
+        }
         // Aliases are encrypted at rest under their own derived key. If the Keychain is unusable
         // the feature is simply absent rather than falling back to plaintext.
         let aliasStore = (try? keys.atRestKey(forStore: "aliases")).map { key in

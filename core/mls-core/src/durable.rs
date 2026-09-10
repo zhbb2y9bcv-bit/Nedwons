@@ -24,7 +24,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::attachment::AttachmentRef;
 use crate::content::{
-    Content, ContentError, HistoryEntry, ReceiptKind, DELIVERY_KEY_LEN, MESSAGE_ID_LEN,
+    Content, ContentError, HistoryEntry, ReceiptKind, DELIVERY_KEY_LEN, DEVICE_ID_LEN,
+    MESSAGE_ID_LEN,
     SECRET_ID_LEN,
 };
 use crate::secret::{SecretRecord, SecretSide, SecretState};
@@ -212,6 +213,8 @@ pub enum InboundOutcome {
     /// sender. Not user-visible.
     DeliveryKeyGranted {
         key_r: [u8; DELIVERY_KEY_LEN],
+        /// The granter's own device ids, so a sealed message can be fanned out to each of them.
+        device_ids: Vec<[u8; DEVICE_ID_LEN]>,
     },
     /// #7: `count` past messages were replicated here and appended to the local log.
     HistorySynced {
@@ -1336,8 +1339,15 @@ impl<J: Journal> DurableSession<J> {
     pub fn enqueue_delivery_key_grant(
         &mut self,
         key_r: &[u8; DELIVERY_KEY_LEN],
+        device_ids: &[[u8; DEVICE_ID_LEN]],
     ) -> Result<u64, DurableError> {
-        self.enqueue_content(Content::DeliveryKeyGrant { key_r: *key_r }, None)
+        self.enqueue_content(
+            Content::DeliveryKeyGrant {
+                key_r: *key_r,
+                device_ids: device_ids.to_vec(),
+            },
+            None,
+        )
     }
 
     // ----- New-device history sync (#7) -------------------------------------------------------
@@ -2243,7 +2253,9 @@ fn apply_incoming(
                     InboundOutcome::SecretConsumedRemotely { secret_id }
                 }
                 // ADR-0014 Slice 2c: surfaced for the client to store keyed by sender; no log entry.
-                Content::DeliveryKeyGrant { key_r } => InboundOutcome::DeliveryKeyGranted { key_r },
+                Content::DeliveryKeyGrant { key_r, device_ids } => {
+                    InboundOutcome::DeliveryKeyGranted { key_r, device_ids }
+                }
                 // A file: logged now, fetched from the relay when the user opens it (or eagerly by the
                 // client). The reference — including its key — is durable, so a relaunch can still open
                 // it.

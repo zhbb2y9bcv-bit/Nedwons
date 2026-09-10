@@ -37,6 +37,20 @@ public protocol ConversationRelay: Sendable {
     func confirmSetup(accessToken: String, conversationID: String, deviceID: String) async throws
     func claimDeviceKeyPackage(accessToken: String, deviceID: String) async throws
         -> ClaimedKeyPackage
+
+    // Sealed sender (ADR-0014). Registering a verifier is authenticated (we set our own gate);
+    // DELIVERING is deliberately unauthenticated — presenting the recipient's `K_r` is the only
+    // credential, which is the whole point: the relay never learns who sent it.
+    func registerDeliveryAccessKey(accessToken: String, deliveryKey: DeliveryAccessKey) async throws
+    func deliverSealed(
+        deliveryKey: DeliveryAccessKey, recipientDevice: String, ciphertext: Data,
+        idempotencyKey: Data
+    ) async throws
+    /// Acknowledge sealed envelopes. They live in their own id space, so they are acked separately
+    /// from identified ones — never mixed.
+    func ackSealed(accessToken: String, sealedIDs: [Int]) async throws
+    /// This account's own device ids, which a grant carries so contacts can fan out sealed to us.
+    func myDeviceIDs(accessToken: String) async throws -> [String]
 }
 
 extension NedwonsClient: ConversationRelay {
@@ -48,5 +62,15 @@ extension NedwonsClient: ConversationRelay {
     /// spaces and are acked by their own consumers.
     public func ackInbox(accessToken: String, ids: [Int]) async throws {
         try await ackInbox(accessToken: accessToken, ids: ids, sealedIds: [], selfGroupIds: [])
+    }
+
+    public func ackSealed(accessToken: String, sealedIDs: [Int]) async throws {
+        try await ackInbox(accessToken: accessToken, ids: [], sealedIds: sealedIDs, selfGroupIds: [])
+    }
+
+    public func myDeviceIDs(accessToken: String) async throws -> [String] {
+        try await listDevices(accessToken: accessToken)
+            .filter { !$0.revoked }
+            .map(\.deviceID)
     }
 }

@@ -614,7 +614,7 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
      * ADR-0014 Slice 2c: share `K_r` (exactly 32 bytes) over the E2EE channel — the relay never
      * sees it. `encrypt`/`mark_sent` then proceed as for a normal message.
      */
-    func enqueueDeliveryKeyGrant(keyR: Data) throws  -> UInt64
+    func enqueueDeliveryKeyGrant(keyR: Data, deviceIds: [Data]) throws  -> UInt64
     
     /**
      * #7: replicate `entries` over the self-group. `WrongState` if none is established.
@@ -1127,10 +1127,11 @@ open func enqueue(plaintext: Data)throws  -> UInt64  {
      * ADR-0014 Slice 2c: share `K_r` (exactly 32 bytes) over the E2EE channel — the relay never
      * sees it. `encrypt`/`mark_sent` then proceed as for a normal message.
      */
-open func enqueueDeliveryKeyGrant(keyR: Data)throws  -> UInt64  {
+open func enqueueDeliveryKeyGrant(keyR: Data, deviceIds: [Data])throws  -> UInt64  {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_enqueue_delivery_key_grant(self.uniffiClonePointer(),
-        FfiConverterData.lower(keyR),$0
+        FfiConverterData.lower(keyR),
+        FfiConverterSequenceData.lower(deviceIds),$0
     )
 })
 }
@@ -2753,9 +2754,11 @@ public enum InboundResult {
     case secretConsumedRemotely(secretId: Data
     )
     /**
-     * ADR-0014 Slice 2c: store `K_r` keyed by the sender for future sealed sends.
+     * ADR-0014 Slice 2c: store `K_r` keyed by the sender for future sealed sends, together with
+     * the granter's own device ids — sealed delivery is per-device client-side fan-out, and this
+     * is how the sender learns where to send without any endpoint that lists someone's devices.
      */
-    case deliveryKeyGranted(keyR: Data
+    case deliveryKeyGranted(keyR: Data, deviceIds: [Data]
     )
     /**
      * #7: `count` past messages were appended to this device's log.
@@ -2843,7 +2846,7 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
         case 5: return .secretConsumedRemotely(secretId: try FfiConverterData.read(from: &buf)
         )
         
-        case 6: return .deliveryKeyGranted(keyR: try FfiConverterData.read(from: &buf)
+        case 6: return .deliveryKeyGranted(keyR: try FfiConverterData.read(from: &buf), deviceIds: try FfiConverterSequenceData.read(from: &buf)
         )
         
         case 7: return .historySynced(count: try FfiConverterUInt64.read(from: &buf)
@@ -2909,9 +2912,10 @@ public struct FfiConverterTypeInboundResult: FfiConverterRustBuffer {
             FfiConverterData.write(secretId, into: &buf)
             
         
-        case let .deliveryKeyGranted(keyR):
+        case let .deliveryKeyGranted(keyR,deviceIds):
             writeInt(&buf, Int32(6))
             FfiConverterData.write(keyR, into: &buf)
+            FfiConverterSequenceData.write(deviceIds, into: &buf)
             
         
         case let .historySynced(count):
@@ -3643,7 +3647,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue() != 21140) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue_delivery_key_grant() != 56582) {
+    if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue_delivery_key_grant() != 28113) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_enqueue_history_sync() != 59844) {

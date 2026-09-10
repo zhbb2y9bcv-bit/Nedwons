@@ -686,16 +686,30 @@ impl MlsClient {
         })
     }
 
-    /// ADR-0014: share `K_r` (exactly 32 bytes) over the E2EE channel — the relay never sees it.
+    /// ADR-0014: share `K_r` (exactly 32 bytes) plus the granter's own device ids over the E2EE
+    /// channel — the relay never sees either. Each device id is exactly 16 bytes.
     #[wasm_bindgen(js_name = enqueueDeliveryKeyGrant)]
-    pub fn enqueue_delivery_key_grant(&self, key_r: Vec<u8>) -> Result<u64> {
+    pub fn enqueue_delivery_key_grant(
+        &self,
+        key_r: Vec<u8>,
+        device_ids: Vec<js_sys::Uint8Array>,
+    ) -> Result<u64> {
         let key: [u8; 32] = key_r
             .as_slice()
             .try_into()
             .map_err(|_| WasmError::InvalidMessage)?;
+        let ids: Vec<[u8; 16]> = device_ids
+            .iter()
+            .map(|d| {
+                d.to_vec()
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| WasmError::InvalidMessage)
+            })
+            .collect::<std::result::Result<_, _>>()?;
         let mut g = self.state()?;
         active_mut(&mut g)?
-            .enqueue_delivery_key_grant(&key)
+            .enqueue_delivery_key_grant(&key, &ids)
             .map_err(map_durable)
     }
 
@@ -1025,7 +1039,7 @@ fn to_inbound(outcome: InboundOutcome) -> InboundResult {
             r.kind = InboundKind::SecretConsumedRemotely;
             r.secret_id = Some(secret_id.to_vec());
         }
-        InboundOutcome::DeliveryKeyGranted { key_r } => {
+        InboundOutcome::DeliveryKeyGranted { key_r, .. } => {
             r.kind = InboundKind::DeliveryKeyGranted;
             r.key_r = Some(key_r.to_vec());
         }
@@ -1033,6 +1047,13 @@ fn to_inbound(outcome: InboundOutcome) -> InboundResult {
             r.kind = InboundKind::HistorySynced;
             r.count = Some(count);
         }
+        // The web spike deliberately surfaces only the subset above. Everything else the core can
+        // report (renames, attachments, reactions, receipts, typing, timers, deletes, edits, group
+        // photos, cover decoys) is still APPLIED durably by the core — it just isn't projected into
+        // this JS shape yet, so it reads as a state advance. A wildcard, not an omission: the spike
+        // must keep compiling as the core grows, and `docs/` records that it is a spike, not the
+        // web client.
+        _ => r.kind = InboundKind::StateAdvanced,
     }
     r
 }

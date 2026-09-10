@@ -1137,3 +1137,39 @@ fn sealed_and_identified_ids_do_not_collide_in_dedup() {
     );
     assert_eq!(bob.messages().len(), 2, "replays added nothing");
 }
+
+/// A sealed envelope carries no conversation id, so the client must find the right store by TRYING
+/// each one. That is only safe if a failed decrypt is inert: no ratchet advance, no message, no
+/// dedup marker — otherwise probing would corrupt every store it touched on the way. Proven here
+/// against a real MLS session that is handed someone else's ciphertext.
+#[test]
+fn a_failed_decrypt_leaves_the_store_untouched() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+    // A second, unrelated pair — carol's group has nothing to do with alice/bob.
+    let (mut carol, _jc, mut _dan, _jd) = pair();
+
+    let id = carol.enqueue(b"not for bob").expect("enqueue");
+    let foreign = carol.encrypt(id).expect("encrypt");
+
+    let epoch_before = bob.epoch();
+    let messages_before = bob.messages().len();
+
+    // Bob tries the foreign ciphertext (what probing a wrong store looks like) — it fails.
+    assert!(
+        bob.process_sealed_inbound(1, &foreign).is_err(),
+        "a ciphertext for another group must not decrypt here"
+    );
+
+    assert_eq!(bob.epoch(), epoch_before, "a failed probe must not advance the ratchet");
+    assert_eq!(bob.messages().len(), messages_before, "and must store nothing");
+
+    // Crucially, the id is NOT burned: the RIGHT store can still process that same envelope id.
+    let real = alice.enqueue(b"for bob").expect("enqueue");
+    let env = alice.encrypt(real).expect("encrypt");
+    assert_eq!(
+        bob.process_sealed_inbound(1, &env).expect("real sealed message"),
+        InboundOutcome::Application(b"for bob".to_vec()),
+        "a failed probe must not mark the id seen"
+    );
+    assert_eq!(bob.messages().len(), messages_before + 1);
+}
