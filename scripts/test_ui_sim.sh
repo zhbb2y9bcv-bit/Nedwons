@@ -69,16 +69,50 @@ if [ "$STATUS" -ne 0 ]; then
   echo "== UI tests FAILED (exit ${STATUS}). Why: =="
   # Assertion failures, crashed/terminated runners, and build errors — each of which explains a
   # failure the pass/fail lines alone do not.
+  # `|| true` is REQUIRED, not defensive noise: this script runs under `set -euo pipefail`, and
+  # grep exits 1 when it matches nothing. Without it, a failure whose log contains none of these
+  # patterns kills the script right here — losing both the annotations below and the real exit
+  # code, which is the exact blindness this block exists to prevent.
   REASONS="$(grep -nE "error:|XCTAssert|Assertion Failure|crashed|terminated|lost connection|Failed to|failed to|timed out" \
-    "$FULL_LOG" | tail -30)"
+    "$FULL_LOG" | tail -30 || true)"
   printf '%s\n' "$REASONS"
+
   # Under GitHub Actions, repeat the reason as workflow annotations. Reading a failed job's raw log
   # requires repo-ADMIN rights and the result bundle is likewise gated, but the run SUMMARY is not —
   # so without this a CI-only failure is invisible to anyone who does not own the repository.
-  if [ -n "${GITHUB_ACTIONS:-}" ] && [ -n "$REASONS" ]; then
-    printf '%s\n' "$REASONS" | tail -8 | while IFS= read -r line; do
-      printf '::error title=UI test failure::%s\n' "$(printf '%s' "$line" | tr -d '\r' | cut -c1-400)"
+  #
+  # WHICH lines get annotated matters as much as annotating at all. This used to tail the list,
+  # which is exactly backwards for a COMPILE failure: the tail of 142 isolation errors was four
+  # diagnostics about the file's last line, and reading them cost a day chasing a one-line bug that
+  # did not exist. A compiler reports the root cause FIRST, so compile errors are annotated from the
+  # top; only when there are none does the tail (a genuine assertion failure or a dead runner) win.
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    # `error:` with a file:line prefix — a compile diagnostic. Deduplicated with awk rather than
+    # `sort -u`, because sorting is lexical and would reorder the diagnostics: ":103:" sorts before
+    # ":39:", so the compiler's FIRST error (the one most likely to be the root cause) gets pushed
+    # out of the top ten by later ones. awk keeps first-seen order while still dropping the copies
+    # xcodebuild prints once per compilation unit.
+    # `|| true` for the same reason as above — a run that failed on an assertion rather than a
+    # compile error matches nothing here, and that is the COMMON case, not an edge one.
+    COMPILE_ERRORS="$(grep -hoE "[^ ]+\.(swift|m|h):[0-9]+:[0-9]+: error: .*" "$FULL_LOG" \
+      | awk '!seen[$0]++' || true)"
+    LABEL="UI test build error"
+    if [ -n "$COMPILE_ERRORS" ]; then
+      ANNOTATIONS="$(printf '%s\n' "$COMPILE_ERRORS" | head -10)"
+    else
+      ANNOTATIONS="$(printf '%s\n' "$REASONS" | tail -10)"
+      LABEL="UI test failure"
+    fi
+    # How much was left unsaid, so a truncated list never reads as a complete one.
+    TOTAL="$(printf '%s' "$COMPILE_ERRORS" | grep -c . || true)"
+    printf '%s\n' "$ANNOTATIONS" | while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      printf '::error title=%s::%s\n' "$LABEL" "$(printf '%s' "$line" | tr -d '\r' | cut -c1-400)"
     done
+    if [ "${TOTAL:-0}" -gt 10 ]; then
+      printf '::error title=%s::… and %s more compile errors; see the full log at %s\n' \
+        "$LABEL" "$((TOTAL - 10))" "$FULL_LOG"
+    fi
   fi
   exit "$STATUS"
 fi

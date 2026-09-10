@@ -9,6 +9,15 @@ import XCTest
 ///
 /// Element lookup goes through the accessibility identifiers in `GroupAdminA11y`; those are the
 /// contract between the screens and this suite.
+///
+/// `@MainActor` is load-bearing, not decoration. Every XCUI API — `tap()`, `exists`, `label`,
+/// `value`, `waitForExistence` — is main-actor isolated, so a nonisolated test method touching one
+/// is a Swift 6 concurrency violation. Toolchains disagree about the severity: Xcode 26.6 emits
+/// warnings, while the macos-15 runner's Xcode 26 emits ERRORS, which is why this suite compiled
+/// locally and failed CI with `exit code 65` and nothing in the console summary to explain it.
+/// Isolating the class to the main actor is also simply correct — XCUITest drives the UI, and the
+/// UI lives on the main thread.
+@MainActor
 final class GroupAdminUITests: XCTestCase {
     private let conversationID = "c0" + String(repeating: "1", count: 30)
     private let bob = "bb" + String(repeating: "0", count: 30)
@@ -17,6 +26,37 @@ final class GroupAdminUITests: XCTestCase {
 
     override func setUpWithError() throws {
         continueAfterFailure = false
+    }
+
+    // MARK: Assertions
+
+    // `XCTAssertTrue` and friends take their expression as an `@autoclosure`, and that closure is
+    // NONISOLATED. Every XCUI API — `exists`, `label`, `value`, `waitForExistence` — is
+    // `@MainActor`, so writing `XCTAssertTrue(app.buttons["x"].exists)` asks a nonisolated closure
+    // to touch main-actor state. Under Swift 6 that is an error:
+    //
+    //     error: main actor-isolated property 'staticTexts' can not be referenced from a
+    //            nonisolated autoclosure
+    //
+    // Newer toolchains let an autoclosure inherit its caller's isolation and accept it, which is
+    // why this compiled locally on Xcode 26.6 while failing the macos-15 runner. Rather than
+    // depend on that leniency, these wrappers take values that are ALREADY EVALUATED: an ordinary
+    // parameter is computed at the call site, inside the main-actor test body, where touching XCUI
+    // is legal on every toolchain. The message is eager for the same reason — several call sites
+    // interpolate an element's label into it.
+    private func expectTrue(_ value: Bool, _ message: String = "",
+                            file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertTrue(value, message, file: file, line: line)
+    }
+
+    private func expectFalse(_ value: Bool, _ message: String = "",
+                             file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertFalse(value, message, file: file, line: line)
+    }
+
+    private func expectEqual<T: Equatable>(_ actual: T, _ expected: T, _ message: String = "",
+                                           file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(actual, expected, message, file: file, line: line)
     }
 
     // MARK: Launch + navigation helpers
@@ -36,8 +76,8 @@ final class GroupAdminUITests: XCTestCase {
     @discardableResult
     private func waitFor(_ element: XCUIElement, _ timeout: TimeInterval = 10,
                          file: StaticString = #filePath, line: UInt = #line) -> XCUIElement {
-        XCTAssertTrue(element.waitForExistence(timeout: timeout),
-                      "expected \(element) to appear", file: file, line: line)
+        let appeared = element.waitForExistence(timeout: timeout)
+        expectTrue(appeared, "expected \(element) to appear", file: file, line: line)
         return element
     }
 
@@ -46,18 +86,20 @@ final class GroupAdminUITests: XCTestCase {
                       file: StaticString = #filePath, line: UInt = #line) {
         let expectation = XCTNSPredicateExpectation(
             predicate: NSPredicate(format: predicate), object: element)
-        XCTAssertEqual(XCTWaiter().wait(for: [expectation], timeout: timeout), .completed,
-                       "expected '\(predicate)' on \(element)", file: file, line: line)
+        let outcome = XCTWaiter().wait(for: [expectation], timeout: timeout)
+        expectEqual(outcome, .completed, "expected '\(predicate)' on \(element)",
+                    file: file, line: line)
     }
 
     /// Rows in a SwiftUI `List` exist only while rendered, so a row below the fold is scrolled to.
+    @discardableResult
     private func waitForRow(_ app: XCUIApplication, _ identifier: String,
                             file: StaticString = #filePath, line: UInt = #line) -> XCUIElement {
         let row = element(app, identifier)
         for _ in 0..<4 where !row.waitForExistence(timeout: 3) {
             app.swipeUp()
         }
-        XCTAssertTrue(row.exists, "expected row \(identifier)", file: file, line: line)
+        expectTrue(row.exists, "expected row \(identifier)", file: file, line: line)
         return row
     }
 
@@ -108,15 +150,15 @@ final class GroupAdminUITests: XCTestCase {
         let app = launch()
         openGroupPanel(app)
         openMember(app, carol)
-        XCTAssertEqual(status(app), "Member")
+        expectEqual(status(app), "Member")
 
         waitFor(element(app, "group.member.mute")).tap()
         waitForStatus(app, contains: "Muted until")
-        XCTAssertFalse(element(app, "group.member.mute").exists, "a muted member offers Unmute, not Mute")
+        expectFalse(element(app, "group.member.mute").exists, "a muted member offers Unmute, not Mute")
 
         waitFor(element(app, "group.member.unmute")).tap()
         waitForStatus(app, contains: "Member")
-        XCTAssertTrue(element(app, "group.member.mute").exists)
+        expectTrue(element(app, "group.member.mute").exists)
     }
 
     /// Announcement mode ("mute all") flips from the panel: the switch reads on, and the header
@@ -125,8 +167,8 @@ final class GroupAdminUITests: XCTestCase {
         let app = launch()
         openGroupPanel(app)
         let toggle = waitFor(app.switches["group.toggle.announcementsOnly"].firstMatch)
-        XCTAssertEqual(toggle.value as? String, "0")
-        XCTAssertFalse(element(app, "group.header.announcementsOnly").exists)
+        expectEqual(toggle.value as? String, "0")
+        expectFalse(element(app, "group.header.announcementsOnly").exists)
 
         flip(toggle)
         wait("value == '1'", on: toggle)
@@ -143,8 +185,8 @@ final class GroupAdminUITests: XCTestCase {
         let app = launch(scenario: "announcements_only")
         openConversation(app)
         let locked = waitFor(element(app, "conversation.composer.locked"))
-        XCTAssertTrue(locked.label.localizedCaseInsensitiveContains("only admins"))
-        XCTAssertFalse(element(app, "conversation.composer.field").exists)
+        expectTrue(locked.label.localizedCaseInsensitiveContains("only admins"))
+        expectFalse(element(app, "conversation.composer.field").exists)
     }
 
     /// A muted member is told they are muted — not shown a generic failure — and cannot type.
@@ -152,14 +194,14 @@ final class GroupAdminUITests: XCTestCase {
         let app = launch(scenario: "muted")
         openConversation(app)
         let locked = waitFor(element(app, "conversation.composer.locked"))
-        XCTAssertTrue(locked.label.localizedCaseInsensitiveContains("muted"))
-        XCTAssertFalse(element(app, "conversation.composer.field").exists)
+        expectTrue(locked.label.localizedCaseInsensitiveContains("muted"))
+        expectFalse(element(app, "conversation.composer.field").exists)
 
         // The panel says the same thing, and offers none of the admin controls.
         element(app, "conversation.groupInfo").tap()
         waitFor(element(app, "group.panel"))
-        XCTAssertFalse(element(app, "group.addMembers").exists)
-        XCTAssertFalse(app.switches["group.toggle.announcementsOnly"].exists)
+        expectFalse(element(app, "group.addMembers").exists)
+        expectFalse(app.switches["group.toggle.announcementsOnly"].exists)
     }
 
     /// Roles: promote, then demote. The screen re-reads state after each action, so the button that
@@ -170,11 +212,11 @@ final class GroupAdminUITests: XCTestCase {
         openMember(app, carol)
         waitFor(element(app, "group.member.promote")).tap()
         waitForStatus(app, contains: "Admin")
-        XCTAssertFalse(element(app, "group.member.mute").exists, "admins cannot be muted")
+        expectFalse(element(app, "group.member.mute").exists, "admins cannot be muted")
 
         waitFor(element(app, "group.member.demote")).tap()
         waitForStatus(app, contains: "Member")
-        XCTAssertTrue(element(app, "group.member.promote").exists)
+        expectTrue(element(app, "group.member.promote").exists)
     }
 
     /// Demoting another admin while one remains is allowed, and the role round-trips. The
@@ -196,7 +238,7 @@ final class GroupAdminUITests: XCTestCase {
     func testAdminAddsAndRemovesAMember() {
         let app = launch()
         openGroupPanel(app)
-        XCTAssertFalse(element(app, "group.member.\(erin)").exists)
+        expectFalse(element(app, "group.member.\(erin)").exists)
 
         waitForRow(app, "group.addMembers").tap()
         // Let the sheet finish presenting before tapping inside it: a tap during the animation is
@@ -229,7 +271,7 @@ final class GroupAdminUITests: XCTestCase {
     func testAdminRenamesTheGroup() {
         let app = launch()
         openGroupPanel(app)
-        XCTAssertEqual(element(app, "group.title").label, "Group · 4 people")
+        expectEqual(element(app, "group.title").label, "Group · 4 people")
 
         waitFor(element(app, "group.rename")).tap()
         let field = waitFor(element(app, "group.rename.field"))
@@ -244,7 +286,7 @@ final class GroupAdminUITests: XCTestCase {
         app.navigationBars.buttons.element(boundBy: 0).tap()  // back to the conversation
         wait("label BEGINSWITH 'Weekend Trip'", on: element(app, "conversation.title"))
         app.navigationBars.buttons.element(boundBy: 0).tap()  // back to the list
-        XCTAssertTrue(app.staticTexts["Weekend Trip"].firstMatch.waitForExistence(timeout: 5),
+        expectTrue(app.staticTexts["Weekend Trip"].firstMatch.waitForExistence(timeout: 5),
                       "the chat list shows the new name")
     }
 
@@ -252,7 +294,7 @@ final class GroupAdminUITests: XCTestCase {
     func testUnreadBadgeClearsWhenTheConversationIsOpened() {
         let app = launch()
         let badge = waitFor(element(app, "chats.unread.\(conversationID)"))
-        XCTAssertEqual(badge.label, "3 unread")
+        expectEqual(badge.label, "3 unread")
         openConversation(app)
         app.navigationBars.buttons.element(boundBy: 0).tap()  // back to the list
         wait("exists == false", on: element(app, "chats.unread.\(conversationID)"))
@@ -275,12 +317,12 @@ final class GroupAdminUITests: XCTestCase {
         // Long-press offers Reply and the quick reactions.
         bubble.press(forDuration: 1.2)
         let reply = waitFor(app.buttons["Reply"].firstMatch, 5)
-        XCTAssertTrue(app.buttons["👍"].firstMatch.exists, "quick reactions are offered")
+        expectTrue(app.buttons["👍"].firstMatch.exists, "quick reactions are offered")
         reply.tap()
 
         // The reply bar names what is being answered, and cancelling clears it.
         let bar = waitFor(element(app, "conversation.reply.bar"))
-        XCTAssertTrue(
+        expectTrue(
             bar.label.localizedCaseInsensitiveContains("hello there"),
             "the composer names what is being answered, was: \(bar.label)")
         waitFor(element(app, "conversation.reply.cancel")).tap()
@@ -297,15 +339,15 @@ final class GroupAdminUITests: XCTestCase {
         let app = launch(scenario: "member")
         openGroupPanel(app)
         waitFor(element(app, "group.member.\(bob)"))
-        XCTAssertFalse(element(app, "group.addMembers").exists)
-        XCTAssertFalse(app.switches["group.toggle.announcementsOnly"].exists)
-        XCTAssertFalse(element(app, "group.createInvite").exists)
-        XCTAssertTrue(app.staticTexts["Who can send"].firstMatch.waitForExistence(timeout: 5))
+        expectFalse(element(app, "group.addMembers").exists)
+        expectFalse(app.switches["group.toggle.announcementsOnly"].exists)
+        expectFalse(element(app, "group.createInvite").exists)
+        expectTrue(app.staticTexts["Who can send"].firstMatch.waitForExistence(timeout: 5))
 
         openMember(app, carol)
-        XCTAssertFalse(element(app, "group.member.mute").exists)
-        XCTAssertFalse(element(app, "group.member.promote").exists)
-        XCTAssertFalse(element(app, "group.member.remove").exists)
+        expectFalse(element(app, "group.member.mute").exists)
+        expectFalse(element(app, "group.member.promote").exists)
+        expectFalse(element(app, "group.member.remove").exists)
     }
 
     /// An admin's composer stays usable in announcement mode, and a sent message renders. The mode
@@ -320,10 +362,10 @@ final class GroupAdminUITests: XCTestCase {
         app.navigationBars.buttons.element(boundBy: 0).tap()  // back to the conversation
 
         let field = waitFor(element(app, "conversation.composer.field"))
-        XCTAssertFalse(element(app, "conversation.composer.locked").exists, "admins are exempt")
+        expectFalse(element(app, "conversation.composer.locked").exists, "admins are exempt")
         field.tap()
         field.typeText("announcement")
         app.buttons["arrow.up.circle.fill"].firstMatch.tap()
-        XCTAssertTrue(app.staticTexts["announcement"].firstMatch.waitForExistence(timeout: 10))
+        expectTrue(app.staticTexts["announcement"].firstMatch.waitForExistence(timeout: 10))
     }
 }
