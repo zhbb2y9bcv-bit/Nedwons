@@ -480,6 +480,54 @@ public final class AppModel: ObservableObject {
         typingIndicatorControl?(enabled)
     }
 
+    // MARK: App lock (Face ID / passcode gate)
+
+    /// Whether a device-owner check is required to open the app. Persisted; OFF by default.
+    @Published public internal(set) var appLockEnabled: Bool = UserDefaults.standard.bool(
+        forKey: "nedwons.appLock")
+    /// True while the lock screen should cover the app. Starts locked iff app lock is on, so a cold
+    /// launch of a protected app is gated before anything renders.
+    @Published public internal(set) var isLocked: Bool = UserDefaults.standard.bool(
+        forKey: "nedwons.appLock")
+    /// The device-owner check. Replaceable in tests; the default uses `LocalAuthentication`.
+    public var appLockAuthenticator: AppLockAuthenticating = LocalAuthAppLock()
+
+    /// "Face ID" / "Touch ID" / "passcode", for labeling the control.
+    public var appLockBiometryName: String { appLockAuthenticator.biometryName }
+
+    /// Turn app lock on or off. Either direction requires a successful owner check first, so an
+    /// unlocked phone in someone else's hands cannot silently enable OR disable the gate. Returns
+    /// whether the change was made.
+    @discardableResult
+    public func setAppLock(_ enabled: Bool) async -> Bool {
+        if enabled && !appLockAuthenticator.isAvailable {
+            banner = "Set up Face ID, Touch ID, or a device passcode first."
+            return false
+        }
+        let ok = await appLockAuthenticator.authenticate(
+            reason: enabled ? "Turn on app lock" : "Turn off app lock")
+        guard ok else { return false }
+        appLockEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "nedwons.appLock")
+        // Just-authenticated, so the app is unlocked right now either way.
+        isLocked = false
+        return true
+    }
+
+    /// Lock the app if the feature is on (called when the app leaves the foreground).
+    public func lockIfEnabled() {
+        if appLockEnabled { isLocked = true }
+    }
+
+    /// Attempt to unlock — the owner check behind the lock screen. A failure or cancel leaves it
+    /// locked; the user can try again.
+    public func unlock() async {
+        guard appLockEnabled, isLocked else { return }
+        if await appLockAuthenticator.authenticate(reason: "Unlock Nedwons") {
+            isLocked = false
+        }
+    }
+
     /// Per-chat local presentation preferences (pin / archive / mute). Never sent to the relay.
     @Published public internal(set) var chatPrefs = ChatPrefs()
     public var chatPrefsStore: ChatPrefsStoring = UserDefaultsChatPrefsStore()
