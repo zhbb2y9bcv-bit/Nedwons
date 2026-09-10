@@ -227,7 +227,10 @@ fn delivery_key_grant_over_the_ffi() {
     // relay never sees it, and bob receives it as DeliveryKeyGranted (a control message).
     let (alice, bob) = two_party(&tmp("a"), &tmp("b"));
     let key_r = vec![0x7cu8; 32];
-    let id = alice.enqueue_delivery_key_grant(key_r.clone()).unwrap();
+    let my_devices = vec![vec![0xD1u8; 16], vec![0xD2u8; 16]];
+    let id = alice
+        .enqueue_delivery_key_grant(key_r.clone(), my_devices.clone())
+        .unwrap();
     let env = alice.encrypt(id).unwrap();
     alice.mark_sent(id).unwrap();
     assert!(
@@ -235,11 +238,21 @@ fn delivery_key_grant_over_the_ffi() {
         "K_r must not appear in the ciphertext"
     );
     match bob.process_inbound(1, env).unwrap() {
-        InboundResult::DeliveryKeyGranted { key_r: got } => assert_eq!(got, key_r),
+        InboundResult::DeliveryKeyGranted {
+            key_r: got,
+            device_ids,
+        } => {
+            assert_eq!(got, key_r);
+            assert_eq!(device_ids, my_devices, "the granter's devices ride with the key");
+        }
         other => panic!("expected DeliveryKeyGranted, got {other:?}"),
     }
     // A non-32-byte key is rejected at the boundary.
-    assert!(alice.enqueue_delivery_key_grant(vec![0u8; 31]).is_err());
+    assert!(alice.enqueue_delivery_key_grant(vec![0u8; 31], vec![]).is_err());
+    // …as is a malformed device id.
+    assert!(alice
+        .enqueue_delivery_key_grant(key_r.clone(), vec![vec![0u8; 15]])
+        .is_err());
 }
 
 #[test]

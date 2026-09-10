@@ -575,7 +575,12 @@ fn delivery_key_grant_travels_e2ee_and_is_surfaced() {
     let (mut alice, _ja, mut bob, _jb) = pair();
     let key_r = [0x7cu8; 32];
 
-    let local_id = alice.enqueue_delivery_key_grant(&key_r).unwrap();
+    // The grant also names the granter's own devices, so the holder can fan a sealed message out
+    // to each of them without any endpoint that lists someone's devices.
+    let my_devices = [[0xD1u8; 16], [0xD2u8; 16]];
+    let local_id = alice
+        .enqueue_delivery_key_grant(&key_r, &my_devices)
+        .unwrap();
     let env = alice.encrypt(local_id).unwrap();
     alice.mark_sent(local_id).unwrap();
 
@@ -584,6 +589,10 @@ fn delivery_key_grant_travels_e2ee_and_is_surfaced() {
         !env.windows(32).any(|w| w == key_r),
         "K_r must not appear in the ciphertext the relay forwards"
     );
+    assert!(
+        !env.windows(16).any(|w| w == my_devices[0]),
+        "nor may the granter's device ids appear in the clear"
+    );
     // It is NOT a user-visible message on the sender (a control message, no message-log entry).
     assert!(
         alice.messages().is_empty(),
@@ -591,7 +600,13 @@ fn delivery_key_grant_travels_e2ee_and_is_surfaced() {
     );
 
     match bob.process_inbound(1, &env).unwrap() {
-        InboundOutcome::DeliveryKeyGranted { key_r: got } => assert_eq!(got, key_r),
+        InboundOutcome::DeliveryKeyGranted {
+            key_r: got,
+            device_ids,
+        } => {
+            assert_eq!(got, key_r);
+            assert_eq!(device_ids, my_devices.to_vec(), "the granter's devices come with the key");
+        }
         other => panic!("expected DeliveryKeyGranted, got {other:?}"),
     }
     // The grant is a control message — it does not appear in Bob's message log.
