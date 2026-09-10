@@ -85,15 +85,10 @@ public final class AppComposition: ObservableObject {
             relay: NedwonsClient(baseURL: AppConfig.serverURL),
             storeDirectory: storeDirectory,
             keyProvider: { storeID in try keys.atRestKey(forStore: storeID) })
-        // MLS-commit-authoritative membership (ADR-0010): signing a membership manifest uses the
-        // device's ENROLLED key, and verifying someone else's uses the pinned transparency-log key.
-        // Both are resolved lazily — the enrolled key is provisioned at registration/sign-in, well
-        // after this graph is built.
-        coordinator.membershipSignerProvider = { [weak model] in model?.enrolledDeviceSigner() }
-        coordinator.pinnedLogKeyProvider = { [weak model] in
-            guard let model else { throw NedwonsClient.ClientError.decoding }
-            return try await model.currentPinnedLogKey()
-        }
+        // MLS-commit-authoritative membership (ADR-0010) needs no wiring here: the coordinator
+        // resolves the device's enrolled signing key and the pinned transparency-log key from the
+        // model itself. Setting the providers explicitly is only for harnesses with a synthetic
+        // identity — doing it here too would create a second source of truth for the same fact.
         // Encrypted chat backups (docs/BACKUPS.md): sealing reads the live store files, which is
         // safe alongside the coordinator (commits are atomic renames); RESTORE stops it first so
         // no store is open while files land, and start() re-reads the index after.

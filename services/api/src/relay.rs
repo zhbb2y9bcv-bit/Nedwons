@@ -145,6 +145,11 @@ pub enum SendRefusal {
     MemberMuted,
     /// The whole group is in announcement mode and this member is not an admin.
     AnnouncementsOnly,
+    /// This device's account has left, or been removed by an admin, and the remove-commit that
+    /// makes it cryptographic has not landed yet (ADR-0010, V31). Still a routed member on paper —
+    /// only a commit may change that — but no longer a participant: it can neither send nor
+    /// receive from the moment the departure was recorded.
+    Departed,
 }
 
 impl SendRefusal {
@@ -153,6 +158,7 @@ impl SendRefusal {
         match self {
             SendRefusal::MemberMuted => "muted",
             SendRefusal::AnnouncementsOnly => "announcements_only",
+            SendRefusal::Departed => "departed",
         }
     }
 }
@@ -217,7 +223,10 @@ fn send_refusal_in_txn(
                     EXISTS (SELECT 1 FROM group_mutes gm
                              WHERE gm.conversation_id = c.conversation_id
                                AND gm.account_id = cm.account_id
-                               AND (gm.expires_at IS NULL OR gm.expires_at > now()))
+                               AND (gm.expires_at IS NULL OR gm.expires_at > now())),
+                    EXISTS (SELECT 1 FROM membership_intents i
+                             WHERE i.conversation_id = c.conversation_id
+                               AND i.device_id = cm.device_id AND i.kind = 2)
              FROM conversations c
              JOIN conversation_members cm
                   ON cm.conversation_id = c.conversation_id AND cm.device_id = $2
@@ -233,6 +242,13 @@ fn send_refusal_in_txn(
     let announcements_only: bool = row.get(0);
     let is_admin: bool = row.get(1);
     let is_muted: bool = row.get(2);
+    let departed: bool = row.get(3);
+    if departed {
+        // A member who has left (or been removed) is done participating from that moment, not
+        // from whenever a remaining member next syncs and posts the remove-commit. Checked first:
+        // it is the most specific true thing to tell them.
+        return Ok(Some(SendRefusal::Departed));
+    }
     if is_muted {
         // Checked before announcement mode so the client can say something true and specific:
         // "an admin muted you" is different feedback from "the group is locked".
@@ -1151,11 +1167,20 @@ impl PgRelay {
         }
         let rows = txn
             .query(
+                // A device with a pending REMOVAL intent (V31) is skipped: its account left, or an
+                // admin removed it, and the remove-commit that deletes its routing row is on its
+                // way. Suppressing delivery here is honest about what the relay can already do —
+                // it can decline to deliver to anyone, undetectably — so gating it on a recorded,
+                // authorized departure grants the relay no power it lacked. What the commit
+                // protocol guards, MEMBERSHIP, still changes only by an accepted commit.
                 "INSERT INTO envelopes
                      (conversation_id, sender_device, recipient_device, ciphertext, idempotency_key)
                  SELECT $1, $2, cm.device_id, $3, $4
                  FROM conversation_members cm
                  WHERE cm.conversation_id = $1 AND cm.device_id <> $2
+                   AND NOT EXISTS (SELECT 1 FROM membership_intents i
+                                   WHERE i.conversation_id = cm.conversation_id
+                                     AND i.device_id = cm.device_id AND i.kind = 2)
                  ON CONFLICT (sender_device, recipient_device, idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING
                  RETURNING recipient_device",
                 &[

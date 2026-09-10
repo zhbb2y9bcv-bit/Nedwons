@@ -81,6 +81,26 @@ public final class ConversationCoordinator {
     /// **logged** actor key rather than one the server merely asserts. Same lazy reasoning.
     public var pinnedLogKeyProvider: (@Sendable () async throws -> Data)?
 
+    /// The signer for membership manifests: an injected provider if one was set, otherwise the
+    /// device's enrolled key straight from the model.
+    ///
+    /// The fallback is the fix for a real failure. A coordinator built without an explicit provider
+    /// used to be unable to add anyone — silently, inside a swallowed error — which is exactly what
+    /// happened to a live harness the moment new conversations became authoritative. The model
+    /// always knows the enrolled key for a signed-in user, so there is no reason a coordinator
+    /// should be able to exist without it. An explicit provider is now only for harnesses whose
+    /// session was minted with a synthetic identity the model has never seen.
+    private func membershipSigner() -> (any DeviceSigner)? {
+        membershipSignerProvider?() ?? model.enrolledDeviceSigner()
+    }
+
+    /// Same shape for the pinned log key: injected, else the model's (configured or trust-on-first-
+    /// use), so verification of inbound membership never silently has nothing to verify against.
+    private func pinnedLogKey() async throws -> Data {
+        if let provider = pinnedLogKeyProvider { return try await provider() }
+        return try await model.currentPinnedLogKey()
+    }
+
     public init(
         model: AppModel,
         relay: any ConversationRelay,
@@ -449,7 +469,7 @@ public final class ConversationCoordinator {
     /// exists to prevent.
     private func addByCommit(target: SetupTarget, keyPackage: Data, client: MlsClient) async throws {
         guard let token else { throw CoordinatorError.notSignedIn }
-        guard let signer = membershipSignerProvider?() else {
+        guard let signer = membershipSigner() else {
             throw CoordinatorError.noMembershipSigner
         }
         guard let actorDevice = identity,
@@ -484,7 +504,7 @@ public final class ConversationCoordinator {
         conversationID: String, targets: [SetupTarget], client: MlsClient
     ) async throws {
         guard let token else { throw CoordinatorError.notSignedIn }
-        guard let signer = membershipSignerProvider?() else {
+        guard let signer = membershipSigner() else {
             throw CoordinatorError.noMembershipSigner
         }
         guard let actorDevice = identity else { throw CoordinatorError.notSignedIn }
@@ -545,7 +565,7 @@ public final class ConversationCoordinator {
         conversationID: String, epoch: UInt64, ciphertext: Data, client: MlsClient
     ) async -> Bool {
         guard let token else { return false }
-        guard let pinnedLogKey = try? await pinnedLogKeyProvider?() else {
+        guard let pinnedLogKey = try? await pinnedLogKey() else {
             // With no pinned log key we cannot tell the actor's real device key from a server-chosen
             // one, and an unverified merge is exactly what R-506 forbids. Leave it unacked so a
             // later sync — once the key is available — can still verify and merge it.

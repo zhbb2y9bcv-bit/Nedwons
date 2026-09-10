@@ -123,6 +123,9 @@ public enum GroupRefusal: String, Sendable, Equatable {
     case muted
     /// The group is in announcement mode and you are not an admin.
     case announcementsOnly = "announcements_only"
+    /// You have left this group (or been removed), and the signed update that makes that final is
+    /// still on its way. You can no longer send or receive here regardless (ADR-0010).
+    case departed
     /// Refused to demote the group's only admin.
     case lastAdmin = "last_admin"
     /// Refused to mute an admin: demote first.
@@ -148,15 +151,18 @@ public enum GroupRefusal: String, Sendable, Equatable {
         return GroupRefusal(rawValue: code)
     }
 
-    /// The two refusals a SEND can get back while still being a member in good standing. The
-    /// composer treats these as "locked", not as a transient failure to retry.
-    public var isSendRefusal: Bool { self == .muted || self == .announcementsOnly }
+    /// The refusals a SEND can get back while the sender is still a routed member. The composer
+    /// treats these as "locked", not as a transient failure to retry.
+    public var isSendRefusal: Bool {
+        self == .muted || self == .announcementsOnly || self == .departed
+    }
 
     /// Copy shown to the person the refusal applies to.
     public var userFacingText: String {
         switch self {
         case .muted: "An admin has muted you in this group."
         case .announcementsOnly: "Only admins can send messages in this group right now."
+        case .departed: "You're no longer in this group."
         case .lastAdmin: "A group needs at least one admin. Make someone else an admin first."
         case .targetIsAdmin: "Admins can't be muted. Remove their admin role first."
         case .notMember: "That person isn't in this group."
