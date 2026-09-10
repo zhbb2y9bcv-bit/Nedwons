@@ -955,12 +955,22 @@ impl<J: Journal> DurableSession<J> {
     }
 
     pub fn stage_remove_member(&mut self, identity: &[u8]) -> Result<Vec<u8>, DurableError> {
+        self.stage_remove_members(std::slice::from_ref(&identity.to_vec()))
+    }
+
+    /// Several removals in one commit — removing an account means removing every device it is
+    /// present through, and that has to be one epoch transition (see
+    /// [`Conversation::stage_remove_members`]).
+    pub fn stage_remove_members(
+        &mut self,
+        identities: &[Vec<u8>],
+    ) -> Result<Vec<u8>, DurableError> {
         let Session {
             member,
             conversation,
             ..
         } = &mut self.session;
-        Ok(conversation.stage_remove_member(member, identity)?)
+        Ok(conversation.stage_remove_members(member, identities)?)
     }
 
     /// Merge the pending staged commit (server accepted) and persist the advanced state.

@@ -20,7 +20,11 @@ final class InMemoryRelay: ConversationRelay, @unchecked Sendable {
     private var devices: [String: Device] = [:]  // token → device
     private var prekeys: [String: [(device: String, keyPackage: Data)]] = [:]  // account → queue
     private var members: [String: Set<String>] = [:]  // conversation → device ids
-    private var inboxes: [String: [(id: Int, conversation: String, sender: String, ciphertext: Data)]] = [:]
+    private var inboxes:
+        [String: [(
+            id: Int, conversation: String, sender: String, ciphertext: Data,
+            membershipEpoch: UInt64?
+        )]] = [:]
     private var nextID = 1
     private var seenKeys: Set<String> = []
     var failSends = false
@@ -77,13 +81,23 @@ final class InMemoryRelay: ConversationRelay, @unchecked Sendable {
     func setupNeeded(accessToken: String) async throws -> [SetupTarget] {
         try sync {
             let d = try device(accessToken)
-            return pendingSetup
+            // Legacy V27 rows...
+            var out = pendingSetup
                 .filter { isSetUpMember(d.deviceID, in: $0.conversation) && $0.device != d.deviceID }
                 .map {
                     SetupTarget(
                         conversationID: $0.conversation, accountID: $0.account,
                         deviceID: $0.device)
                 }
+            // ...plus ADR-0010 intents, which the caller must carry out by signed commit.
+            out += intents
+                .filter { isSetUpMember(d.deviceID, in: $0.conversation) && $0.device != d.deviceID }
+                .map {
+                    SetupTarget(
+                        conversationID: $0.conversation, accountID: $0.account,
+                        deviceID: $0.device, authoritative: true, removal: $0.removal)
+                }
+            return out
         }
     }
 
@@ -96,6 +110,9 @@ final class InMemoryRelay: ConversationRelay, @unchecked Sendable {
                 pendingSetup.contains(where: {
                     $0.conversation == conversationID && $0.device == deviceID
                 })
+                    || intents.contains(where: {
+                        $0.conversation == conversationID && $0.device == deviceID
+                    })
             else { return false }
             let key = "\(conversationID)/\(deviceID)"
             guard setupClaims[key] == nil || setupClaims[key] == d.deviceID else { return false }
@@ -138,8 +155,206 @@ final class InMemoryRelay: ConversationRelay, @unchecked Sendable {
         return d
     }
 
-    private func enqueue(to device: String, conversation: String, sender: String, ciphertext: Data) {
-        inboxes[device, default: []].append((nextID, conversation, sender, ciphertext))
+    // ----- MLS-commit-authoritative membership (ADR-0010, V31) -------------------------------
+    //
+    // Faithful to the server's acceptance order, because the coordinator's error handling depends
+    // on it: intent requirement → epoch compare-and-swap → routing delta → commit fan-out (tagged
+    // with `membership_epoch`) + targeted welcomes → intent consumption → append-only event log.
+
+    struct Intent: Equatable {
+        let conversation: String
+        let account: String
+        let device: String
+        /// false = join (consumed by an add commit), true = removal (consumed by a remove commit).
+        let removal: Bool
+    }
+    private var authoritativeConversations: Set<String> = []
+    private var epochs: [String: UInt64] = [:]
+    private var intents: [Intent] = []
+    /// conversation → next_epoch → the accepted manifest, exactly as the audit log holds it.
+    private var membershipEvents: [String: [UInt64: (manifest: MembershipManifest, signature: Data)]] = [:]
+    /// device → its enrolled verifying key, so signatures are really checked, not assumed.
+    private var deviceKeys: [String: Data] = [:]
+
+    /// Make `id` MLS-authoritative with `creatorDevice` as the lone genesis member at epoch 0 — what
+    /// `POST /v1/groups {mls_authoritative: true}` does. Everyone else arrives by commit.
+    func createAuthoritativeConversation(
+        _ id: String, creatorDevice: String, intended: [(account: String, device: String)]
+    ) {
+        lock.lock(); defer { lock.unlock() }
+        authoritativeConversations.insert(id)
+        if members[id] == nil {
+            members[id] = [creatorDevice]
+            epochs[id] = 0
+        }
+        for person in intended {
+            intents.append(
+                .init(
+                    conversation: id, account: person.account, device: person.device,
+                    removal: false))
+        }
+    }
+
+    /// Authorize one more device to join later — what a direct add, an accepted invite, or an
+    /// approved join request records once the group already exists.
+    func authorizeJoin(conversation: String, account: String, device: String) {
+        lock.lock(); defer { lock.unlock() }
+        guard !(members[conversation] ?? []).contains(device) else { return }
+        intents.append(
+            .init(conversation: conversation, account: account, device: device, removal: false))
+    }
+
+    /// Another member's commit won this epoch transition first. The next commit built against the
+    /// old epoch must lose the compare-and-swap.
+    func simulateConcurrentCommitWinner(conversation: String) {
+        lock.lock(); defer { lock.unlock() }
+        epochs[conversation] = (epochs[conversation] ?? 0) + 1
+    }
+
+    /// Record an authorized departure: what `/leave` and admin removal do in an authoritative
+    /// conversation — mark every routed device of the account, purge its queued mail, and leave the
+    /// routing rows for the remove-commit to delete.
+    func queueRemoval(conversation: String, account: String) {
+        lock.lock(); defer { lock.unlock() }
+        let routed = (members[conversation] ?? []).filter { deviceID in
+            devices.values.first { $0.deviceID == deviceID }?.accountID == account
+        }
+        for deviceID in routed {
+            intents.removeAll { $0.conversation == conversation && $0.device == deviceID }
+            intents.append(
+                .init(conversation: conversation, account: account, device: deviceID, removal: true))
+            inboxes[deviceID]?.removeAll { $0.conversation == conversation }
+        }
+    }
+
+    var intentCount: Int { sync { intents.count } }
+    func routedDevices(in conversation: String) -> Set<String> { sync { members[conversation] ?? [] } }
+    func epoch(of conversation: String) -> UInt64 { sync { epochs[conversation] ?? 0 } }
+
+    /// A committer who signs a manifest that does not describe what their commit really did. The
+    /// relay cannot detect this (it never parses the commit — the documented ADR-0010 limitation),
+    /// so ONLY the recipient's correspondence check stands between the group and the lie.
+    var lieAboutAddedDevice: String?
+    /// Simulate a manifest whose signature does not verify under the actor's transparency-logged
+    /// device key — the other half of recipient verification.
+    var failManifestSignature = false
+
+    func conversationEpoch(accessToken: String, conversationID: String) async throws -> UInt64 {
+        try sync {
+            let d = try device(accessToken)
+            guard members[conversationID]?.contains(d.deviceID) == true else {
+                throw NedwonsClient.ClientError.http(status: 403, body: #"{"error":"forbidden"}"#)
+            }
+            return epochs[conversationID] ?? 0
+        }
+    }
+
+    func commitMembership(
+        accessToken: String, conversationID: String, actorDevice: Data, change: MembershipChange,
+        idempotencyKey: Data, ttlSeconds: UInt64, signer: DeviceSigner
+    ) async throws -> MembershipCommitOutcome {
+        try sync {
+            let d = try device(accessToken)
+            deviceKeys[d.deviceID] = signer.publicKeyX963
+            guard members[conversationID]?.contains(d.deviceID) == true else {
+                throw NedwonsClient.ClientError.http(status: 403, body: #"{"error":"forbidden"}"#)
+            }
+
+            // The manifest the actor signs, byte-for-byte what the real client builds.
+            let nextEpoch = change.prevEpoch + 1
+            let manifest = MembershipManifest(
+                control: change.control, groupID: Hex.decode(conversationID)!,
+                prevEpoch: change.prevEpoch, nextEpoch: nextEpoch,
+                commitHash: Data(SHA256.hash(data: change.commit)), actorDevice: actorDevice,
+                added: change.added, removed: change.removed, idempotencyKey: idempotencyKey,
+                expiresAt: UInt64(Date().timeIntervalSince1970) + ttlSeconds)
+            let signature = try signer.sign(manifest.canonicalBytes())
+
+            // Every touched device must carry the matching intent — the authorization ledger is
+            // what replaces re-checking the committer's role (any member may be the courier).
+            for (account, deviceData) in change.added {
+                let deviceHex = Hex.encode(deviceData)
+                guard intents.contains(where: {
+                    $0.conversation == conversationID && $0.device == deviceHex
+                        && $0.account == Hex.encode(account) && !$0.removal
+                }) else { return .forbidden }
+            }
+            for deviceData in change.removed {
+                let deviceHex = Hex.encode(deviceData)
+                guard intents.contains(where: {
+                    $0.conversation == conversationID && $0.device == deviceHex && $0.removal
+                }) else { return .forbidden }
+            }
+
+            // Epoch compare-and-swap: exactly one commit wins each transition.
+            guard (epochs[conversationID] ?? 0) == change.prevEpoch else { return .staleEpoch }
+            epochs[conversationID] = nextEpoch
+
+            // The commit fans out to every PRE-change member device except the actor and the
+            // removed ones; captured before the delta.
+            let removedHex = Set(change.removed.map { Hex.encode($0) })
+            let recipients = (members[conversationID] ?? [])
+                .filter { $0 != d.deviceID && !removedHex.contains($0) }
+                .sorted()
+
+            for (_, deviceData) in change.added { members[conversationID]?.insert(Hex.encode(deviceData)) }
+            for deviceHex in removedHex {
+                members[conversationID]?.remove(deviceHex)
+                inboxes[deviceHex]?.removeAll { $0.conversation == conversationID }
+            }
+
+            for recipient in recipients {
+                enqueue(
+                    to: recipient, conversation: conversationID, sender: d.deviceID,
+                    ciphertext: change.commit, membershipEpoch: nextEpoch)
+            }
+            for (i, (_, deviceData)) in change.added.enumerated() {
+                enqueue(
+                    to: Hex.encode(deviceData), conversation: conversationID, sender: d.deviceID,
+                    ciphertext: change.welcomes[i], membershipEpoch: nil)
+            }
+
+            // Consumed by the commit that honours them.
+            for (_, deviceData) in change.added {
+                intents.removeAll { $0.conversation == conversationID && $0.device == Hex.encode(deviceData) }
+            }
+            for deviceHex in removedHex {
+                intents.removeAll { $0.conversation == conversationID && $0.device == deviceHex }
+            }
+
+            membershipEvents[conversationID, default: [:]][nextEpoch] = (manifest, signature)
+            return .applied(nextEpoch: nextEpoch)
+        }
+    }
+
+    func verifyIncomingMembershipEvent(
+        accessToken: String, conversationID: String, epoch: UInt64, pinnedLogPublicKeyX963: Data
+    ) async throws -> MembershipVerifyResult {
+        try sync {
+            _ = try device(accessToken)
+            guard let event = membershipEvents[conversationID]?[epoch] else {
+                throw NedwonsClient.ClientError.http(status: 403, body: #"{"error":"forbidden"}"#)
+            }
+            if failManifestSignature { return .badSignature }
+            // The real check: the manifest bytes verify under the actor's LOGGED device key.
+            guard let key = deviceKeys[Hex.encode(event.manifest.actorDevice)],
+                let publicKey = try? P256.Signing.PublicKey(x963Representation: key),
+                let sig = try? P256.Signing.ECDSASignature(rawRepresentation: event.signature),
+                publicKey.isValidSignature(sig, for: event.manifest.canonicalBytes())
+            else { return .badSignature }
+            var added = event.manifest.added.map(\.device)
+            if let lie = lieAboutAddedDevice, let bytes = Hex.decode(lie) { added = [bytes] }
+            return .verified(
+                added: added, removed: event.manifest.removed, nextEpoch: event.manifest.nextEpoch)
+        }
+    }
+
+    private func enqueue(
+        to device: String, conversation: String, sender: String, ciphertext: Data,
+        membershipEpoch: UInt64? = nil
+    ) {
+        inboxes[device, default: []].append(
+            (nextID, conversation, sender, ciphertext, membershipEpoch))
         nextID += 1
     }
 
@@ -242,10 +457,13 @@ final class InMemoryRelay: ConversationRelay, @unchecked Sendable {
         try sync {
             let d = try device(accessToken)
             var rows = (inboxes[d.deviceID] ?? []).map { row -> [String: Any] in
-                [
+                var out: [String: Any] = [
                     "id": row.id, "conversation_id": row.conversation, "sender_device": row.sender,
                     "ciphertext": Hex.encode(row.ciphertext), "sealed": false, "self_group": false,
                 ]
+                // Only a membership commit carries the tag; ordinary mail and welcomes omit it.
+                if let epoch = row.membershipEpoch { out["membership_epoch"] = epoch }
+                return out
             }
             // Sealed envelopes carry NO sender and NO conversation — the recipient works out which
             // conversation it is by decrypting.
@@ -348,10 +566,24 @@ struct Participant {
     var coordinator: ConversationCoordinator
     let directory: URL
 
+    /// This device's enrolled signing key — stable across relaunches, exactly like the real one, so
+    /// manifests it signed before a restart still verify after. Signs ADR-0010 membership manifests.
+    let signer: SoftwareDeviceSigner
+
+    /// Ids have to decode as real 16-byte hex, because the ADR-0010 membership manifest parses them:
+    /// a mnemonic-but-invalid id (the old `"llll…"` for carol) makes every commit naming that device
+    /// fail, silently, inside a `try?`. One character in, 16 identical bytes out — injective, so the
+    /// fixture's convention survives: the FIRST character picks the account (making "alicx" alice's
+    /// tablet) and the LAST picks the device.
+    private static func hexID(_ seed: Character) -> String {
+        String(repeating: String(format: "%02x", seed.asciiValue ?? 0x3f), count: 16)
+    }
+
     init(_ name: String, relay: InMemoryRelay, directory: URL? = nil) {
         self.name = name
-        accountID = String(repeating: name.first!.lowercased(), count: 32)
-        deviceID = String(repeating: name.last!.lowercased(), count: 32)
+        accountID = Self.hexID(Character(name.first!.lowercased()))
+        deviceID = Self.hexID(Character(name.last!.lowercased()))
+        signer = SoftwareDeviceSigner()
         model = AppModel(client: NedwonsClient(baseURL: URL(string: "http://127.0.0.1:1")!))
         model.session = NedwonsClient.Session(
             accountID: accountID, deviceID: deviceID, accessToken: name, accessExpiresAt: 1 << 40,
@@ -359,14 +591,20 @@ struct Participant {
         self.directory = directory ?? FileManager.default.temporaryDirectory
             .appendingPathComponent("coord-\(name)-\(UUID().uuidString)", isDirectory: true)
         relay.register(token: name, accountID: accountID, deviceID: deviceID)
-        coordinator = Self.makeCoordinator(model: model, relay: relay, directory: self.directory)
+        coordinator = Self.makeCoordinator(
+            model: model, relay: relay, directory: self.directory, signer: signer)
     }
 
-    static func makeCoordinator(model: AppModel, relay: InMemoryRelay, directory: URL) -> ConversationCoordinator {
+    static func makeCoordinator(
+        model: AppModel, relay: InMemoryRelay, directory: URL, signer: SoftwareDeviceSigner
+    ) -> ConversationCoordinator {
         let c = ConversationCoordinator(
             model: model, relay: relay, storeDirectory: directory,
             keyProvider: { storeID in Data(SHA256.hash(data: Data(storeID.utf8))) },
             minimumKeyPackages: 2)
+        // What the composition root wires in the shipped app (ADR-0010).
+        c.membershipSignerProvider = { signer }
+        c.pinnedLogKeyProvider = { Data("pinned-transparency-log-key".utf8) }
         c.attach(aliasStore: nil)
         return c
     }
@@ -374,7 +612,8 @@ struct Participant {
     /// "Relaunch": a fresh coordinator over the same directory, the previous one discarded.
     mutating func relaunch(relay: InMemoryRelay) {
         coordinator.stop()
-        coordinator = Self.makeCoordinator(model: model, relay: relay, directory: directory)
+        coordinator = Self.makeCoordinator(
+            model: model, relay: relay, directory: directory, signer: signer)
     }
 
     func texts(in conversation: String) -> [(String, Bool)] {
@@ -1103,5 +1342,202 @@ final class SealedSenderFlowTests: XCTestCase {
         XCTAssertGreaterThan(relay.deliveries, 0, "and the message still goes, identified")
         _ = try await bob.coordinator.syncOnce()
         XCTAssertTrue(bob.texts(in: conv).map(\.0).contains("after the block"))
+    }
+}
+
+/// MLS-commit-authoritative membership end to end (ADR-0010, R-506) over the REAL MLS core: the
+/// relay's routing set is written only by an accepted, device-signed commit, and every recipient
+/// verifies the signed manifest — signature AND correspondence — before merging.
+@MainActor
+final class AuthoritativeMembershipTests: XCTestCase {
+    private let conv = "ca" + String(repeating: "9", count: 30)
+
+    /// Alice creates an authoritative group and builds its MLS group; the others are then
+    /// AUTHORIZED but not members — they exist only as membership intents until a signed commit
+    /// brings them in, which is what each test drives explicitly.
+    private func openGroup(
+        relay: InMemoryRelay, creator: Participant, intended: [Participant]
+    ) async throws {
+        for person in intended { await person.coordinator.ensureKeyPackages() }
+        relay.createAuthoritativeConversation(
+            conv, creatorDevice: creator.deviceID, intended: [])
+        try await creator.coordinator.bootstrap(conversationID: conv, memberAccountIDs: [])
+        for person in intended {
+            relay.authorizeJoin(
+                conversation: conv, account: person.accountID, device: person.deviceID)
+        }
+    }
+
+    /// The core claim: nobody joins routing except through a commit, and once they do the group
+    /// really works. The relay starts with the creator alone at epoch 0.
+    func testMembershipIsCreatedOnlyByAnAcceptedCommit() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        XCTAssertEqual(relay.epoch(of: conv), 0)
+
+        try await openGroup(relay: relay, creator: alice, intended: [bob])
+
+        // Bob was authorized but is NOT routed until the commit lands.
+        XCTAssertEqual(relay.routedDevices(in: conv), [alice.deviceID])
+        XCTAssertEqual(relay.intentCount, 1)
+
+        await alice.coordinator.reconcileSetup()
+
+        XCTAssertEqual(relay.epoch(of: conv), 1, "the epoch CAS moved exactly one transition")
+        XCTAssertEqual(relay.routedDevices(in: conv), [alice.deviceID, bob.deviceID])
+        XCTAssertEqual(relay.intentCount, 0, "the commit consumed the intent that authorized it")
+
+        // And the group is real: Bob redeems his Welcome and reads Alice's message.
+        await alice.model.sendMessage("hello from an authoritative group", to: conv)
+        _ = try await bob.coordinator.syncOnce()
+        XCTAssertEqual(
+            bob.texts(in: conv).map(\.0), ["hello from an authoritative group"])
+    }
+
+    /// An EXISTING member is the one who has to verify: Bob receives Alice's add-Carol commit
+    /// tagged with its epoch, checks the signed manifest, and only then merges.
+    func testExistingMemberVerifiesAndMergesAnHonestCommit() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        let carol = Participant("carol", relay: relay)
+        try await openGroup(relay: relay, creator: alice, intended: [bob])
+        await alice.coordinator.reconcileSetup()
+        _ = try await bob.coordinator.syncOnce()
+
+        // Carol is authorized later (an admin add / accepted invite).
+        await carol.coordinator.ensureKeyPackages()
+        relay.authorizeJoin(conversation: conv, account: carol.accountID, device: carol.deviceID)
+        await alice.coordinator.reconcileSetup()
+        XCTAssertEqual(relay.epoch(of: conv), 2)
+
+        // Bob merges only after verifying, and stays in sync with the group.
+        _ = try await bob.coordinator.syncOnce()
+        XCTAssertNil(bob.model.securityNotice, "an honest commit raises nothing")
+        await alice.model.sendMessage("carol is here", to: conv)
+        _ = try await bob.coordinator.syncOnce()
+        _ = try await carol.coordinator.syncOnce()
+        XCTAssertTrue(bob.texts(in: conv).map(\.0).contains("carol is here"))
+        XCTAssertTrue(carol.texts(in: conv).map(\.0).contains("carol is here"))
+    }
+
+    /// The limitation ADR-0010 states in full: the relay CANNOT tell that a valid member's manifest
+    /// lies about its commit, because it never parses the commit. Only the recipient can — and does.
+    /// The group's cryptographic state must simply not follow the lie.
+    func testLyingManifestIsRefusedAndTheGroupDoesNotFollowIt() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        let carol = Participant("carol", relay: relay)
+        try await openGroup(relay: relay, creator: alice, intended: [bob])
+        await alice.coordinator.reconcileSetup()
+        _ = try await bob.coordinator.syncOnce()
+        let bobEpochBefore = relay.epoch(of: conv)
+
+        // Alice adds Carol for real, but the manifest names a different device.
+        await carol.coordinator.ensureKeyPackages()
+        relay.authorizeJoin(conversation: conv, account: carol.accountID, device: carol.deviceID)
+        relay.lieAboutAddedDevice = String(repeating: "f", count: 32)
+        await alice.coordinator.reconcileSetup()
+
+        // The server accepted it (it cannot see inside), so routing moved...
+        XCTAssertEqual(relay.epoch(of: conv), bobEpochBefore + 1)
+        // ...but Bob refuses to merge a commit that does not do what it claims.
+        _ = try await bob.coordinator.syncOnce()
+        XCTAssertNotNil(bob.model.securityNotice, "the refusal is surfaced, not silent")
+
+        // Bob's own view did not follow the lie: the commit was discarded unmerged.
+        await alice.model.sendMessage("sent at the lied-about epoch", to: conv)
+        _ = try await bob.coordinator.syncOnce()
+        XCTAssertFalse(
+            bob.texts(in: conv).map(\.0).contains("sent at the lied-about epoch"),
+            "a refused commit leaves the recipient at the old epoch — desynced by construction, "
+                + "which ADR-0010 accepts and repairs by re-add")
+    }
+
+    /// The other half of recipient verification: a manifest whose signature does not verify under
+    /// the actor's transparency-logged device key is refused before the correspondence check runs.
+    func testUnverifiableManifestSignatureIsRefused() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        let carol = Participant("carol", relay: relay)
+        try await openGroup(relay: relay, creator: alice, intended: [bob])
+        await alice.coordinator.reconcileSetup()
+        _ = try await bob.coordinator.syncOnce()
+
+        await carol.coordinator.ensureKeyPackages()
+        relay.authorizeJoin(conversation: conv, account: carol.accountID, device: carol.deviceID)
+        relay.failManifestSignature = true
+        await alice.coordinator.reconcileSetup()
+
+        _ = try await bob.coordinator.syncOnce()
+        XCTAssertNotNil(bob.model.securityNotice)
+        await alice.model.sendMessage("after the unsigned change", to: conv)
+        _ = try await bob.coordinator.syncOnce()
+        XCTAssertFalse(bob.texts(in: conv).map(\.0).contains("after the unsigned change"))
+    }
+
+    /// A removal is carried out by whichever member syncs first — never by the person leaving, since
+    /// MLS refuses a commit that removes the committer's own leaf. Delivery stops and the epoch moves.
+    func testAuthorizedRemovalLandsAsASignedCommit() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        let carol = Participant("carol", relay: relay)
+        try await openGroup(relay: relay, creator: alice, intended: [bob, carol])
+        await alice.coordinator.reconcileSetup()
+        _ = try await bob.coordinator.syncOnce()
+        _ = try await carol.coordinator.syncOnce()
+        XCTAssertEqual(
+            relay.routedDevices(in: conv), [alice.deviceID, bob.deviceID, carol.deviceID])
+        let epochBefore = relay.epoch(of: conv)
+
+        // Carol is removed (an admin's decision, or Carol leaving): recorded, not yet cryptographic.
+        relay.queueRemoval(conversation: conv, account: carol.accountID)
+        XCTAssertEqual(
+            relay.routedDevices(in: conv), [alice.deviceID, bob.deviceID, carol.deviceID],
+            "routing does not move until a commit says so")
+
+        await alice.coordinator.reconcileSetup()
+
+        XCTAssertEqual(relay.epoch(of: conv), epochBefore + 1)
+        XCTAssertEqual(relay.routedDevices(in: conv), [alice.deviceID, bob.deviceID])
+        XCTAssertEqual(relay.intentCount, 0)
+
+        // Bob verifies the removal commit and stays in sync; Carol receives nothing further.
+        await alice.model.sendMessage("after carol left", to: conv)
+        _ = try await bob.coordinator.syncOnce()
+        _ = try await carol.coordinator.syncOnce()
+        XCTAssertTrue(bob.texts(in: conv).map(\.0).contains("after carol left"))
+        XCTAssertFalse(carol.texts(in: conv).map(\.0).contains("after carol left"))
+    }
+
+    /// Losing the epoch race must be harmless: the loser discards its staged commit rather than
+    /// merging one the group never accepted, and is still a working member afterwards.
+    func testLosingTheEpochRaceDoesNotDesyncTheLoser() async throws {
+        let relay = InMemoryRelay()
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        let carol = Participant("carol", relay: relay)
+        try await openGroup(relay: relay, creator: alice, intended: [bob])
+        await alice.coordinator.reconcileSetup()
+        _ = try await bob.coordinator.syncOnce()
+
+        // A concurrent commit wins the transition Alice is about to build against.
+        await carol.coordinator.ensureKeyPackages()
+        relay.authorizeJoin(conversation: conv, account: carol.accountID, device: carol.deviceID)
+        relay.simulateConcurrentCommitWinner(conversation: conv)
+
+        await alice.coordinator.reconcileSetup()
+        XCTAssertNotNil(alice.coordinator.lastSyncError, "the race loss is recorded, not swallowed")
+
+        // Alice did not merge, so she is still at the epoch her group really holds and can still
+        // talk to Bob.
+        await alice.model.sendMessage("still working after losing the race", to: conv)
+        _ = try await bob.coordinator.syncOnce()
+        XCTAssertTrue(
+            bob.texts(in: conv).map(\.0).contains("still working after losing the race"))
     }
 }

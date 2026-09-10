@@ -69,6 +69,17 @@ public final class ConversationCoordinator {
     private var myDeviceIDs: [String] = []
     /// True once this session registered our delivery verifier with the relay.
     private var deliveryKeyRegistered = false
+    /// Resolves this device's **enrolled** signing key, which signs ADR-0010 membership manifests —
+    /// the same key the server verified at registration and published in the transparency log, so
+    /// every membership change is attributable to a specific device by anyone auditing the log.
+    ///
+    /// A closure rather than a stored signer because the key is provisioned at registration/sign-in,
+    /// *after* the object graph is built: a value captured at construction would always be nil.
+    /// Injectable so tests can supply a software signer.
+    public var membershipSignerProvider: (@MainActor @Sendable () -> (any DeviceSigner)?)?
+    /// Resolves the pinned transparency-log key, so an inbound manifest is verified against the
+    /// **logged** actor key rather than one the server merely asserts. Same lazy reasoning.
+    public var pinnedLogKeyProvider: (@Sendable () async throws -> Data)?
 
     public init(
         model: AppModel,
@@ -105,6 +116,9 @@ public final class ConversationCoordinator {
         model.addMembersToConversationAction = { [weak self] conversationID, members in
             guard let self else { throw CoordinatorError.notSignedIn }
             try await self.addMembers(to: conversationID, memberAccountIDs: members)
+        }
+        model.reconcileMembershipAction = { [weak self] in
+            await self?.reconcileSetup()
         }
         model.renameGroupAction = { [weak self] conversationID, name in
             guard let self else { throw CoordinatorError.notSignedIn }
@@ -334,7 +348,36 @@ public final class ConversationCoordinator {
         guard let targets = try? await relay.setupNeeded(accessToken: token), !targets.isEmpty
         else { return }
         var touched = Set<String>()
-        for target in targets.prefix(limit) {
+
+        // Departures first, batched per conversation. An account is present in the group through
+        // every device it enrolled, so putting it out is ONE commit naming them all — not one epoch
+        // per device, with the account half-removed in between and a fresh chance to lose the epoch
+        // CAS at each step.
+        let departures = Dictionary(grouping: targets.filter(\.removal), by: \.conversationID)
+        for conversationID in departures.keys.sorted() {
+            guard let group = departures[conversationID],
+                let client = activeClient(for: conversationID)
+            else { continue }
+            var claimed: [SetupTarget] = []
+            for target in group {
+                if (try? await relay.claimSetup(
+                    accessToken: token, conversationID: conversationID,
+                    deviceID: target.deviceID)) == true
+                {
+                    claimed.append(target)
+                }
+            }
+            guard !claimed.isEmpty else { continue }
+            do {
+                try await removeByCommit(
+                    conversationID: conversationID, targets: claimed, client: client)
+                touched.insert(conversationID)
+            } catch {
+                lastSyncError = error
+            }
+        }
+
+        for target in targets.filter({ !$0.removal }).prefix(limit) {
             // Only a device that holds this conversation's MLS group can add to it.
             guard let client = activeClient(for: target.conversationID) else { continue }
             guard (try? await relay.claimSetup(
@@ -347,17 +390,28 @@ public final class ConversationCoordinator {
                 guard let keyPackage = Hex.decode(claimed.keyPackage) else {
                     throw CoordinatorError.badKeyPackage
                 }
-                let outcome = try client.addMember(keyPackage: keyPackage)
-                try await relay.sendWelcome(
-                    accessToken: token, conversationID: target.conversationID,
-                    recipientDevice: target.deviceID, ciphertext: outcome.welcome,
-                    idempotencyKey: Self.randomKey())
-                try await relay.confirmSetup(
-                    accessToken: token, conversationID: target.conversationID,
-                    deviceID: target.deviceID)
-                _ = try await relay.sendMessage(
-                    accessToken: token, conversationID: target.conversationID,
-                    ciphertext: outcome.commit, idempotencyKey: Self.randomKey())
+                if target.authoritative {
+                    // ADR-0010: the target is NOT a routing member yet — it holds a membership
+                    // *intent*. The signed commit we post is what creates its routing membership,
+                    // delivers its Welcome, and moves every existing member to the next epoch, all
+                    // in one server transaction. Nothing is applied locally until the server's epoch
+                    // CAS says ours won.
+                    try await addByCommit(target: target, keyPackage: keyPackage, client: client)
+                } else {
+                    // Legacy V27: routing already exists; we deliver the Welcome, confirm, and fan
+                    // the commit out as ordinary mail for recipients to merge unverified.
+                    let outcome = try client.addMember(keyPackage: keyPackage)
+                    try await relay.sendWelcome(
+                        accessToken: token, conversationID: target.conversationID,
+                        recipientDevice: target.deviceID, ciphertext: outcome.welcome,
+                        idempotencyKey: Self.randomKey())
+                    try await relay.confirmSetup(
+                        accessToken: token, conversationID: target.conversationID,
+                        deviceID: target.deviceID)
+                    _ = try await relay.sendMessage(
+                        accessToken: token, conversationID: target.conversationID,
+                        ciphertext: outcome.commit, idempotencyKey: Self.randomKey())
+                }
                 // The name and photo live only inside the ciphertext; re-send them so the
                 // newcomer's list shows the real group. Best-effort — the next change fixes a miss.
                 if let name = (try? client.groupName()) ?? nil {
@@ -372,13 +426,157 @@ public final class ConversationCoordinator {
                 }
                 touched.insert(target.conversationID)
             } catch {
-                // No prekey yet (deferred add), or a transient failure: the claim expires and the
-                // target is retried on a later sync — here or on another member's device.
+                // No prekey yet (deferred add), a lost epoch race, or a transient failure: the claim
+                // expires and the target is retried on a later sync — here or on another member's
+                // device. Nothing partial was applied either way.
                 lastSyncError = error
             }
         }
         for conversationID in touched { refresh(conversationID) }
     }
+
+    // MARK: MLS-commit-authoritative membership (ADR-0010, R-506)
+
+    /// Add one intended device with a **signed membership commit**, the only way routing membership
+    /// changes in an authoritative conversation.
+    ///
+    /// The order is the whole point: stage locally (no epoch advance, nothing persisted) → ask the
+    /// server to accept the signed manifest → merge only if it did. That way the relay's routing set
+    /// and this device's MLS state move together or not at all. On refusal the staged commit is
+    /// discarded rather than merged — merging a commit the server refused IS the divergence R-506
+    /// exists to prevent.
+    private func addByCommit(target: SetupTarget, keyPackage: Data, client: MlsClient) async throws {
+        guard let token else { throw CoordinatorError.notSignedIn }
+        guard let signer = membershipSignerProvider?() else {
+            throw CoordinatorError.noMembershipSigner
+        }
+        guard let actorDevice = identity,
+            let addedAccount = Hex.decode(target.accountID),
+            let addedDevice = Hex.decode(target.deviceID)
+        else { throw CoordinatorError.badKeyPackage }
+
+        let prevEpoch = try client.epoch()
+        let staged = try client.stageAdd(keyPackage: keyPackage)
+        let change = MembershipChange(
+            control: .add, prevEpoch: prevEpoch,
+            added: [(account: addedAccount, device: addedDevice)], removed: [],
+            commit: staged.commit, welcomes: [staged.welcome])
+        let outcome = try await relay.commitMembership(
+            accessToken: token, conversationID: target.conversationID, actorDevice: actorDevice,
+            change: change, idempotencyKey: Self.randomKey(),
+            ttlSeconds: Self.manifestTTLSeconds, signer: signer)
+        try applyCommitOutcome(outcome, client: client)
+    }
+
+    /// Carry out authorized departures with one **remove commit**.
+    ///
+    /// Whoever syncs first does this, not necessarily an admin and never the person leaving: MLS
+    /// refuses a commit that removes the committer's own leaf, so a leaver cannot evidence their own
+    /// departure. The relay recorded the authorization (an admin's removal, or the account's own
+    /// leave) as a removal intent and already purged that account's queued mail; this turns it into
+    /// the cryptographic removal — new mail stops, and post-removal secrecy becomes MLS's job.
+    ///
+    /// The manifest's `removed` list is sorted and duplicate-free because that is part of the
+    /// canonical encoding the server re-derives before checking our signature.
+    private func removeByCommit(
+        conversationID: String, targets: [SetupTarget], client: MlsClient
+    ) async throws {
+        guard let token else { throw CoordinatorError.notSignedIn }
+        guard let signer = membershipSignerProvider?() else {
+            throw CoordinatorError.noMembershipSigner
+        }
+        guard let actorDevice = identity else { throw CoordinatorError.notSignedIn }
+        let removed = targets.compactMap { Hex.decode($0.deviceID) }
+            .sorted { $0.lexicographicallyPrecedes($1) }
+        guard removed.count == targets.count, !removed.isEmpty else {
+            throw CoordinatorError.badKeyPackage
+        }
+
+        let prevEpoch = try client.epoch()
+        let commit = try client.stageRemoveMany(identities: removed)
+        let change = MembershipChange(
+            control: .remove, prevEpoch: prevEpoch, added: [], removed: removed,
+            commit: commit, welcomes: [])
+        let outcome = try await relay.commitMembership(
+            accessToken: token, conversationID: conversationID, actorDevice: actorDevice,
+            change: change, idempotencyKey: Self.randomKey(),
+            ttlSeconds: Self.manifestTTLSeconds, signer: signer)
+        try applyCommitOutcome(outcome, client: client)
+    }
+
+    /// Merge or discard the staged commit according to what the server did with it. The refusal
+    /// cases all cost us the prekey we claimed — an accepted price for never merging a change the
+    /// relay did not record; the target's claim expires and a later pass rebuilds from the new epoch.
+    private func applyCommitOutcome(
+        _ outcome: MembershipCommitOutcome, client: MlsClient
+    ) throws {
+        switch outcome {
+        case .applied, .alreadyApplied:
+            // `alreadyApplied` means the server holds this exact manifest under this exact
+            // idempotency key — the same durable state `applied` produces, so merging is right.
+            try client.mergeStaged()
+        case .staleEpoch:
+            try client.clearStaged()
+            throw CoordinatorError.membershipRaceLost
+        case .forbidden, .idempotencyConflict:
+            try client.clearStaged()
+            throw CoordinatorError.membershipRefused
+        }
+    }
+
+    /// Process an inbound envelope the relay tagged as an ADR-0010 membership commit. Verification
+    /// happens **before** the merge and in two independent halves:
+    ///
+    /// 1. **Signature** — the manifest must be signed by the actor's device key *as published in the
+    ///    transparency log*, checked under our pinned log key (`verifyIncomingMembershipEvent`), so
+    ///    a server cannot mint a membership change or substitute a key it never logged.
+    /// 2. **Correspondence** — the staged commit's real adds/removes must equal what the manifest
+    ///    claimed (`processCommit`), so a *valid member* whose manifest lies changes nothing here.
+    ///
+    /// A refusal is not recoverable and is not meant to be: OpenMLS consumes a commit's decryption
+    /// secret on processing, so the same bytes can never be re-processed. We are desynced by
+    /// construction and rejoin by being re-added at a new epoch (ADR-0010's v1 resync rule).
+    ///
+    /// Returns true when the envelope is consumed (ack it either way — a commit we refuse can never
+    /// become processable later, and leaving it would wedge the queue).
+    private func processMembershipCommit(
+        conversationID: String, epoch: UInt64, ciphertext: Data, client: MlsClient
+    ) async -> Bool {
+        guard let token else { return false }
+        guard let pinnedLogKey = try? await pinnedLogKeyProvider?() else {
+            // With no pinned log key we cannot tell the actor's real device key from a server-chosen
+            // one, and an unverified merge is exactly what R-506 forbids. Leave it unacked so a
+            // later sync — once the key is available — can still verify and merge it.
+            lastSyncError = CoordinatorError.noPinnedLogKey
+            return false
+        }
+        do {
+            let verdict = try await relay.verifyIncomingMembershipEvent(
+                accessToken: token, conversationID: conversationID, epoch: epoch,
+                pinnedLogPublicKeyX963: pinnedLogKey)
+            guard case .verified(let added, let removed, let nextEpoch) = verdict else {
+                model.noteSecurityEvent(
+                    "A membership change in this group could not be verified and was rejected.")
+                lastSyncError = CoordinatorError.membershipUnverified
+                return true
+            }
+            try client.processCommit(
+                envelope: ciphertext, nextEpoch: nextEpoch, added: added, removed: removed)
+            return true
+        } catch {
+            // Either the correspondence check failed (a lying committer — the group's crypto state
+            // simply does not follow the lie) or the fetch failed. Both leave local state untouched.
+            model.noteSecurityEvent(
+                "A membership change in this group did not match its signed description and was "
+                    + "rejected.")
+            lastSyncError = error
+            return true
+        }
+    }
+
+    /// How long a membership manifest is accepted in transit. Short: the epoch CAS is the real
+    /// anti-replay, and this only bounds how long a captured manifest is worth anything.
+    private static let manifestTTLSeconds: UInt64 = 300
 
     // MARK: Group name & read state
 
@@ -898,6 +1096,19 @@ public final class ConversationCoordinator {
                 continue
             }
             if let client = activeClient(for: conversationID) {
+                // ADR-0010 membership commits are NOT ordinary mail: they must be verified against
+                // their signed manifest before they may advance this group's state, so they never
+                // reach `processInbound`.
+                if let epoch = envelope.membershipEpoch {
+                    if await processMembershipCommit(
+                        conversationID: conversationID, epoch: epoch, ciphertext: bytes,
+                        client: client)
+                    {
+                        touched.insert(conversationID)
+                        acked.append(envelope.id)
+                    }
+                    continue
+                }
                 // A commit we already applied, a duplicate, or garbage all surface as errors here;
                 // none can ever be processed later, so the envelope is consumed either way. The
                 // error is kept for diagnostics, never shown: the user did nothing to cause it.
@@ -1239,5 +1450,18 @@ public final class ConversationCoordinator {
         case unknownMessage
         /// Account ids that could not be added (no prekey, or delivery failed).
         case membersNotSetUp([String])
+        /// No enrolled device signer, so this device cannot sign an ADR-0010 membership manifest.
+        /// It can still receive and verify everyone else's.
+        case noMembershipSigner
+        /// A concurrent commit won the epoch CAS. Nothing was applied anywhere; rebuild and retry.
+        case membershipRaceLost
+        /// The relay refused the membership change (governance, or a reused idempotency key).
+        case membershipRefused
+        /// An inbound membership commit's manifest did not verify against the actor's
+        /// transparency-logged device key — refused rather than merged.
+        case membershipUnverified
+        /// No pinned transparency-log key yet, so an inbound membership commit cannot be verified.
+        /// It is left unacked rather than merged unverified.
+        case noPinnedLogKey
     }
 }
