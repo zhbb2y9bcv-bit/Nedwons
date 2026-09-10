@@ -522,7 +522,11 @@ impl PgSocial {
         conn.execute(
             "INSERT INTO message_requests (conversation_id, from_account, to_account)
              VALUES ($1, $2, $3)",
-            &[&conversation_id.as_slice(), &from.as_bytes(), &to.as_bytes()],
+            &[
+                &conversation_id.as_slice(),
+                &from.as_bytes(),
+                &to.as_bytes(),
+            ],
         )
         .map_err(db_err)?;
         Ok(())

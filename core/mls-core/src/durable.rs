@@ -25,8 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::attachment::AttachmentRef;
 use crate::content::{
     Content, ContentError, HistoryEntry, ReceiptKind, DELIVERY_KEY_LEN, DEVICE_ID_LEN,
-    MESSAGE_ID_LEN,
-    SECRET_ID_LEN,
+    MESSAGE_ID_LEN, SECRET_ID_LEN,
 };
 use crate::secret::{SecretRecord, SecretSide, SecretState};
 use crate::{Conversation, Incoming, Member};

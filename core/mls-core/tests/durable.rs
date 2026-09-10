@@ -1073,10 +1073,16 @@ fn cover_decoy_is_invisible_and_does_not_desync() {
     let (mut alice, _ja, mut bob, _jb) = pair();
 
     let before = alice.messages().len();
-    let decoy = alice.enqueue_cover(vec![0x11u8; 300]).expect("enqueue cover");
+    let decoy = alice
+        .enqueue_cover(vec![0x11u8; 300])
+        .expect("enqueue cover");
     let env = alice.encrypt(decoy).expect("encrypt cover");
     // The sender keeps no local trace of a decoy.
-    assert_eq!(alice.messages().len(), before, "no sender-side row for a decoy");
+    assert_eq!(
+        alice.messages().len(),
+        before,
+        "no sender-side row for a decoy"
+    );
 
     assert_eq!(
         bob.process_inbound(1, &env).expect("process cover"),
@@ -1084,7 +1090,8 @@ fn cover_decoy_is_invisible_and_does_not_desync() {
     );
     assert_eq!(bob.messages().len(), 0, "a decoy is never stored");
     assert!(
-        bob.unacknowledged_inbound(ReceiptKind::Delivered).is_empty(),
+        bob.unacknowledged_inbound(ReceiptKind::Delivered)
+            .is_empty(),
         "a decoy is nothing to acknowledge"
     );
 
@@ -1127,7 +1134,8 @@ fn sealed_and_identified_ids_do_not_collide_in_dedup() {
 
     // Dedup still works WITHIN the sealed channel.
     assert_eq!(
-        bob.process_sealed_inbound(1, &env_b).expect("sealed replay"),
+        bob.process_sealed_inbound(1, &env_b)
+            .expect("sealed replay"),
         InboundOutcome::Duplicate
     );
     // …and within the identified channel.
@@ -1160,14 +1168,23 @@ fn a_failed_decrypt_leaves_the_store_untouched() {
         "a ciphertext for another group must not decrypt here"
     );
 
-    assert_eq!(bob.epoch(), epoch_before, "a failed probe must not advance the ratchet");
-    assert_eq!(bob.messages().len(), messages_before, "and must store nothing");
+    assert_eq!(
+        bob.epoch(),
+        epoch_before,
+        "a failed probe must not advance the ratchet"
+    );
+    assert_eq!(
+        bob.messages().len(),
+        messages_before,
+        "and must store nothing"
+    );
 
     // Crucially, the id is NOT burned: the RIGHT store can still process that same envelope id.
     let real = alice.enqueue(b"for bob").expect("enqueue");
     let env = alice.encrypt(real).expect("encrypt");
     assert_eq!(
-        bob.process_sealed_inbound(1, &env).expect("real sealed message"),
+        bob.process_sealed_inbound(1, &env)
+            .expect("real sealed message"),
         InboundOutcome::Application(b"for bob".to_vec()),
         "a failed probe must not mark the id seen"
     );

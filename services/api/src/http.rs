@@ -4061,7 +4061,10 @@ async fn create_message_request(
         if social.pending_outbound_request_count(&me.account_id)?
             >= crate::social::PgSocial::MAX_PENDING_OUTBOUND_REQUESTS
         {
-            return Ok(Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "too_many_requests")));
+            return Ok(Err(ApiError(
+                StatusCode::TOO_MANY_REQUESTS,
+                "too_many_requests",
+            )));
         }
         // The target must actually exist / have a device to reach.
         if active_devices_of(&service, &target)?.is_empty() {

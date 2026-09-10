@@ -605,7 +605,11 @@ fn delivery_key_grant_travels_e2ee_and_is_surfaced() {
             device_ids,
         } => {
             assert_eq!(got, key_r);
-            assert_eq!(device_ids, my_devices.to_vec(), "the granter's devices come with the key");
+            assert_eq!(
+                device_ids,
+                my_devices.to_vec(),
+                "the granter's devices come with the key"
+            );
         }
         other => panic!("expected DeliveryKeyGranted, got {other:?}"),
     }

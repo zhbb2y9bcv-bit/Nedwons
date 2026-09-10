@@ -243,12 +243,17 @@ fn delivery_key_grant_over_the_ffi() {
             device_ids,
         } => {
             assert_eq!(got, key_r);
-            assert_eq!(device_ids, my_devices, "the granter's devices ride with the key");
+            assert_eq!(
+                device_ids, my_devices,
+                "the granter's devices ride with the key"
+            );
         }
         other => panic!("expected DeliveryKeyGranted, got {other:?}"),
     }
     // A non-32-byte key is rejected at the boundary.
-    assert!(alice.enqueue_delivery_key_grant(vec![0u8; 31], vec![]).is_err());
+    assert!(alice
+        .enqueue_delivery_key_grant(vec![0u8; 31], vec![])
+        .is_err());
     // …as is a malformed device id.
     assert!(alice
         .enqueue_delivery_key_grant(key_r.clone(), vec![vec![0u8; 15]])

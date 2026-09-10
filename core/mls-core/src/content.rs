@@ -800,13 +800,24 @@ mod tests {
             };
             let decoded = Content::decode(&c.encode()).unwrap();
             assert_eq!(decoded, c);
-            assert!(decoded.body().is_empty(), "a grant is not a readable message");
+            assert!(
+                decoded.body().is_empty(),
+                "a grant is not a readable message"
+            );
 
             let mut over = c.encode();
             over.push(0);
-            assert_eq!(Content::decode(&over), Err(ContentError::Malformed), "no trailer");
+            assert_eq!(
+                Content::decode(&over),
+                Err(ContentError::Malformed),
+                "no trailer"
+            );
             let short = &c.encode()[..c.encode().len() - 1];
-            assert_eq!(Content::decode(short), Err(ContentError::Malformed), "no short list");
+            assert_eq!(
+                Content::decode(short),
+                Err(ContentError::Malformed),
+                "no short list"
+            );
         }
     }
 
