@@ -167,6 +167,26 @@ relay is deliberately MLS-blind (it must never link the MLS library); it depends
 MLS core (ADR-0007) and key transparency (R-201). Until it lands, server routing membership and
 MLS membership remain distinct (R-506), and this must not be described as fully realized.
 
+**Landed 2026-09-09 — message requests (the controlled exception to the friend-gate):** until now
+consent was strictly prior: you could only be added to a conversation by a friend (friendship =
+consent), and a stranger could not put anything in front of you. Message requests relax that in one
+narrow, quarantined way. A NON-friend may open exactly one 1:1 conversation with you through
+`POST /v1/message-requests`; the server records it in `message_requests` (V30) as `pending` and it
+lands in your **Requests folder**, never your main inbox, and never notifies you loudly. You then:
+- **Accept** — it becomes an ordinary conversation and the two of you become friends
+  (`/v1/message-requests/{id}/accept`); or
+- **Delete / Block** — you are dropped from the conversation (consent withdrawal, exactly like
+  leaving), and Block additionally severs the sender so they can never request again
+  (`/v1/message-requests/{id}/decline`, `block: true`).
+
+Anti-spam holds the line the friend-gate used to: at most one pending request per pair, a standing
+cap on a sender's total pending requests (`PgSocial::MAX_PENDING_OUTBOUND_REQUESTS`), a per-hour
+rate limit (`quota::MESSAGE_REQUESTS`), and blocked senders are refused outright. The conversation
+itself is ordinary MLS — the relay reads nothing; this only governs the membership gate and the
+folder. Cryptographically the recipient IS a group member (so they can read the first message), so
+"cannot reply until accepted" is a client rule (the composer is replaced by an accept/decline bar),
+honestly not a server-enforced silence.
+
 ## Consequences
 
 Makes real-world groups possible and closes the server↔MLS divergence hazard by construction. Hard

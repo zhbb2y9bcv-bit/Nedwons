@@ -223,6 +223,17 @@ struct ChatsListView: View {
 
     private var regularList: some View {
         List(selection: $selectedChat) {
+            if !model.messageRequests.isEmpty {
+                NavigationLink {
+                    MessageRequestsView(model: model)
+                } label: {
+                    Label(
+                        "Message requests (\(model.messageRequests.count))",
+                        systemImage: "tray.and.arrow.down")
+                        .foregroundStyle(palette.accentPrimary)
+                }
+                .accessibilityIdentifier("chats.messageRequests")
+            }
             ForEach(chats) { chat in
                 selectableChatRow(chat).tag(chat)
             }
@@ -317,8 +328,10 @@ struct ChatsListView: View {
 
     /// Derived from the server's conversation list (routing metadata only) joined with local
     /// display state. Previews come from decrypted on-device history, never from the relay.
+    /// Pending message requests are quarantined out of here into their own folder.
     private var chats: [ChatSummary] {
         sortedForChatList(model.chatSummaries, prefs: model.chatPrefs)
+            .filter { !model.isMessageRequest($0.conversationID) }
     }
 
     private var archivedChats: [ChatSummary] {
@@ -380,6 +393,17 @@ struct ChatsListView: View {
 
     private var list: some View {
         List {
+            if !model.messageRequests.isEmpty {
+                NavigationLink {
+                    MessageRequestsView(model: model)
+                } label: {
+                    Label(
+                        "Message requests (\(model.messageRequests.count))",
+                        systemImage: "tray.and.arrow.down")
+                        .foregroundStyle(palette.accentPrimary)
+                }
+                .accessibilityIdentifier("chats.messageRequests")
+            }
             ForEach(chats) { chat in
                 chatRow(chat)
             }
@@ -590,5 +614,59 @@ struct ArchivedChatsView: View {
         .listStyle(.plain)
         .navigationTitle("Archived")
         .inlineNavigationTitle()
+    }
+}
+
+/// The quarantine folder for conversations opened by people who aren't your contacts. Opening one
+/// lets you read what they sent before deciding to accept, delete, or block — the decision controls
+/// live in the conversation itself.
+struct MessageRequestsView: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.colorScheme) private var scheme
+    private var palette: Nedwons.Palette { .forScheme(scheme) }
+
+    /// A ChatSummary to open the request's conversation with — the real one once its Welcome has
+    /// been processed, otherwise a minimal stand-in built from who is asking.
+    private func summary(for request: MessageRequest) -> ChatSummary {
+        model.chatSummaries.first { $0.conversationID == request.conversationID }
+            ?? ChatSummary(
+                conversationID: request.conversationID,
+                peerAccountID: request.from.accountID,
+                peerUsername: request.from.username,
+                memberCount: 2)
+    }
+
+    var body: some View {
+        List {
+            if model.messageRequests.isEmpty {
+                Text("No message requests.")
+                    .foregroundStyle(palette.textSecondary)
+            }
+            ForEach(model.messageRequests) { request in
+                NavigationLink {
+                    ConversationView(model: model, chat: summary(for: request))
+                } label: {
+                    ChatRow(model: model, chat: summary(for: request), palette: palette)
+                }
+                .accessibilityIdentifier("request.row.\(request.conversationID)")
+                .swipeActions(edge: .trailing) {
+                    Button(role: .destructive) {
+                        Task { await model.declineMessageRequest(request.conversationID, block: true) }
+                    } label: {
+                        Label("Block", systemImage: "hand.raised")
+                    }
+                    Button {
+                        Task { await model.declineMessageRequest(request.conversationID, block: false) }
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                    }
+                    .tint(.gray)
+                }
+            }
+        }
+        .listStyle(.plain)
+        .navigationTitle("Message requests")
+        .inlineNavigationTitle()
+        .task { await model.refreshMessageRequests() }
     }
 }

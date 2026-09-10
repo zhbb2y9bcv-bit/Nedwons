@@ -198,6 +198,27 @@ final class ComposeDraftTests: XCTestCase {
 }
 
 @MainActor
+final class MessageRequestQuarantineTests: XCTestCase {
+    private func model() -> AppModel {
+        AppModel(
+            baseURL: URL(string: "http://127.0.0.1:1")!,
+            deviceIdentity: DeviceIdentity(
+                store: InMemoryDeviceKeyStore(), secureEnclaveAvailable: false),
+            sessionStore: SessionStore(store: FakeSecretStore()))
+    }
+
+    /// A conversation flagged as a pending request is recognised as one; an ordinary conversation
+    /// is not — this is exactly the predicate the Chats list uses to quarantine it.
+    func testRequestConversationsAreRecognised() {
+        let m = model()
+        m.requestConversationIDs = ["req-1", "req-2"]
+        XCTAssertTrue(m.isMessageRequest("req-1"))
+        XCTAssertTrue(m.isMessageRequest("req-2"))
+        XCTAssertFalse(m.isMessageRequest("ordinary"))
+    }
+}
+
+@MainActor
 final class ConversationDeletionTests: XCTestCase {
     private func model() -> AppModel {
         AppModel(

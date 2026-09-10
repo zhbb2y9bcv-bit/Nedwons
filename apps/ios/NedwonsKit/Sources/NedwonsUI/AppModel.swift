@@ -393,6 +393,7 @@ public final class AppModel: ObservableObject {
         blocked = (try? await client.listBlocked(accessToken: token)) ?? []
         conversations = (try? await client.listConversations(accessToken: token)) ?? []
         rememberUsernames(friends + incomingRequests + blocked)
+        await refreshMessageRequests()
     }
 
     public func refreshConversations() async {
@@ -400,6 +401,9 @@ public final class AppModel: ObservableObject {
             guard let token else { return }
             conversations = try await client.listConversations(accessToken: token)
         }
+        // Keep the quarantine set current so a stranger's conversation stays in the Requests folder
+        // and out of the main inbox.
+        await refreshMessageRequests()
     }
 
     // MARK: Devices, linking & key-transparency monitoring (#8/#9)
@@ -697,6 +701,73 @@ public final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: Message requests (a non-friend reaching you, quarantined)
+
+    /// Pending incoming requests (the Requests folder), each naming the sender.
+    @Published public internal(set) var messageRequests: [MessageRequest] = []
+    /// Conversation ids that are still pending requests, so the Chats list keeps them out of the
+    /// main inbox and a thread shows an accept/decline bar instead of a composer.
+    @Published public internal(set) var requestConversationIDs: Set<String> = []
+
+    public func isMessageRequest(_ conversationID: String) -> Bool {
+        requestConversationIDs.contains(conversationID)
+    }
+
+    /// Refresh the Requests folder from the relay. Quiet: an offline refresh just leaves the last
+    /// known state.
+    public func refreshMessageRequests() async {
+        guard let token else { return }
+        guard let reqs = try? await client.messageRequests(accessToken: token) else { return }
+        messageRequests = reqs
+        requestConversationIDs = Set(reqs.map { $0.conversationID })
+        rememberUsernames(reqs.map { $0.from })
+    }
+
+    /// Start a conversation with a non-friend by sending them a message request. Creates the
+    /// request server-side, then builds the MLS group (the same bootstrap path a new group uses) so
+    /// the recipient receives the Welcome and can be messaged. Returns the conversation id to open,
+    /// or nil if it couldn't be created (e.g. they blocked you, or you're already friends).
+    @discardableResult
+    public func startMessageRequest(to accountID: String) async -> String? {
+        guard let token, let bootstrapConversationAction else { return nil }
+        var conversationID: String?
+        await run { [self] in
+            let cid = try await client.createMessageRequest(accessToken: token, accountID: accountID)
+            try await bootstrapConversationAction(cid, [accountID])
+            conversationID = cid
+        }
+        if conversationID != nil { await refreshConversations() }
+        return conversationID
+    }
+
+    /// Accept a request: it becomes an ordinary conversation and you become friends.
+    public func acceptMessageRequest(_ conversationID: String) async {
+        await run { [self] in
+            guard let token else { return }
+            try await client.acceptMessageRequest(accessToken: token, conversationID: conversationID)
+            requestConversationIDs.remove(conversationID)
+            messageRequests.removeAll { $0.conversationID == conversationID }
+            friends = (try? await client.listFriends(accessToken: token)) ?? friends
+            banner = "Request accepted."
+        }
+    }
+
+    /// Decline a request; with `block`, the sender can never reach you again. The conversation is
+    /// removed from this device.
+    public func declineMessageRequest(_ conversationID: String, block: Bool) async {
+        await run { [self] in
+            guard let token else { return }
+            try await client.declineMessageRequest(
+                accessToken: token, conversationID: conversationID, block: block)
+            requestConversationIDs.remove(conversationID)
+            messageRequests.removeAll { $0.conversationID == conversationID }
+            if block { blocked = (try? await client.listBlocked(accessToken: token)) ?? blocked }
+        }
+        // Drop the local conversation store and hide the thread.
+        await deleteConversationLocally(conversationID)
+        banner = block ? "Blocked." : "Request removed."
+    }
+
     // MARK: Blocking & reporting
 
     /// Block an account: the server severs any friendship and refuses future requests.
@@ -845,9 +916,14 @@ public final class AppModel: ObservableObject {
             unhideConversation(existing.conversationID)
             return summary(for: existing, peer: person)
         }
-        guard let created = await createGroup(memberAccountIDs: [person.accountID]) else {
-            return nil
-        }
+        // A contact gets an ordinary conversation; anyone else gets a message request — the thread
+        // opens normally for you, but lands in their Requests folder until they accept.
+        let isFriend = friends.contains { $0.accountID == person.accountID }
+        let created =
+            isFriend
+            ? await createGroup(memberAccountIDs: [person.accountID])
+            : await startMessageRequest(to: person.accountID)
+        guard let created else { return nil }
         await refreshConversations()
         guard let made = conversations.first(where: { $0.conversationID == created }) else {
             return nil

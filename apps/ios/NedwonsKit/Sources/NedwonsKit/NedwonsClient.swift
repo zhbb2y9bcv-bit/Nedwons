@@ -293,6 +293,16 @@ public struct Conversation: Decodable, Sendable, Identifiable {
     }
 }
 
+/// A pending incoming message request: a non-friend's conversation, quarantined until you decide.
+public struct MessageRequest: Decodable, Sendable, Identifiable {
+    public let conversationID: String
+    public let from: ProfileSummary
+    public var id: String { conversationID }
+    enum CodingKeys: String, CodingKey {
+        case conversationID = "conversation_id", from
+    }
+}
+
 public struct InboxEnvelope: Decodable, Sendable, Identifiable {
     public let id: Int
     /// Absent when sealed (ADR-0014): the relay never learned it; the client recovers it from the
@@ -440,6 +450,48 @@ public extension NedwonsClient {
     /// Accounts this user has blocked.
     func listBlocked(accessToken: String) async throws -> [ProfileSummary] {
         try decode(await perform(authed("GET", "/v1/blocks", accessToken: accessToken)))
+    }
+
+    // ----- message requests (reaching a non-friend, quarantined) -----
+
+    /// Open a message request to a NON-friend: creates a 1:1 conversation the recipient sees in
+    /// their Requests folder until they accept. Returns the new conversation id to build MLS for.
+    /// The server refuses (409) if you are already friends — use the ordinary flow then.
+    func createMessageRequest(accessToken: String, accountID: String) async throws -> String {
+        struct Body: Encodable { let account_id: String }
+        struct Res: Decodable {
+            let conversationID: String
+            enum CodingKeys: String, CodingKey { case conversationID = "conversation_id" }
+        }
+        var request = authed("POST", "/v1/message-requests", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(Body(account_id: accountID))
+        let res: Res = try decode(await perform(request))
+        return res.conversationID
+    }
+
+    /// The pending requests addressed to me — my Requests folder.
+    func messageRequests(accessToken: String) async throws -> [MessageRequest] {
+        try decode(await perform(authed("GET", "/v1/message-requests", accessToken: accessToken)))
+    }
+
+    /// Accept a request: the conversation becomes ordinary and we become friends.
+    func acceptMessageRequest(accessToken: String, conversationID: String) async throws {
+        _ = try await perform(
+            authed(
+                "POST", "/v1/message-requests/\(conversationID)/accept", accessToken: accessToken))
+    }
+
+    /// Decline a request; with `block: true` the sender can never request again.
+    func declineMessageRequest(
+        accessToken: String, conversationID: String, block: Bool
+    ) async throws {
+        struct Body: Encodable { let block: Bool }
+        var request = authed(
+            "POST", "/v1/message-requests/\(conversationID)/decline", accessToken: accessToken)
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONEncoder().encode(Body(block: block))
+        _ = try await perform(request)
     }
 
     /// `evidence` is only what the user chooses to include — the server cannot read E2EE content.
