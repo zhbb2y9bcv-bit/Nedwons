@@ -34,6 +34,18 @@ use crate::{Conversation, Incoming, Member};
 /// than silently misread. Surfaced via the FFI `capabilities()` call.
 pub const BLOB_FORMAT_VERSION: u32 = 1;
 
+/// Which server-side id sequence an inbound envelope came from. Each has its OWN table and its own
+/// `BIGSERIAL`, so their ids overlap; dedup must therefore be tracked per channel, never pooled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DedupChannel {
+    /// `envelopes.id` — ordinary identified delivery.
+    Conversation,
+    /// `sealed_envelopes.id` — sealed-sender delivery (ADR-0014).
+    Sealed,
+    /// the self-group channel's own sequence (ADR-0015).
+    SelfGroup,
+}
+
 /// Caps the out-of-order dedup tail above [`Meta::dedup_watermark`] (R-105): the whole blob is
 /// rewritten each commit, so an unbounded seen-set would grow every write. Only bites under a
 /// pathological permanent gap, where the watermark is force-advanced (see [`compact_dedup`]).
@@ -267,6 +279,20 @@ struct Meta {
     /// The out-of-order tail above `dedup_watermark`, bounded by [`MAX_SEEN_ABOVE_WATERMARK`].
     /// With the watermark, this is the full dedup set.
     seen_inbound: BTreeSet<u64>,
+    /// Dedup for the SEALED channel. Sealed envelopes come from their own server-side sequence
+    /// (`sealed_envelopes.id`), which overlaps the identified one — so they MUST NOT share a dedup
+    /// space, or a sealed message would be silently dropped as a "duplicate" of an unrelated
+    /// identified envelope with the same id. `#[serde(default)]` ⇒ blobs written before this field
+    /// load empty and self-heal.
+    #[serde(default)]
+    sealed_dedup_watermark: u64,
+    #[serde(default)]
+    seen_sealed: BTreeSet<u64>,
+    /// Dedup for the SELF-GROUP channel, which likewise has its own id sequence.
+    #[serde(default)]
+    self_dedup_watermark: u64,
+    #[serde(default)]
+    seen_self: BTreeSet<u64>,
     /// Durably processed, so safe to acknowledge to the server.
     ack_eligible: BTreeSet<u64>,
     next_local_id: u64,
@@ -471,42 +497,76 @@ impl Meta {
         id
     }
 
-    /// True if `envelope_id` was already processed (below the watermark or in the tracked tail).
-    fn is_seen(&self, envelope_id: u64) -> bool {
-        envelope_id <= self.dedup_watermark || self.seen_inbound.contains(&envelope_id)
+    /// True if `envelope_id` was already processed **on that channel** (below the channel's
+    /// watermark or in its tracked tail).
+    fn is_seen_on(&self, channel: DedupChannel, envelope_id: u64) -> bool {
+        let (watermark, seen) = self.dedup_space(channel);
+        envelope_id <= *watermark || seen.contains(&envelope_id)
     }
 
-    /// Mark `envelope_id` processed, then compact so the stored tail stays bounded (R-105).
-    fn record_seen(&mut self, envelope_id: u64) {
-        if envelope_id > self.dedup_watermark {
-            self.seen_inbound.insert(envelope_id);
+    /// True if `envelope_id` was already processed on the conversation channel.
+    fn is_seen(&self, envelope_id: u64) -> bool {
+        self.is_seen_on(DedupChannel::Conversation, envelope_id)
+    }
+
+    /// Mark `envelope_id` processed on `channel`, then compact so the stored tail stays bounded
+    /// (R-105).
+    fn record_seen_on(&mut self, channel: DedupChannel, envelope_id: u64) {
+        {
+            let (watermark, seen) = self.dedup_space_mut(channel);
+            if envelope_id > *watermark {
+                seen.insert(envelope_id);
+            }
         }
-        self.compact_dedup();
+        self.compact_dedup_on(channel);
+    }
+
+    /// Mark `envelope_id` processed on the conversation channel.
+    fn record_seen(&mut self, envelope_id: u64) {
+        self.record_seen_on(DedupChannel::Conversation, envelope_id)
+    }
+
+    /// The (watermark, tail) pair backing one channel's dedup.
+    fn dedup_space(&self, channel: DedupChannel) -> (&u64, &BTreeSet<u64>) {
+        match channel {
+            DedupChannel::Conversation => (&self.dedup_watermark, &self.seen_inbound),
+            DedupChannel::Sealed => (&self.sealed_dedup_watermark, &self.seen_sealed),
+            DedupChannel::SelfGroup => (&self.self_dedup_watermark, &self.seen_self),
+        }
+    }
+
+    fn dedup_space_mut(&mut self, channel: DedupChannel) -> (&mut u64, &mut BTreeSet<u64>) {
+        match channel {
+            DedupChannel::Conversation => (&mut self.dedup_watermark, &mut self.seen_inbound),
+            DedupChannel::Sealed => (&mut self.sealed_dedup_watermark, &mut self.seen_sealed),
+            DedupChannel::SelfGroup => (&mut self.self_dedup_watermark, &mut self.seen_self),
+        }
     }
 
     /// Collapse the contiguous low prefix into `dedup_watermark`; if the tail still exceeds the cap,
     /// force the watermark up to absorb the lowest ids. Forcing only marks *older* ids seen, never
     /// un-sees a newer one, so at worst an unseen low id is later treated as a duplicate — bounded,
     /// and the ratchet is the real replay guard (see [`MAX_SEEN_ABOVE_WATERMARK`]).
-    fn compact_dedup(&mut self) {
+    fn compact_dedup_on(&mut self, channel: DedupChannel) {
+        let (watermark, seen) = self.dedup_space_mut(channel);
         // Drop anything already covered by the watermark, and advance over the contiguous prefix.
-        while let Some(&lowest) = self.seen_inbound.iter().next() {
-            if lowest <= self.dedup_watermark {
-                self.seen_inbound.remove(&lowest);
-            } else if lowest == self.dedup_watermark + 1 {
-                self.dedup_watermark = lowest;
-                self.seen_inbound.remove(&lowest);
+        while let Some(&lowest) = seen.iter().next() {
+            if lowest <= *watermark {
+                seen.remove(&lowest);
+            } else if lowest == *watermark + 1 {
+                *watermark = lowest;
+                seen.remove(&lowest);
             } else {
                 break;
             }
         }
         // Hard cap on the out-of-order tail.
-        while self.seen_inbound.len() > MAX_SEEN_ABOVE_WATERMARK {
-            let Some(&lowest) = self.seen_inbound.iter().next() else {
+        while seen.len() > MAX_SEEN_ABOVE_WATERMARK {
+            let Some(&lowest) = seen.iter().next() else {
                 break;
             };
-            self.dedup_watermark = self.dedup_watermark.max(lowest);
-            self.seen_inbound.remove(&lowest);
+            *watermark = (*watermark).max(lowest);
+            seen.remove(&lowest);
         }
     }
 }
@@ -981,7 +1041,7 @@ impl<J: Journal> DurableSession<J> {
         envelope_id: u64,
         ciphertext: &[u8],
     ) -> Result<InboundOutcome, DurableError> {
-        if self.meta.is_seen(envelope_id) {
+        if self.meta.is_seen_on(DedupChannel::SelfGroup, envelope_id) {
             return Ok(InboundOutcome::Duplicate);
         }
         let incoming = {
@@ -993,8 +1053,36 @@ impl<J: Journal> DurableSession<J> {
         };
         let mut meta = self.meta.clone();
         let outcome = apply_incoming(&mut meta, incoming, envelope_id)?;
-        meta.record_seen(envelope_id);
-        meta.ack_eligible.insert(envelope_id);
+        meta.record_seen_on(DedupChannel::SelfGroup, envelope_id);
+        self.commit(meta)?;
+        Ok(outcome)
+    }
+
+    /// SEALED channel (ADR-0014): the ciphertext is an ordinary application message for THIS
+    /// conversation — sealed delivery only hides the sender from the relay, so decryption (and the
+    /// MLS authentication that comes with it) is identical to [`process_inbound`]. What differs is
+    /// dedup: sealed envelope ids come from their own sequence and must not be pooled with the
+    /// identified one. Ack-eligibility is deliberately NOT recorded here, because a sealed envelope
+    /// is acknowledged through a different id space (`sealed_ids`) than [`Self::ack_eligible`].
+    pub fn process_sealed_inbound(
+        &mut self,
+        envelope_id: u64,
+        ciphertext: &[u8],
+    ) -> Result<InboundOutcome, DurableError> {
+        if self.meta.is_seen_on(DedupChannel::Sealed, envelope_id) {
+            return Ok(InboundOutcome::Duplicate);
+        }
+        let incoming = {
+            let Session {
+                member,
+                conversation,
+                ..
+            } = &mut self.session;
+            conversation.process(member, ciphertext)?
+        };
+        let mut meta = self.meta.clone();
+        let outcome = apply_incoming(&mut meta, incoming, envelope_id)?;
+        meta.record_seen_on(DedupChannel::Sealed, envelope_id);
         self.commit(meta)?;
         Ok(outcome)
     }

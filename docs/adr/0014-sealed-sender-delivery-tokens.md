@@ -141,10 +141,42 @@ identified + sealed envelopes; sealed ones carry no sender field.
   rides `X-Delivery-Key`; per-recipient client-side fan-out; uniform 403 surfaced typed);
   `InboxEnvelope` decodes sealed envelopes (optional sender/conversation + `sealed` flag — fixing
   the previously-required fields that would have failed the whole inbox decode on the first sealed
-  envelope); `ackInbox` gained `sealedIds`. **Still open in 2c (app-flow half, needs the AppModel/
-  app target):** distributing `K_r` to contacts over the E2EE channel, recipient-side block-drop
-  after `verifySealedSender`, the block→rotate-and-redistribute policy, and the message-request
-  fallback UX for non-holders.
+  envelope); `ackInbox` gained `sealedIds`.
+
+  **2c prerequisite landed 2026-09-09 — per-channel envelope dedup (a REAL BUG, found while
+  scoping the app-flow half).** Sealed envelopes come from their own `BIGSERIAL`
+  (`sealed_envelopes.id`), which OVERLAPS the identified sequence (`envelopes.id`) and the
+  self-group one. The durable core pooled every inbound id into ONE dedup space
+  (`dedup_watermark` + `seen_inbound`), so routing sealed envelopes through it would have silently
+  swallowed a real sealed message as a "duplicate" of an unrelated identified envelope that
+  happened to share an id — silent message loss, the worst failure mode in a messenger. The same
+  latent hazard already existed for the self-group channel. Fixed: `Meta` now keeps a dedup space
+  PER CHANNEL (`DedupChannel::{Conversation, Sealed, SelfGroup}`; the new fields are
+  `#[serde(default)]` so existing blobs load and self-heal), `process_self_inbound` uses the
+  self-group space, and a new `process_sealed_inbound` (core + FFI) decrypts exactly like
+  `process_inbound` — sealed delivery only hides the sender from the RELAY, so MLS still
+  authenticates the sender — while deduping in the sealed space. Self-group ids also stopped being
+  pooled into `ack_eligible`, which is the identified-ack id space. Regression-tested at both
+  layers (core `tests/durable.rs`, ffi `tests/client.rs`): an identified id 1 and a sealed id 1 are
+  two different messages and both are kept, while a replay within either channel is still
+  `Duplicate`.
+
+  **Still open in 2c (app-flow half, needs the AppModel/app target):** distributing `K_r` to
+  contacts over the E2EE channel, recipient-side block-drop after `verifySealedSender`, the
+  block→rotate-and-redistribute policy, and the message-request fallback UX for non-holders.
+  Two further prerequisites are now identified and NOT yet solved, and should be settled before
+  that half is written:
+  1. **Which store decrypts a sealed envelope.** A sealed envelope deliberately carries no
+     `conversation_id`, so the client must resolve the conversation itself — trying each store in
+     turn (a failed MLS decrypt must be proven side-effect-free) or carrying a conversation hint
+     inside the E2EE payload.
+  2. **How a sender learns the recipient's device ids.** Sealed delivery is per-recipient-DEVICE
+     client-side fan-out (`POST /v1/sealed/deliver` takes one `recipient_device`), but the client
+     has no roster API — `mls-ffi` exposes no group membership, and no endpoint lists another
+     account's devices. The privacy-preserving option is to carry the granter's device ids inside
+     the `DeliveryKeyGrant` itself (it already travels E2EE, so the relay learns nothing and no new
+     enumeration surface is added), which means a content-wire addition and a re-grant whenever a
+     device is added or revoked.
 - **2d — padding / cover traffic** (size/timing) — **BOTH halves now landed**:
   - *padding* (2026-09-09): the client envelope (`mls_core::envelope` v2) pads every message to a
     size bucket (256B…64KB, then 64KB steps; zero padding outside the MLS ciphertext, stripped
