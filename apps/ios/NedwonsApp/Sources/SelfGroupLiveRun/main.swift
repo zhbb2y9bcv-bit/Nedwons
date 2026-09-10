@@ -223,18 +223,33 @@ struct SelfGroupLiveRun {
         _ = try await client.sendFriendRequest(accessToken: alice.accessToken, accountID: bob.accountID)
         try await client.acceptFriend(accessToken: bob.accessToken, accountID: alice.accountID)
 
-        func participant(_ session: NedwonsClient.Session, _ tag: String) -> (AppModel, ConversationCoordinator) {
+        // New conversations are MLS-authoritative (ADR-0010), so a coordinator needs the two things
+        // the shipping composition root gives it: the device's enrolled key, which signs membership
+        // manifests, and the pinned transparency-log key, against which inbound ones are verified.
+        // Without the signer this device can add nobody — which is exactly what this harness caught
+        // the first time the default flipped.
+        let logKey = try await {
+            let sth = try await client.transparencySignedTreeHead(accessToken: alice.accessToken)
+            guard let key = Hex.decode(sth.logPublicKey) else { fail("bad log public key") }
+            return key
+        }()
+
+        func participant(
+            _ session: NedwonsClient.Session, _ tag: String, signer: SoftwareDeviceSigner
+        ) -> (AppModel, ConversationCoordinator) {
             let model = AppModel(client: client)
             model.session = session
             let dir = URL(fileURLWithPath: tmpDB("coord-\(tag)"), isDirectory: true)
             let coordinator = ConversationCoordinator(
                 model: model, relay: client, storeDirectory: dir,
                 keyProvider: { storeID in try keys.atRestKey(forStore: storeID) }, minimumKeyPackages: 2)
+            coordinator.membershipSignerProvider = { signer }
+            coordinator.pinnedLogKeyProvider = { logKey }
             coordinator.attach(aliasStore: nil)
             return (model, coordinator)
         }
-        let (aliceModel, aliceCoord) = participant(alice, "alice")
-        let (bobModel, bobCoord) = participant(bob, "bob")
+        let (aliceModel, aliceCoord) = participant(alice, "alice", signer: aliceSigner)
+        let (bobModel, bobCoord) = participant(bob, "bob", signer: bobSigner)
 
         // Bob publishes prekeys through the coordinator; the relay reports them.
         await bobCoord.ensureKeyPackages()

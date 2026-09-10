@@ -25,6 +25,10 @@ pub struct EnvelopeOut {
     pub conversation_id: [u8; 16],
     pub sender_device: [u8; 16],
     pub ciphertext: Vec<u8>,
+    /// `Some(next_epoch)` when this envelope is an ADR-0010 membership commit rather than ordinary
+    /// mail: the recipient must verify the manifest for that epoch and check commit↔manifest
+    /// correspondence before merging it.
+    pub membership_epoch: Option<u64>,
 }
 
 /// ADR-0014: the relay knows only the recipient and the ciphertext — never sender or conversation.
@@ -75,6 +79,14 @@ pub struct SetupTarget {
     pub conversation_id: [u8; 16],
     pub account_id: [u8; 16],
     pub device_id: [u8; 16],
+    /// Which protocol the adder must run for this target. `true` = the conversation is
+    /// MLS-authoritative (ADR-0010): the row is a *membership intent*, and the change lands only by
+    /// posting a signed commit to `/commit`. `false` = the legacy V27 queue, where routing already
+    /// exists and the adder just delivers a Welcome and confirms.
+    pub authoritative: bool,
+    /// `true` when the pending change is a REMOVAL (an admin removed this device's account, or it
+    /// left) rather than a join. Only ever true for authoritative targets.
+    pub removal: bool,
 }
 
 /// A conversation the caller belongs to, with its member accounts (for the Chats list).
@@ -439,6 +451,40 @@ impl PgRelay {
         Ok(row.map(|r| r.get::<_, bool>(0)).unwrap_or(false))
     }
 
+    /// As [`Self::is_authoritative`], inside a caller-owned transaction — an entry path must decide
+    /// which queue to write in the SAME transaction that authorizes the join, or a conversation
+    /// flipped concurrently could get a routing row it must never accept.
+    pub fn is_authoritative_in_txn(
+        txn: &mut postgres::Transaction<'_>,
+        conversation_id: &[u8; 16],
+    ) -> StoreResult<bool> {
+        Ok(txn
+            .query_opt(
+                "SELECT mls_authoritative FROM conversations WHERE conversation_id = $1",
+                &[&conversation_id.as_slice()],
+            )
+            .map_err(db_err)?
+            .map(|r| r.get::<_, bool>(0))
+            .unwrap_or(false))
+    }
+
+    /// Record an authorized join in whichever queue the conversation uses: a **membership intent**
+    /// (ADR-0010 — routing will be written by the commit that honours it) when the conversation is
+    /// MLS-authoritative, or the legacy V27 routing row otherwise. Every entry path funnels through
+    /// here so the two models can never be mixed up at a call site.
+    pub fn enqueue_join_in_txn(
+        txn: &mut postgres::Transaction<'_>,
+        conversation_id: &[u8; 16],
+        account: AccountId,
+        device: DeviceId,
+    ) -> StoreResult<()> {
+        if Self::is_authoritative_in_txn(txn, conversation_id)? {
+            Self::add_intent_in_txn(txn, conversation_id, account, device)
+        } else {
+            Self::add_pending_member_in_txn(txn, conversation_id, account, device)
+        }
+    }
+
     /// Add a device to a conversation's routing membership (idempotent).
     pub fn add_member(
         &self,
@@ -522,15 +568,21 @@ impl PgRelay {
 
     // ----- MLS setup queue (V27): multi-device + automatic/deferred adds ----------------------
 
-    /// Setup work visible to `caller`: members of the caller's conversations that still need an
-    /// MLS add, unclaimed (or whose claim expired — a reconciler that crashed or found no prekey
-    /// must not wedge its target forever). Only a caller that has itself COMPLETED setup for a
-    /// conversation sees its queue — a device with no group keys cannot add anyone.
+    /// Setup work visible to `caller`, across BOTH queues: legacy V27 rows (routing exists,
+    /// `mls_added = FALSE`) and MLS-authoritative *intents* (V31 — routing does not exist yet and
+    /// will be created by the commit itself). Unclaimed, or claim expired — a reconciler that
+    /// crashed or found no prekey must not wedge its target forever. Only a caller that has itself
+    /// COMPLETED setup for a conversation sees its queue: a device with no group keys cannot add
+    /// anyone.
+    ///
+    /// The two halves are one query so the limit is shared and the caller drains them together;
+    /// `authoritative` tells it which protocol each row wants.
     pub fn setup_needed(&self, caller: &DeviceId, limit: i64) -> StoreResult<Vec<SetupTarget>> {
         let mut conn = self.conn()?;
         let rows = conn
             .query(
-                "SELECT t.conversation_id, t.account_id, t.device_id
+                "SELECT t.conversation_id, t.account_id, t.device_id,
+                        FALSE AS authoritative, FALSE AS removal
                  FROM conversation_members t
                  JOIN conversation_members me
                    ON me.conversation_id = t.conversation_id
@@ -538,7 +590,17 @@ impl PgRelay {
                    AND NOT t.mls_added AND t.device_id <> $1
                    AND (t.setup_claimed_at IS NULL
                         OR t.setup_claimed_at < now() - make_interval(secs => $2))
-                 ORDER BY t.conversation_id
+                 UNION ALL
+                 SELECT i.conversation_id, i.account_id, i.device_id,
+                        TRUE AS authoritative, i.kind = 2 AS removal
+                 FROM membership_intents i
+                 JOIN conversation_members me
+                   ON me.conversation_id = i.conversation_id
+                 WHERE me.device_id = $1 AND me.mls_added
+                   AND i.device_id <> $1
+                   AND (i.claimed_at IS NULL
+                        OR i.claimed_at < now() - make_interval(secs => $2))
+                 ORDER BY 1
                  LIMIT $3",
                 &[&caller.as_bytes(), &(SETUP_CLAIM_TTL_SECS as f64), &limit],
             )
@@ -549,9 +611,128 @@ impl PgRelay {
                     conversation_id: id16(r.get::<_, &[u8]>(0))?,
                     account_id: id16(r.get::<_, &[u8]>(1))?,
                     device_id: id16(r.get::<_, &[u8]>(2))?,
+                    authoritative: r.get::<_, bool>(3),
+                    removal: r.get::<_, bool>(4),
                 })
             })
             .collect()
+    }
+
+    // ----- Membership intents (V31): the authoritative half of the setup queue ------------------
+
+    /// Record that `device` is authorized to JOIN `conversation_id` but is not a member yet
+    /// (ADR-0010). Idempotent. An intent routes NO mail and grants NO membership — it records the
+    /// authorization decision, makes the device visible in the setup queue, and lets a member claim
+    /// its prekey in order to add it by commit.
+    pub fn add_intent(
+        &self,
+        conversation_id: &[u8; 16],
+        account: AccountId,
+        device: DeviceId,
+    ) -> StoreResult<()> {
+        let mut conn = self.conn()?;
+        let mut txn = conn.transaction().map_err(db_err)?;
+        Self::add_intent_in_txn(&mut txn, conversation_id, account, device)?;
+        txn.commit().map_err(db_err)?;
+        Ok(())
+    }
+
+    /// As [`Self::add_intent`], but joins a caller-owned transaction — entry paths that CONSUME
+    /// something to earn the join (an invite use, a join request) must record the intent in the same
+    /// transaction that consumes it.
+    ///
+    /// A device that is ALREADY a routed member gets no join intent: the commit that added it is the
+    /// membership, and a duplicate-add commit would be refused anyway.
+    pub fn add_intent_in_txn(
+        txn: &mut postgres::Transaction<'_>,
+        conversation_id: &[u8; 16],
+        account: AccountId,
+        device: DeviceId,
+    ) -> StoreResult<()> {
+        txn.execute(
+            "INSERT INTO membership_intents (conversation_id, account_id, device_id, kind)
+             SELECT $1, $2, $3, 1
+             WHERE NOT EXISTS (SELECT 1 FROM conversation_members
+                               WHERE conversation_id = $1 AND device_id = $3)
+             ON CONFLICT (conversation_id, device_id) DO NOTHING",
+            &[
+                &conversation_id.as_slice(),
+                &account.as_bytes(),
+                &device.as_bytes(),
+            ],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Record that every device `account` is routed to should be REMOVED from `conversation_id`, and
+    /// purge their undelivered mail for it. Used by both exits in an authoritative conversation: an
+    /// admin removing someone, and a member leaving.
+    ///
+    /// The routing rows deliberately stay until a remove-commit deletes them — that is the whole
+    /// invariant. What does NOT wait is the delivery cutoff: the queued mail goes now, so "leave"
+    /// and "remove" take effect for the user immediately even though the cryptographic removal lands
+    /// when a remaining member next syncs.
+    ///
+    /// Returns the number of devices marked, so a caller can tell "nothing to do" from "done".
+    pub fn add_remove_intents(
+        &self,
+        conversation_id: &[u8; 16],
+        account: &AccountId,
+    ) -> StoreResult<u64> {
+        let mut conn = self.conn()?;
+        let mut txn = conn.transaction().map_err(db_err)?;
+        let marked = txn
+            .execute(
+                "INSERT INTO membership_intents (conversation_id, account_id, device_id, kind)
+                 SELECT conversation_id, account_id, device_id, 2 FROM conversation_members
+                 WHERE conversation_id = $1 AND account_id = $2
+                 ON CONFLICT (conversation_id, device_id)
+                 DO UPDATE SET kind = 2, claimed_by = NULL, claimed_at = NULL",
+                &[&conversation_id.as_slice(), &account.as_bytes()],
+            )
+            .map_err(db_err)?;
+        txn.execute(
+            "DELETE FROM envelopes
+             WHERE conversation_id = $1 AND NOT delivered
+               AND recipient_device IN (
+                   SELECT device_id FROM conversation_members
+                   WHERE conversation_id = $1 AND account_id = $2)",
+            &[&conversation_id.as_slice(), &account.as_bytes()],
+        )
+        .map_err(db_err)?;
+        txn.commit().map_err(db_err)?;
+        Ok(marked)
+    }
+
+    /// Atomically claim one intent so exactly ONE member's device builds the commit for it — two
+    /// adders racing would both lose the epoch CAS, wasting a prekey each. Mirrors
+    /// [`Self::claim_setup`]: expiring claims, claimer must be a set-up member.
+    pub fn claim_intent(
+        &self,
+        claimer: &DeviceId,
+        conversation_id: &[u8; 16],
+        target_device: &DeviceId,
+    ) -> StoreResult<bool> {
+        let mut conn = self.conn()?;
+        let updated = conn
+            .execute(
+                "UPDATE membership_intents i SET claimed_by = $1, claimed_at = now()
+                 WHERE i.conversation_id = $2 AND i.device_id = $3
+                   AND (i.claimed_at IS NULL
+                        OR i.claimed_at < now() - make_interval(secs => $4)
+                        OR i.claimed_by = $1)
+                   AND EXISTS (SELECT 1 FROM conversation_members me
+                               WHERE me.conversation_id = $2 AND me.device_id = $1 AND me.mls_added)",
+                &[
+                    &claimer.as_bytes(),
+                    &conversation_id.as_slice(),
+                    &target_device.as_bytes(),
+                    &(SETUP_CLAIM_TTL_SECS as f64),
+                ],
+            )
+            .map_err(db_err)?;
+        Ok(updated == 1)
     }
 
     /// Atomically claim one setup target so exactly ONE member's device performs the add — two
@@ -610,15 +791,30 @@ impl PgRelay {
         Ok(updated == 1)
     }
 
-    /// Whether `caller` shares at least one conversation with `target` — the authorization for
-    /// claiming a SPECIFIC device's prekey (a reconciler adding that device to a shared group).
+    /// Whether `caller` may claim `target`'s prekey — a reconciler adding that device to a group
+    /// they share. Two ways to earn it, and they are the same trust level:
+    ///
+    /// * they already share a conversation (the legacy V27 case: routing exists, the MLS add is
+    ///   catching up), or
+    /// * `target` has a pending **membership intent** (V31) in a conversation `caller` belongs to:
+    ///   an admin, an invite, or an approved join request already authorized that device to join,
+    ///   and in an MLS-authoritative conversation the add cannot create the routing row first — the
+    ///   commit does that, and building the commit needs the prekey.
+    ///
+    /// Both sides are anchored in the CALLER's own memberships, so this never lets a stranger
+    /// enumerate prekeys: the caller must already be inside the group the target is joining.
     pub fn shares_conversation(&self, caller: &DeviceId, target: &DeviceId) -> StoreResult<bool> {
         let mut conn = self.conn()?;
         Ok(conn
             .query_opt(
                 "SELECT 1 FROM conversation_members a
                  JOIN conversation_members b ON a.conversation_id = b.conversation_id
-                 WHERE a.device_id = $1 AND b.device_id = $2 LIMIT 1",
+                 WHERE a.device_id = $1 AND b.device_id = $2
+                 UNION ALL
+                 SELECT 1 FROM conversation_members a
+                 JOIN membership_intents i ON a.conversation_id = i.conversation_id
+                 WHERE a.device_id = $1 AND i.device_id = $2
+                 LIMIT 1",
                 &[&caller.as_bytes(), &target.as_bytes()],
             )
             .map_err(db_err)?
@@ -635,16 +831,35 @@ impl PgRelay {
         device: &DeviceId,
     ) -> StoreResult<u64> {
         let mut conn = self.conn()?;
-        let inserted = conn
+        let mut txn = conn.transaction().map_err(db_err)?;
+        // Legacy conversations: routing now, MLS setup queued (V27).
+        let routed = txn
             .execute(
                 "INSERT INTO conversation_members (conversation_id, account_id, device_id, mls_added)
                  SELECT DISTINCT cm.conversation_id, $1::bytea, $2::bytea, FALSE
-                 FROM conversation_members cm WHERE cm.account_id = $1
+                 FROM conversation_members cm
+                 JOIN conversations c ON c.conversation_id = cm.conversation_id
+                 WHERE cm.account_id = $1 AND NOT c.mls_authoritative
                  ON CONFLICT (conversation_id, device_id) DO NOTHING",
                 &[&account.as_bytes(), &device.as_bytes()],
             )
             .map_err(db_err)?;
-        Ok(inserted)
+        // Authoritative conversations: an INTENT only. A sibling device joins the group the same way
+        // anyone else does — by being added in a signed commit — so linking a new phone never
+        // silently expands a group's routing set without cryptographic evidence.
+        let intended = txn
+            .execute(
+                "INSERT INTO membership_intents (conversation_id, account_id, device_id)
+                 SELECT DISTINCT cm.conversation_id, $1::bytea, $2::bytea
+                 FROM conversation_members cm
+                 JOIN conversations c ON c.conversation_id = cm.conversation_id
+                 WHERE cm.account_id = $1 AND c.mls_authoritative
+                 ON CONFLICT (conversation_id, device_id) DO NOTHING",
+                &[&account.as_bytes(), &device.as_bytes()],
+            )
+            .map_err(db_err)?;
+        txn.commit().map_err(db_err)?;
+        Ok(routed + intended)
     }
 
     /// Membership by ACCOUNT (any of its devices), inside a caller-owned transaction. Used by the
@@ -970,7 +1185,7 @@ impl PgRelay {
         let mut conn = self.conn()?;
         let rows = conn
             .query(
-                "SELECT id, conversation_id, sender_device, ciphertext
+                "SELECT id, conversation_id, sender_device, ciphertext, membership_epoch
                  FROM envelopes
                  WHERE recipient_device = $1 AND NOT delivered
                  ORDER BY id LIMIT $2",
@@ -984,6 +1199,7 @@ impl PgRelay {
                     conversation_id: id16(r.get::<_, &[u8]>(1))?,
                     sender_device: id16(r.get::<_, &[u8]>(2))?,
                     ciphertext: r.get::<_, Vec<u8>>(3),
+                    membership_epoch: r.get::<_, Option<i64>>(4).map(|e| e as u64),
                 })
             })
             .collect()

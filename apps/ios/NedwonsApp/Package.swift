@@ -49,6 +49,14 @@ let package = Package(
                 .product(name: "NedwonsKit", package: "NedwonsKit"),
                 .product(name: "MlsFfi", package: "NedwonsMLS"),
             ]),
+        // ADR-0010 membership over the full shipping stack against a live server.
+        .executableTarget(
+            name: "AuthoritativeLiveRun",
+            dependencies: [
+                "NedwonsAppKit",
+                .product(name: "NedwonsKit", package: "NedwonsKit"),
+                .product(name: "MlsFfi", package: "NedwonsMLS"),
+            ]),
         .testTarget(
             name: "NedwonsAppKitTests", dependencies: ["NedwonsAppKit", "NedwonsPush"]),
     ]

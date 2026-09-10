@@ -34,6 +34,10 @@ use mls_core::{MlsError, CIPHERSUITE_NAME, VERSION as CORE_VERSION};
 /// Bounds per-call FFI marshalling.
 pub const MAX_PAGE_MESSAGES: u32 = 256;
 
+/// Members removable in one staged commit. Matches the relay's `MAX_COMMIT_MEMBER_DELTA`, so a
+/// commit this side will build is never one the server would refuse for shape.
+pub const MAX_REMOVE_MEMBERS: usize = 32;
+
 /// Messages are variant-only: no library internals, key bytes, plaintext, or paths ever appear
 /// (asserted by a redaction test).
 #[derive(Debug, PartialEq, Eq, thiserror::Error, uniffi::Error)]
@@ -522,11 +526,23 @@ impl MlsClient {
     /// Stage a remove (see [`stage_add`](Self::stage_add)). `identity` is the target member's
     /// credential identity bytes. Returns the commit; the group is not advanced until merged.
     pub fn stage_remove(&self, identity: Vec<u8>) -> Result<Vec<u8>, MlsClientError> {
+        self.stage_remove_many(vec![identity])
+    }
+
+    /// Stage the removal of SEVERAL members in one commit — what removing a person means, since an
+    /// account is present through every device it enrolled. One epoch, one manifest, one signature;
+    /// all-or-nothing if any identity is not in the group.
+    pub fn stage_remove_many(&self, identities: Vec<Vec<u8>>) -> Result<Vec<u8>, MlsClientError> {
         catch(move || {
-            bound(identity.len(), MAX_IDENTITY_LEN)?;
+            bound(identities.len(), MAX_REMOVE_MEMBERS)?;
+            for identity in &identities {
+                bound(identity.len(), MAX_IDENTITY_LEN)?;
+            }
             let mut g = self.lock()?;
             let session = active_mut(&mut g)?;
-            session.stage_remove_member(&identity).map_err(map_durable)
+            session
+                .stage_remove_members(&identities)
+                .map_err(map_durable)
         })
     }
 

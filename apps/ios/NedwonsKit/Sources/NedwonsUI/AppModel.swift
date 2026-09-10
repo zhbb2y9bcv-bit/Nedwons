@@ -44,6 +44,14 @@ public final class AppModel: ObservableObject {
     @Published public var inbox: [InboxEnvelope] = []
     @Published public var isBusy = false
     @Published public var banner: String?
+    /// Something the app **refused** on security grounds and the user should know about — today:
+    /// a group membership change whose signed manifest did not verify, or did not match what the
+    /// MLS commit actually did (ADR-0010), and which was therefore not applied.
+    ///
+    /// Deliberately separate from `banner`: a banner reports transient feedback about something the
+    /// user just did, while this reports a refusal that happened on its own and stays true until
+    /// dismissed.
+    @Published public var securityNotice: String?
     /// Assurance level of the key backing the current session (hardware vs software fallback).
     @Published public var deviceAssurance: DeviceAssurance?
 
@@ -609,6 +617,20 @@ public final class AppModel: ObservableObject {
         acknowledgedDeviceIDs.insert(deviceID)
     }
 
+    /// Record a security refusal for the user (see `securityNotice`). Called by the messaging
+    /// pipeline when it declines to apply something that failed verification.
+    public func noteSecurityEvent(_ message: String) {
+        securityNotice = message
+    }
+
+    /// This device's **enrolled** signing key — the one the server verified at registration and
+    /// published in the transparency log. The messaging pipeline signs ADR-0010 membership manifests
+    /// with it, so every membership change is attributable to a device anyone can look up in the
+    /// log. `nil` before enrolment, or if the Keychain is unusable.
+    public func enrolledDeviceSigner() -> (any DeviceSigner)? {
+        (try? deviceIdentity.loadEnrolled())?.signer
+    }
+
     /// Audit the account's logged device set against the acknowledged set (#8). An unexpected logged
     /// device raises the alarm banner.
     public func auditDevices() async {
@@ -629,8 +651,11 @@ public final class AppModel: ObservableObject {
         }
     }
 
-    // Internal (not private) so the verification surface (`VerificationModel.swift`) shares it.
-    func currentPinnedLogKey() async throws -> Data {
+    /// The pinned transparency-log key: `AppConfig`'s if the build ships one, else trust-on-first-use
+    /// from the first fetch, cached for the session. Public so the messaging pipeline can verify
+    /// inbound membership manifests (ADR-0010) against the LOGGED actor key rather than one the
+    /// server merely asserts.
+    public func currentPinnedLogKey() async throws -> Data {
         if let pinnedLogKey { return pinnedLogKey }
         guard let token else { throw NedwonsClient.ClientError.decoding }
         let sth = try await client.transparencySignedTreeHead(accessToken: token)
@@ -948,8 +973,13 @@ public final class AppModel: ObservableObject {
         await markConversationReadAction?(conversationID)
     }
 
-    /// Leave a group: consent withdrawal. The server removes this account from routing and purges
-    /// its queued mail for the conversation; the Chats list refreshes without it.
+    /// Leave a group: consent withdrawal. Queued mail for the conversation is purged immediately
+    /// either way; the Chats list refreshes without it.
+    ///
+    /// In an MLS-authoritative group (ADR-0010) the server records the departure rather than editing
+    /// routing itself, and a remaining member's next sync turns it into a signed remove-commit —
+    /// because MLS will not let anyone commit their own removal. The user-visible effect (mail
+    /// stops, the chat is gone from the list) is immediate regardless.
     public func leaveGroup(_ conversationID: String) async {
         await run { [self] in
             guard let token else { return }
@@ -1181,6 +1211,12 @@ public final class AppModel: ObservableObject {
     /// Injected: add people to an EXISTING conversation's MLS group after the relay has added them
     /// to routing. Without it they would be routed ciphertext they hold no key for.
     public var addMembersToConversationAction: ((String, [String]) async throws -> Void)?
+
+    /// Injected: drain the relay's membership work queue now instead of on the next sync tick. Used
+    /// right after an action whose cryptographic half this device should perform immediately — an
+    /// admin removal in an MLS-authoritative group (ADR-0010), where the admin who just tapped
+    /// Remove is by definition online and can post the remove-commit at once.
+    public var reconcileMembershipAction: (() async -> Void)?
 
     /// Injected: rename the group for everyone, over the E2EE channel.
     public var renameGroupAction: ((String, String) async throws -> Void)?
@@ -1576,11 +1612,17 @@ public final class AppModel: ObservableObject {
 
     /// Create a group from selected people; the server refuses only if a blocked pair is included.
     /// Returns the new conversation id, or nil on failure (banner explains why).
+    ///
+    /// New conversations are **MLS-commit-authoritative** (ADR-0010): the relay routes mail to the
+    /// creator alone until a device-signed MLS commit adds each person, so the server's idea of who
+    /// is in the conversation cannot drift from the cryptographic group's. Everything else about
+    /// creation is unchanged — the same consent rules decide who may be listed.
     public func createGroup(memberAccountIDs: [String]) async -> String? {
         var conversationID: String?
         await run { [self] in
             guard let token else { return }
-            let group = try await client.createGroup(accessToken: token, memberAccountIDs: memberAccountIDs)
+            let group = try await client.createGroup(
+                accessToken: token, memberAccountIDs: memberAccountIDs, mlsAuthoritative: true)
             conversationID = group.conversationID
             conversations = try await client.listConversations(accessToken: token)
             banner = "Group created."

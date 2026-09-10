@@ -329,6 +329,10 @@ pub fn build_router_full(
         .route("/v1/conversations/{id}/commit", post(membership_commit))
         .route("/v1/conversations/{id}/epoch", get(conversation_epoch))
         .route(
+            "/v1/conversations/{id}/members/{account}/devices",
+            get(member_devices),
+        )
+        .route(
             "/v1/conversations/{id}/membership/{epoch}",
             get(membership_event),
         )
@@ -1582,6 +1586,12 @@ struct InboxEnvelopeDto {
     /// sibling; `conversation_id` is absent because this is not a conversation.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     self_group: bool,
+    /// Present iff this envelope is an ADR-0010 **membership commit** for that `next_epoch`. The
+    /// recipient must fetch the epoch's signed manifest, verify it against the actor's
+    /// transparency-logged device key, and require the staged commit's real adds/removes to equal
+    /// the manifest's — merging only then. Ordinary mail omits the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    membership_epoch: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1699,6 +1709,15 @@ struct SetupTargetDto {
     conversation_id: String,
     account_id: String,
     device_id: String,
+    /// `true` = an ADR-0010 membership intent: routing for this device is NOT what it will be, and
+    /// the change lands only by posting a signed commit. `false` = the legacy V27 row, where routing
+    /// already exists and the adder delivers a Welcome and confirms.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    authoritative: bool,
+    /// `true` when the pending change is a REMOVAL (an admin removed this account, or it left)
+    /// rather than a join — the committer stages a remove commit instead of claiming a prekey.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    removal: bool,
 }
 
 #[derive(Serialize)]
@@ -1706,8 +1725,9 @@ struct SetupNeededDto {
     targets: Vec<SetupTargetDto>,
 }
 
-/// Members of the caller's conversations still awaiting their MLS add (V27). The caller's next
-/// step per row: claim it, claim the device's prekey, add + Welcome, confirm.
+/// Devices awaiting their MLS add in the caller's conversations, from both queues (V27 routing rows
+/// and V31 membership intents). The caller's next step per row: claim it, claim the device's prekey,
+/// then either add + Welcome + confirm (legacy) or stage + `/commit` (authoritative).
 async fn setup_needed(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1722,6 +1742,8 @@ async fn setup_needed(
                 conversation_id: hex::encode(t.conversation_id),
                 account_id: hex::encode(t.account_id),
                 device_id: hex::encode(t.device_id),
+                authoritative: t.authoritative,
+                removal: t.removal,
             })
             .collect(),
     }))
@@ -1733,7 +1755,9 @@ struct SetupRefBody {
     device_id: String,
 }
 
-/// Take the exclusive (expiring) claim on one setup target. `409` = someone else is on it.
+/// Take the exclusive (expiring) claim on one setup target, in whichever queue holds it. `409` =
+/// someone else is on it (or it is already done). Trying both is deliberate: the client does not
+/// have to tell us which queue it read the target from, and a conversation cannot be in both.
 async fn setup_claim(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1743,8 +1767,11 @@ async fn setup_claim(
     let conversation_id = id16_from_hex(&body.conversation_id)?;
     let target = DeviceId(id16_from_hex(&body.device_id)?);
     let relay = state.relay.clone();
-    let claimed =
-        blocking_store(move || relay.claim_setup(&me.device_id, &conversation_id, &target)).await?;
+    let claimed = blocking_store(move || {
+        Ok(relay.claim_setup(&me.device_id, &conversation_id, &target)?
+            || relay.claim_intent(&me.device_id, &conversation_id, &target)?)
+    })
+    .await?;
     if claimed {
         Ok(StatusCode::NO_CONTENT)
     } else {
@@ -1753,6 +1780,10 @@ async fn setup_claim(
 }
 
 /// The Welcome has been delivered (queued): the target is set up. Requires the live claim.
+///
+/// Legacy queue only. In an authoritative conversation there is nothing to confirm: the accepted
+/// commit is what creates the routing row, in the same transaction that queues the Welcome — so a
+/// separate confirmation step could only ever disagree with the commit log.
 async fn setup_confirm(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1761,6 +1792,7 @@ async fn setup_confirm(
     let me = authed_device(&state, &headers).await?;
     let conversation_id = id16_from_hex(&body.conversation_id)?;
     let target = DeviceId(id16_from_hex(&body.device_id)?);
+    reject_if_authoritative(&state, &conversation_id).await?;
     let relay = state.relay.clone();
     let confirmed =
         blocking_store(move || relay.confirm_setup(&me.device_id, &conversation_id, &target))
@@ -2306,7 +2338,6 @@ async fn add_member(
     let me = authed_device(&state, &headers).await?;
     let conversation_id = id16_from_hex(&conversation_hex)?;
     let target_account = AccountId(id16_from_hex(&body.account_id)?);
-    reject_if_authoritative(&state, &conversation_id).await?;
 
     let relay = state.relay.clone();
     let service = state.service.clone();
@@ -2323,11 +2354,21 @@ async fn add_member(
         {
             return Ok(None);
         }
-        // Server-side authority, never client-asserted. Every non-revoked device joins the V27
-        // setup queue; none yet ⇒ the add is DEFERRED until they enroll and publish prekeys —
-        // the membership row appears the moment a device does.
+        // Server-side authority, never client-asserted. Every non-revoked device joins the setup
+        // queue; none yet ⇒ the add is DEFERRED until they enroll and publish prekeys.
+        //
+        // In an MLS-authoritative conversation the queued row is an INTENT: this endpoint supplies
+        // the ADR-0009 consent (admin + friendship + no block, checked just above), and the signed
+        // commit that consumes the intent supplies the ADR-0010 evidence. The friendship check is
+        // exactly why `apply_commit` demands an intent — an admin cannot conjure a member without
+        // having passed through here.
+        let authoritative = relay.is_authoritative(&conversation_id)?;
         for device in active_devices_of(&service, &target_account)? {
-            relay.add_pending_member(&conversation_id, target_account, device)?;
+            if authoritative {
+                relay.add_intent(&conversation_id, target_account, device)?;
+            } else {
+                relay.add_pending_member(&conversation_id, target_account, device)?;
+            }
         }
         Ok(Some(()))
     })
@@ -2346,9 +2387,23 @@ async fn leave_conversation(
 ) -> Result<StatusCode, ApiError> {
     let me = authed_device(&state, &headers).await?;
     let conversation_id = id16_from_hex(&conversation_hex)?;
-    reject_if_authoritative(&state, &conversation_id).await?;
+    let relay = state.relay.clone();
     let groups = state.groups.clone();
-    blocking_store(move || groups.leave_conversation(&conversation_id, &me.account_id)).await?;
+    blocking_store(move || {
+        if relay.is_authoritative(&conversation_id)? {
+            // ADR-0010: routing here is written only by an accepted commit — and a leaver cannot
+            // produce one for their own departure, because MLS refuses a commit that removes the
+            // committer's own leaf. So leaving records the authorization (a removal intent) and
+            // purges the leaver's queued mail immediately; a remaining member's next sync turns it
+            // into a real remove-commit. Consent withdrawal therefore takes effect for delivery at
+            // once, and becomes cryptographic shortly after.
+            relay.add_remove_intents(&conversation_id, &me.account_id)?;
+        } else {
+            groups.leave_conversation(&conversation_id, &me.account_id)?;
+        }
+        Ok(())
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2482,9 +2537,10 @@ async fn create_invite(
     // whole groups.
     enforce_quota(&state, crate::quota::GROUP_INVITES, &me.account_id).await?;
     let conversation_id = id16_from_hex(&conversation_hex)?;
-    // Authoritative conversations grow only through /commit, so minting no invite closes the whole
-    // join path at its source: no invite ⇒ no accept ⇒ no join request.
-    reject_if_authoritative(&state, &conversation_id).await?;
+    // Invites work for authoritative conversations too (V31): accepting one records a membership
+    // INTENT, and a member's device turns that into routing by posting a signed commit. The invite
+    // is still what supplies the joiner's consent (ADR-0009); the commit is what supplies the
+    // cryptographic evidence (ADR-0010).
     let expires = body
         .expires_in_secs
         .unwrap_or(INVITE_DEFAULT_EXPIRES_SECS)
@@ -2591,15 +2647,12 @@ async fn accept_invite(
         crate::tx::transaction(&pool, |txn| {
             let outcome = PgGroups::accept_invite_in_txn(txn, &token, &me.account_id)?;
             if let InviteOutcome::Joined { conversation_id } = &outcome {
-                // ALL of the joiner's devices, queued for MLS setup (V27): a current member's
-                // device claims each prekey and delivers the Welcomes on its next sync.
+                // ALL of the joiner's devices are queued: as V27 routing rows in a legacy
+                // conversation, or as ADR-0010 membership intents in an authoritative one. Either
+                // way a current member's device claims each prekey and does the MLS add on its next
+                // sync — in the authoritative case that add IS the routing change.
                 for device in &devices {
-                    PgRelay::add_pending_member_in_txn(
-                        txn,
-                        conversation_id,
-                        me.account_id,
-                        *device,
-                    )?;
+                    PgRelay::enqueue_join_in_txn(txn, conversation_id, me.account_id, *device)?;
                 }
             }
             Ok(outcome)
@@ -2647,7 +2700,6 @@ async fn approve_join_request(
     let me = authed_device(&state, &headers).await?;
     let conversation_id = id16_from_hex(&conversation_hex)?;
     let target = AccountId(id16_from_hex(&body.account_id)?);
-    reject_if_authoritative(&state, &conversation_id).await?;
     let st = state.clone();
     let approved = blocking_store(move || {
         // Resolve the target's device BEFORE opening the transaction: the auth service owns its
@@ -2670,7 +2722,7 @@ async fn approve_join_request(
                 return Ok(Some(false));
             }
             for device_id in &devices {
-                PgRelay::add_pending_member_in_txn(txn, &conversation_id, target, *device_id)?;
+                PgRelay::enqueue_join_in_txn(txn, &conversation_id, target, *device_id)?;
             }
             Ok(Some(true))
         })
@@ -2719,13 +2771,19 @@ async fn remove_member(
     if target.0 == me.account_id.0 {
         return Err(bad_request());
     }
-    reject_if_authoritative(&state, &conversation_id).await?;
     let st = state.clone();
     blocking_store(move || {
         if !is_conversation_admin(&st, &conversation_id, &me)? {
             return Ok(None);
         }
-        st.groups.leave_conversation(&conversation_id, &target)?;
+        if st.relay.is_authoritative(&conversation_id)? {
+            // The admin's decision is recorded as a removal intent and the target's queued mail is
+            // purged now; the routing rows go when a remove-commit lands (usually the admin's own
+            // device, moments later — it posts one straight after this call).
+            st.relay.add_remove_intents(&conversation_id, &target)?;
+        } else {
+            st.groups.leave_conversation(&conversation_id, &target)?;
+        }
         Ok(Some(()))
     })
     .await?
@@ -3453,6 +3511,43 @@ async fn membership_event(
     }))
 }
 
+#[derive(Serialize)]
+struct MemberDevicesDto {
+    device_ids: Vec<String>,
+}
+
+/// The devices `account` is routed to in this conversation — what a **remove** commit must name,
+/// since an account is present through every device it enrolled and ADR-0010's manifest removes
+/// devices, not accounts.
+///
+/// Members only, and scoped to one conversation the caller is already in. It discloses nothing a
+/// member cannot already infer: they see the member list, and the setup queue already names member
+/// devices to them. An empty list is the same answer for "not a member of this conversation" and
+/// "a member with no devices", so it is not an oracle for account existence.
+async fn member_devices(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((conversation_hex, account_hex)): Path<(String, String)>,
+) -> Result<Json<MemberDevicesDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let target = AccountId(id16_from_hex(&account_hex)?);
+    let st = state.clone();
+    let devices = blocking_store(move || {
+        if !st.relay.is_member(&conversation_id, &me.device_id)? {
+            return Ok(None);
+        }
+        st.groups
+            .member_devices(&conversation_id, &target)
+            .map(Some)
+    })
+    .await?
+    .ok_or_else(forbidden)?;
+    Ok(Json(MemberDevicesDto {
+        device_ids: devices.iter().map(|d| hex::encode(d.0)).collect(),
+    }))
+}
+
 /// A client rebasing after `stale_epoch` reads this before rebuilding its commit. Members only.
 async fn conversation_epoch(
     State(state): State<AppState>,
@@ -3502,6 +3597,7 @@ async fn fetch_inbox(
             ciphertext: hex::encode(e.ciphertext),
             sealed: false,
             self_group: false,
+            membership_epoch: e.membership_epoch,
         })
         .collect();
     out.extend(sealed.into_iter().map(|e| InboxEnvelopeDto {
@@ -3511,6 +3607,7 @@ async fn fetch_inbox(
         ciphertext: hex::encode(e.ciphertext),
         sealed: true,
         self_group: false,
+        membership_epoch: None,
     }));
     out.extend(self_group.into_iter().map(|e| InboxEnvelopeDto {
         id: e.id,
@@ -3519,6 +3616,7 @@ async fn fetch_inbox(
         ciphertext: hex::encode(e.ciphertext),
         sealed: false,
         self_group: true,
+        membership_epoch: None,
     }));
     Ok(Json(out))
 }
@@ -3655,6 +3753,7 @@ async fn stream_socket(
                             ciphertext: hex::encode(e.ciphertext),
                             sealed: false,
                             self_group: false,
+                            membership_epoch: e.membership_epoch,
                         });
                     }
                 }
@@ -3668,6 +3767,7 @@ async fn stream_socket(
                             ciphertext: hex::encode(e.ciphertext),
                             sealed: true,
                             self_group: false,
+                            membership_epoch: None,
                         });
                     }
                 }
@@ -3681,6 +3781,7 @@ async fn stream_socket(
                             ciphertext: hex::encode(e.ciphertext),
                             sealed: false,
                             self_group: true,
+                            membership_epoch: None,
                         });
                     }
                 }
@@ -3789,6 +3890,11 @@ struct FriendActionDto {
 #[serde(deny_unknown_fields)]
 struct CreateGroupBody {
     member_account_ids: Vec<String>,
+    /// Opt into MLS-commit-authoritative membership (ADR-0010). The creator's device is the group's
+    /// only member at epoch 0; every listed member is recorded as an INTENT and joins only when a
+    /// signed commit adds them. Defaults false so older clients keep the legacy behaviour.
+    #[serde(default)]
+    mls_authoritative: bool,
 }
 
 #[derive(Serialize)]
@@ -4559,6 +4665,7 @@ async fn create_group(
     let service = state.service.clone();
     let others_for_task = others.clone();
     let groups = state.groups.clone();
+    let authoritative = body.mls_authoritative;
     let outcome = blocking_store(move || {
         // ADR-0009: listing someone is a DIRECT add, so the creator must be friends with each
         // listed member (friendship implies consent; strangers join via invite links, stopping
@@ -4573,21 +4680,33 @@ async fn create_group(
             return Ok(Err("blocked_member"));
         }
         let conversation_id = auth_core::crypto::random_bytes::<16>();
-        // Legacy multi-member creation seeds routing directly, so it stays non-authoritative;
-        // authoritative groups start empty and grow through /commit.
-        relay.create_conversation(conversation_id, me.account_id, me.device_id, false)?;
+        // The creator's own device is the genesis routing row at epoch 0 — the one membership that
+        // cannot come from a commit, since there is no group yet to commit against. Everyone else
+        // joins by commit when the conversation is authoritative.
+        relay.create_conversation(conversation_id, me.account_id, me.device_id, authoritative)?;
         groups.bootstrap_admin(&conversation_id, &me.account_id)?;
-        // EVERY device of every member — including the creator's own siblings — lands in the
-        // V27 setup queue; the creator's device (which builds the MLS group) reconciles them.
-        // A member with no devices publishing prekeys yet is simply deferred, not failed.
+        // EVERY device of every member — including the creator's own siblings — lands in the setup
+        // queue: legacy routing rows (V27), or membership intents when authoritative. The creator's
+        // device (which builds the MLS group) reconciles them. A member with no devices publishing
+        // prekeys yet is simply deferred, not failed.
+        //
+        // The ADR-0009 consent for these adds is the friendship check above, which is exactly what
+        // `apply_commit` relies on when it demands an intent per added device.
+        let enqueue = |member: AccountId, device: DeviceId| -> auth_core::store::StoreResult<()> {
+            if authoritative {
+                relay.add_intent(&conversation_id, member, device)
+            } else {
+                relay.add_pending_member(&conversation_id, member, device)
+            }
+        };
         for member in &others_for_task {
             for device in active_devices_of(&service, member)? {
-                relay.add_pending_member(&conversation_id, *member, device)?;
+                enqueue(*member, device)?;
             }
         }
         for device in active_devices_of(&service, &me.account_id)? {
             if device.0 != me.device_id.0 {
-                relay.add_pending_member(&conversation_id, me.account_id, device)?;
+                enqueue(me.account_id, device)?;
             }
         }
         Ok(Ok(conversation_id))

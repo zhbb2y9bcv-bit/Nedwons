@@ -160,11 +160,17 @@ extension AppModel {
     }
 
     /// Remove ("kick") a member. Their queued mail for the group is purged server-side.
+    ///
+    /// In an MLS-authoritative group (ADR-0010) the endpoint records the admin's decision and this
+    /// device then performs the actual removal as a signed commit — which is why the reconcile runs
+    /// right here rather than waiting for the next sync tick: the admin who just tapped Remove is
+    /// online by definition, so the cryptographic removal lands immediately.
     @discardableResult
     public func removeGroupMember(_ accountID: String, from conversationID: String) async -> Bool {
         await groupAction(conversationID, success: "Removed from the group.") { [self] token in
             try await client.removeGroupMember(
                 accessToken: token, conversationID: conversationID, accountID: accountID)
+            await reconcileMembershipAction?()
             conversations = try await client.listConversations(accessToken: token)
         }
     }

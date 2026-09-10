@@ -302,12 +302,33 @@ impl Conversation {
     }
 
     pub fn stage_remove_member(&mut self, me: &Member, identity: &[u8]) -> Result<Vec<u8>> {
-        let leaf = self
-            .leaf_for_identity(identity)
-            .ok_or(MlsError::MemberNotFound)?;
+        self.stage_remove_members(me, std::slice::from_ref(&identity.to_vec()))
+    }
+
+    /// Remove several members in ONE commit — one epoch transition, one manifest, one signature.
+    ///
+    /// This is what removing a *person* means: an account is present through every device it has
+    /// enrolled, so kicking it device-by-device would take N epochs, give N chances to lose the
+    /// server's epoch CAS race, and leave the account half-removed in between. ADR-0010's manifest
+    /// carries `removed` as a list for exactly this reason.
+    ///
+    /// All-or-nothing: an identity that is not in the group fails the whole call rather than
+    /// silently producing a commit that removes fewer members than the manifest will claim — which
+    /// every honest recipient would then reject as a correspondence mismatch.
+    pub fn stage_remove_members(&mut self, me: &Member, identities: &[Vec<u8>]) -> Result<Vec<u8>> {
+        if identities.is_empty() {
+            return Err(MlsError::MemberNotFound);
+        }
+        let mut leaves = Vec::with_capacity(identities.len());
+        for identity in identities {
+            leaves.push(
+                self.leaf_for_identity(identity)
+                    .ok_or(MlsError::MemberNotFound)?,
+            );
+        }
         let (commit, _welcome, _info) = self
             .group
-            .remove_members(&me.provider, &me.signer, &[leaf])
+            .remove_members(&me.provider, &me.signer, &leaves)
             .map_err(lib)?;
         commit.tls_serialize_detached().map_err(|_| MlsError::Codec)
     }

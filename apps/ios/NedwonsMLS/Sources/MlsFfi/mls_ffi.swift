@@ -835,6 +835,13 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func stageRemove(identity: Data) throws  -> Data
     
     /**
+     * Stage the removal of SEVERAL members in one commit — what removing a person means, since an
+     * account is present through every device it enrolled. One epoch, one manifest, one signature;
+     * all-or-nothing if any identity is not in the group.
+     */
+    func stageRemoveMany(identities: [Data]) throws  -> Data
+    
+    /**
      * 0 = pre-versioning; a Pending client also reports 0.
      */
     func storageFormatVersion() throws  -> UInt32
@@ -1581,6 +1588,19 @@ open func stageRemove(identity: Data)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_stage_remove(self.uniffiClonePointer(),
         FfiConverterData.lower(identity),$0
+    )
+})
+}
+    
+    /**
+     * Stage the removal of SEVERAL members in one commit — what removing a person means, since an
+     * account is present through every device it enrolled. One epoch, one manifest, one signature;
+     * all-or-nothing if any identity is not in the group.
+     */
+open func stageRemoveMany(identities: [Data])throws  -> Data  {
+    return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_stage_remove_many(self.uniffiClonePointer(),
+        FfiConverterSequenceData.lower(identities),$0
     )
 })
 }
@@ -3762,6 +3782,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_stage_remove() != 13093) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_stage_remove_many() != 12702) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_storage_format_version() != 65410) {

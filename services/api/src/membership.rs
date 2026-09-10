@@ -130,41 +130,69 @@ impl PgMembership {
             return Ok(ApplyOutcome::Forbidden);
         }
 
-        // Governance (ADR-0009, re-checked inside the txn).
-        match req.control_type {
-            // Add / Remove require the admin role.
-            1 | 2 => {
-                let is_admin = txn
-                    .query_opt(
-                        "SELECT 1 FROM group_admins WHERE conversation_id = $1 AND account_id = $2",
-                        &[&conv, &req.actor_account.as_bytes()],
-                    )
-                    .map_err(db_err)?
-                    .is_some();
-                if !is_admin {
-                    return Ok(ApplyOutcome::Forbidden);
+        // Is this conversation commit-authoritative? If so, routing is written ONLY here, and every
+        // device this commit touches must already carry a membership INTENT (V31).
+        let authoritative: bool = txn
+            .query_opt(
+                "SELECT mls_authoritative FROM conversations WHERE conversation_id = $1",
+                &[&conv],
+            )
+            .map_err(db_err)?
+            .map(|r| r.get::<_, bool>(0))
+            .unwrap_or(false);
+
+        // GOVERNANCE (ADR-0009), and where it lives in each model.
+        //
+        // Authoritative: the authorization decision was made — and consent-checked — at the endpoint
+        // that minted the intent (an admin who is friends with the target, a redeemed invite, an
+        // approved join request, an admin removal, a member leaving). The committing device is the
+        // COURIER, not the decider, because the V27 reconcile model has whichever member is online
+        // carry out the change. Re-checking the courier's role here would break invite joins
+        // whenever no admin happens to be online, and would not add authority the intent lacks. The
+        // per-device intent checks below are the enforcement.
+        //
+        // Legacy: no intents exist, so the actor's own role is all there is to check.
+        if !authoritative {
+            match req.control_type {
+                // Add / Remove require the admin role.
+                1 | 2 => {
+                    let is_admin = txn
+                        .query_opt(
+                            "SELECT 1 FROM group_admins
+                             WHERE conversation_id = $1 AND account_id = $2",
+                            &[&conv, &req.actor_account.as_bytes()],
+                        )
+                        .map_err(db_err)?
+                        .is_some();
+                    if !is_admin {
+                        return Ok(ApplyOutcome::Forbidden);
+                    }
                 }
-            }
-            // Self-leave: the removed set must be exactly the actor's own routed devices.
-            3 => {
-                let mut own: Vec<[u8; 16]> = txn
-                    .query(
-                        "SELECT device_id FROM conversation_members
-                         WHERE conversation_id = $1 AND account_id = $2",
-                        &[&conv, &req.actor_account.as_bytes()],
-                    )
-                    .map_err(db_err)?
-                    .into_iter()
-                    .filter_map(|r| r.get::<_, &[u8]>(0).try_into().ok())
-                    .collect();
-                own.sort();
-                let mut claimed: Vec<[u8; 16]> = req.removed.iter().map(|d| d.0).collect();
-                claimed.sort();
-                if own.is_empty() || own != claimed {
-                    return Ok(ApplyOutcome::Forbidden);
+                // Self-leave: the removed set must be exactly the actor's own routed devices.
+                3 => {
+                    let mut own: Vec<[u8; 16]> = txn
+                        .query(
+                            "SELECT device_id FROM conversation_members
+                             WHERE conversation_id = $1 AND account_id = $2",
+                            &[&conv, &req.actor_account.as_bytes()],
+                        )
+                        .map_err(db_err)?
+                        .into_iter()
+                        .filter_map(|r| r.get::<_, &[u8]>(0).try_into().ok())
+                        .collect();
+                    own.sort();
+                    let mut claimed: Vec<[u8; 16]> = req.removed.iter().map(|d| d.0).collect();
+                    claimed.sort();
+                    if own.is_empty() || own != claimed {
+                        return Ok(ApplyOutcome::Forbidden);
+                    }
                 }
+                _ => return Ok(ApplyOutcome::Invalid),
             }
-            _ => return Ok(ApplyOutcome::Invalid),
+        } else if !matches!(req.control_type, 1..=3) {
+            // Authoritative conversations skip the role checks above, so the control type still has
+            // to be validated somewhere: an unknown one names no protocol we can enforce.
+            return Ok(ApplyOutcome::Invalid);
         }
 
         // Adds: device not already routed; no block between the added account and any member;
@@ -182,6 +210,29 @@ impl PgMembership {
                 .is_some();
             if exists {
                 return Ok(ApplyOutcome::Invalid);
+            }
+            // CONSENT (ADR-0009), preserved across the move to commits. Admin-ness alone was never
+            // authority to pull someone into a group: the legacy `add_member` also required
+            // friendship, an invite token, or an approved join request. Those paths mint a JOIN
+            // intent; here we require one, for this exact (account, device) pair. Without it,
+            // routing membership through /commit would quietly weaken the consent model to "any
+            // admin may add any account".
+            //
+            // Non-authoritative conversations skip the requirement — they seed routing directly
+            // elsewhere, so an intent would be meaningless there.
+            if authoritative {
+                let intended = txn
+                    .query_opt(
+                        "SELECT 1 FROM membership_intents
+                         WHERE conversation_id = $1 AND device_id = $2 AND account_id = $3
+                           AND kind = 1",
+                        &[&conv, &device.as_bytes(), &account.as_bytes()],
+                    )
+                    .map_err(db_err)?
+                    .is_some();
+                if !intended {
+                    return Ok(ApplyOutcome::Forbidden);
+                }
             }
             let blocked = txn
                 .query_opt(
@@ -214,7 +265,23 @@ impl PgMembership {
             let Some(owner) = owner else {
                 return Ok(ApplyOutcome::Invalid);
             };
-            if req.control_type == 2 && owner != req.actor_account.0 {
+            if authoritative {
+                // The authorization to put this device out was recorded by the admin-gated removal
+                // endpoint, or by the device's own account leaving. The committer carries it out.
+                // A commit naming a device nobody authorized removing is refused — which is what
+                // stops a lone member from silently ejecting the rest of a group.
+                let intended = txn
+                    .query_opt(
+                        "SELECT 1 FROM membership_intents
+                         WHERE conversation_id = $1 AND device_id = $2 AND kind = 2",
+                        &[&conv, &device.as_bytes()],
+                    )
+                    .map_err(db_err)?
+                    .is_some();
+                if !intended {
+                    return Ok(ApplyOutcome::Forbidden);
+                }
+            } else if req.control_type == 2 && owner != req.actor_account.0 {
                 let target_is_admin = txn
                     .query_opt(
                         "SELECT 1 FROM group_admins WHERE conversation_id = $1 AND account_id = $2",
@@ -255,12 +322,21 @@ impl PgMembership {
             .filter(|d: &[u8; 16]| !req.removed.iter().any(|r| &r.0 == d))
             .collect();
 
-        // Routing delta.
+        // Routing delta. An added device is set up by construction — its Welcome is queued in this
+        // same transaction — so it never enters the V27 catch-up queue.
         for (account, device) in req.added {
             txn.execute(
                 "INSERT INTO conversation_members (conversation_id, account_id, device_id)
                  VALUES ($1, $2, $3)",
                 &[&conv, &account.as_bytes(), &device.as_bytes()],
+            )
+            .map_err(db_err)?;
+            // The intent is CONSUMED by the commit that honours it: the work item and the
+            // membership it asked for can never both exist, and a redelivered/retried add finds no
+            // intent and is refused rather than double-adding.
+            txn.execute(
+                "DELETE FROM membership_intents WHERE conversation_id = $1 AND device_id = $2",
+                &[&conv, &device.as_bytes()],
             )
             .map_err(db_err)?;
         }
@@ -277,6 +353,12 @@ impl PgMembership {
                 &[&conv, &device.as_bytes()],
             )
             .map_err(db_err)?;
+            // A departing device's pending intents (if any) go with it.
+            txn.execute(
+                "DELETE FROM membership_intents WHERE conversation_id = $1 AND device_id = $2",
+                &[&conv, &device.as_bytes()],
+            )
+            .map_err(db_err)?;
             // Role hygiene on self-leave: an account with no remaining devices keeps no admin row.
             txn.execute(
                 "DELETE FROM group_admins ga WHERE ga.conversation_id = $1
@@ -287,19 +369,64 @@ impl PgMembership {
             .map_err(db_err)?;
         }
 
-        // Fan out the commit + targeted welcomes under the manifest's idempotency key.
+        // Governance hygiene after a departure, matching what the legacy `leave_conversation` has
+        // always done — otherwise routing every leave through /commit would let the last admin walk
+        // out and strand a populated group with nobody able to add, remove, or invite. Safe to do as
+        // count-then-act: the epoch CAS above row-locked this conversation, so nothing else is
+        // changing its membership concurrently.
+        if !req.removed.is_empty() {
+            let remaining: i64 = txn
+                .query_one(
+                    "SELECT count(*) FROM conversation_members WHERE conversation_id = $1",
+                    &[&conv],
+                )
+                .map_err(db_err)?
+                .get(0);
+            if remaining > 0 {
+                let admins: i64 = txn
+                    .query_one(
+                        "SELECT count(*) FROM group_admins WHERE conversation_id = $1",
+                        &[&conv],
+                    )
+                    .map_err(db_err)?
+                    .get(0);
+                if admins == 0 {
+                    txn.execute(
+                        "INSERT INTO group_admins (conversation_id, account_id)
+                         SELECT conversation_id, account_id FROM conversation_members
+                         WHERE conversation_id = $1
+                         ORDER BY added_at, account_id LIMIT 1
+                         ON CONFLICT DO NOTHING",
+                        &[&conv],
+                    )
+                    .map_err(db_err)?;
+                }
+            }
+            // Deliberately NOT mirrored from the legacy path: an emptied conversation is not
+            // deleted here. `membership_events` cascades from `conversations`, so dropping the row
+            // would destroy the append-only audit log of who changed membership — the evidence
+            // ADR-0010 exists to produce. An empty authoritative conversation is inert (no members,
+            // so no routing, no fan-out) and is reclaimed by retention, not by the exit path.
+        }
+
+        // Fan out the commit + targeted welcomes under the manifest's idempotency key. The commit
+        // rows carry `membership_epoch` so a recipient can tell a membership commit from ordinary
+        // ciphertext and run the ADR-0010 correspondence check before merging it; welcomes stay
+        // untagged because a joiner processes a Welcome, not a commit.
         let mut woken: Vec<[u8; 16]> = Vec::new();
         for recipient in &commit_recipients {
             txn.execute(
                 "INSERT INTO envelopes
-                     (conversation_id, sender_device, recipient_device, ciphertext, idempotency_key)
-                 VALUES ($1, $2, $3, $4, $5)",
+                     (conversation_id, sender_device, recipient_device, ciphertext, idempotency_key,
+                      membership_epoch)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
                 &[
                     &conv,
                     &req.actor_device.as_bytes(),
                     &recipient.as_slice(),
                     &req.commit,
                     &req.idempotency_key.as_slice(),
+                    &(req.next_epoch as i64),
                 ],
             )
             .map_err(db_err)?;

@@ -12,7 +12,9 @@ mod common;
 
 use axum::http::StatusCode;
 use axum::Router;
-use common::{get_auth, http_register, make_app, post_json_auth, unique_username, TestDevice};
+use common::{
+    befriend, get_auth, http_register, make_app, post_json_auth, unique_username, TestDevice,
+};
 use serde_json::{json, Value};
 
 use auth_core::crypto::sha256;
@@ -996,11 +998,13 @@ async fn membership_event_signature_verifies_under_actor_key() {
     assert_eq!(decoded.added, vec![(bob.account, bob.device_id)]);
 }
 
-/// An MLS-authoritative conversation refuses every legacy routing mutation (409
-/// commits_required) and accepts membership changes only through /commit — the migration
-/// enforcement (ADR-0010). A default (non-authoritative) conversation is unaffected.
+/// In an MLS-authoritative conversation (ADR-0010 + V31) a commit is not self-authorizing. The
+/// consent-checked endpoint records the decision as a membership INTENT; the signed commit consumes
+/// it. A commit naming a device nobody authorized is refused — which is what keeps ADR-0009's
+/// consent model intact once routing moves onto commits, instead of quietly weakening it to "any
+/// admin may add any account".
 #[tokio::test]
-async fn authoritative_conversation_refuses_legacy_mutations() {
+async fn authoritative_add_requires_an_authorizing_intent() {
     let app = make_app(100_000).await;
     let alice = actor(&app, "msimja").await;
     let bob = actor(&app, "msimjb").await;
@@ -1014,30 +1018,14 @@ async fn authoritative_conversation_refuses_legacy_mutations() {
     .await;
     let conv_hex = conv["conversation_id"].as_str().unwrap().to_string();
 
-    // Legacy direct add, remove, leave, and invite creation are all refused.
-    for (path, body) in [
-        (
-            format!("/v1/conversations/{conv_hex}/members"),
-            json!({ "account_id": hex::encode(bob.account) }),
-        ),
-        (
-            format!("/v1/conversations/{conv_hex}/members/remove"),
-            json!({ "account_id": hex::encode(bob.account) }),
-        ),
-        (format!("/v1/conversations/{conv_hex}/leave"), json!({})),
-        (format!("/v1/conversations/{conv_hex}/invites"), json!({})),
-    ] {
-        let (status, body) = post_json_auth(&app, &path, alice.token(), body).await;
-        assert_eq!(status, StatusCode::CONFLICT, "{path} should be refused");
-        assert_eq!(body["error"], "commits_required", "{path}");
-    }
-
-    // But /commit works: alice adds bob via the staged flow.
     let mut group_a = alice.mls.create_group().unwrap();
     let add_bob = group_a
         .stage_add_member(&alice.mls, &bob.mls.key_package_bytes().unwrap())
         .unwrap();
-    let (s, _) = post_commit(
+
+    // Alice is the group's only member AND its admin — and still cannot add Bob, because nothing
+    // has recorded that Bob may join. Admin-ness was never consent.
+    let (status, _) = post_commit(
         &app,
         &conv_hex,
         &alice,
@@ -1050,9 +1038,279 @@ async fn authoritative_conversation_refuses_legacy_mutations() {
         std::slice::from_ref(&add_bob.welcome),
     )
     .await;
-    assert_eq!(s, StatusCode::OK);
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "no intent authorizes this add"
+    );
+    assert_eq!(server_epoch(&app, &conv_hex, alice.token()).await, 0);
+
+    // The direct-add endpoint still enforces ADR-0009 in full: an admin who is NOT friends with the
+    // target is refused, so no intent is minted.
+    let (status, _) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conv_hex}/members"),
+        alice.token(),
+        json!({ "account_id": hex::encode(bob.account) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "not friends yet");
+
+    // Friends: now the endpoint records the intent — and records ONLY that. Routing is untouched.
+    befriend(
+        &app,
+        alice.token(),
+        &hex::encode(alice.account),
+        bob.token(),
+        &hex::encode(bob.account),
+    )
+    .await;
+    let (status, _) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conv_hex}/members"),
+        alice.token(),
+        json!({ "account_id": hex::encode(bob.account) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        server_epoch(&app, &conv_hex, alice.token()).await,
+        0,
+        "an intent moves no epoch and creates no membership"
+    );
+    // Bob is not a member, so he cannot even read the conversation's epoch.
+    let (status, _) = get_auth(
+        &app,
+        &format!("/v1/conversations/{conv_hex}/epoch"),
+        bob.token(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // It surfaces to Alice as work, flagged as the authoritative protocol.
+    let (status, queue) = get_auth(&app, "/v1/setup/needed", alice.token()).await;
+    assert_eq!(status, StatusCode::OK);
+    let pending: Vec<&Value> = queue["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|t| t["conversation_id"] == conv_hex.as_str())
+        .collect();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0]["device_id"], hex::encode(bob.device_id));
+    assert_eq!(pending[0]["authoritative"], true);
+    assert!(
+        pending[0]["removal"].as_bool().is_none(),
+        "a join, not a removal"
+    );
+
+    // The same commit, now authorized, is accepted — and Bob is routed.
+    let (status, _) = post_commit(
+        &app,
+        &conv_hex,
+        &alice,
+        ControlType::Add,
+        0,
+        &[(AccountId(bob.account), DeviceId(bob.device_id))],
+        &[],
+        [31u8; 16],
+        &add_bob.commit,
+        std::slice::from_ref(&add_bob.welcome),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
     group_a.merge_staged(&alice.mls).unwrap();
     assert_eq!(server_epoch(&app, &conv_hex, alice.token()).await, 1);
+    assert_eq!(server_epoch(&app, &conv_hex, bob.token()).await, 1);
+
+    // The commit consumed the intent that authorized it: the work item is gone, so nothing can
+    // replay it. (MLS would refuse a duplicate add on its own, but the ledger is the layer that
+    // must not leave a reusable authorization lying around.)
+    let (status, queue) = get_auth(&app, "/v1/setup/needed", alice.token()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        queue["targets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["conversation_id"] != conv_hex.as_str()),
+        "the authorization is spent, not left reusable"
+    );
+}
+
+/// A departure is recorded, not applied: `/leave` in an authoritative conversation purges the
+/// leaver's queued mail at once (the cutoff a user expects) but leaves routing for a remove-commit
+/// to delete — because MLS refuses a commit that removes the committer's own leaf, so the leaver
+/// cannot evidence their own departure. Another member carries it out.
+#[tokio::test]
+async fn authoritative_leave_is_recorded_then_committed_by_someone_else() {
+    let app = make_app(100_000).await;
+    let alice = actor(&app, "msimka").await;
+    let bob = actor(&app, "msimkb").await;
+    befriend(
+        &app,
+        alice.token(),
+        &hex::encode(alice.account),
+        bob.token(),
+        &hex::encode(bob.account),
+    )
+    .await;
+
+    let (_, conv) = post_json_auth(
+        &app,
+        "/v1/conversations",
+        alice.token(),
+        json!({ "mls_authoritative": true }),
+    )
+    .await;
+    let conv_hex = conv["conversation_id"].as_str().unwrap().to_string();
+
+    // Bring Bob in properly: authorize, then commit.
+    let mut group_a = alice.mls.create_group().unwrap();
+    let add_bob = group_a
+        .stage_add_member(&alice.mls, &bob.mls.key_package_bytes().unwrap())
+        .unwrap();
+    let (status, _) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conv_hex}/members"),
+        alice.token(),
+        json!({ "account_id": hex::encode(bob.account) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = post_commit(
+        &app,
+        &conv_hex,
+        &alice,
+        ControlType::Add,
+        0,
+        &[(AccountId(bob.account), DeviceId(bob.device_id))],
+        &[],
+        [40u8; 16],
+        &add_bob.commit,
+        std::slice::from_ref(&add_bob.welcome),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    group_a.merge_staged(&alice.mls).unwrap();
+
+    // Bob leaves. Accepted, but routing has NOT moved — his membership survives until a commit.
+    let (status, _) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conv_hex}/leave"),
+        bob.token(),
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        server_epoch(&app, &conv_hex, bob.token()).await,
+        1,
+        "still routed, because only a commit may remove him"
+    );
+
+    // Alice carries the departure out. Control type is Remove, not Leave: the committer is not the
+    // person leaving, which is the only shape MLS can actually produce.
+    let remove = group_a
+        .stage_remove_members(&alice.mls, &[bob.device_id.to_vec()])
+        .unwrap();
+    let (status, _) = post_commit(
+        &app,
+        &conv_hex,
+        &alice,
+        ControlType::Remove,
+        1,
+        &[],
+        &[DeviceId(bob.device_id)],
+        [41u8; 16],
+        &remove,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    group_a.merge_staged(&alice.mls).unwrap();
+
+    assert_eq!(server_epoch(&app, &conv_hex, alice.token()).await, 2);
+    let (status, _) = get_auth(
+        &app,
+        &format!("/v1/conversations/{conv_hex}/epoch"),
+        bob.token(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "bob is out of routing");
+}
+
+/// A member cannot eject the rest of a group on their own initiative: a remove commit naming a
+/// device nobody authorized removing is refused, exactly as an unauthorized add is.
+#[tokio::test]
+async fn authoritative_remove_requires_an_authorizing_intent() {
+    let app = make_app(100_000).await;
+    let alice = actor(&app, "msimla").await;
+    let bob = actor(&app, "msimlb").await;
+    befriend(
+        &app,
+        alice.token(),
+        &hex::encode(alice.account),
+        bob.token(),
+        &hex::encode(bob.account),
+    )
+    .await;
+
+    let (_, conv) = post_json_auth(
+        &app,
+        "/v1/conversations",
+        alice.token(),
+        json!({ "mls_authoritative": true }),
+    )
+    .await;
+    let conv_hex = conv["conversation_id"].as_str().unwrap().to_string();
+
+    let mut group_a = alice.mls.create_group().unwrap();
+    let add_bob = group_a
+        .stage_add_member(&alice.mls, &bob.mls.key_package_bytes().unwrap())
+        .unwrap();
+    post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conv_hex}/members"),
+        alice.token(),
+        json!({ "account_id": hex::encode(bob.account) }),
+    )
+    .await;
+    post_commit(
+        &app,
+        &conv_hex,
+        &alice,
+        ControlType::Add,
+        0,
+        &[(AccountId(bob.account), DeviceId(bob.device_id))],
+        &[],
+        [50u8; 16],
+        &add_bob.commit,
+        std::slice::from_ref(&add_bob.welcome),
+    )
+    .await;
+    group_a.merge_staged(&alice.mls).unwrap();
+
+    // Alice is an admin and still cannot remove Bob without a recorded decision.
+    let remove = group_a
+        .stage_remove_members(&alice.mls, &[bob.device_id.to_vec()])
+        .unwrap();
+    let (status, _) = post_commit(
+        &app,
+        &conv_hex,
+        &alice,
+        ControlType::Remove,
+        1,
+        &[],
+        &[DeviceId(bob.device_id)],
+        [51u8; 16],
+        &remove,
+        &[],
+    )
+    .await;
+    group_a.clear_staged(&alice.mls).unwrap();
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(server_epoch(&app, &conv_hex, bob.token()).await, 1);
 }
 
 /// A default conversation (mls_authoritative omitted) still allows the legacy direct add — the

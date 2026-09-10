@@ -160,12 +160,21 @@ limit, stated in the UI: an invite join adds *routing* membership; a current mem
 still run the MLS add ("Finish encryption setup" on the member page) before ciphertext reaches
 them — the deferred-add automation remains open below.
 
-**Not yet done (designed above):** group system messages,
-per-invite member-list preview, and — the big one — binding routing membership to
-**authenticated MLS Add/Remove commits**. That binding is inherently client-driven because the
-relay is deliberately MLS-blind (it must never link the MLS library); it depends on the on-device
-MLS core (ADR-0007) and key transparency (R-201). Until it lands, server routing membership and
-MLS membership remain distinct (R-506), and this must not be described as fully realized.
+**Not yet done (designed above):** group system messages and per-invite member-list preview.
+
+**Landed 2026-09-10 — routing membership bound to authenticated MLS commits (ADR-0010, V31).** In a
+conversation created as `mls_authoritative`, every path in this ADR — direct add, invite accept,
+join approval, admin removal, leave — no longer edits routing. It records the consent decision in
+`membership_intents`, and a **device-signed MLS commit** consumes that record and is what writes
+`conversation_members`. The consent rules here are unchanged and are now load-bearing in a new way:
+`apply_commit` refuses to add a device no endpoint authorized, so "admin" alone still cannot pull
+anyone into a group — the friendship / invite-token / approved-request check remains the only way in.
+
+Every conversation the app now creates is authoritative. Two honest limits keep R-506 MITIGATING
+rather than CLOSED: conversations created **before** this change stay legacy (the flag is set at
+creation and nothing migrates an existing one), and leaving is asynchronous — MLS refuses a commit
+that removes the committer's own leaf, so a departure purges the leaver's queued mail at once but
+becomes cryptographic when a remaining member next syncs. See ADR-0010 for the full boundary.
 
 **Landed 2026-09-09 — message requests (the controlled exception to the friend-gate):** until now
 consent was strictly prior: you could only be added to a conversation by a friend (friendship =

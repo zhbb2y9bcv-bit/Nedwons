@@ -63,3 +63,7 @@ core/mls-ffi/fuzz/corpus/secret_state/
 
 # Generated Info.plist (xcodegen from project.yml info: block — regenerable)
 apps/ios/Nedwons/Nedwons/
+
+# Local scratch: agent-generated reports/audits kept beside the repo, never part of it.
+# (Untracked already; ignored so a stray `git add -A` can never sweep one in.)
+*outputs/

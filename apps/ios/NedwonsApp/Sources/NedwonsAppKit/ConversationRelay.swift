@@ -51,6 +51,27 @@ public protocol ConversationRelay: Sendable {
     func ackSealed(accessToken: String, sealedIDs: [Int]) async throws
     /// This account's own device ids, which a grant carries so contacts can fan out sealed to us.
     func myDeviceIDs(accessToken: String) async throws -> [String]
+
+    // MLS-commit-authoritative membership (ADR-0010, R-506). In an authoritative conversation the
+    // relay's routing set is written ONLY by an accepted commit, so these three calls are the whole
+    // membership protocol: read the epoch to build against, post the signed change, and verify
+    // someone else's before merging it.
+
+    /// The conversation's current membership epoch — the `prev_epoch` a commit is built against, and
+    /// what to re-read after losing an epoch CAS race.
+    func conversationEpoch(accessToken: String, conversationID: String) async throws -> UInt64
+    /// Sign the ADR-0010 manifest for `change` and POST it. The outcome says whether to
+    /// `mergeStaged()` (the server's CAS accepted it) or `clearStaged()` and rebase.
+    func commitMembership(
+        accessToken: String, conversationID: String, actorDevice: Data, change: MembershipChange,
+        idempotencyKey: Data, ttlSeconds: UInt64, signer: DeviceSigner
+    ) async throws -> MembershipCommitOutcome
+    /// Fetch and fully verify an inbound membership event: the actor's device key must be the one in
+    /// the transparency log (under the pinned log key), and the manifest signature must verify under
+    /// **that** key. Only `.verified` may be fed to the correspondence check.
+    func verifyIncomingMembershipEvent(
+        accessToken: String, conversationID: String, epoch: UInt64, pinnedLogPublicKeyX963: Data
+    ) async throws -> MembershipVerifyResult
 }
 
 extension NedwonsClient: ConversationRelay {

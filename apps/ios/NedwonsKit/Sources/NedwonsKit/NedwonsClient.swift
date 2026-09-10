@@ -318,10 +318,15 @@ public struct InboxEnvelope: Decodable, Sendable, Identifiable {
     /// and ack via `ackInbox(selfGroupIds:)`, a third separate id space. `senderDevice` is the
     /// sibling; `conversationID` is nil.
     public let selfGroup: Bool
+    /// Non-nil iff this envelope is an ADR-0010 **membership commit** for that `next_epoch`. Such an
+    /// envelope must NOT go through `processInbound` — the recipient fetches the epoch's signed
+    /// manifest, verifies it against the actor's transparency-logged device key, and merges only if
+    /// the staged commit's real adds/removes equal what the manifest claimed.
+    public let membershipEpoch: UInt64?
 
     enum CodingKeys: String, CodingKey {
         case id, conversationID = "conversation_id", senderDevice = "sender_device", ciphertext,
-            sealed, selfGroup = "self_group"
+            sealed, selfGroup = "self_group", membershipEpoch = "membership_epoch"
     }
 
     public init(from decoder: Decoder) throws {
@@ -332,6 +337,7 @@ public struct InboxEnvelope: Decodable, Sendable, Identifiable {
         ciphertext = try c.decode(String.self, forKey: .ciphertext)
         sealed = try c.decodeIfPresent(Bool.self, forKey: .sealed) ?? false
         selfGroup = try c.decodeIfPresent(Bool.self, forKey: .selfGroup) ?? false
+        membershipEpoch = try c.decodeIfPresent(UInt64.self, forKey: .membershipEpoch)
     }
 }
 
@@ -342,17 +348,41 @@ public struct SetupTarget: Decodable, Sendable, Equatable {
     public let conversationID: String
     public let accountID: String
     public let deviceID: String
+    /// Which protocol this target wants. `true` = an ADR-0010 membership **intent**: the device is
+    /// not routed yet, and the adder must stage the MLS add and post a *signed commit*, which is
+    /// what creates its routing membership. `false` = the legacy V27 row, where routing already
+    /// exists and the adder delivers a Welcome, confirms, and fans the commit out as ordinary mail.
+    public let authoritative: Bool
+    /// `true` when the pending change is a **removal** — this device's account was removed by an
+    /// admin, or left — rather than a join. Only ever true for authoritative targets: the adder
+    /// stages a remove commit instead of claiming a prekey.
+    public let removal: Bool
 
     enum CodingKeys: String, CodingKey {
         case conversationID = "conversation_id"
         case accountID = "account_id"
         case deviceID = "device_id"
+        case authoritative, removal
     }
 
-    public init(conversationID: String, accountID: String, deviceID: String) {
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        conversationID = try c.decode(String.self, forKey: .conversationID)
+        accountID = try c.decode(String.self, forKey: .accountID)
+        deviceID = try c.decode(String.self, forKey: .deviceID)
+        authoritative = try c.decodeIfPresent(Bool.self, forKey: .authoritative) ?? false
+        removal = try c.decodeIfPresent(Bool.self, forKey: .removal) ?? false
+    }
+
+    public init(
+        conversationID: String, accountID: String, deviceID: String, authoritative: Bool = false,
+        removal: Bool = false
+    ) {
         self.conversationID = conversationID
         self.accountID = accountID
         self.deviceID = deviceID
+        self.authoritative = authoritative
+        self.removal = removal
     }
 }
 
@@ -560,11 +590,22 @@ public extension NedwonsClient {
     }
 
     /// The server rejects with 403 unless the creator is friends with each listed member.
-    func createGroup(accessToken: String, memberAccountIDs: [String]) async throws -> GroupCreated {
-        struct Body: Encodable { let member_account_ids: [String] }
+    ///
+    /// With `mlsAuthoritative` (ADR-0010) the new group starts with the creator's device alone at
+    /// epoch 0 and every listed member is recorded as a membership *intent*: they become routing
+    /// members only when a device-signed commit adds them, so the relay's idea of who is in the
+    /// group can never diverge from the MLS group's.
+    func createGroup(
+        accessToken: String, memberAccountIDs: [String], mlsAuthoritative: Bool = false
+    ) async throws -> GroupCreated {
+        struct Body: Encodable {
+            let member_account_ids: [String]
+            let mls_authoritative: Bool
+        }
         var request = authed("POST", "/v1/groups", accessToken: accessToken)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(Body(member_account_ids: memberAccountIDs))
+        request.httpBody = try JSONEncoder().encode(
+            Body(member_account_ids: memberAccountIDs, mls_authoritative: mlsAuthoritative))
         return try decode(await perform(request))
     }
 
@@ -1452,6 +1493,19 @@ extension NedwonsClient {
             "GET", "/v1/conversations/\(conversationID)/epoch", accessToken: accessToken)
         let res: Res = try decode(await perform(request))
         return res.epoch
+    }
+
+    /// The devices an account is routed to in this conversation — what a **remove** commit must
+    /// name, since ADR-0010 manifests remove devices, not accounts. Members only.
+    public func conversationMemberDevices(
+        accessToken: String, conversationID: String, accountID: String
+    ) async throws -> [String] {
+        struct Res: Decodable { let device_ids: [String] }
+        let request = authed(
+            "GET", "/v1/conversations/\(conversationID)/members/\(accountID)/devices",
+            accessToken: accessToken)
+        let res: Res = try decode(await perform(request))
+        return res.device_ids
     }
 
     /// Fetch a stored membership event (`epoch` = its `next_epoch`) so a recipient can run the

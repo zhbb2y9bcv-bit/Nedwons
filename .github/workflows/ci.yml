@@ -90,6 +90,30 @@ jobs:
       - name: Test (FFI object semantics + adversarial corpus)
         run: cargo test
 
+  # mls-wasm was in NO job until 2026-09-10 and silently stopped compiling as a result: its inbound
+  # match covered 7 of ~17 outcomes and nothing noticed for weeks. It has no tests of its own (the
+  # logic under it is mls-core's, which is tested), so a build is the whole point — it is here to
+  # fail loudly the next time the core's surface moves out from under it.
+  mls-wasm:
+    name: mls-wasm (web binding builds)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: core/mls-wasm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+      - name: Format check
+        run: cargo fmt -- --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      - name: Build (wasm target)
+        run: cargo build --target wasm32-unknown-unknown
+
   sbom:
     name: SBOM (CycloneDX, R-501)
     runs-on: ubuntu-latest
