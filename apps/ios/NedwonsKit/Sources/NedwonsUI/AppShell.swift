@@ -27,6 +27,14 @@ public struct NedwonsAppRoot: View {
             }
         }
         .overlay(alignment: .bottom) { bannerOverlay }
+        // App lock sits in FRONT of everything — including the banner — so a protected app shows
+        // nothing until the owner authenticates. Only present when enabled AND currently locked.
+        .overlay {
+            if model.appLockEnabled && model.isLocked {
+                LockScreenView(model: model)
+                    .transition(.opacity)
+            }
+        }
         .task { await model.restoreSession() }
     }
 

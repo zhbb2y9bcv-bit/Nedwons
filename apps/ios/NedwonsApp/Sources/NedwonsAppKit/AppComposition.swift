@@ -38,11 +38,18 @@ public final class AppComposition: ObservableObject {
     /// and the cross-process lock so the Notification Service Extension can decrypt while we're
     /// away (ADR-0007 single-writer); foregrounding re-opens and picks up whatever it committed.
     public func sceneDidEnterBackground() {
+        // App lock re-engages the moment we leave the foreground, regardless of session phase, so
+        // the app is already covered before the app switcher can snapshot it.
+        model.lockIfEnabled()
         guard model.phase == .authenticated else { return }
         coordinator?.stop()
     }
 
     public func sceneDidBecomeActive() {
+        // If we returned to a locked app, prompt for the owner check right away.
+        if model.appLockEnabled && model.isLocked {
+            Task { await model.unlock() }
+        }
         guard model.phase == .authenticated else { return }
         coordinator?.start()
     }

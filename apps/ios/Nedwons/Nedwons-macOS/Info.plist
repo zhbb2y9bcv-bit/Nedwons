@@ -22,6 +22,8 @@
 	<string>1</string>
 	<key>ITSAppUsesNonExemptEncryption</key>
 	<true/>
+	<key>NSFaceIDUsageDescription</key>
+	<string>Unlock Nedwons with Touch ID when app lock is on.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Record voice messages. Audio is end-to-end encrypted before it leaves your device.</string>
 	<key>NedwonsAppGroup</key>

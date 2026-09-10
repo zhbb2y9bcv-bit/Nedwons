@@ -291,6 +291,7 @@ struct SettingsRootView: View {
                 }
 
                 Section("Security") {
+                    AppLockToggleRow(model: model)
                     LabeledContent("Encryption", value: "MLS (RFC 9420)")
                     LabeledContent("Key exchange", value: "Hybrid post-quantum (X-Wing)")
                     NavigationLink("Devices and key transparency") {
@@ -756,6 +757,22 @@ struct DiagnosticsToggleRow: View {
         }
         .onAppear { on = model.diagnostics.enabled }
         .onChange(of: on) { _, value in model.diagnostics.setEnabled(value) }
+    }
+}
+
+/// A Face ID / Touch ID / passcode gate in front of the app. Toggling it either way requires the
+/// owner check first, so an unlocked phone in the wrong hands can't flip it.
+struct AppLockToggleRow: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Toggle(
+            "Require \(model.appLockBiometryName)",
+            isOn: Binding(
+                get: { model.appLockEnabled },
+                set: { want in Task { await model.setAppLock(want) } })
+        )
+        .accessibilityIdentifier("settings.appLock")
     }
 }
 
