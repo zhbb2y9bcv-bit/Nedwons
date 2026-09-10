@@ -154,7 +154,9 @@ struct ConversationView: View {
     var body: some View {
         VStack(spacing: 0) {
             messages
-            if let lock = model.composerLock(for: chat.conversationID) {
+            if model.isMessageRequest(chat.conversationID) {
+                messageRequestBar
+            } else if let lock = model.composerLock(for: chat.conversationID) {
                 lockedComposer(lock)
             } else {
                 composer
@@ -612,6 +614,63 @@ struct ConversationView: View {
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier(GroupAdminA11y.composerLocked)
     }
+
+    /// Shown instead of the composer when this conversation is an unaccepted message request from a
+    /// non-contact: read the message, then decide. Replying is impossible until you accept — which
+    /// is the whole point of quarantining a stranger.
+    @State private var confirmBlockRequest = false
+    private var messageRequestBar: some View {
+        VStack(spacing: Nedwons.Spacing.sm) {
+            Text("\(headerTitle) isn't in your contacts and wants to message you.")
+                .font(Nedwons.TypeScale.caption)
+                .foregroundStyle(palette.textSecondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
+            HStack(spacing: Nedwons.Spacing.sm) {
+                Button(role: .destructive) {
+                    confirmBlockRequest = true
+                } label: {
+                    Text("Block").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("request.block")
+                Button {
+                    Task {
+                        await model.declineMessageRequest(chat.conversationID, block: false)
+                        dismiss()
+                    }
+                } label: {
+                    Text("Delete").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .accessibilityIdentifier("request.delete")
+                Button {
+                    Task { await model.acceptMessageRequest(chat.conversationID) }
+                } label: {
+                    Text("Accept").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("request.accept")
+            }
+        }
+        .padding(Nedwons.Spacing.md)
+        .background(palette.surface)
+        .confirmationDialog(
+            "Block \(headerTitle)?", isPresented: $confirmBlockRequest, titleVisibility: .visible
+        ) {
+            Button("Block", role: .destructive) {
+                Task {
+                    await model.declineMessageRequest(chat.conversationID, block: true)
+                    dismiss()
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("They won't be able to message you or find you through a request again.")
+        }
+    }
+
+    @Environment(\.dismiss) private var dismiss
 
     private var composer: some View {
         VStack(spacing: 0) {

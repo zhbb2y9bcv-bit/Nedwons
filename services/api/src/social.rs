@@ -477,6 +477,199 @@ impl PgSocial {
             .collect()
     }
 
+    // ----- message requests ----------------------------------------------------------
+
+    /// A sender may have at most this many pending outbound requests at once — a coarse anti-spam
+    /// cap on top of the per-route rate limiter, so one account cannot paper the whole app with
+    /// requests even slowly.
+    pub const MAX_PENDING_OUTBOUND_REQUESTS: i64 = 20;
+
+    /// True iff `from` already has a pending request to `to` — one outstanding request per pair, so
+    /// a re-send is a no-op rather than a second row.
+    pub fn message_request_pending(&self, from: &AccountId, to: &AccountId) -> StoreResult<bool> {
+        let mut conn = self.conn()?;
+        Ok(conn
+            .query_opt(
+                "SELECT 1 FROM message_requests
+                 WHERE from_account = $1 AND to_account = $2 AND status = 'pending'",
+                &[&from.as_bytes(), &to.as_bytes()],
+            )
+            .map_err(db_err)?
+            .is_some())
+    }
+
+    /// How many pending requests `from` currently has outstanding (for the anti-spam cap).
+    pub fn pending_outbound_request_count(&self, from: &AccountId) -> StoreResult<i64> {
+        let mut conn = self.conn()?;
+        Ok(conn
+            .query_one(
+                "SELECT count(*) FROM message_requests
+                 WHERE from_account = $1 AND status = 'pending'",
+                &[&from.as_bytes()],
+            )
+            .map_err(db_err)?
+            .get::<_, i64>(0))
+    }
+
+    /// Record a new pending request for the conversation `from` just created toward `to`.
+    pub fn insert_message_request(
+        &self,
+        conversation_id: &[u8; 16],
+        from: &AccountId,
+        to: &AccountId,
+    ) -> StoreResult<()> {
+        let mut conn = self.conn()?;
+        conn.execute(
+            "INSERT INTO message_requests (conversation_id, from_account, to_account)
+             VALUES ($1, $2, $3)",
+            &[&conversation_id.as_slice(), &from.as_bytes(), &to.as_bytes()],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// The pending requests addressed to `me`, newest first: (conversation_id, from_account, from
+    /// username, from display name) so the folder can name who is asking without a second lookup.
+    pub fn incoming_message_requests(
+        &self,
+        me: &AccountId,
+    ) -> StoreResult<Vec<([u8; 16], ProfileSummary)>> {
+        let mut conn = self.conn()?;
+        let rows = conn
+            .query(
+                "SELECT r.conversation_id, a.account_id, a.username_normalized,
+                        COALESCE(p.display_name, '')
+                 FROM message_requests r
+                 JOIN accounts a ON a.account_id = r.from_account
+                 LEFT JOIN profiles p ON p.account_id = a.account_id
+                 WHERE r.to_account = $1 AND r.status = 'pending'
+                 ORDER BY r.created_at DESC",
+                &[&me.as_bytes()],
+            )
+            .map_err(db_err)?;
+        rows.into_iter()
+            .map(|r| {
+                Ok((
+                    id16(r.get::<_, &[u8]>(0))?,
+                    ProfileSummary {
+                        account_id: id16(r.get::<_, &[u8]>(1))?,
+                        username: r.get(2),
+                        display_name: r.get(3),
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// The (from, to, status) of a request conversation, if it is one.
+    pub fn message_request(
+        &self,
+        conversation_id: &[u8; 16],
+    ) -> StoreResult<Option<(AccountId, AccountId, String)>> {
+        let mut conn = self.conn()?;
+        let row = conn
+            .query_opt(
+                "SELECT from_account, to_account, status FROM message_requests
+                 WHERE conversation_id = $1",
+                &[&conversation_id.as_slice()],
+            )
+            .map_err(db_err)?;
+        match row {
+            None => Ok(None),
+            Some(r) => Ok(Some((
+                AccountId(id16(r.get::<_, &[u8]>(0))?),
+                AccountId(id16(r.get::<_, &[u8]>(1))?),
+                r.get(2),
+            ))),
+        }
+    }
+
+    /// Accept the request `me` received on `conversation_id`: mark it accepted AND create the
+    /// friendship (so everything onward is an ordinary conversation between friends). Returns false
+    /// if there is no such pending request addressed to `me`, or a block stands between the pair.
+    /// First-writer-wins on the status flip, like the report resolver.
+    pub fn accept_message_request(
+        &self,
+        me: &AccountId,
+        conversation_id: &[u8; 16],
+    ) -> StoreResult<bool> {
+        let mut conn = self.conn()?;
+        let mut txn = conn.transaction().map_err(db_err)?;
+        let row = txn
+            .query_opt(
+                "SELECT from_account FROM message_requests
+                 WHERE conversation_id = $1 AND to_account = $2 AND status = 'pending'
+                 FOR UPDATE",
+                &[&conversation_id.as_slice(), &me.as_bytes()],
+            )
+            .map_err(db_err)?;
+        let Some(row) = row else { return Ok(false) };
+        let from = AccountId(id16(row.get::<_, &[u8]>(0))?);
+        // A block placed while the request sat pending must win — never befriend across a block.
+        if txn
+            .query_opt(
+                "SELECT 1 FROM blocks
+                 WHERE (blocker = $1 AND blocked = $2) OR (blocker = $2 AND blocked = $1)",
+                &[&me.as_bytes(), &from.as_bytes()],
+            )
+            .map_err(db_err)?
+            .is_some()
+        {
+            return Ok(false);
+        }
+        txn.execute(
+            "UPDATE message_requests SET status = 'accepted' WHERE conversation_id = $1",
+            &[&conversation_id.as_slice()],
+        )
+        .map_err(db_err)?;
+        let (lo, hi) = canon(me.0, from.0);
+        txn.execute(
+            "INSERT INTO friendships (account_lo, account_hi) VALUES ($1, $2)
+             ON CONFLICT DO NOTHING",
+            &[&lo.as_slice(), &hi.as_slice()],
+        )
+        .map_err(db_err)?;
+        // Any leftover friend request between the two is now redundant.
+        txn.execute(
+            "DELETE FROM friend_requests
+             WHERE (from_account = $1 AND to_account = $2)
+                OR (from_account = $2 AND to_account = $1)",
+            &[&me.as_bytes(), &from.as_bytes()],
+        )
+        .map_err(db_err)?;
+        txn.commit().map_err(db_err)?;
+        Ok(true)
+    }
+
+    /// Decline the request `me` received on `conversation_id`: mark it declined. Returns the sender
+    /// account (so the caller can also drop `me` from the conversation, and block if asked), or
+    /// None if there was no pending request addressed to `me`.
+    pub fn decline_message_request(
+        &self,
+        me: &AccountId,
+        conversation_id: &[u8; 16],
+    ) -> StoreResult<Option<AccountId>> {
+        let mut conn = self.conn()?;
+        let mut txn = conn.transaction().map_err(db_err)?;
+        let row = txn
+            .query_opt(
+                "SELECT from_account FROM message_requests
+                 WHERE conversation_id = $1 AND to_account = $2 AND status = 'pending'
+                 FOR UPDATE",
+                &[&conversation_id.as_slice(), &me.as_bytes()],
+            )
+            .map_err(db_err)?;
+        let Some(row) = row else { return Ok(None) };
+        let from = AccountId(id16(row.get::<_, &[u8]>(0))?);
+        txn.execute(
+            "UPDATE message_requests SET status = 'declined' WHERE conversation_id = $1",
+            &[&conversation_id.as_slice()],
+        )
+        .map_err(db_err)?;
+        txn.commit().map_err(db_err)?;
+        Ok(Some(from))
+    }
+
     // ----- reports -------------------------------------------------------------------
 
     /// Record a user report. `evidence` is only what the reporter chose to submit (the server

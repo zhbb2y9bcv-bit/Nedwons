@@ -36,6 +36,11 @@ impl Quota {
 /// — while leaving ordinary use (adding everyone you know in one sitting) untouched.
 pub const FRIEND_REQUESTS: Quota = Quota::new("friend_request", 60, 3600);
 
+/// Message requests to non-friends. A request puts a conversation in a stranger's Requests folder,
+/// so like friend requests it is a harassment surface — bounded per hour on top of the standing cap
+/// on how many can sit pending at once (`PgSocial::MAX_PENDING_OUTBOUND_REQUESTS`).
+pub const MESSAGE_REQUESTS: Quota = Quota::new("message_request", 30, 3600);
+
 /// Username searches. Discovery is username-only, so search is the ONLY enumeration surface: this
 /// is what stops an authenticated account from harvesting the user list by walking prefixes.
 pub const PROFILE_SEARCH: Quota = Quota::new("profile_search", 300, 3600);

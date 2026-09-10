@@ -380,6 +380,18 @@ pub fn build_router_full(
         .route("/v1/friends/remove", post(friend_remove))
         .route("/v1/blocks", get(list_blocked).post(block_user))
         .route("/v1/blocks/remove", post(unblock_user))
+        .route(
+            "/v1/message-requests",
+            get(list_message_requests).post(create_message_request),
+        )
+        .route(
+            "/v1/message-requests/{conversation_id}/accept",
+            post(accept_message_request),
+        )
+        .route(
+            "/v1/message-requests/{conversation_id}/decline",
+            post(decline_message_request),
+        )
         .route("/v1/groups", post(create_group))
         .layer(RequestBodyLimitLayer::new(MAX_RELAY_BODY_BYTES));
 
@@ -3994,6 +4006,157 @@ async fn unblock_user(
     let social = state.social.clone();
     blocking_store(move || social.unblock(&me.account_id, &target)).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ----- message requests (a non-friend reaching you, quarantined) ---------------------
+
+#[derive(Serialize)]
+struct MessageRequestDto {
+    conversation_id: String,
+    /// Who is asking — enough to name them in the folder without a second lookup.
+    from: ProfileSummaryDto,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeclineRequestBody {
+    /// Also block the sender (they can never request again). Defaults to a plain decline.
+    #[serde(default)]
+    block: bool,
+}
+
+/// Open a message request: create a 1:1 conversation with a NON-friend and record it as pending in
+/// their Requests folder. The conversation is ordinary MLS (the relay reads nothing); this only
+/// bypasses the friend-gate on membership, under anti-spam checks, and remembers that the recipient
+/// has not consented yet. Returns the new conversation id, which the caller then builds the MLS
+/// group for exactly like any other conversation.
+async fn create_message_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<AccountRefBody>,
+) -> Result<Json<ConversationDto>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    enforce_quota(&state, crate::quota::MESSAGE_REQUESTS, &me.account_id).await?;
+    let target = AccountId(id16_from_hex(&body.account_id)?);
+    if target.0 == me.account_id.0 {
+        return Err(bad_request());
+    }
+    let social = state.social.clone();
+    let relay = state.relay.clone();
+    let service = state.service.clone();
+    let groups = state.groups.clone();
+    let outcome = blocking_store(move || {
+        // Already friends? Then this is not a request — use the ordinary conversation flow.
+        if social.are_friends(&me.account_id, &target)? {
+            return Ok(Err(ApiError(StatusCode::CONFLICT, "already_friends")));
+        }
+        if social.is_blocked_between(&me.account_id, &target)? {
+            return Ok(Err(ApiError(StatusCode::FORBIDDEN, "blocked")));
+        }
+        // One outstanding request per pair, and a standing cap on how many a sender may have
+        // pending at once — a slow trickle of requests to many strangers is still spam.
+        if social.message_request_pending(&me.account_id, &target)? {
+            return Ok(Err(ApiError(StatusCode::CONFLICT, "already_requested")));
+        }
+        if social.pending_outbound_request_count(&me.account_id)?
+            >= crate::social::PgSocial::MAX_PENDING_OUTBOUND_REQUESTS
+        {
+            return Ok(Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "too_many_requests")));
+        }
+        // The target must actually exist / have a device to reach.
+        if active_devices_of(&service, &target)?.is_empty() {
+            return Ok(Err(ApiError(StatusCode::NOT_FOUND, "no_such_recipient")));
+        }
+        let conversation_id = auth_core::crypto::random_bytes::<16>();
+        relay.create_conversation(conversation_id, me.account_id, me.device_id, false)?;
+        groups.bootstrap_admin(&conversation_id, &me.account_id)?;
+        for device in active_devices_of(&service, &target)? {
+            relay.add_pending_member(&conversation_id, target, device)?;
+        }
+        for device in active_devices_of(&service, &me.account_id)? {
+            if device.0 != me.device_id.0 {
+                relay.add_pending_member(&conversation_id, me.account_id, device)?;
+            }
+        }
+        social.insert_message_request(&conversation_id, &me.account_id, &target)?;
+        Ok(Ok(conversation_id))
+    })
+    .await?;
+    let conversation_id = outcome?;
+    Ok(Json(ConversationDto {
+        conversation_id: hex::encode(conversation_id),
+    }))
+}
+
+/// The pending requests addressed to me — my Requests folder.
+async fn list_message_requests(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<MessageRequestDto>>, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let social = state.social.clone();
+    let reqs = blocking_store(move || social.incoming_message_requests(&me.account_id)).await?;
+    Ok(Json(
+        reqs.into_iter()
+            .map(|(cid, from)| MessageRequestDto {
+                conversation_id: hex::encode(cid),
+                from: summary_dto(from),
+            })
+            .collect(),
+    ))
+}
+
+/// Accept a request I received: it becomes an ordinary conversation and we become friends.
+async fn accept_message_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let social = state.social.clone();
+    let accepted =
+        blocking_store(move || social.accept_message_request(&me.account_id, &conversation_id))
+            .await?;
+    if accepted {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        // No pending request addressed to me here (or a block stands between us).
+        Err(ApiError(StatusCode::NOT_FOUND, "no_request"))
+    }
+}
+
+/// Decline a request I received: mark it declined, drop my devices from the conversation (so the
+/// sender can no longer reach me through it), and — if asked — block the sender.
+async fn decline_message_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(conversation_hex): Path<String>,
+    body: Option<Json<DeclineRequestBody>>,
+) -> Result<StatusCode, ApiError> {
+    let me = authed_device(&state, &headers).await?;
+    let conversation_id = id16_from_hex(&conversation_hex)?;
+    let block = body.map(|b| b.0.block).unwrap_or(false);
+    let social = state.social.clone();
+    let groups = state.groups.clone();
+    let from = blocking_store(move || {
+        let from = social.decline_message_request(&me.account_id, &conversation_id)?;
+        if let Some(from) = from {
+            // Consent withdrawal: remove me from routing so nothing else in this conversation
+            // reaches me, exactly like leaving it.
+            groups.leave_conversation(&conversation_id, &me.account_id)?;
+            if block {
+                social.block(&me.account_id, &from)?;
+            }
+        }
+        Ok(from)
+    })
+    .await?;
+    if from.is_some() {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError(StatusCode::NOT_FOUND, "no_request"))
+    }
 }
 
 async fn list_blocked(
