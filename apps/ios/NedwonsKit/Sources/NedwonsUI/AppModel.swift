@@ -1612,11 +1612,17 @@ public final class AppModel: ObservableObject {
 
     /// Create a group from selected people; the server refuses only if a blocked pair is included.
     /// Returns the new conversation id, or nil on failure (banner explains why).
+    ///
+    /// New conversations are **MLS-commit-authoritative** (ADR-0010): the relay routes mail to the
+    /// creator alone until a device-signed MLS commit adds each person, so the server's idea of who
+    /// is in the conversation cannot drift from the cryptographic group's. Everything else about
+    /// creation is unchanged — the same consent rules decide who may be listed.
     public func createGroup(memberAccountIDs: [String]) async -> String? {
         var conversationID: String?
         await run { [self] in
             guard let token else { return }
-            let group = try await client.createGroup(accessToken: token, memberAccountIDs: memberAccountIDs)
+            let group = try await client.createGroup(
+                accessToken: token, memberAccountIDs: memberAccountIDs, mlsAuthoritative: true)
             conversationID = group.conversationID
             conversations = try await client.listConversations(accessToken: token)
             banner = "Group created."

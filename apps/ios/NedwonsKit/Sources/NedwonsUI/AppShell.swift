@@ -27,6 +27,7 @@ public struct NedwonsAppRoot: View {
             }
         }
         .overlay(alignment: .bottom) { bannerOverlay }
+        .overlay(alignment: .top) { securityNoticeOverlay }
         // App lock sits in FRONT of everything — including the banner — so a protected app shows
         // nothing until the owner authenticates. Only present when enabled AND currently locked.
         .overlay {
@@ -54,6 +55,40 @@ public struct NedwonsAppRoot: View {
                     try? await Task.sleep(nanoseconds: 3_000_000_000)
                     model.banner = nil
                 }
+        }
+    }
+
+    /// A security refusal — something the app declined to apply, such as a group membership change
+    /// whose signed description did not match what it actually did (ADR-0010).
+    ///
+    /// Deliberately unlike the banner below it: at the TOP, in the warning colour, and it does NOT
+    /// time out. A message that disappears after three seconds is the wrong shape for "we refused to
+    /// change who is in your group" — the user dismisses this one themselves.
+    @ViewBuilder
+    private var securityNoticeOverlay: some View {
+        if let notice = model.securityNotice {
+            HStack(alignment: .top, spacing: Nedwons.Spacing.sm) {
+                Image(systemName: "exclamationmark.shield.fill")
+                    .foregroundStyle(.orange)
+                    .accessibilityHidden(true)
+                Text(notice)
+                    .font(Nedwons.TypeScale.caption)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 0)
+                Button {
+                    model.securityNotice = nil
+                } label: {
+                    Image(systemName: "xmark")
+                        .font(Nedwons.TypeScale.caption)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Dismiss")
+            }
+            .padding(Nedwons.Spacing.md)
+            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: Nedwons.Radius.md))
+            .padding(.horizontal, Nedwons.Spacing.md)
+            .accessibilityElement(children: .contain)
+            .accessibilityAddTraits(.isStaticText)
         }
     }
 }

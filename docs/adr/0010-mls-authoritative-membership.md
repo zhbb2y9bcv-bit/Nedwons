@@ -1,10 +1,11 @@
 # ADR-0010: MLS-commit-authoritative membership via device-signed manifests (R-506)
 
-- **Status:** Accepted — reference implementation + headless multi-client simulation + **client
-  wiring** (staged commits through `mls-ffi`, a byte-identical Swift manifest encoder, and the
-  proposer/recipient endpoints) landed in this repo. Legacy-path migration, application-envelope
-  versioning, recipient signature verification, and the `@main` app screens (R-101) are follow-ups.
-- **Date:** 2026-07-18
+- **Status:** Accepted — reference implementation, headless multi-client simulation, client wiring,
+  and (2026-09-10) the **shipping app path**: real conversations opt in, the app's membership engine
+  drives adds and removals through signed commits, and recipients verify signature *and*
+  correspondence before merging. Application-envelope versioning and the `@main` group-creation
+  screens (R-101) remain follow-ups. See "What actually landed" below for the honest boundary.
+- **Date:** 2026-07-18 (revised 2026-09-10)
 - **Deciders:** crypto integrator, backend lead
 - **Supersedes/extends:** ADR-0009's "MLS membership becomes authoritative" sketch
 
@@ -174,6 +175,7 @@ merging the staged commit**:
 | Retries | Idempotency key with the message-send semantics (dedup identical, conflict different). |
 | Rollback | Single transaction — a failure anywhere applies nothing. |
 | Mismatch recovery / resync (v1) | A member whose local state cannot process the group's next commit (or who refused a lying commit) re-enters via a fresh add: publish a new key package, be re-added by an admin (new epoch). Losing unread history is accepted v1 behavior — never silently re-derive or trust server-supplied state. A finer-grained resync protocol is future work. **Reference-simulation finding (hardens this rule):** OpenMLS *consumes the commit's decryption secret on processing* (forward secrecy), so a refused commit can never be re-processed from the same bytes — after refusing a lie the member is desynced *by construction* and resync/re-add is the **only** recovery, not merely the recommended one. Verified in `mls-core/tests/membership_check.rs`. |
+| Self-removal | **Not expressible.** OpenMLS refuses a commit that removes the committer's own leaf, so `control_type = 3` cannot be built by the actor it describes. Leaving is handled as a recorded removal intent that another member commits — see "Leaving: what MLS will not let us do". |
 
 ## What the server still cannot prove (honest statement — do not overclaim)
 
@@ -198,14 +200,101 @@ merging the staged commit**:
 - New endpoint `POST /v1/conversations/{id}/commit`. The reference implementation + a headless
   multi-client simulation (real MLS clients through the real relay, including the lying-manifest
   case) land with this ADR.
-- **Legacy paths**: `create_conversation`, invite-accept, join-request-approve, direct `add
-  member`, and `leave` still mutate routing without commits. They remain during migration and are
-  the documented gap: R-506 stays MITIGATING (not CLOSED) until clients drive all membership
-  through commits and the legacy mutation paths are gated off. Invite/join flows will compose with
-  this protocol (the admin's *accept* becomes an add-commit; the token/consent logic of ADR-0009
-  is unchanged).
-- **Swift wiring** (follow-up): expose the correspondence check through `mls-ffi`
-  (`process_commit_checked`) and drive the new endpoint from `NedwonsKit`; then two-device flows
-  on simulator/hardware (R-101).
+- **Swift wiring**: the correspondence check is exposed through `mls-ffi` (`process_commit`) and
+  driven from `NedwonsKit`/`NedwonsAppKit`.
 - Envelope-level protocol versioning for *application* messages remains open (tracked in R-506's
   residual); membership control messages are versioned by the manifest domain tag as of v1.
+
+## Migration: intent vs. routing (V31, 2026-09-10)
+
+The legacy paths named above (`create_conversation` with members, invite-accept,
+join-request-approve, direct `add member`, admin removal, and `leave`) mutated routing with no
+cryptographic evidence. Migrating them onto commits ran into a structural conflict with the V27
+setup queue, which is **routing-first**: it inserts a `conversation_members` row immediately and
+lets the MLS add catch up later, precisely so a join can be *deferred* when no existing member is
+online to run it. ADR-0010 is **commit-first**: the commit is what creates the routing row.
+
+Resolution: the deferred-join intent moves out of routing into its own table.
+
+**`membership_intents` is an authorization ledger.** The consent-checked endpoints record a
+decision there; a signed commit consumes it and is what writes `conversation_members`. An intent
+routes no mail, joins no fan-out, and moves no epoch.
+
+| kind | minted by | consumed by |
+|------|-----------|-------------|
+| join | direct add, invite accept, join approval, group creation, sibling linking | an **add** commit |
+| remove | admin removal, a member leaving | a **remove** commit |
+
+Two consequences worth stating plainly, because both changed the security properties:
+
+1. **The ledger, not the committer's role, is the authorization.** `apply_commit` originally
+   re-checked "is the actor an admin". That is wrong for this model in two directions. It is *too
+   strict*: the V27 reconcile loop has whichever member is online carry out the change, so an invite
+   joiner would wait for an admin to appear. And it was *too weak*: it never checked ADR-0009's
+   friendship rule, so routing adds through `/commit` would have silently relaxed consent to "any
+   admin may add any account" — a real regression the intent requirement prevents. In an
+   authoritative conversation the actor must be a routed member and every touched device must carry
+   a matching intent; the committer is the courier and the signature says which courier it was.
+2. **Recipients can tell a membership commit from ordinary mail.** `apply_commit` tags its commit
+   fan-out with `envelopes.membership_epoch`, so a recipient knows to fetch that epoch's manifest
+   and run both checks before merging instead of merging on sight. This reveals nothing new to the
+   relay: `apply_commit` created those rows itself.
+
+### Leaving: what MLS will not let us do
+
+ADR-0010 v1 specified `control_type = 3` (self-leave) as "removed == the actor's own devices".
+**OpenMLS refuses to build that commit** — verified directly: *"The Commit tried to remove self from
+the group. This is not possible."* A leaver therefore cannot produce the cryptographic evidence for
+their own departure; someone else has to.
+
+So leaving an authoritative conversation records a **removal intent** and purges the leaver's queued
+mail immediately — the delivery cutoff a user expects from "leave" does not wait for anyone — while
+the routing row survives until a remaining member's next sync turns the intent into a real remove
+commit (`control_type = 2`, since the committer is not the person leaving). The invariant stays
+exact: routing in an authoritative conversation is written only by an accepted commit.
+
+Honest costs of that choice:
+
+- Between the leave and the commit, the leaver is still routed and would receive newly sent mail.
+  In practice a member syncs within seconds; if literally nobody is online, nobody is sending
+  either. It is a latency, not a hole — but it is a real one.
+- If **every** remaining member is permanently gone, the departure never becomes cryptographic. The
+  conversation is inert (no one to send), and retention reclaims it.
+- `control_type = 3` is consequently unreachable in authoritative conversations. It remains in the
+  wire format and in the legacy path; a v2 manifest should either drop it or bind it to an MLS
+  SelfRemove proposal once OpenMLS exposes one.
+
+An emptied authoritative conversation is deliberately **not** deleted the way the legacy exit path
+deletes one: `membership_events` cascades from `conversations`, so dropping the row would destroy
+the append-only audit log this ADR exists to produce.
+
+## What actually landed, and what did not
+
+**Closed by this work:** every routing-membership change in an authoritative conversation — create,
+invite join, approved join, direct add, sibling link, admin removal, leave — now happens only via a
+device-signed, epoch-CAS'd commit; ADR-0009's consent rules survive the move intact; and recipients
+verify both halves (signature under the transparency-logged actor key, and commit↔manifest
+correspondence) before merging, surfacing refusals rather than swallowing them.
+
+**`AppModel.createGroup` now passes `mls_authoritative: true`**, so every conversation the app
+creates — 1:1 and group alike — is authoritative. Verified end to end over the full shipping stack
+by `scripts/authoritative_live_run.sh`: the real coordinator, over real HTTP, against a running
+relay, with recipient verification resolved against the live transparency log.
+
+**Still open — R-506 remains MITIGATING, not CLOSED:**
+
+- **Conversations created before this change stay legacy.** The flag is per-conversation and set at
+  creation; nothing migrates an existing conversation, and there is no mechanism to. Both models
+  therefore coexist indefinitely, and `setup_needed` reports which protocol each target wants.
+- **Message-request conversations are deliberately legacy.** They are quarantined 1:1 threads that
+  become ordinary on accept; leaving that flow untouched kept this arc's blast radius honest.
+- The relay still cannot detect a *valid member* whose manifest lies about its commit — unchanged,
+  and now covered by tests on both sides: the server accepts it, every honest recipient refuses it.
+- Censorship evidence (a server that simply drops commits) remains future work.
+- No external cryptographic review (R-202/R-503 remain launch blockers).
+
+**Operational note:** an authoritative conversation is unusable to a device with no enrolled signer —
+it can add nobody. The composition root wires `membershipSignerProvider`; anything else that builds a
+`ConversationCoordinator` must too, and the coordinator surfaces a security notice rather than
+retrying in silence if it cannot. This is not hypothetical: flipping the default immediately broke
+`SelfGroupLiveRun`, which built a coordinator without one.

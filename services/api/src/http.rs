@@ -3537,7 +3537,9 @@ async fn member_devices(
         if !st.relay.is_member(&conversation_id, &me.device_id)? {
             return Ok(None);
         }
-        st.groups.member_devices(&conversation_id, &target).map(Some)
+        st.groups
+            .member_devices(&conversation_id, &target)
+            .map(Some)
     })
     .await?
     .ok_or_else(forbidden)?;

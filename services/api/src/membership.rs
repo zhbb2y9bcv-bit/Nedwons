@@ -189,7 +189,9 @@ impl PgMembership {
                 }
                 _ => return Ok(ApplyOutcome::Invalid),
             }
-        } else if !matches!(req.control_type, 1 | 2 | 3) {
+        } else if !matches!(req.control_type, 1..=3) {
+            // Authoritative conversations skip the role checks above, so the control type still has
+            // to be validated somewhere: an unknown one names no protocol we can enforce.
             return Ok(ApplyOutcome::Invalid);
         }
 

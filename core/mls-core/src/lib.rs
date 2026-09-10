@@ -315,11 +315,7 @@ impl Conversation {
     /// All-or-nothing: an identity that is not in the group fails the whole call rather than
     /// silently producing a commit that removes fewer members than the manifest will claim — which
     /// every honest recipient would then reject as a correspondence mismatch.
-    pub fn stage_remove_members(
-        &mut self,
-        me: &Member,
-        identities: &[Vec<u8>],
-    ) -> Result<Vec<u8>> {
+    pub fn stage_remove_members(&mut self, me: &Member, identities: &[Vec<u8>]) -> Result<Vec<u8>> {
         if identities.is_empty() {
             return Err(MlsError::MemberNotFound);
         }

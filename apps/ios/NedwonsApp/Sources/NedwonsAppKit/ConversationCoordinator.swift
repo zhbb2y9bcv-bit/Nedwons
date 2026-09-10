@@ -374,6 +374,7 @@ public final class ConversationCoordinator {
                 touched.insert(conversationID)
             } catch {
                 lastSyncError = error
+                noteIfUnrecoverable(error)
             }
         }
 
@@ -430,6 +431,7 @@ public final class ConversationCoordinator {
                 // expires and the target is retried on a later sync — here or on another member's
                 // device. Nothing partial was applied either way.
                 lastSyncError = error
+                noteIfUnrecoverable(error)
             }
         }
         for conversationID in touched { refresh(conversationID) }
@@ -577,6 +579,21 @@ public final class ConversationCoordinator {
     /// How long a membership manifest is accepted in transit. Short: the epoch CAS is the real
     /// anti-replay, and this only bounds how long a captured manifest is worth anything.
     private static let manifestTTLSeconds: UInt64 = 300
+
+    /// Most reconcile failures are ordinary and self-healing — no prekey published yet, a lost epoch
+    /// race, a dropped connection — and retry on the next sync, so they stay in `lastSyncError` for
+    /// diagnostics and out of the user's way.
+    ///
+    /// Missing an enrolled signer is not like that. Every membership change in an authoritative
+    /// conversation needs one, so without it nobody is ever added and retrying forever changes
+    /// nothing. Since new conversations are authoritative, that would look like invited people
+    /// silently never arriving — so it is surfaced instead of retried in silence.
+    private func noteIfUnrecoverable(_ error: Error) {
+        guard case CoordinatorError.noMembershipSigner = error else { return }
+        model.noteSecurityEvent(
+            "This device can't sign membership changes, so people can't be added to or removed "
+                + "from groups here. Signing in again on this device should restore it.")
+    }
 
     // MARK: Group name & read state
 
