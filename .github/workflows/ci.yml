@@ -430,14 +430,44 @@ jobs:
             fi
           fi
           exit $STATUS
+      # Direct invocation for the same reason as the image scan above — this step was failing the
+      # same way, which only became visible once the image scan stopped failing first and let
+      # execution reach it. Reuses the verified binary that step downloaded.
+      #
+      # It also scans the API Dockerfile now. `infra/` holds only docker-compose.yml, which Trivy's
+      # misconfiguration scanner does not support, so this job was reporting "0 config files
+      # detected" and asserting nothing whatsoever. The Dockerfile is a supported type and is the
+      # thing actually shipped, so scanning it makes the job mean something. Verified clean locally
+      # before wiring it in, so this adds coverage without importing a new failure.
       - name: Scan infrastructure definitions
-        uses: aquasecurity/trivy-action@v0.33.1
-        with:
-          scan-type: config
-          scan-ref: infra
-          format: table
-          exit-code: '1'
-          severity: CRITICAL,HIGH
+        run: |
+          set -uo pipefail
+          STATUS=0
+          for target in infra services/api/Dockerfile; do
+            ./trivy config \
+              --severity CRITICAL,HIGH \
+              --format table \
+              --output trivy-config.txt \
+              --exit-code 1 \
+              "$target" >trivy-config-run.log 2>&1
+            RC=$?
+            echo "--- trivy config: ${target} (exit ${RC}) ---"
+            cat trivy-config-run.log
+            if [ -s trivy-config.txt ]; then cat trivy-config.txt; fi
+            if [ "$RC" -ne 0 ]; then
+              STATUS=$RC
+              if [ -s trivy-config.txt ]; then
+                grep -E "CRITICAL|HIGH|AVD-" trivy-config.txt | head -10 | while IFS= read -r line; do
+                  printf '::error title=Trivy IaC finding::%s: %s\n' "$target" "$(printf '%s' "$line" | tr -d '\r' | cut -c1-360)"
+                done
+              else
+                tail -12 trivy-config-run.log | while IFS= read -r line; do
+                  printf '::error title=Trivy config scanner error::%s: %s\n' "$target" "$(printf '%s' "$line" | tr -d '\r' | cut -c1-360)"
+                done
+              fi
+            fi
+          done
+          exit $STATUS
 
   release-gate:
     name: release readiness (placeholder check blocking, risks reported)
