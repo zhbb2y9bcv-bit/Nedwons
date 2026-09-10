@@ -161,22 +161,39 @@ identified + sealed envelopes; sealed ones carry no sender field.
   two different messages and both are kept, while a replay within either channel is still
   `Duplicate`.
 
-  **Still open in 2c (app-flow half, needs the AppModel/app target):** distributing `K_r` to
-  contacts over the E2EE channel, recipient-side block-drop after `verifySealedSender`, the
-  block→rotate-and-redistribute policy, and the message-request fallback UX for non-holders.
-  Two further prerequisites are now identified and NOT yet solved, and should be settled before
-  that half is written:
-  1. **Which store decrypts a sealed envelope.** A sealed envelope deliberately carries no
-     `conversation_id`, so the client must resolve the conversation itself — trying each store in
-     turn (a failed MLS decrypt must be proven side-effect-free) or carrying a conversation hint
-     inside the E2EE payload.
-  2. **How a sender learns the recipient's device ids.** Sealed delivery is per-recipient-DEVICE
-     client-side fan-out (`POST /v1/sealed/deliver` takes one `recipient_device`), but the client
-     has no roster API — `mls-ffi` exposes no group membership, and no endpoint lists another
-     account's devices. The privacy-preserving option is to carry the granter's device ids inside
-     the `DeliveryKeyGrant` itself (it already travels E2EE, so the relay learns nothing and no new
-     enumeration surface is added), which means a content-wire addition and a re-grant whenever a
-     device is added or revoked.
+  **2c app-flow half LANDED 2026-09-09.** Both open questions were settled first:
+  1. *Which store decrypts a sealed envelope.* It carries no `conversation_id`, so the client
+     resolves the conversation by **trying each store**, which is only safe because a failed MLS
+     decrypt is inert — no ratchet advance, no message, no dedup marker, and the envelope id is not
+     burned. That is now a core test (`a_failed_decrypt_leaves_the_store_untouched`), not an
+     assumption.
+  2. *How a sender learns the recipient's device ids.* The granter names their **own** devices
+     inside the `DeliveryKeyGrant`. It already travels E2EE, so the relay learns neither the key nor
+     the device list, and no endpoint that enumerates someone's devices had to be added. Cost,
+     stated: a granter must re-grant when their devices change.
+
+  What now runs in the app: `DeliveryKeyStore` (our `K_r` + the grants contacts gave us, encrypted
+  at rest under its own derived key, so it dies with the at-rest root); the coordinator registers
+  our verifier on sign-in and hands `K_r` + our device ids to every 1:1 contact who lacks it;
+  incoming grants are stored keyed by the peer; a message in a 1:1 whose peer's grant we hold goes
+  out **sealed** — one ciphertext, client-side fan-out to each of the peer's devices under their
+  `K_r` and to our own siblings under ours — falling back to identified delivery if any sealed
+  delivery fails, because privacy is best-effort here and delivery is not; sealed envelopes are
+  read via `process_sealed_inbound` and acked in their own id space.
+  **Recipient-side block-drop happens before any state change:** a store whose peer is blocked is
+  never probed, so a sealed message from a blocked contact decrypts nowhere and is discarded rather
+  than being deleted after the fact. Blocking also rotates `K_r`, re-registers the verifier, forgets
+  the blocked contact's grant and re-grants everyone else — which is what actually revokes them at
+  the relay.
+
+  Tested end to end against two real MLS clients over an in-memory relay that mirrors the real gate
+  (verifier compare, own id sequence, no sender stored): contacts exchange keys and a message then
+  travels sealed and NOT identified; a sealed id 1 and an identified id 1 both deliver; and after a
+  block the stale key is refused, the message falls back to identified, and it still arrives.
+
+  **Still open in 2c:** groups (a grant names one account's key, so group traffic stays identified),
+  and the message-request fallback UX for non-holders — first contact already works, since a
+  non-holder simply sends identified, but it is not yet surfaced as a "request" in that path.
 - **2d — padding / cover traffic** (size/timing) — **BOTH halves now landed**:
   - *padding* (2026-09-09): the client envelope (`mls_core::envelope` v2) pads every message to a
     size bucket (256B…64KB, then 64KB steps; zero padding outside the MLS ciphertext, stripped

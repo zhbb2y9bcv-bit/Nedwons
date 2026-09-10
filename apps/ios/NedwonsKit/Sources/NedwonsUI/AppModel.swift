@@ -818,6 +818,10 @@ public final class AppModel: ObservableObject {
 
     // MARK: Blocking & reporting
 
+    /// Set by the coordinator: extra work a block must trigger that needs the MLS core — rotating
+    /// our sealed-sender key so the blocked account loses the ability to deliver to us (ADR-0014).
+    public var didBlockAction: ((String) async -> Void)?
+
     /// Block an account: the server severs any friendship and refuses future requests.
     public func block(_ accountID: String) async {
         await run { [self] in
@@ -827,6 +831,9 @@ public final class AppModel: ObservableObject {
             blocked = try await client.listBlocked(accessToken: token)
             banner = "Blocked."
         }
+        // Revoke their sealed-sender access too: a block that only stopped identified delivery
+        // would leave the blocked account able to keep dropping sealed envelopes in our inbox.
+        await didBlockAction?(accountID)
     }
 
     public func unblock(_ accountID: String) async {

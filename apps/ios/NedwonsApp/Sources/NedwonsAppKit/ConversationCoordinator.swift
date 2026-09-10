@@ -61,6 +61,14 @@ public final class ConversationCoordinator {
     /// Whether this device broadcasts typing indicators. A privacy choice, driven by the Settings
     /// toggle via `model`; when off, `setTyping` sends nothing.
     public var sendTypingIndicators = true
+    /// Sealed-sender key material (ADR-0014 2c): our own `K_r` and the grants contacts gave us.
+    /// `nil` disables sealed sending entirely and everything falls back to identified delivery.
+    public var deliveryKeys: DeliveryKeyStore?
+    /// Our own device ids, learned once per session — a grant carries them so contacts can fan a
+    /// sealed message out to every device of ours.
+    private var myDeviceIDs: [String] = []
+    /// True once this session registered our delivery verifier with the relay.
+    private var deliveryKeyRegistered = false
 
     public init(
         model: AppModel,
@@ -161,6 +169,9 @@ public final class ConversationCoordinator {
         model.coverTrafficControl = { [weak self] enabled in
             self?.setCoverTraffic(enabled)
         }
+        model.didBlockAction = { [weak self] accountID in
+            await self?.revokeSealedAccess(for: accountID)
+        }
         model.readReceiptsControl = { [weak self] enabled in
             self?.sendReadReceipts = enabled
         }
@@ -192,6 +203,7 @@ public final class ConversationCoordinator {
                 do {
                     _ = try await self.syncOnce(waitSeconds: 25)
                     await self.reconcileSetup()
+                    await self.grantDeliveryKeysIfNeeded()
                     await self.retryUnsent()
                 } catch is CancellationError {
                     return
@@ -228,6 +240,9 @@ public final class ConversationCoordinator {
         for conversationID in index.conversations.keys { refresh(conversationID) }
         await ensureKeyPackages()
         await reconcileSetup()
+        // Sealed sender: publish our verifier, then hand our key to contacts who don't have it.
+        await ensureDeliveryKeyRegistered()
+        await grantDeliveryKeysIfNeeded()
         await retryUnsent()
     }
 
@@ -685,6 +700,106 @@ public final class ConversationCoordinator {
         }
     }
 
+    // MARK: Sealed sender (ADR-0014 slice 2c)
+
+    /// Make sure the relay holds the verifier for our current `K_r`, so approved contacts can
+    /// deliver to us sealed. Idempotent per session; quiet on failure (retried next sync — until it
+    /// succeeds we simply keep receiving identified mail).
+    func ensureDeliveryKeyRegistered() async {
+        guard let token, let keys = deliveryKeys, !deliveryKeyRegistered else { return }
+        do {
+            try await relay.registerDeliveryAccessKey(
+                accessToken: token, deliveryKey: keys.mineOrCreate())
+            if myDeviceIDs.isEmpty {
+                myDeviceIDs = try await relay.myDeviceIDs(accessToken: token)
+            }
+            deliveryKeyRegistered = true
+        } catch {
+            lastSyncError = error
+        }
+    }
+
+    /// Hand our `K_r` (and our own device ids) to each 1:1 contact we haven't granted yet, over the
+    /// E2EE channel — the relay never sees either. Only 1:1 conversations: a grant names ONE
+    /// account's key, and in a group there is no single peer to attribute it to.
+    func grantDeliveryKeysIfNeeded() async {
+        guard let token, let keys = deliveryKeys, deliveryKeyRegistered else { return }
+        let mine = keys.mineOrCreate()
+        let devices = myDeviceIDs.compactMap { Hex.decode($0) }
+        for conversationID in index.conversations.keys.sorted() {
+            guard let peer = peerAccount(of: conversationID), !keys.hasGranted(to: peer),
+                let client = activeClient(for: conversationID)
+            else { continue }
+            do {
+                let localID = try client.enqueueDeliveryKeyGrant(
+                    keyR: mine.key, deviceIds: devices)
+                try await upload(localID: localID, client: client, conversationID: conversationID)
+                keys.markGranted(to: peer)
+            } catch {
+                lastSyncError = error  // retried on a later sync
+            }
+        }
+        _ = token
+    }
+
+    /// The other account in a 1:1 conversation, or nil for a group (or one we can't resolve).
+    private func peerAccount(of conversationID: String) -> String? {
+        guard let me = model.session?.accountID,
+            let conversation = model.conversations.first(where: {
+                $0.conversationID == conversationID
+            })
+        else { return nil }
+        let others = conversation.memberAccountIDs.filter { $0 != me }
+        return others.count == 1 ? others.first : nil
+    }
+
+    /// Whether this conversation's message can go out sealed: a 1:1 with a contact whose grant we
+    /// hold. Anything else (a group, or a contact who never granted us) takes the identified path.
+    private func sealedRecipients(for conversationID: String) -> (DeliveryGrant, DeliveryAccessKey)? {
+        guard let keys = deliveryKeys, let peer = peerAccount(of: conversationID),
+            let grant = keys.grant(from: peer), grant.key != nil
+        else { return nil }
+        return (grant, keys.mineOrCreate())
+    }
+
+    /// Client-side per-device fan-out of one ciphertext: every device of the peer (under THEIR
+    /// `K_r`) and every other device of ours (under our own), so our siblings still get the
+    /// message. Throws if any delivery fails, so the caller can fall back to identified delivery
+    /// rather than losing the message.
+    private func deliverSealedToAll(
+        ciphertext: Data, grant: DeliveryGrant, mine: DeliveryAccessKey, localID: UInt64,
+        conversationID: String
+    ) async throws {
+        guard let peerKey = grant.key else { throw CoordinatorError.notSignedIn }
+        for device in grant.deviceIDs {
+            try await relay.deliverSealed(
+                deliveryKey: peerKey, recipientDevice: device, ciphertext: ciphertext,
+                idempotencyKey: Self.idempotencyKey(conversationID: conversationID, localID: localID))
+        }
+        for device in myDeviceIDs where device != model.session?.deviceID {
+            try await relay.deliverSealed(
+                deliveryKey: mine, recipientDevice: device, ciphertext: ciphertext,
+                idempotencyKey: Self.idempotencyKey(conversationID: conversationID, localID: localID))
+        }
+    }
+
+    /// Blocking someone must also revoke their sealed access: rotate `K_r` (which invalidates every
+    /// holder at the relay), forget their grant, and let the next sync re-grant everyone else.
+    public func revokeSealedAccess(for blockedAccount: String) async {
+        guard let token, let keys = deliveryKeys else { return }
+        let rotation = SealedSenderPolicy.rotateOnBlock(
+            approvedContacts: keys.grantedKeys(), blocking: blockedAccount)
+        do {
+            try await relay.registerDeliveryAccessKey(
+                accessToken: token, deliveryKey: rotation.newKey)
+            keys.rotateMine(to: rotation.newKey)
+            keys.forgetGrant(from: blockedAccount)
+            await grantDeliveryKeysIfNeeded()  // re-grant the remaining contacts
+        } catch {
+            lastSyncError = error
+        }
+    }
+
     // MARK: Cover traffic (R-204)
 
     /// The decoy cadence: a fresh random gap in this range before each cover send. Deliberately
@@ -738,6 +853,20 @@ public final class ConversationCoordinator {
     private func upload(localID: UInt64, client: MlsClient, conversationID: String) async throws {
         guard let token else { throw CoordinatorError.notSignedIn }
         let ciphertext = try client.encrypt(localId: localID)
+        // Sealed when we can: a 1:1 contact whose K_r we hold. The relay then stores the envelope
+        // with NO sender. If any sealed delivery fails we fall back to the identified path rather
+        // than lose the message — privacy is best-effort here, delivery is not.
+        if let (grant, mine) = sealedRecipients(for: conversationID) {
+            do {
+                try await deliverSealedToAll(
+                    ciphertext: ciphertext, grant: grant, mine: mine, localID: localID,
+                    conversationID: conversationID)
+                try client.markSent(localId: localID)
+                return
+            } catch {
+                lastSyncError = error
+            }
+        }
         _ = try await relay.sendMessage(
             accessToken: token, conversationID: conversationID, ciphertext: ciphertext,
             idempotencyKey: Self.idempotencyKey(conversationID: conversationID, localID: localID))
@@ -781,6 +910,13 @@ public final class ConversationCoordinator {
                         model.noteTyping(
                             Hex.encode(sender), active: active, in: conversationID)
                     }
+                    // A contact handing us their sealed-sender key (and their devices), so we can
+                    // seal to them from here on. Grants ride the ordinary E2EE path.
+                    if case .deliveryKeyGranted(let keyR, let deviceIDs) = result,
+                        let peer = peerAccount(of: conversationID)
+                    {
+                        storeGrant(keyR: keyR, deviceIDs: deviceIDs, from: peer)
+                    }
                 } catch {
                     lastSyncError = error
                 }
@@ -796,6 +932,25 @@ public final class ConversationCoordinator {
                 acked.append(envelope.id)
             }
         }
+        // Sealed envelopes (ADR-0014): no sender AND no conversation id, so we resolve the
+        // conversation by trying each store. A failed decrypt is inert — proven in the core — so
+        // probing cannot corrupt a store it does not belong to, and the id is not burned.
+        var sealedAcked: [Int] = []
+        for envelope in envelopes.sorted(by: { $0.id < $1.id }) where envelope.sealed {
+            guard let bytes = Hex.decode(envelope.ciphertext) else {
+                sealedAcked.append(envelope.id)
+                continue
+            }
+            if let conversationID = processSealed(envelopeID: envelope.id, ciphertext: bytes) {
+                touched.insert(conversationID)
+            }
+            // Acked either way: nothing that failed every store can ever be processed later, and a
+            // sealed envelope from someone we blocked is meant to go nowhere.
+            sealedAcked.append(envelope.id)
+        }
+        if !sealedAcked.isEmpty {
+            try await relay.ackSealed(accessToken: token, sealedIDs: sealedAcked)
+        }
         if !acked.isEmpty {
             try await relay.ackInbox(accessToken: token, ids: acked)
         }
@@ -809,6 +964,49 @@ public final class ConversationCoordinator {
             await ensureKeyPackages()  // one lobby identity was consumed
         }
         return acked.count
+    }
+
+    /// Resolve a sealed envelope to a conversation by trying each store, returning the conversation
+    /// it belonged to (nil if none could decrypt it).
+    ///
+    /// **Recipient-side block-drop happens here, before any state changes:** a store whose peer we
+    /// have blocked is never even probed, so a sealed message from a blocked contact decrypts
+    /// nowhere and is discarded. Doing it this way — rather than deleting after the fact — means a
+    /// blocked sender's message never enters the log at all. (The primary control is still the
+    /// relay-side one: blocking rotates `K_r`, which revokes their ability to deliver sealed.)
+    private func processSealed(envelopeID: Int, ciphertext: Data) -> String? {
+        let blocked = Set(model.blocked.map(\.accountID))
+        for conversationID in index.conversations.keys.sorted() {
+            if let peer = peerAccount(of: conversationID),
+                SealedSenderPolicy.shouldDropDecrypted(
+                    verifiedSenderAccountID: peer, blocked: blocked)
+            {
+                continue  // blocked: do not even try
+            }
+            guard let client = activeClient(for: conversationID) else { continue }
+            guard
+                let result = try? client.processSealedInbound(
+                    envelopeId: UInt64(envelopeID), ciphertext: ciphertext)
+            else { continue }
+            if case .typing(let sender, let active) = result {
+                model.noteTyping(Hex.encode(sender), active: active, in: conversationID)
+            }
+            // A contact handing us their K_r: remember it (and their devices) so we can seal back.
+            if case .deliveryKeyGranted(let keyR, let deviceIDs) = result,
+                let peer = peerAccount(of: conversationID)
+            {
+                storeGrant(keyR: keyR, deviceIDs: deviceIDs, from: peer)
+            }
+            return conversationID
+        }
+        return nil
+    }
+
+    /// Persist a contact's delivery grant so we can send them sealed messages.
+    private func storeGrant(keyR: Data, deviceIDs: [Data], from account: String) {
+        deliveryKeys?.storeGrant(
+            DeliveryGrant(keyHex: Hex.encode(keyR), deviceIDs: deviceIDs.map { Hex.encode($0) }),
+            from: account)
     }
 
     /// Try the Welcome against each lobby identity. The one whose prekey it was made for joins and

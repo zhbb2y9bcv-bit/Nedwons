@@ -241,11 +241,16 @@ final class InMemoryRelay: ConversationRelay, @unchecked Sendable {
     func fetchInbox(accessToken: String, waitSeconds: Int) async throws -> [InboxEnvelope] {
         try sync {
             let d = try device(accessToken)
-            let rows = (inboxes[d.deviceID] ?? []).map { row -> [String: Any] in
+            var rows = (inboxes[d.deviceID] ?? []).map { row -> [String: Any] in
                 [
                     "id": row.id, "conversation_id": row.conversation, "sender_device": row.sender,
                     "ciphertext": Hex.encode(row.ciphertext), "sealed": false, "self_group": false,
                 ]
+            }
+            // Sealed envelopes carry NO sender and NO conversation — the recipient works out which
+            // conversation it is by decrypting.
+            rows += (sealedInboxes[d.deviceID] ?? []).map { row -> [String: Any] in
+                ["id": row.id, "ciphertext": Hex.encode(row.ciphertext), "sealed": true, "self_group": false]
             }
             let data = try JSONSerialization.data(withJSONObject: rows)
             return try JSONDecoder().decode([InboxEnvelope].self, from: data)
@@ -262,6 +267,74 @@ final class InMemoryRelay: ConversationRelay, @unchecked Sendable {
     func pending(deviceID: String) -> Int {
         lock.lock(); defer { lock.unlock() }
         return inboxes[deviceID]?.count ?? 0
+    }
+
+    // ----- sealed sender (ADR-0014) ---------------------------------------------------------
+    //
+    // Mirrors the real relay: a verifier per ACCOUNT, delivery gated on SHA-256(presented) == V_r,
+    // and sealed envelopes stored with NO sender and NO conversation in their OWN id space.
+
+    private var verifiers: [String: Data] = [:]  // account → V_r
+    private var sealedInboxes: [String: [(id: Int, ciphertext: Data)]] = [:]
+    private var nextSealedID = 1
+    private var sealedSeenKeys: Set<String> = []
+    /// Sealed deliveries the relay accepted — so a test can prove a message went out sealed.
+    private(set) var sealedDeliveries = 0
+    /// Sealed deliveries refused because the presented key didn't match the verifier.
+    private(set) var sealedRefusals = 0
+
+    func registerDeliveryAccessKey(accessToken: String, deliveryKey: DeliveryAccessKey) async throws
+    {
+        try sync {
+            let d = try device(accessToken)
+            verifiers[d.accountID] = deliveryKey.verifier
+        }
+    }
+
+    func deliverSealed(
+        deliveryKey: DeliveryAccessKey, recipientDevice: String, ciphertext: Data,
+        idempotencyKey: Data
+    ) async throws {
+        try sync {
+            // Deliberately UNAUTHENTICATED: presenting K_r is the only credential.
+            guard let account = devices.values.first(where: { $0.deviceID == recipientDevice })?
+                .accountID,
+                let expected = verifiers[account], expected == deliveryKey.verifier
+            else {
+                sealedRefusals += 1
+                throw NedwonsClient.ClientError.http(status: 403, body: #"{"error":"forbidden"}"#)
+            }
+            // Idempotency is re-scoped to (recipient, key): there is no sender to key on.
+            guard
+                sealedSeenKeys.insert("\(recipientDevice)/\(Hex.encode(idempotencyKey))").inserted
+            else { return }
+            sealedInboxes[recipientDevice, default: []].append(
+                (id: nextSealedID, ciphertext: ciphertext))
+            nextSealedID += 1
+            sealedDeliveries += 1
+        }
+    }
+
+    func ackSealed(accessToken: String, sealedIDs: [Int]) async throws {
+        try sync {
+            let d = try device(accessToken)
+            sealedInboxes[d.deviceID]?.removeAll { sealedIDs.contains($0.id) }
+        }
+    }
+
+    func myDeviceIDs(accessToken: String) async throws -> [String] {
+        try sync {
+            let d = try device(accessToken)
+            return devices.values.filter { $0.accountID == d.accountID }.map(\.deviceID).sorted()
+        }
+    }
+
+    func pendingSealed(deviceID: String) -> Int { sync { sealedInboxes[deviceID]?.count ?? 0 } }
+
+    /// Deliberately starts sealed ids at 1, the SAME sequence the identified inbox uses, so tests
+    /// exercise the id-collision hazard rather than hiding it.
+    func sealedRows(for deviceID: String) -> [(id: Int, ciphertext: Data)] {
+        sync { sealedInboxes[deviceID] ?? [] }
     }
 }
 
@@ -898,5 +971,137 @@ final class ConversationCoordinatorTests: XCTestCase {
         XCTAssertEqual(a, ConversationCoordinator.idempotencyKey(conversationID: conv, localID: 1))
         XCTAssertNotEqual(a, ConversationCoordinator.idempotencyKey(conversationID: conv, localID: 2))
         XCTAssertEqual(a.count, 16)
+    }
+}
+
+/// Sealed sender end to end (ADR-0014 slice 2c): two contacts exchange delivery-access keys over
+/// the E2EE channel, then messages travel by the SEALED path — the relay stores them with no
+/// sender at all — and are still read normally. Blocking rotates the key, which revokes the blocked
+/// contact's sealed access at the relay and forces them back to identified delivery.
+@MainActor
+final class SealedSenderFlowTests: XCTestCase {
+    private let conv = "c" + String(repeating: "7", count: 31)
+
+    private func keyStore(_ name: String) -> DeliveryKeyStore {
+        DeliveryKeyStore(
+            fileURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("dak-\(name)-\(UUID().uuidString).bin"),
+            atRestKey: Data(SHA256.hash(data: Data(name.utf8))))
+    }
+
+    /// Wire two participants into one 1:1 conversation with sealed sender enabled on both.
+    private func pair(_ relay: InMemoryRelay) async throws -> (Participant, Participant) {
+        let alice = Participant("alice", relay: relay)
+        let bob = Participant("bob", relay: relay)
+        alice.coordinator.deliveryKeys = keyStore("alice")
+        bob.coordinator.deliveryKeys = keyStore("bob")
+
+        // peerAccount() reads the routing membership the app normally gets from
+        // /v1/conversations. `Conversation` is Decodable-only outside its own module, so build it
+        // the same way the client does — from the relay's JSON shape.
+        let membershipJSON = try JSONSerialization.data(withJSONObject: [
+            ["conversation_id": conv, "member_account_ids": [alice.accountID, bob.accountID]]
+        ])
+        let membership = try JSONDecoder().decode([Conversation].self, from: membershipJSON)
+        alice.model.conversations = membership
+        bob.model.conversations = membership
+
+        await bob.coordinator.ensureKeyPackages()
+        relay.createConversation(conv, memberDevices: [alice.deviceID, bob.deviceID])
+        try await alice.coordinator.bootstrap(
+            conversationID: conv, memberAccountIDs: [bob.accountID])
+        _ = try await bob.coordinator.syncOnce()
+        return (alice, bob)
+    }
+
+    /// Both sides publish a verifier and hand each other their K_r, then a message goes out sealed.
+    func testContactsExchangeKeysThenMessagesGoSealed() async throws {
+        let relay = InMemoryRelay()
+        let (alice, bob) = try await pair(relay)
+
+        // Register verifiers and exchange grants (what prepare() does on sign-in).
+        await alice.coordinator.ensureDeliveryKeyRegistered()
+        await bob.coordinator.ensureDeliveryKeyRegistered()
+        await alice.coordinator.grantDeliveryKeysIfNeeded()
+        await bob.coordinator.grantDeliveryKeysIfNeeded()
+        // Each side receives the other's grant.
+        _ = try await bob.coordinator.syncOnce()
+        _ = try await alice.coordinator.syncOnce()
+
+        XCTAssertNotNil(
+            alice.coordinator.deliveryKeys?.grant(from: bob.accountID),
+            "alice holds bob's delivery key")
+        XCTAssertNotNil(
+            bob.coordinator.deliveryKeys?.grant(from: alice.accountID),
+            "bob holds alice's delivery key")
+
+        // Now a message from alice must go out SEALED, not identified.
+        relay.resetCounters()
+        let sealedBefore = relay.sealedDeliveries
+        await alice.model.sendMessage("sealed hello", to: conv)
+        XCTAssertGreaterThan(
+            relay.sealedDeliveries, sealedBefore, "the message went out by the sealed path")
+        XCTAssertEqual(relay.deliveries, 0, "and NOT by the identified path")
+
+        // Bob reads it — the sealed envelope carries no sender or conversation, so his client
+        // resolved the conversation by decrypting.
+        _ = try await bob.coordinator.syncOnce()
+        XCTAssertEqual(bob.texts(in: conv).map(\.0), ["sealed hello"])
+        XCTAssertEqual(relay.pendingSealed(deviceID: bob.deviceID), 0, "and acked it")
+    }
+
+    /// A sealed envelope id starts at 1 — the same sequence the identified inbox uses. The two must
+    /// not be confused, or a real message vanishes as a phantom "duplicate".
+    func testSealedAndIdentifiedIdsBothDeliver() async throws {
+        let relay = InMemoryRelay()
+        let (alice, bob) = try await pair(relay)
+
+        // An identified message first, consuming identified id 1.
+        await alice.model.sendMessage("identified first", to: conv)
+        _ = try await bob.coordinator.syncOnce()
+
+        // Then enable sealed and send again — this becomes SEALED id 1.
+        await alice.coordinator.ensureDeliveryKeyRegistered()
+        await bob.coordinator.ensureDeliveryKeyRegistered()
+        await bob.coordinator.grantDeliveryKeysIfNeeded()
+        _ = try await alice.coordinator.syncOnce()
+        await alice.model.sendMessage("sealed second", to: conv)
+
+        _ = try await bob.coordinator.syncOnce()
+        XCTAssertEqual(
+            bob.texts(in: conv).map(\.0), ["identified first", "sealed second"],
+            "both arrive: the sealed id must not collide with the identified one")
+    }
+
+    /// Blocking revokes sealed access: the key rotates, so the blocked contact's stored key no
+    /// longer opens the gate and their traffic falls back to the identified path.
+    func testBlockingRotatesTheKeyAndRevokesSealedAccess() async throws {
+        let relay = InMemoryRelay()
+        let (alice, bob) = try await pair(relay)
+
+        await alice.coordinator.ensureDeliveryKeyRegistered()
+        await bob.coordinator.ensureDeliveryKeyRegistered()
+        await bob.coordinator.grantDeliveryKeysIfNeeded()
+        _ = try await alice.coordinator.syncOnce()
+        XCTAssertNotNil(alice.coordinator.deliveryKeys?.grant(from: bob.accountID))
+
+        let keyBefore = bob.coordinator.deliveryKeys!.mineOrCreate()
+        // Bob blocks alice.
+        await bob.coordinator.revokeSealedAccess(for: alice.accountID)
+        let keyAfter = bob.coordinator.deliveryKeys!.mineOrCreate()
+        XCTAssertNotEqual(keyBefore, keyAfter, "blocking rotates K_r")
+        XCTAssertNil(
+            bob.coordinator.deliveryKeys?.grant(from: alice.accountID),
+            "and forgets the blocked contact's key")
+
+        // Alice still holds bob's OLD key; a sealed delivery with it is now refused, so her message
+        // falls back to identified delivery rather than being lost.
+        relay.resetCounters()
+        let refusalsBefore = relay.sealedRefusals
+        await alice.model.sendMessage("after the block", to: conv)
+        XCTAssertGreaterThan(relay.sealedRefusals, refusalsBefore, "the stale key is refused")
+        XCTAssertGreaterThan(relay.deliveries, 0, "and the message still goes, identified")
+        _ = try await bob.coordinator.syncOnce()
+        XCTAssertTrue(bob.texts(in: conv).map(\.0).contains("after the block"))
     }
 }
