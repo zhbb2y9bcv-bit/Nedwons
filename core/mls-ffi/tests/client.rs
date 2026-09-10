@@ -92,6 +92,36 @@ fn cover_decoy_crosses_the_bridge_and_is_discarded() {
 }
 
 #[test]
+fn sealed_channel_dedups_separately_from_identified() {
+    let (alice, bob) = two_party(&tmp("alice"), &tmp("bob"));
+
+    // Identified envelope id 1.
+    let a = alice.enqueue(b"identified".to_vec()).unwrap();
+    let env_a = alice.encrypt(a).unwrap();
+    assert!(matches!(
+        bob.process_inbound(1, env_a).unwrap(),
+        InboundResult::Application { .. }
+    ));
+
+    // A SEALED envelope that also happens to carry id 1 — a different message from a different
+    // server-side sequence. It must NOT be swallowed as a duplicate.
+    let b = alice.enqueue(b"sealed".to_vec()).unwrap();
+    let env_b = alice.encrypt(b).unwrap();
+    match bob.process_sealed_inbound(1, env_b.clone()).unwrap() {
+        InboundResult::Application { plaintext } => assert_eq!(plaintext, b"sealed"),
+        other => panic!("expected the sealed message, got {other:?}"),
+    }
+    assert_eq!(bob.messages().unwrap().len(), 2);
+
+    // Replay protection still holds within the sealed channel.
+    assert!(matches!(
+        bob.process_sealed_inbound(1, env_b).unwrap(),
+        InboundResult::Duplicate
+    ));
+    assert_eq!(bob.messages().unwrap().len(), 2);
+}
+
+#[test]
 fn retry_encrypt_returns_same_ciphertext_and_does_not_advance() {
     let (alice, _bob) = two_party(&tmp("alice"), &tmp("bob"));
     let id = alice.enqueue(b"once".to_vec()).unwrap();

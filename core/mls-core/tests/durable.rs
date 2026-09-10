@@ -1097,3 +1097,43 @@ fn cover_decoy_is_invisible_and_does_not_desync() {
     );
     assert_eq!(bob.messages().len(), 1);
 }
+
+/// Sealed, self-group and identified envelopes come from THREE different server-side sequences
+/// (`envelopes.id`, `sealed_envelopes.id`, and the self-group channel's), so their ids overlap.
+/// Pooling them in one dedup space would silently swallow a real message as a "duplicate" of an
+/// unrelated envelope that happened to share an id — the worst kind of bug in a messenger. Each
+/// channel therefore dedups on its own.
+#[test]
+fn sealed_and_identified_ids_do_not_collide_in_dedup() {
+    let (mut alice, _ja, mut bob, _jb) = pair();
+
+    // Identified envelope id 1.
+    let a = alice.enqueue(b"identified one").expect("enqueue");
+    let env_a = alice.encrypt(a).expect("encrypt");
+    assert_eq!(
+        bob.process_inbound(1, &env_a).expect("identified"),
+        InboundOutcome::Application(b"identified one".to_vec())
+    );
+
+    // A SEALED envelope that also happens to be id 1 — a different message entirely.
+    let b = alice.enqueue(b"sealed one").expect("enqueue");
+    let env_b = alice.encrypt(b).expect("encrypt");
+    assert_eq!(
+        bob.process_sealed_inbound(1, &env_b).expect("sealed"),
+        InboundOutcome::Application(b"sealed one".to_vec()),
+        "a sealed id must not be mistaken for an already-seen identified id"
+    );
+    assert_eq!(bob.messages().len(), 2, "both messages are kept");
+
+    // Dedup still works WITHIN the sealed channel.
+    assert_eq!(
+        bob.process_sealed_inbound(1, &env_b).expect("sealed replay"),
+        InboundOutcome::Duplicate
+    );
+    // …and within the identified channel.
+    assert_eq!(
+        bob.process_inbound(1, &env_a).expect("identified replay"),
+        InboundOutcome::Duplicate
+    );
+    assert_eq!(bob.messages().len(), 2, "replays added nothing");
+}

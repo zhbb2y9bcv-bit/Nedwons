@@ -783,52 +783,7 @@ impl MlsClient {
             let outcome = session
                 .process_inbound(envelope_id, &payload)
                 .map_err(map_durable_input)?;
-            Ok(match outcome {
-                InboundOutcome::Application(pt) => InboundResult::Application { plaintext: pt },
-                InboundOutcome::StateAdvanced => InboundResult::StateAdvanced,
-                InboundOutcome::Duplicate => InboundResult::Duplicate,
-                InboundOutcome::SecretSealed { secret_id } => InboundResult::SecretSealed {
-                    secret_id: secret_id.to_vec(),
-                },
-                InboundOutcome::SecretConsumedRemotely { secret_id } => {
-                    InboundResult::SecretConsumedRemotely {
-                        secret_id: secret_id.to_vec(),
-                    }
-                }
-                InboundOutcome::DeliveryKeyGranted { key_r } => InboundResult::DeliveryKeyGranted {
-                    key_r: key_r.to_vec(),
-                },
-                InboundOutcome::HistorySynced { count } => InboundResult::HistorySynced { count },
-                InboundOutcome::GroupRenamed { name } => InboundResult::GroupRenamed { name },
-                InboundOutcome::AttachmentReceived { attachment } => {
-                    InboundResult::AttachmentReceived {
-                        attachment: to_attachment_info(&attachment),
-                    }
-                }
-                InboundOutcome::ReactionChanged { target } => InboundResult::ReactionChanged {
-                    target: target.to_vec(),
-                },
-                InboundOutcome::ReceiptsReceived { kind, count } => {
-                    InboundResult::ReceiptsReceived {
-                        kind: to_receipt_kind(kind),
-                        count,
-                    }
-                }
-                InboundOutcome::Typing { sender, active } => {
-                    InboundResult::Typing { sender, active }
-                }
-                InboundOutcome::TimerChanged { seconds } => InboundResult::TimerChanged { seconds },
-                InboundOutcome::MessageDeleted { target } => InboundResult::MessageDeleted {
-                    target: target.to_vec(),
-                },
-                InboundOutcome::MessageEdited { target } => InboundResult::MessageEdited {
-                    target: target.to_vec(),
-                },
-                InboundOutcome::GroupAvatarChanged { removed } => {
-                    InboundResult::GroupAvatarChanged { removed }
-                }
-                InboundOutcome::Cover => InboundResult::Cover,
-            })
+            Ok(to_inbound_result(outcome))
         })
     }
 
@@ -850,52 +805,31 @@ impl MlsClient {
             let outcome = session
                 .process_self_inbound(envelope_id, &payload)
                 .map_err(map_durable_input)?;
-            Ok(match outcome {
-                InboundOutcome::Application(pt) => InboundResult::Application { plaintext: pt },
-                InboundOutcome::StateAdvanced => InboundResult::StateAdvanced,
-                InboundOutcome::Duplicate => InboundResult::Duplicate,
-                InboundOutcome::SecretSealed { secret_id } => InboundResult::SecretSealed {
-                    secret_id: secret_id.to_vec(),
-                },
-                InboundOutcome::SecretConsumedRemotely { secret_id } => {
-                    InboundResult::SecretConsumedRemotely {
-                        secret_id: secret_id.to_vec(),
-                    }
-                }
-                InboundOutcome::DeliveryKeyGranted { key_r } => InboundResult::DeliveryKeyGranted {
-                    key_r: key_r.to_vec(),
-                },
-                InboundOutcome::HistorySynced { count } => InboundResult::HistorySynced { count },
-                InboundOutcome::GroupRenamed { name } => InboundResult::GroupRenamed { name },
-                InboundOutcome::AttachmentReceived { attachment } => {
-                    InboundResult::AttachmentReceived {
-                        attachment: to_attachment_info(&attachment),
-                    }
-                }
-                InboundOutcome::ReactionChanged { target } => InboundResult::ReactionChanged {
-                    target: target.to_vec(),
-                },
-                InboundOutcome::ReceiptsReceived { kind, count } => {
-                    InboundResult::ReceiptsReceived {
-                        kind: to_receipt_kind(kind),
-                        count,
-                    }
-                }
-                InboundOutcome::Typing { sender, active } => {
-                    InboundResult::Typing { sender, active }
-                }
-                InboundOutcome::TimerChanged { seconds } => InboundResult::TimerChanged { seconds },
-                InboundOutcome::MessageDeleted { target } => InboundResult::MessageDeleted {
-                    target: target.to_vec(),
-                },
-                InboundOutcome::MessageEdited { target } => InboundResult::MessageEdited {
-                    target: target.to_vec(),
-                },
-                InboundOutcome::GroupAvatarChanged { removed } => {
-                    InboundResult::GroupAvatarChanged { removed }
-                }
-                InboundOutcome::Cover => InboundResult::Cover,
-            })
+            Ok(to_inbound_result(outcome))
+        })
+    }
+
+    /// SEALED channel (ADR-0014): an ordinary application message for this conversation that was
+    /// delivered without the relay learning who sent it. Decryption — and the MLS authentication
+    /// that comes with it — is identical to [`Self::process_inbound`]; only the dedup space differs,
+    /// because sealed envelope ids come from their own server-side sequence and would otherwise
+    /// collide with identified ones. Acknowledge these through the relay's `sealed_ids`.
+    pub fn process_sealed_inbound(
+        &self,
+        envelope_id: u64,
+        ciphertext: Vec<u8>,
+    ) -> Result<InboundResult, MlsClientError> {
+        catch(move || {
+            bound(ciphertext.len(), MAX_ENVELOPE_LEN)?;
+            let payload = mls_core::envelope::unwrap(&ciphertext)
+                .map_err(|_| MlsClientError::InvalidMessage)?
+                .to_vec();
+            let mut g = self.lock()?;
+            let session = active_mut(&mut g)?;
+            let outcome = session
+                .process_sealed_inbound(envelope_id, &payload)
+                .map_err(map_durable_input)?;
+            Ok(to_inbound_result(outcome))
         })
     }
 
@@ -1438,6 +1372,51 @@ fn to_stored(m: &CoreMessageView) -> StoredMessage {
         deleted: m.deleted,
         edited: m.edited,
         sender: m.sender.clone(),
+    }
+}
+
+/// One place that maps a core inbound outcome to the bridge's result, shared by every channel
+/// (identified, sealed, self-group) so they can never drift apart.
+fn to_inbound_result(outcome: InboundOutcome) -> InboundResult {
+    match outcome {
+        InboundOutcome::Application(pt) => InboundResult::Application { plaintext: pt },
+        InboundOutcome::StateAdvanced => InboundResult::StateAdvanced,
+        InboundOutcome::Duplicate => InboundResult::Duplicate,
+        InboundOutcome::SecretSealed { secret_id } => InboundResult::SecretSealed {
+            secret_id: secret_id.to_vec(),
+        },
+        InboundOutcome::SecretConsumedRemotely { secret_id } => {
+            InboundResult::SecretConsumedRemotely {
+                secret_id: secret_id.to_vec(),
+            }
+        }
+        InboundOutcome::DeliveryKeyGranted { key_r } => InboundResult::DeliveryKeyGranted {
+            key_r: key_r.to_vec(),
+        },
+        InboundOutcome::HistorySynced { count } => InboundResult::HistorySynced { count },
+        InboundOutcome::GroupRenamed { name } => InboundResult::GroupRenamed { name },
+        InboundOutcome::AttachmentReceived { attachment } => InboundResult::AttachmentReceived {
+            attachment: to_attachment_info(&attachment),
+        },
+        InboundOutcome::ReactionChanged { target } => InboundResult::ReactionChanged {
+            target: target.to_vec(),
+        },
+        InboundOutcome::ReceiptsReceived { kind, count } => InboundResult::ReceiptsReceived {
+            kind: to_receipt_kind(kind),
+            count,
+        },
+        InboundOutcome::Typing { sender, active } => InboundResult::Typing { sender, active },
+        InboundOutcome::TimerChanged { seconds } => InboundResult::TimerChanged { seconds },
+        InboundOutcome::MessageDeleted { target } => InboundResult::MessageDeleted {
+            target: target.to_vec(),
+        },
+        InboundOutcome::MessageEdited { target } => InboundResult::MessageEdited {
+            target: target.to_vec(),
+        },
+        InboundOutcome::GroupAvatarChanged { removed } => {
+            InboundResult::GroupAvatarChanged { removed }
+        }
+        InboundOutcome::Cover => InboundResult::Cover,
     }
 }
 

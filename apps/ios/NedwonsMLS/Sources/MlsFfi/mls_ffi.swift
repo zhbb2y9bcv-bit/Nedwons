@@ -712,6 +712,15 @@ public protocol MlsClientProtocol: AnyObject, Sendable {
     func processInbound(envelopeId: UInt64, ciphertext: Data) throws  -> InboundResult
     
     /**
+     * SEALED channel (ADR-0014): an ordinary application message for this conversation that was
+     * delivered without the relay learning who sent it. Decryption — and the MLS authentication
+     * that comes with it — is identical to [`Self::process_inbound`]; only the dedup space differs,
+     * because sealed envelope ids come from their own server-side sequence and would otherwise
+     * collide with identified ones. Acknowledge these through the relay's `sealed_ids`.
+     */
+    func processSealedInbound(envelopeId: UInt64, ciphertext: Data) throws  -> InboundResult
+    
+    /**
      * Self-group channel (ADR-0015 option 3): a `SecretConsumed` from another of this account's
      * devices, or a self-group membership commit. Decrypting with the self-group keeps the read
      * signal private to the account. Same dedup + ack contract as [`Self::process_inbound`].
@@ -1318,6 +1327,22 @@ open func processCommit(envelope: Data, nextEpoch: UInt64, added: [Data], remove
 open func processInbound(envelopeId: UInt64, ciphertext: Data)throws  -> InboundResult  {
     return try  FfiConverterTypeInboundResult_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
     uniffi_mls_ffi_fn_method_mlsclient_process_inbound(self.uniffiClonePointer(),
+        FfiConverterUInt64.lower(envelopeId),
+        FfiConverterData.lower(ciphertext),$0
+    )
+})
+}
+    
+    /**
+     * SEALED channel (ADR-0014): an ordinary application message for this conversation that was
+     * delivered without the relay learning who sent it. Decryption — and the MLS authentication
+     * that comes with it — is identical to [`Self::process_inbound`]; only the dedup space differs,
+     * because sealed envelope ids come from their own server-side sequence and would otherwise
+     * collide with identified ones. Acknowledge these through the relay's `sealed_ids`.
+     */
+open func processSealedInbound(envelopeId: UInt64, ciphertext: Data)throws  -> InboundResult  {
+    return try  FfiConverterTypeInboundResult_lift(try rustCallWithError(FfiConverterTypeMlsClientError_lift) {
+    uniffi_mls_ffi_fn_method_mlsclient_process_sealed_inbound(self.uniffiClonePointer(),
         FfiConverterUInt64.lower(envelopeId),
         FfiConverterData.lower(ciphertext),$0
     )
@@ -3676,6 +3701,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_process_inbound() != 65073) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_mls_ffi_checksum_method_mlsclient_process_sealed_inbound() != 11108) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_mls_ffi_checksum_method_mlsclient_process_self_inbound() != 28883) {
