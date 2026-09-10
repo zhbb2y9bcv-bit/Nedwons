@@ -406,9 +406,18 @@ final class InMemoryRelay: ConversationRelay, @unchecked Sendable {
             guard members[conversationID]?.contains(d.deviceID) == true else {
                 throw NedwonsClient.ClientError.http(status: 403, body: #"{"error":"forbidden"}"#)
             }
+            // A device with a pending removal intent is done participating: it can neither send
+            // nor receive, from the moment the departure was recorded (V31).
+            func departed(_ device: String) -> Bool {
+                intents.contains { $0.conversation == conversationID && $0.device == device && $0.removal }
+            }
+            if departed(d.deviceID) {
+                throw NedwonsClient.ClientError.http(status: 403, body: #"{"error":"departed"}"#)
+            }
             guard seenKeys.insert("\(d.deviceID)/*/\(Hex.encode(idempotencyKey))").inserted else { return 0 }
             var count = 0
-            for recipient in members[conversationID]!.sorted() where recipient != d.deviceID {
+            for recipient in members[conversationID]!.sorted()
+            where recipient != d.deviceID && !departed(recipient) {
                 enqueue(to: recipient, conversation: conversationID, sender: d.deviceID, ciphertext: ciphertext)
                 count += 1
             }
@@ -575,7 +584,7 @@ struct Participant {
     /// fail, silently, inside a `try?`. One character in, 16 identical bytes out — injective, so the
     /// fixture's convention survives: the FIRST character picks the account (making "alicx" alice's
     /// tablet) and the LAST picks the device.
-    private static func hexID(_ seed: Character) -> String {
+    static func hexID(_ seed: Character) -> String {
         String(repeating: String(format: "%02x", seed.asciiValue ?? 0x3f), count: 16)
     }
 
@@ -1499,6 +1508,26 @@ final class AuthoritativeMembershipTests: XCTestCase {
         XCTAssertEqual(
             relay.routedDevices(in: conv), [alice.deviceID, bob.deviceID, carol.deviceID],
             "routing does not move until a commit says so")
+        // ...yet Carol is already out for every purpose that matters to a user: mail sent now skips
+        // her, and her own sends are refused with the true reason.
+        await alice.model.sendMessage("sent while carol's removal is pending", to: conv)
+        _ = try await carol.coordinator.syncOnce()
+        XCTAssertFalse(
+            carol.texts(in: conv).map(\.0).contains("sent while carol's removal is pending"),
+            "delivery stops the moment the departure is recorded, not when the commit lands")
+        // Her send is refused at the relay as `departed` (the UI mapping of that code is covered by
+        // `GroupRefusal`; here the model's follow-up group-state refresh would hit this fixture's
+        // dead server and overwrite the banner, so the truthful assertion is the effect: nothing
+        // she sends after leaving reaches anyone).
+        await carol.model.sendMessage("carol trying to post after leaving", to: conv)
+        _ = try await alice.coordinator.syncOnce()
+        _ = try await bob.coordinator.syncOnce()
+        XCTAssertFalse(
+            alice.texts(in: conv).map(\.0).contains("carol trying to post after leaving"))
+        XCTAssertFalse(bob.texts(in: conv).map(\.0).contains("carol trying to post after leaving"))
+        XCTAssertNotEqual(
+            carol.model.banner, "Couldn't send that message. It stays queued and will retry.",
+            "a departure is a refusal with a reason, never a transient failure to retry")
 
         await alice.coordinator.reconcileSetup()
 
@@ -1512,6 +1541,51 @@ final class AuthoritativeMembershipTests: XCTestCase {
         _ = try await carol.coordinator.syncOnce()
         XCTAssertTrue(bob.texts(in: conv).map(\.0).contains("after carol left"))
         XCTAssertFalse(carol.texts(in: conv).map(\.0).contains("after carol left"))
+    }
+
+    /// A coordinator must not be constructible in a state where it silently cannot do membership.
+    /// This one sets NO providers: the signer and the pinned log key come from the model itself —
+    /// the enrolled device identity and the configured log key — exactly as in the shipped app.
+    /// The regression this guards is real: the first coordinator built without explicit wiring
+    /// could add nobody, and the failure lived inside a swallowed error.
+    func testCoordinatorResolvesSignerAndLogKeyFromTheModelWithoutWiring() async throws {
+        let relay = InMemoryRelay()
+        let bob = Participant("bob", relay: relay)
+
+        // Alice's model owns a real (in-memory) enrolled device identity, as a signed-in user's does.
+        let identity = DeviceIdentity(store: InMemoryDeviceKeyStore(), secureEnclaveAvailable: false)
+        _ = try identity.provision(policy: .allowSoftwareFallback)
+        let model = AppModel(
+            client: NedwonsClient(baseURL: URL(string: "http://127.0.0.1:1")!),
+            pinnedLogKey: Data("configured-log-key".utf8), deviceIdentity: identity)
+        let aliceAccount = Participant.hexID("a"), aliceDevice = Participant.hexID("z")
+        model.session = NedwonsClient.Session(
+            accountID: aliceAccount, deviceID: aliceDevice, accessToken: "alice-unwired",
+            accessExpiresAt: 1 << 40, refreshToken: "r", refreshExpiresAt: 1 << 40)
+        relay.register(token: "alice-unwired", accountID: aliceAccount, deviceID: aliceDevice)
+        let coordinator = ConversationCoordinator(
+            model: model, relay: relay,
+            storeDirectory: FileManager.default.temporaryDirectory
+                .appendingPathComponent("coord-unwired-\(UUID().uuidString)", isDirectory: true),
+            keyProvider: { storeID in Data(SHA256.hash(data: Data(storeID.utf8))) },
+            minimumKeyPackages: 2)
+        coordinator.attach(aliasStore: nil)
+        XCTAssertNil(coordinator.membershipSignerProvider, "the point: nothing was wired")
+        XCTAssertNil(coordinator.pinnedLogKeyProvider)
+
+        await bob.coordinator.ensureKeyPackages()
+        relay.createAuthoritativeConversation(conv, creatorDevice: aliceDevice, intended: [])
+        try await coordinator.bootstrap(conversationID: conv, memberAccountIDs: [])
+        relay.authorizeJoin(conversation: conv, account: bob.accountID, device: bob.deviceID)
+
+        await coordinator.reconcileSetup()
+
+        XCTAssertNil(model.securityNotice, "no 'cannot sign' notice: the model supplied the key")
+        XCTAssertEqual(relay.epoch(of: conv), 1, "the add commit was signed and accepted")
+        XCTAssertEqual(relay.routedDevices(in: conv), [aliceDevice, bob.deviceID])
+        await model.sendMessage("signed with the enrolled key", to: conv)
+        _ = try await bob.coordinator.syncOnce()
+        XCTAssertEqual(bob.texts(in: conv).map(\.0), ["signed with the enrolled key"])
     }
 
     /// Losing the epoch race must be harmless: the loser discards its staged commit rather than

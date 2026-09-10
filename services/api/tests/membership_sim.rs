@@ -1209,6 +1209,35 @@ async fn authoritative_leave_is_recorded_then_committed_by_someone_else() {
         "still routed, because only a commit may remove him"
     );
 
+    // ...but he is DONE participating from this moment, not from whenever the commit lands. New
+    // mail skips him, and his own sends are refused with a reason he can be told.
+    drain_inbox(&app, bob.token()).await; // clear anything queued before the leave
+    let envelope = group_a.encrypt(&alice.mls, b"sent after bob left").unwrap();
+    let (status, _) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conv_hex}/messages"),
+        alice.token(),
+        json!({ "ciphertext": hex::encode(&envelope), "idempotency_key": hex::encode([42u8; 16]) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        drain_inbox(&app, bob.token()).await.is_empty(),
+        "a departed member receives nothing, even before the remove-commit"
+    );
+    let (status, body) = post_json_auth(
+        &app,
+        &format!("/v1/conversations/{conv_hex}/messages"),
+        bob.token(),
+        json!({ "ciphertext": hex::encode(&envelope), "idempotency_key": hex::encode([43u8; 16]) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        body["error"], "departed",
+        "told the true reason, not a generic refusal"
+    );
+
     // Alice carries the departure out. Control type is Remove, not Leave: the committer is not the
     // person leaving, which is the only shape MLS can actually produce.
     let remove = group_a

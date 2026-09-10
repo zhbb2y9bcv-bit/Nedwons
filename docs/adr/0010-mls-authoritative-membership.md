@@ -253,13 +253,23 @@ the routing row survives until a remaining member's next sync turns the intent i
 commit (`control_type = 2`, since the committer is not the person leaving). The invariant stays
 exact: routing in an authoritative conversation is written only by an accepted commit.
 
-Honest costs of that choice:
+**Departure takes effect immediately, membership changes on commit — and that split is honest.**
+From the moment a removal intent is recorded, the relay's fan-out skips that device and refuses its
+sends (`403 departed`), so for the user "leave" and "remove" are instantaneous even though the
+routing row survives until the commit. This does not weaken the invariant, and the reason is worth
+being precise about. The relay can *already* decline to deliver to anyone, at any time, undetectably
+— that is the refuse-service power the "what the server cannot prove" section has always conceded.
+Gating delivery on a **recorded, authorized departure** therefore grants the relay nothing it
+lacked; it merely makes one specific non-delivery legible in the intent ledger. What the commit
+protocol protects is *membership*: who holds the epoch, and who can be added or removed. That still
+moves only by an accepted, device-signed commit. (An earlier revision of this section listed
+"still routed until the commit" as a real cost. It was; it is now fixed.)
 
-- Between the leave and the commit, the leaver is still routed and would receive newly sent mail.
-  In practice a member syncs within seconds; if literally nobody is online, nobody is sending
-  either. It is a latency, not a hole — but it is a real one.
+Honest costs that remain:
+
 - If **every** remaining member is permanently gone, the departure never becomes cryptographic. The
-  conversation is inert (no one to send), and retention reclaims it.
+  conversation is inert (no one to send, and the departed device receives nothing regardless), and
+  retention reclaims it.
 - `control_type = 3` is consequently unreachable in authoritative conversations. It remains in the
   wire format and in the legacy path; a v2 manifest should either drop it or bind it to an MLS
   SelfRemove proposal once OpenMLS exposes one.
@@ -294,7 +304,10 @@ relay, with recipient verification resolved against the live transparency log.
 - No external cryptographic review (R-202/R-503 remain launch blockers).
 
 **Operational note:** an authoritative conversation is unusable to a device with no enrolled signer —
-it can add nobody. The composition root wires `membershipSignerProvider`; anything else that builds a
-`ConversationCoordinator` must too, and the coordinator surfaces a security notice rather than
-retrying in silence if it cannot. This is not hypothetical: flipping the default immediately broke
-`SelfGroupLiveRun`, which built a coordinator without one.
+it can add nobody. Flipping the default immediately broke `SelfGroupLiveRun`, which built a
+coordinator without wiring one, and the failure was silent. Fixed at the root rather than by
+documentation: the coordinator now resolves the enrolled key and the pinned log key from the model
+itself, so a coordinator for a signed-in user cannot exist without them. The explicit providers
+remain only for harnesses whose session was minted with a synthetic identity. The one case that
+survives — a device that genuinely has no enrolled key — is a real device condition, and it raises a
+security notice instead of retrying in silence.
