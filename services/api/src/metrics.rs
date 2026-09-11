@@ -154,6 +154,13 @@ pub static PUSH_FAILURES: Counter = Counter::new(
     "nedwons_push_failures_total",
     "Contentless APNs wake pushes rejected or errored.",
 );
+/// Distinct from a failure: the push failed AND Apple said the address is permanently gone, so the
+/// row was removed. A steady trickle is normal (uninstalls); a spike means the build is pushing to
+/// the wrong APNs environment or topic.
+pub static PUSH_TOKENS_DROPPED: Counter = Counter::new(
+    "nedwons_push_tokens_dropped_total",
+    "Push tokens deleted after APNs reported them permanently invalid.",
+);
 
 // Key transparency: a gap here is a security incident, not a performance problem.
 pub static KT_APPENDS: Counter = Counter::new(
@@ -188,6 +195,7 @@ pub fn render() -> String {
         &ENVELOPES_DELIVERED,
         &PUSH_SENT,
         &PUSH_FAILURES,
+        &PUSH_TOKENS_DROPPED,
         &KT_APPENDS,
         &KT_APPEND_FAILURES,
         &ACCOUNTS_DELETED,

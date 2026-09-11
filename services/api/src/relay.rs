@@ -1557,6 +1557,23 @@ impl PgRelay {
             .collect())
     }
 
+    /// Delete ONE push token that APNs has rejected as permanently invalid (`410 Unregistered`,
+    /// `400 BadDeviceToken`/`DeviceTokenNotForTopic`). Idempotent; returns rows removed.
+    ///
+    /// Scoped to the exact token, not the device: a device may have re-registered a fresh token
+    /// between the dispatch and this cleanup, and deleting by device alone would throw away the
+    /// working replacement along with the dead one — silently disabling push for a live device.
+    pub fn delete_push_token(&self, device: &DeviceId, token: &str) -> StoreResult<u64> {
+        let mut conn = self.conn()?;
+        let removed = conn
+            .execute(
+                "DELETE FROM device_push_tokens WHERE device_id = $1 AND token = $2",
+                &[&device.as_bytes(), &token],
+            )
+            .map_err(db_err)?;
+        Ok(removed)
+    }
+
     /// Delete all of a device's push tokens (on revocation). Idempotent; returns rows removed.
     pub fn delete_push_tokens(&self, device: &DeviceId) -> StoreResult<u64> {
         let mut conn = self.conn()?;

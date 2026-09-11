@@ -45,17 +45,75 @@ pub struct ApnsRequest {
     pub body: Vec<u8>,
 }
 
+/// One APNs reply: the status and, for a rejection, the JSON body carrying Apple's `reason`.
+///
+/// The body is part of the contract, not diagnostic garnish. APNs signals "this token is dead"
+/// only in the reason string (`BadDeviceToken`, `Unregistered`, `DeviceTokenNotForTopic`), so a
+/// transport that returned the status alone could never distinguish a token worth deleting from a
+/// transient 503 — and the service would keep pushing to addresses Apple has already told it to
+/// stop using.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushResponse {
+    pub status: u16,
+    /// APNs error JSON (`{"reason":"…"}`); empty on success.
+    pub body: Vec<u8>,
+}
+
+impl PushResponse {
+    pub fn accepted() -> Self {
+        Self {
+            status: 200,
+            body: Vec::new(),
+        }
+    }
+
+    /// Apple's machine-readable rejection code, when the body carries one.
+    ///
+    /// Deliberately a substring scan rather than a JSON parse: the body is small, the shape is
+    /// fixed, and a malformed body must degrade to "unknown reason" (keep the token) instead of
+    /// failing the dispatch.
+    pub fn reason(&self) -> Option<&'static str> {
+        let body = std::str::from_utf8(&self.body).ok()?;
+        APNS_FATAL_TOKEN_REASONS
+            .into_iter()
+            .find(|reason| body.contains(reason))
+    }
+}
+
+/// Reasons that mean the TOKEN is permanently invalid, so the row should go. Everything else —
+/// `TooManyRequests`, `InternalServerError`, `ServiceUnavailable`, `ExpiredProviderToken`,
+/// `BadCertificateEnvironment` — is transient or an operator misconfiguration, where deleting a
+/// user's token would turn an outage into silent, permanent push loss for that device.
+const APNS_FATAL_TOKEN_REASONS: [&str; 3] =
+    ["BadDeviceToken", "Unregistered", "DeviceTokenNotForTopic"];
+
+/// Whether this reply means the stored token must be removed.
+///
+/// `410` is unconditional: Apple returns it only for a token that is no longer active. On `400`
+/// the reason decides, because that status also covers payload and header faults that say nothing
+/// about the token.
+pub fn token_is_dead(response: &PushResponse) -> bool {
+    match response.status {
+        410 => true,
+        400 => matches!(
+            response.reason(),
+            Some("BadDeviceToken") | Some("DeviceTokenNotForTopic") | Some("Unregistered")
+        ),
+        _ => false,
+    }
+}
+
 /// Injected so the protocol logic is testable without a network. Blocking; called off the async
-/// path. Returns the APNs HTTP status (200 = accepted).
+/// path.
 pub trait PushTransport: Send + Sync {
-    fn post(&self, request: &ApnsRequest) -> Result<u16, String>;
+    fn post(&self, request: &ApnsRequest) -> Result<PushResponse, String>;
 }
 
 /// A transport that sends nothing (kept for tests and for explicitly-disabled deployments).
 pub struct NullTransport;
 impl PushTransport for NullTransport {
-    fn post(&self, _request: &ApnsRequest) -> Result<u16, String> {
-        Ok(200)
+    fn post(&self, _request: &ApnsRequest) -> Result<PushResponse, String> {
+        Ok(PushResponse::accepted())
     }
 }
 
@@ -107,7 +165,7 @@ impl HttpPushTransport {
 }
 
 impl PushTransport for HttpPushTransport {
-    fn post(&self, request: &ApnsRequest) -> Result<u16, String> {
+    fn post(&self, request: &ApnsRequest) -> Result<PushResponse, String> {
         let url = format!("{}{}", self.base_url, request.path);
         let response = self
             .client()?
@@ -119,7 +177,16 @@ impl PushTransport for HttpPushTransport {
             .body(request.body.clone())
             .send()
             .map_err(|e| format!("apns send: {e}"))?;
-        Ok(response.status().as_u16())
+        let status = response.status().as_u16();
+        // Read the body only for rejections: a 200 carries none, and the error bodies are a few
+        // dozen bytes. A body that cannot be read degrades to empty, which reads as "unknown
+        // reason" and therefore keeps the token.
+        let body = if status == 200 {
+            Vec::new()
+        } else {
+            response.bytes().map(|b| b.to_vec()).unwrap_or_default()
+        };
+        Ok(PushResponse { status, body })
     }
 }
 
@@ -288,8 +355,44 @@ impl PushService {
                 // Best-effort by design (a wake push is a hint, never the delivery path), but the
                 // OUTCOME still has to be observable: silent push failure looks exactly like "no
                 // traffic" from the outside, and that is how an outage hides.
+                //
+                // ONLY 200 is "sent". This previously counted every `Ok` — so a 410 Unregistered,
+                // a 400 BadDeviceToken and a 403 from an expired provider key all incremented the
+                // success counter. The dashboard then showed a perfectly healthy push pipeline
+                // while Apple was rejecting every single notification, which is precisely the
+                // failure this metric exists to make visible.
                 match inner.transport.post(&req) {
-                    Ok(_) => crate::metrics::PUSH_SENT.incr(),
+                    Ok(response) if response.status == 200 => crate::metrics::PUSH_SENT.incr(),
+                    Ok(response) => {
+                        crate::metrics::PUSH_FAILURES.incr();
+                        let reason = response.reason().unwrap_or("unspecified");
+                        if token_is_dead(&response) {
+                            // Apple has told us this address is permanently gone (the app was
+                            // uninstalled, or the token belongs to another environment/topic).
+                            // Keeping it means pushing into the void forever and re-counting the
+                            // same failure on every message.
+                            match inner.relay.delete_push_token(&DeviceId(*device), &token) {
+                                Ok(removed) if removed > 0 => {
+                                    crate::metrics::PUSH_TOKENS_DROPPED.incr();
+                                    tracing::info!(
+                                        status = response.status,
+                                        reason,
+                                        "dropped a push token APNs rejected as permanently invalid"
+                                    );
+                                }
+                                Ok(_) => {}
+                                Err(e) => {
+                                    tracing::warn!("could not drop a dead push token: {e}");
+                                }
+                            }
+                        } else {
+                            tracing::warn!(
+                                status = response.status,
+                                reason,
+                                "APNs refused a wake push"
+                            );
+                        }
+                    }
                     Err(_) => crate::metrics::PUSH_FAILURES.incr(),
                 }
             }

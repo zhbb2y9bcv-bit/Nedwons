@@ -78,11 +78,12 @@ async fn http_push_transport_speaks_http2_end_to_end() {
     // The real transport, pointed at the local server (http:// ⇒ HTTP/2 prior knowledge).
     let transport = HttpPushTransport::new(format!("http://{addr}"));
     let request = build_push(&test_cfg(), "deadbeefcafe", 1_700_000_000);
-    let status = tokio::task::spawn_blocking(move || transport.post(&request))
+    let reply = tokio::task::spawn_blocking(move || transport.post(&request))
         .await
         .unwrap()
         .expect("post succeeds");
-    assert_eq!(status, 200);
+    assert_eq!(reply.status, 200);
+    assert!(reply.body.is_empty(), "an accepted push carries no error body");
 
     let seen = seen.lock().unwrap().clone().expect("server saw the push");
     // The APNs contract requires HTTP/2 — assert the connection actually negotiated it.
@@ -101,8 +102,12 @@ async fn http_push_transport_speaks_http2_end_to_end() {
 #[tokio::test]
 async fn transport_reports_a_non_200_apns_status() {
     // APNs signals token errors via status codes (e.g. 410 Unregistered); the transport must
-    // surface them, not swallow them.
-    let app = Router::new().route("/3/device/{token}", post(|| async { StatusCode::GONE }));
+    // surface them, not swallow them — INCLUDING the body, because the machine-readable `reason`
+    // lives only there and is what decides whether the stored token gets deleted.
+    let app = Router::new().route(
+        "/3/device/{token}",
+        post(|| async { (StatusCode::GONE, r#"{"reason":"Unregistered"}"#) }),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -111,11 +116,17 @@ async fn transport_reports_a_non_200_apns_status() {
 
     let transport = HttpPushTransport::new(format!("http://{addr}"));
     let request = build_push(&test_cfg(), "gonetoken", 1_700_000_000);
-    let status = tokio::task::spawn_blocking(move || transport.post(&request))
+    let reply = tokio::task::spawn_blocking(move || transport.post(&request))
         .await
         .unwrap()
         .expect("request completes");
-    assert_eq!(status, 410, "410 Unregistered surfaces to the caller");
+    assert_eq!(reply.status, 410, "410 Unregistered surfaces to the caller");
+    assert_eq!(
+        reply.reason(),
+        Some("Unregistered"),
+        "the reason must survive the transport, or the token can never be cleaned up"
+    );
+    assert!(nedwons_api::push::token_is_dead(&reply));
 }
 
 #[test]
