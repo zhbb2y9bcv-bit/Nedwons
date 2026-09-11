@@ -75,6 +75,44 @@ public final class AppModel: ObservableObject {
 
     /// App Attest (#10, ADR-0017). Runs once per install and converges on later launches.
     public let appAttest = AppAttestCoordinator()
+
+    /// A pairing model for the role this device is playing (ADR-0008, BN-4).
+    ///
+    /// Built here because both roles need things only the model has: the Enclave-backed identity
+    /// (new device) and the trusted signer plus session (existing device).
+    public func pairingModel(role: DevicePairingModel.Role) -> DevicePairingModel {
+        DevicePairingModel(
+            role: role,
+            provisionKey: { [deviceIdentity, provisionPolicy] in
+                // Reuse an already-enrolled key if this device has one, so re-running pairing does
+                // not strand the previous key; otherwise provision under the current policy, which
+                // fails closed on hardware without a Secure Enclave (INV-3).
+                if let existing = try deviceIdentity.loadEnrolled() {
+                    return existing.signer.publicKeyX963
+                }
+                return try deviceIdentity.provision(policy: provisionPolicy).signer.publicKeyX963
+            },
+            enroll: { [weak self] publicKey in
+                guard let self, let token = self.token, let account = self.session?.accountID,
+                    let enrolled = try? self.deviceIdentity.loadEnrolled()
+                else { throw NedwonsClient.ClientError.transport("not signed in") }
+                return try await self.client.enrollDevice(
+                    accessToken: token, accountID: account,
+                    trustedSigner: enrolled.signer, newDevicePublicKeyX963: publicKey)
+            },
+            adopt: { [weak self] session in
+                guard let self else { return }
+                self.adoptPairedSession(session)
+            })
+    }
+
+    /// Adopt a session handed over by a trusted device during pairing. Same path as a fresh
+    /// sign-in: persisted, bound to a proof authority, push- and attest-registered.
+    func adoptPairedSession(_ session: NedwonsClient.Session) {
+        adopt(session)
+        phase = .authenticated
+        Task { await loadInitial() }
+    }
     private let deviceIdentity: DeviceIdentity
     private let sessionStore: SessionStore
 

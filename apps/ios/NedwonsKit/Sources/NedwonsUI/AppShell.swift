@@ -285,6 +285,16 @@ public struct DevicesScreen: View {
                 }
 
                 Section {
+                    NavigationLink("Add a device") {
+                        PairTrustedDeviceView(model: model.pairingModel(role: .trustedDevice))
+                    }
+                } footer: {
+                    Text(
+                        "Scan the code shown on the new device, then compare the pairing code on "
+                            + "both screens before confirming.")
+                }
+
+                Section {
                     Button("Check the transparency log") { Task { await model.auditDevices() } }
                     Button("Refresh devices") { Task { await model.refreshDevices() } }
                 }

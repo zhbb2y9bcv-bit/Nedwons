@@ -28,6 +28,7 @@ struct WelcomeView: View {
     @Environment(\.colorScheme) private var scheme
     @State private var showRegister = false
     @State private var showLogin = false
+    @State private var showPairing = false
     private var palette: Nedwons.Palette { .forScheme(scheme) }
 
     var body: some View {
@@ -56,12 +57,26 @@ struct WelcomeView: View {
                 .disabled(model.isBusy)
                 .frame(maxWidth: .infinity, alignment: .center)
                 .padding(.top, Nedwons.Spacing.xs)
+            // The third path onto an account, and the only one that needs no password: an existing
+            // device vouches for this one by signing its key (ADR-0008). Offered here because a
+            // second phone has nothing to log in WITH — a password alone can never enroll a device
+            // (INV-2), so without this entry point the flow is unreachable.
+            Button("Add this device to an existing account") { showPairing = true }
+                .disabled(model.isBusy)
+                .font(Nedwons.TypeScale.callout)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .padding(.top, Nedwons.Spacing.xs)
         }
         .padding(Nedwons.Spacing.xl)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(palette.background)
         .sheet(isPresented: $showRegister) { RegisterView(model: model) }
         .sheet(isPresented: $showLogin) { LoginView(model: model) }
+        .sheet(isPresented: $showPairing) {
+            NavigationStack {
+                PairNewDeviceView(model: model.pairingModel(role: .newDevice))
+            }
+        }
     }
 }
 
