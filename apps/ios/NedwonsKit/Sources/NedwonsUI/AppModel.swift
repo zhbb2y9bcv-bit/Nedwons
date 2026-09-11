@@ -67,6 +67,11 @@ public final class AppModel: ObservableObject {
 
     /// Owns the live tokens and the one in-flight refresh. `nil` until sign-in or restore.
     private var authority: SessionAuthority?
+
+    /// Backing store for `pushRegistration`. A `lazy var` cannot be used: its initializer is
+    /// treated as a default argument, which cannot be both main-actor-isolated (it captures this
+    /// model) and nonisolated.
+    private var pushRegistrationStorage: PushRegistrationCoordinator?
     private let deviceIdentity: DeviceIdentity
     private let sessionStore: SessionStore
 
@@ -152,6 +157,7 @@ public final class AppModel: ObservableObject {
                 return
             }
             session = stored
+            await pushRegistration.sessionEstablished(accountID: stored.accountID)
             await loadInitial()
             phase = .authenticated
         } catch NedwonsClient.ClientError.transport {
@@ -257,6 +263,8 @@ public final class AppModel: ObservableObject {
         acknowledgedDeviceIDs = [s.deviceID]
         try? sessionStore.save(s)
         bindAuthority(to: s)
+        // A device token may already be in hand from launch; this is the other half of the pair.
+        Task { await pushRegistration.sessionEstablished(accountID: s.accountID) }
     }
 
     /// Bind the transport to a `SessionAuthority` for `s`, so from here on every authenticated
@@ -288,6 +296,10 @@ public final class AppModel: ObservableObject {
     public func signOut() {
         // Clears session state only; the enrolled device key stays in the Keychain so the same
         // device can sign back in (device binding persists across sign-out).
+        // Forget the push registration too: the APNs token belongs to the INSTALL, not the user, so
+        // without this a different account signing in on this device would be considered already
+        // registered and would never be woken.
+        pushRegistration.signedOut()
         sessionStore.clear()
         session = nil
         myProfile = nil
@@ -690,6 +702,25 @@ public final class AppModel: ObservableObject {
             guard let token else { return }
             try await client.registerPushToken(accessToken: token, token: pushToken)
         }
+    }
+
+    /// The APNs lifecycle for this app (#4). Lazy so it captures a fully-initialized model, and
+    /// owned here because it needs exactly what this type has: the session and the transport.
+    ///
+    /// The closure THROWS on a missing session rather than returning quietly. The coordinator only
+    /// records a registration it believes succeeded, so swallowing this would let it cache a
+    /// registration that never happened and then decline to retry — which is the same silent hole
+    /// `registerPush` had on its own.
+    public var pushRegistration: PushRegistrationCoordinator {
+        if let existing = pushRegistrationStorage { return existing }
+        let coordinator = PushRegistrationCoordinator { [weak self] pushToken in
+            guard let self, let token = self.token else {
+                throw NedwonsClient.ClientError.transport("not signed in")
+            }
+            try await self.client.registerPushToken(accessToken: token, token: pushToken)
+        }
+        pushRegistrationStorage = coordinator
+        return coordinator
     }
 
     /// The pinned transparency-log key: `AppConfig`'s if the build ships one, else trust-on-first-use

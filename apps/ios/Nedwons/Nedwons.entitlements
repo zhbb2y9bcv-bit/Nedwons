@@ -4,11 +4,17 @@
   App entitlements (least privilege). Wired into the build via project.yml (CODE_SIGN_ENTITLEMENTS).
   These declare the capabilities; the matching App ID + provisioning profile are configured in the
   Apple Developer portal (your side) before a device build will sign.
+
+  THESE MUST STAY IDENTICAL TO NotificationService.entitlements for the two group entries below.
+  The extension decrypts a contentless push by reading the SAME shared MLS store (app group) and the
+  SAME session / at-rest root (Keychain access group) the app wrote. If either identifier differs,
+  nothing errors: the extension finds no session and every push silently degrades to the generic
+  "New message" wake. That failure is invisible in the Simulator, where neither group is enforced
+  the way it is on device — which is exactly why `BuildConfiguration.validate()` checks them at
+  launch instead of trusting them.
+
   - App Attest (#10): appattest-environment (development here; "production" for release).
   - Push (#4): aps-environment; payloads are opaque wake-ups only (PRIVACY.md / PUSH_NOTIFICATIONS.md).
-  - Keychain access group (shared with the Notification Service Extension so it can read the same
-    session / at-rest root to decrypt): uncomment once the App ID + app group are provisioned; the
-    identifier must match the real group.
 -->
 <plist version="1.0">
 <dict>
@@ -16,11 +22,23 @@
     <string>development</string>
     <key>com.apple.developer.devicecheck.appattest-environment</key>
     <string>development</string>
-    <!-- Enable once the App ID + Keychain group are provisioned (required for the NSE to decrypt):
+    <!--
+      Shared container for the MLS stores the extension opens under the single-writer lock
+      (ADR-0007). Must equal the NedwonsAppGroup Info.plist value and the extension's entry.
+    -->
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.app.nedwons.demo</string>
+    </array>
+    <!--
+      Shared Keychain so the extension can read the session token and the at-rest root. The
+      $(AppIdentifierPrefix) expansion is the team prefix; the value passed to SecItem* at runtime
+      is the fully-qualified "<TEAMID>.app.nedwons.shared", built by
+      SharedAppIdentifiers.keychainAccessGroup() from NedwonsTeamIdentifierPrefix.
+    -->
     <key>keychain-access-groups</key>
     <array>
         <string>$(AppIdentifierPrefix)app.nedwons.shared</string>
     </array>
-    -->
 </dict>
 </plist>

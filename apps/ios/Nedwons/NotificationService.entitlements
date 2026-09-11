@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Notification Service Extension entitlements.
+
+  The two group entries are IDENTICAL to Nedwons.entitlements, and that is the entire point of this
+  file: an extension has its own bundle identifier, so without explicit shared groups it gets its
+  own private container and its own private Keychain. It would then find no MLS store and no
+  session, and every contentless push would fall back to the generic "New message" wake — silently,
+  on device only, with nothing in the logs to say why.
+
+  The extension deliberately holds NO capabilities of its own. It does not push, does not attest,
+  and never registers for remote notifications; it only reads what the app already wrote.
+  `aps-environment` and the App Attest entitlement belong to the app target alone.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.app.nedwons.demo</string>
+    </array>
+    <key>keychain-access-groups</key>
+    <array>
+        <string>$(AppIdentifierPrefix)app.nedwons.shared</string>
+    </array>
+</dict>
+</plist>

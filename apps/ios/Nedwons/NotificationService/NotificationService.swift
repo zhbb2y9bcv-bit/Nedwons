@@ -21,24 +21,90 @@ import UserNotifications
 /// concurrency here entirely. **Fail-safe:** missing shared state, a network error, or a decrypt
 /// failure falls back to the generic wake. See `docs/NOTIFICATION_EXTENSION.md`.
 final class NotificationService: UNNotificationServiceExtension {
+    /// The extension's own budget, deliberately under the ~30s the system allows.
+    ///
+    /// Finishing on OUR deadline rather than the system's is the whole point: when iOS runs the
+    /// clock out it kills the process, and the user sees the unmodified payload — the literal
+    /// string "New message" — with no chance to present best-attempt content. Returning early with
+    /// whatever we have is always better than being killed with something better half-built.
+    private static let budget: TimeInterval = 20
+
+    /// Per-request network timeout. Must leave room for a second call (inbox fetch, then ack)
+    /// inside `budget`.
+    static let networkTimeout: TimeInterval = 8
+
+    /// Retained so `serviceExtensionTimeWillExpire` can deliver something.
+    private var contentHandler: ((UNNotificationContent) -> Void)?
+    private var bestAttempt: UNNotificationContent?
+    /// Guards exactly-once delivery. `UNNotificationServiceExtension` calls the handler at most
+    /// once by contract, and calling it twice is a hard error — but there are now two callers (the
+    /// normal path and the expiry callback) which can race, so the guarantee needs enforcing rather
+    /// than assuming.
+    private let delivered = DeliveryLatch()
+    /// Cancels in-flight work when the deadline fires, so the process is not still fetching while
+    /// the system tears it down.
+    private var work: DispatchWorkItem?
+
     override func didReceive(
         _ request: UNNotificationRequest,
         withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void
     ) {
-        let content = request.content.mutableCopy() as? UNMutableNotificationContent
-        let fallback = content ?? request.content
+        let mutable = request.content.mutableCopy() as? UNMutableNotificationContent
+        let fallback = mutable ?? request.content
+        self.contentHandler = contentHandler
+        self.bestAttempt = fallback
 
         guard let shared = SharedNotificationContext.current() else {
-            contentHandler(fallback)  // no provisioned shared state → generic wake
+            deliver(fallback)  // no provisioned shared state → generic wake
             return
         }
-        if let resolved = Self.resolveBlocking(shared: shared), let content {
-            content.title = resolved.title
-            content.body = resolved.body
-            contentHandler(content)
-        } else {
-            contentHandler(fallback)  // control-only or an error → generic wake
+
+        // Our own deadline, ahead of the system's. Fires on the main queue so it cannot be starved
+        // by the work item occupying a background queue.
+        let deadline = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.work?.cancel()
+            self.deliver(self.bestAttempt ?? fallback)
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.budget, execute: deadline)
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            let resolved = Self.resolveBlocking(shared: shared)
+            // The deadline may have fired while this was running; `deliver` makes the loser a
+            // no-op rather than a duplicate-call crash.
+            deadline.cancel()
+            if let resolved, let mutable {
+                mutable.title = resolved.title
+                mutable.body = resolved.body
+                self.deliver(mutable)
+            } else {
+                self.deliver(fallback)  // control-only or an error → generic wake
+            }
+        }
+        self.work = work
+        DispatchQueue.global(qos: .userInitiated).async(execute: work)
+    }
+
+    /// The system is about to kill us. Deliver the best content we have — not nothing.
+    ///
+    /// Without this override iOS presents the ORIGINAL payload, which is the placeholder the relay
+    /// sent. Overriding it is the difference between "a generic wake because we ran out of time"
+    /// and "a generic wake because we were killed mid-flight", and only the first is a deliberate
+    /// product behaviour.
+    override func serviceExtensionTimeWillExpire() {
+        work?.cancel()
+        if let bestAttempt {
+            deliver(bestAttempt)
+        }
+    }
+
+    /// Exactly-once delivery. Every path funnels through here.
+    private func deliver(_ content: UNNotificationContent) {
+        guard delivered.claim() else { return }
+        let handler = contentHandler
+        contentHandler = nil
+        handler?(content)
     }
 
     /// Under the cross-process store lock. Fully synchronous; the async client calls are bridged
@@ -82,37 +148,82 @@ final class NotificationService: UNNotificationServiceExtension {
     }
 }
 
+/// A one-shot claim. Guards the exactly-once delivery contract: `UNNotificationServiceExtension`
+/// permits the content handler to be called at most once, and there are now two callers — the
+/// normal completion and the deadline — which can race.
+private final class DeliveryLatch: @unchecked Sendable {
+    private let lock = NSLock()
+    private var taken = false
+
+    /// `true` exactly once, for whichever caller arrives first.
+    func claim() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if taken { return false }
+        taken = true
+        return true
+    }
+}
+
 /// A `Sendable` box carrying an async result back across a blocking bridge.
 private final class ResultBox<T: Sendable>: @unchecked Sendable {
     var value: T?
 }
 
+/// A `URLSession` that gives up quickly.
+///
+/// The extension lives on a hard deadline, so the default 60-second request timeout is far longer
+/// than the entire budget — one unreachable relay would consume every second the system granted and
+/// the user would get the placeholder payload. These bounds guarantee the network can never be the
+/// reason we run out of time.
+private func extensionURLSession() -> URLSession {
+    let config = URLSessionConfiguration.ephemeral
+    config.timeoutIntervalForRequest = NotificationService.networkTimeout
+    config.timeoutIntervalForResource = NotificationService.networkTimeout
+    config.waitsForConnectivity = false  // never park waiting for a network that is not there
+    config.allowsCellularAccess = true
+    return URLSession(configuration: config)
+}
+
 /// Only the `Sendable` `[InboxEnvelope]` crosses the Task boundary.
+///
+/// The wait is BOUNDED. `sem.wait()` with no timeout is indistinguishable from a hang: the task
+/// could be blocked on a socket that never answers, and this thread would sit there until the
+/// system killed the process.
 private func blockingFetchInbox(baseURL: URL, token: String) -> [InboxEnvelope] {
     let sem = DispatchSemaphore(value: 0)
     let box = ResultBox<[InboxEnvelope]>()
-    Task {
-        let client = NedwonsClient(baseURL: baseURL)
+    let task = Task {
+        let client = NedwonsClient(baseURL: baseURL, session: extensionURLSession())
         box.value = try? await client.fetchInbox(accessToken: token)
         sem.signal()
     }
-    sem.wait()
+    if sem.wait(timeout: .now() + NotificationService.networkTimeout + 2) == .timedOut {
+        task.cancel()
+        return []
+    }
     return box.value ?? []
 }
 
-/// Best-effort.
+/// Best-effort, and likewise bounded.
+///
+/// Timing out here is safe in the direction that matters: an un-acked envelope stays queued and the
+/// app collects it later, whereas blocking until the deadline would cost the user the decrypted
+/// notification that has ALREADY been computed.
 private func blockingAck(
     baseURL: URL, token: String, ids: [Int], sealedIds: [Int], selfGroupIds: [Int]
 ) {
     if ids.isEmpty && sealedIds.isEmpty && selfGroupIds.isEmpty { return }
     let sem = DispatchSemaphore(value: 0)
-    Task {
-        let client = NedwonsClient(baseURL: baseURL)
+    let task = Task {
+        let client = NedwonsClient(baseURL: baseURL, session: extensionURLSession())
         try? await client.ackInbox(
             accessToken: token, ids: ids, sealedIds: sealedIds, selfGroupIds: selfGroupIds)
         sem.signal()
     }
-    sem.wait()
+    if sem.wait(timeout: .now() + NotificationService.networkTimeout + 2) == .timedOut {
+        task.cancel()
+    }
 }
 
 /// Sourced from the app group + shared Keychain; `nil` until those are provisioned, so the

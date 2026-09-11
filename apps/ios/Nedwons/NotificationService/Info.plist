@@ -29,7 +29,11 @@
 	</dict>
 	<key>NedwonsAppGroup</key>
 	<string></string>
+	<key>NedwonsKeychainAccessGroup</key>
+	<string></string>
 	<key>NedwonsServerURL</key>
+	<string></string>
+	<key>NedwonsTeamIdentifierPrefix</key>
 	<string></string>
 </dict>
 </plist>

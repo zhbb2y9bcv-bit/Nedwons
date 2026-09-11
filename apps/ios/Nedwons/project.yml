@@ -9,6 +9,16 @@ options:
     iOS: "17.0"
   createIntermediateGroups: true
 
+# Three channels, because the settings that make development pleasant are exactly the ones that
+# must never ship: a loopback relay, an unpinned transparency log, and the development APNs and
+# App Attest environments. `BuildConfiguration.validateAtLaunch()` reads NedwonsBuildChannel and
+# REFUSES to start a Release build carrying any of them, so the separation is enforced at runtime
+# rather than trusted.
+configs:
+  Debug: debug
+  Staging: release
+  Release: release
+
 packages:
   NedwonsKit:
     path: ../NedwonsKit
@@ -65,6 +75,21 @@ targets:
         # entitlement on BOTH targets; AppComposition then roots MLS stores in the shared
         # container and the notification extension can decrypt (NOTIFICATION_EXTENSION.md).
         NedwonsAppGroup: ""
+        # Shared Keychain access group (SUFFIX only — the team prefix is supplied separately, since
+        # the entitlement's $(AppIdentifierPrefix) is expanded by the signing system, not here).
+        # Must match NotificationService's value and both entitlements files.
+        NedwonsKeychainAccessGroup: ""
+        # The team prefix $(AppIdentifierPrefix) expands to, so runtime can build the fully
+        # qualified "<TEAMID>.<suffix>" that SecItem* requires.
+        NedwonsTeamIdentifierPrefix: ""
+        # Which channel this build is. Drives BuildConfiguration's strictness; an unset value is
+        # treated as Debug, never as production.
+        NedwonsBuildChannel: "$(NEDWONS_BUILD_CHANNEL)"
+        # Entitlement values mirrored for launch validation — entitlements are not readable from
+        # the Info.plist at runtime, so a Release build cannot otherwise detect that it still
+        # carries the development APNs or App Attest environment.
+        NedwonsEntitlement.aps-environment: "$(NEDWONS_APS_ENVIRONMENT)"
+        NedwonsEntitlement.com.apple.developer.devicecheck.appattest-environment: "$(NEDWONS_APPATTEST_ENVIRONMENT)"
         # Export compliance. Declared TRUE deliberately: this app's core function is end-to-end
         # encrypted messaging, so claiming one of the exemptions would be a claim we cannot
         # substantiate — and it is made to a regulator, not to Apple. Declaring true means export
@@ -82,6 +107,21 @@ targets:
         # Capabilities are declared in the entitlements file; the App ID + provisioning profile that
         # authorize them are configured in the Apple Developer portal (your side).
         CODE_SIGN_ENTITLEMENTS: Nedwons.entitlements
+      configs:
+        Debug:
+          NEDWONS_BUILD_CHANNEL: debug
+          NEDWONS_APS_ENVIRONMENT: development
+          NEDWONS_APPATTEST_ENVIRONMENT: development
+        Staging:
+          NEDWONS_BUILD_CHANNEL: staging
+          NEDWONS_APS_ENVIRONMENT: development
+          NEDWONS_APPATTEST_ENVIRONMENT: development
+        # Release must carry the production environments. Shipping 'development' here means every
+        # push is addressed to the sandbox APNs gateway and silently never arrives.
+        Release:
+          NEDWONS_BUILD_CHANNEL: release
+          NEDWONS_APS_ENVIRONMENT: production
+          NEDWONS_APPATTEST_ENVIRONMENT: production
 
   # The macOS companion app: the SAME @main, composition, screens, and Rust core (the xcframework
   # carries a macos-arm64 slice), sandboxed with least privilege. It is a second DEVICE of your
@@ -166,9 +206,14 @@ targets:
         # equal to the app target's values.
         NedwonsServerURL: ""
         NedwonsAppGroup: ""
+        NedwonsKeychainAccessGroup: ""
+        NedwonsTeamIdentifierPrefix: ""
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.nedwons.demo.NotificationService
+        # Without this the extension signs into its OWN app group and Keychain, finds no session,
+        # and every push degrades to the generic wake — on device only.
+        CODE_SIGN_ENTITLEMENTS: NotificationService.entitlements
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_VERSION: "6.0"
         MARKETING_VERSION: "0.1.0"

@@ -14,8 +14,17 @@ public struct SessionStore: Sendable {
         self.account = account
     }
 
-    public init(service: String = "app.nedwons.session") {
-        self.init(store: KeychainStore(service: service))
+    /// The session store both the app and the Notification Service Extension use.
+    ///
+    /// `accessGroup` defaults to the build's configured shared group, so the extension reads the
+    /// SAME item the app wrote. Left as its own private keychain when the build has no group
+    /// provisioned (Simulator, development), where the extension then falls back to a generic wake
+    /// rather than silently reading an empty keychain and appearing broken.
+    public init(
+        service: String = "app.nedwons.session",
+        accessGroup: String? = SharedAppIdentifiers.keychainAccessGroup()
+    ) {
+        self.init(store: KeychainStore(service: service, accessGroup: accessGroup))
     }
 
     /// Codable mirror of `NedwonsClient.Session` (which stays a plain value type in the client).

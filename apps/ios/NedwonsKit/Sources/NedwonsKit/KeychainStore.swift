@@ -10,9 +10,40 @@ import Security
 /// Keychain and is validated on device (RISK_REGISTER R-101).
 public struct KeychainStore: Sendable {
     public let service: String
+    /// The shared Keychain access group, or `nil` for the app's private default group.
+    ///
+    /// EXPLICIT, never inferred. An app and its Notification Service Extension have different
+    /// bundle identifiers and therefore different default access groups, so a `KeychainStore` with
+    /// no group reads a DIFFERENT keychain in each target. The extension would find no session, and
+    /// every push would silently degrade to the generic wake — on device only, since the failure is
+    /// invisible until both targets are really signed and installed.
+    ///
+    /// Passing the group explicitly makes that sharing a declared property of the call site rather
+    /// than an accident of entitlement ordering.
+    public let accessGroup: String?
 
-    public init(service: String) {
+    public init(service: String, accessGroup: String? = nil) {
         self.service = service
+        self.accessGroup = accessGroup
+    }
+
+    /// The query attributes identifying an item: service, account, and the access group when one
+    /// is configured.
+    ///
+    /// The group is OMITTED rather than set to nil when absent. `kSecAttrAccessGroup` present with
+    /// an empty or unentitled value fails the query outright (`errSecMissingEntitlement`), which in
+    /// the Simulator — where keychain groups are not enforced the same way — turns into a confusing
+    /// "works here, fails on device" difference.
+    func baseQuery(account: String) -> [String: Any] {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+        ]
+        if let accessGroup {
+            query[kSecAttrAccessGroup as String] = accessGroup
+        }
+        return query
     }
 
     public enum KeychainError: Error, Equatable {
@@ -35,11 +66,7 @@ public struct KeychainStore: Sendable {
         account: String,
         accessible: CFString = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
     ) throws {
-        let base: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
+        let base = baseQuery(account: account)
         let updateStatus = SecItemUpdate(
             base as CFDictionary,
             [
@@ -65,13 +92,9 @@ public struct KeychainStore: Sendable {
 
     /// Load the item for `account`, or `nil` if absent.
     public func load(account: String) throws -> Data? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
+        var query = baseQuery(account: account)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &item)
         if status == errSecItemNotFound {
@@ -85,11 +108,7 @@ public struct KeychainStore: Sendable {
 
     /// Remove the item for `account` (idempotent).
     public func delete(account: String) throws {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
-        ]
+        let query = baseQuery(account: account)
         let status = SecItemDelete(query as CFDictionary)
         guard status == errSecSuccess || status == errSecItemNotFound else {
             throw KeychainError.unexpectedStatus(status)
