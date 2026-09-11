@@ -72,6 +72,9 @@ public final class AppModel: ObservableObject {
     /// treated as a default argument, which cannot be both main-actor-isolated (it captures this
     /// model) and nonisolated.
     private var pushRegistrationStorage: PushRegistrationCoordinator?
+
+    /// App Attest (#10, ADR-0017). Runs once per install and converges on later launches.
+    public let appAttest = AppAttestCoordinator()
     private let deviceIdentity: DeviceIdentity
     private let sessionStore: SessionStore
 
@@ -157,12 +160,20 @@ public final class AppModel: ObservableObject {
                 return
             }
             session = stored
+            // The relaunch case, which is the whole reason these are persisted.
+            acknowledgedDeviceIDs = deviceAcknowledgements.acknowledged(for: stored.accountID)
+                .union([stored.deviceID])
             await pushRegistration.sessionEstablished(accountID: stored.accountID)
+            // An install created before attestation was wired — or whose earlier attempt failed —
+            // still converges here rather than staying unattested forever.
+            Task { await attestDeviceIfNeeded() }
             await loadInitial()
             phase = .authenticated
         } catch NedwonsClient.ClientError.transport {
             // Offline at launch is not an auth failure; keep the session and let the user retry.
             session = stored
+            acknowledgedDeviceIDs = deviceAcknowledgements.acknowledged(for: stored.accountID)
+                .union([stored.deviceID])
             loadVerifiedPeers()
             phase = .authenticated
             banner = "You're offline. Showing what's stored on this device."
@@ -260,11 +271,15 @@ public final class AppModel: ObservableObject {
     /// Persist + adopt a freshly issued session. The current device is trusted from enrollment.
     private func adopt(_ s: NedwonsClient.Session) {
         session = s
-        acknowledgedDeviceIDs = [s.deviceID]
+        // Restore what this ACCOUNT has recognised before, then add the device signing in now.
+        acknowledgedDeviceIDs = deviceAcknowledgements.acknowledged(for: s.accountID)
+            .union([s.deviceID])
+        deviceAcknowledgements.replace(acknowledgedDeviceIDs, for: s.accountID)
         try? sessionStore.save(s)
         bindAuthority(to: s)
         // A device token may already be in hand from launch; this is the other half of the pair.
         Task { await pushRegistration.sessionEstablished(accountID: s.accountID) }
+        Task { await attestDeviceIfNeeded() }
     }
 
     /// Bind the transport to a `SessionAuthority` for `s`, so from here on every authenticated
@@ -477,8 +492,15 @@ public final class AppModel: ObservableObject {
     @Published public var deviceAudit: AccountDeviceAudit?
     /// Devices the user has ACKNOWLEDGED as their own — the trusted expected set the audit compares
     /// the transparency log against. Seeded with the current device on sign-in; the user confirms
-    /// others. (A real app persists this locally; here it lives for the session.)
+    /// others.
+    ///
+    /// PERSISTED per account (`DeviceAcknowledgements`). It used to live only for the session, so
+    /// every relaunch re-flagged devices the user had already recognised — and an alarm that fires
+    /// every launch is one users learn to dismiss, which is the same as not having it.
     @Published public var acknowledgedDeviceIDs: Set<String> = []
+
+    /// Durable backing for `acknowledgedDeviceIDs`.
+    let deviceAcknowledgements = DeviceAcknowledgements()
     /// The out-of-band-pinned transparency log key (fetched once at sign-in in this shell).
     private var pinnedLogKey: Data?
 
@@ -665,9 +687,13 @@ public final class AppModel: ObservableObject {
         await refreshDevices()
     }
 
-    /// The user confirms a device is theirs, adding it to the trusted expected set.
+    /// The user confirms a device is theirs, adding it to the trusted expected set. Written
+    /// through to storage immediately: a recognition that does not survive a relaunch is not a
+    /// recognition.
     public func acknowledgeDevice(_ deviceID: String) {
         acknowledgedDeviceIDs.insert(deviceID)
+        guard let account = session?.accountID else { return }
+        deviceAcknowledgements.acknowledge(deviceID, for: account)
     }
 
     /// Record a security refusal for the user (see `securityNotice`). Called by the messaging
@@ -702,6 +728,21 @@ public final class AppModel: ObservableObject {
             guard let token else { return }
             try await client.registerPushToken(accessToken: token, token: pushToken)
         }
+    }
+
+    /// Attest this install if the hardware allows and it has not already happened (#10).
+    ///
+    /// Fire-and-forget on both session paths. Attestation is defence in depth — a device that
+    /// cannot attest still works, and the server records the lower assurance class (ADR-0017) — so
+    /// this must never gate sign-in or surface an error the user cannot act on.
+    public func attestDeviceIfNeeded() async {
+        guard let token else { return }
+        await appAttest.attestIfNeeded(
+            requestChallenge: { [client] in try await client.attestChallenge(accessToken: token) },
+            submit: { [client] keyID, challenge, blob in
+                try await client.submitAttestation(
+                    accessToken: token, keyID: keyID, challenge: challenge, attestation: blob)
+            })
     }
 
     /// The APNs lifecycle for this app (#4). Lazy so it captures a fully-initialized model, and

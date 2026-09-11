@@ -35,7 +35,11 @@ public struct AppAttestation: Sendable {
     public func generateKey() async throws -> String {
         #if canImport(DeviceCheck)
             if #available(iOS 14.0, macOS 11.0, *), DCAppAttestService.shared.isSupported {
-                return try await DCAppAttestService.shared.generateKey()
+                do {
+                    return try await DCAppAttestService.shared.generateKey()
+                } catch {
+                    throw AppAttestError.classify(error)
+                }
             }
         #endif
         throw AppAttestError.unsupported
@@ -47,7 +51,13 @@ public struct AppAttestation: Sendable {
         #if canImport(DeviceCheck)
             if #available(iOS 14.0, macOS 11.0, *), DCAppAttestService.shared.isSupported {
                 let hash = Data(SHA256.hash(data: challenge))
-                return try await DCAppAttestService.shared.attestKey(keyId, clientDataHash: hash)
+                do {
+                    return try await DCAppAttestService.shared.attestKey(keyId, clientDataHash: hash)
+                } catch {
+                    // A rejected key must surface as `.invalidKey`, not as an opaque error: it is
+                    // the one failure whose correct response is to throw the key away.
+                    throw AppAttestError.classify(error)
+                }
             }
         #endif
         throw AppAttestError.unsupported
@@ -70,4 +80,30 @@ public struct AppAttestation: Sendable {
 public enum AppAttestError: Error, Equatable {
     /// App Attest is not available here (Simulator / macOS / compromised device / missing entitlement).
     case unsupported
+    /// Apple rejected the key id permanently (`DCError.invalidKey`).
+    ///
+    /// Distinguished from every other failure because it is the only one where RETRYING THE SAME
+    /// KEY can never succeed: the stored id must be discarded so the next attempt provisions a
+    /// fresh one. Treating it as a generic error would leave the app re-attesting a dead key on
+    /// every launch until it exhausted Apple's per-app rate limit.
+    case invalidKey
+    /// A transient failure — no network, Apple unavailable, server busy. Worth retrying with the
+    /// SAME key.
+    case temporary
 }
+
+#if canImport(DeviceCheck)
+    extension AppAttestError {
+        /// Classify a `DCError` into the three outcomes that lead to different behaviour.
+        @available(iOS 14.0, macOS 11.0, *)
+        static func classify(_ error: Error) -> AppAttestError {
+            guard let dc = error as? DCError else { return .temporary }
+            switch dc.code {
+            case .invalidKey: return .invalidKey
+            case .featureUnsupported, .invalidInput: return .unsupported
+            case .serverUnavailable: return .temporary
+            default: return .temporary
+            }
+        }
+    }
+#endif

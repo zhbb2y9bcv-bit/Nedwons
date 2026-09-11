@@ -6,6 +6,7 @@ import SwiftUI
 /// unwired shell that showed a dead onboarding scaffold instead of an auth form.
 public struct NedwonsAppRoot: View {
     @ObservedObject private var model: AppModel
+    @Environment(\.scenePhase) private var scenePhase
 
     public init(model: AppModel) {
         self.model = model
@@ -33,6 +34,20 @@ public struct NedwonsAppRoot: View {
         .overlay {
             if model.appLockEnabled && model.isLocked {
                 LockScreenView(model: model)
+                    .transition(.opacity)
+            }
+        }
+        // App-switcher privacy. iOS snapshots the window whenever the scene stops being active,
+        // and that image is written to disk and shown in the switcher — so without a cover, an
+        // open conversation is persisted in plaintext outside the encrypted store and visible to
+        // anyone who double-taps the home bar.
+        //
+        // Keyed on `!= .active` rather than `== .background` on purpose: the snapshot is taken at
+        // `.inactive`, which is also what a control-centre pull or an incoming call produces. A
+        // cover that waits for `.background` is applied after the picture has already been taken.
+        .overlay {
+            if scenePhase != .active && model.isLoggedIn {
+                PrivacyCoverView()
                     .transition(.opacity)
             }
         }
@@ -116,6 +131,32 @@ public struct MainAppView: View {
             SettingsRootView(model: model)
                 .tabItem { Label("Settings", systemImage: "gearshape.fill") }
         }
+    }
+}
+
+/// What the app switcher sees instead of the user's conversations.
+///
+/// Deliberately opaque and branded rather than blurred: a blur of a message list still conveys who
+/// was messaged and roughly how much, and the snapshot is a real file on disk.
+struct PrivacyCoverView: View {
+    @Environment(\.colorScheme) private var scheme
+    private var palette: Nedwons.Palette { .forScheme(scheme) }
+
+    var body: some View {
+        ZStack {
+            palette.background.ignoresSafeArea()
+            VStack(spacing: Nedwons.Spacing.md) {
+                Image(systemName: "lock.shield.fill")
+                    .font(.system(size: 44))
+                    .foregroundStyle(palette.accentPrimary)
+                Text("Nedwons")
+                    .font(Nedwons.TypeScale.title)
+                    .foregroundStyle(palette.textPrimary)
+            }
+        }
+        // The switcher snapshot is an image, so this carries no accessibility value; hiding it
+        // keeps VoiceOver on the real content when the app returns to active.
+        .accessibilityHidden(true)
     }
 }
 

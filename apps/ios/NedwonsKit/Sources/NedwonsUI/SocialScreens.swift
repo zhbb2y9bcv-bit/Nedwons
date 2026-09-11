@@ -593,25 +593,35 @@ struct RecoverySetupView: View {
     @ObservedObject var model: AppModel
     @Environment(\.colorScheme) private var scheme
 
-    @State private var phrase = ""
+    /// Generated once when the screen appears — never typed. See `RecoverySecret`: a user-chosen
+    /// phrase is the weakest link in the only credential that can recover a lost account, and the
+    /// previous 12-character minimum was both guessable AND below the server's floor of 20, so a
+    /// 12–19 character phrase was accepted here and then refused by the backend.
+    @State private var code = ""
     @State private var confirmation = ""
     @State private var acknowledged = false
     @State private var working = false
     @State private var message: String?
     @State private var succeeded = false
+    @State private var revealed = false
 
     private var palette: Nedwons.Palette { .forScheme(scheme) }
 
-    private var mismatch: Bool { !confirmation.isEmpty && phrase != confirmation }
+    /// Confirmation is compared in NORMALISED form, so retyping with different spacing or case is
+    /// accepted — the code is meant to be transcribed by hand.
+    private var mismatch: Bool {
+        !confirmation.isEmpty
+            && RecoverySecret.normalize(confirmation) != RecoverySecret.normalize(code)
+    }
     private var canSave: Bool {
-        phrase.count >= 12 && phrase == confirmation && acknowledged && !working
+        !code.isEmpty && !mismatch && !confirmation.isEmpty && acknowledged && !working
     }
 
     var body: some View {
         Form {
             Section {
                 Text(
-                    "If you lose every device you've signed in on, this phrase is the only way "
+                    "If you lose every device you've signed in on, this code is the only way "
                         + "back into your account.")
                     .font(Nedwons.TypeScale.callout)
                     .foregroundStyle(palette.textPrimary)
@@ -619,24 +629,47 @@ struct RecoverySetupView: View {
                 Text(
                     "Your password alone can never add a new device — that's what stops someone "
                         + "with a stolen password from reading your messages. It also means "
-                        + "without this phrase, losing your devices means losing the account.")
+                        + "without this code, losing your devices means losing the account.")
             }
 
             Section {
-                SecureField("Recovery phrase", text: $phrase).usernameInput()
-                SecureField("Repeat the phrase", text: $confirmation).usernameInput()
+                if revealed {
+                    Text(code)
+                        .font(Nedwons.TypeScale.monoSmall)
+                        .textSelection(.enabled)
+                        .foregroundStyle(palette.textPrimary)
+                        .accessibilityLabel("Recovery code")
+                        // Spelled out for VoiceOver: read as a word, a base32 code is unusable.
+                        .accessibilityValue(
+                            RecoverySecret.normalize(code).map(String.init).joined(separator: " "))
+                } else {
+                    Button("Reveal my recovery code") { revealed = true }
+                        .accessibilityHint("Shows the code so you can write it down")
+                }
+            } header: {
+                Text("Your recovery code")
+            } footer: {
+                Text(
+                    "\(RecoverySecret.entropyBits) bits of randomness, generated on this device. "
+                        + "Nedwons never chooses a code you could guess, and never sees this one "
+                        + "in the clear.")
+            }
+
+            Section {
+                TextField("Type the code back to confirm", text: $confirmation)
+                    .usernameInput()
+                    .font(Nedwons.TypeScale.monoSmall)
                 if mismatch {
-                    Text("The phrases don't match.").font(.caption).foregroundStyle(.red)
-                } else if !phrase.isEmpty && phrase.count < 12 {
-                    Text("Use at least 12 characters.")
+                    Text("That doesn't match the code above.")
                         .font(.caption)
-                        .foregroundStyle(palette.textSecondary)
+                        .foregroundStyle(.red)
                 }
                 Toggle("I've stored this somewhere safe", isOn: $acknowledged)
             } footer: {
                 Text(
-                    "Store it in a password manager or somewhere physically safe. Nedwons cannot "
-                        + "show it to you again and cannot reset it for you.")
+                    "Dashes and capitalisation don't matter. Store it in a password manager or "
+                        + "somewhere physically safe — Nedwons cannot show it to you again and "
+                        + "cannot reset it for you.")
             }
 
             if let message {
@@ -646,7 +679,7 @@ struct RecoverySetupView: View {
             }
 
             Section {
-                Button(working ? "Saving…" : "Save recovery phrase") {
+                Button(working ? "Saving…" : "Save recovery code") {
                     Task { await save() }
                 }
                 .disabled(!canSave)
@@ -654,18 +687,24 @@ struct RecoverySetupView: View {
         }
         .navigationTitle("Recovery")
         .inlineNavigationTitle()
+        // Generated once per presentation, not per render: regenerating in `body` would change the
+        // code underneath a user who is halfway through writing it down.
+        .onAppear { if code.isEmpty { code = RecoverySecret.generate() } }
     }
 
     private func save() async {
         working = true
-        let failure = await model.setRecoverySecret(phrase)
+        // The NORMALISED form is what gets hashed, so the same string is sent on set and on
+        // recover. Sending the displayed form here and the normalised one there would make every
+        // correct code fail verification.
+        let failure = await model.setRecoverySecret(RecoverySecret.normalize(code))
         working = false
         succeeded = failure == nil
-        message = failure ?? "Recovery phrase saved."
+        message = failure ?? "Recovery code saved."
         if succeeded {
-            phrase = ""
             confirmation = ""
             acknowledged = false
+            revealed = false
         }
     }
 }
