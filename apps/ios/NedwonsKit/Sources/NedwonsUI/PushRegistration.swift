@@ -113,8 +113,17 @@ public final class PushRegistrationCoordinator: ObservableObject {
         ///
         /// `registerWithSystem` is the platform call (`UIApplication.registerForRemoteNotifications`),
         /// injected so this stays testable and so the macOS target can supply its own.
+        public func requestAuthorization(registerWithSystem: @MainActor () -> Void) async {
+            await requestAuthorization(
+                center: .current(), registerWithSystem: registerWithSystem)
+        }
+
+        /// Overload rather than a defaulted `center:` parameter. A default argument is evaluated in
+        /// the CALLER's isolation, and `UNUserNotificationCenter` is non-Sendable — so
+        /// `center: UNUserNotificationCenter = .current()` is a concurrency error on toolchains
+        /// that check default arguments strictly, even though it compiles on lenient ones.
         public func requestAuthorization(
-            center: UNUserNotificationCenter = .current(),
+            center: UNUserNotificationCenter,
             registerWithSystem: @MainActor () -> Void
         ) async {
             let granted: Bool
@@ -135,9 +144,30 @@ public final class PushRegistrationCoordinator: ObservableObject {
 
         /// Re-read the system's current setting, which the user can change in Settings at any time
         /// without the app being told.
-        public func refreshAuthorization(center: UNUserNotificationCenter = .current()) async {
-            let settings = await center.notificationSettings()
-            switch settings.authorizationStatus {
+        public func refreshAuthorization() async {
+            await refreshAuthorization(center: .current())
+        }
+
+        /// Reads the status through the completion-handler API on purpose.
+        ///
+        /// `await center.notificationSettings()` returns `UNNotificationSettings`, which is NOT
+        /// `Sendable`, so returning it from a nonisolated context into this main-actor method is a
+        /// Swift 6 concurrency error:
+        ///
+        ///     error: non-sendable result type 'UNNotificationSettings' cannot be sent from
+        ///            nonisolated context in call to instance method 'notificationSettings()'
+        ///
+        /// Toolchains disagree on whether that is an error — it compiled on Xcode 26.6 and failed
+        /// the macos-15 runner — so this avoids the crossing entirely rather than relying on
+        /// leniency. Only `authorizationStatus`, a plain `@objc` enum and therefore `Sendable`, is
+        /// resumed across the boundary; the settings object never leaves the callback.
+        public func refreshAuthorization(center: UNUserNotificationCenter) async {
+            let status: UNAuthorizationStatus = await withCheckedContinuation { continuation in
+                center.getNotificationSettings { settings in
+                    continuation.resume(returning: settings.authorizationStatus)
+                }
+            }
+            switch status {
             case .authorized, .ephemeral: authorization = .authorized
             case .provisional: authorization = .provisional
             case .denied: authorization = .denied
