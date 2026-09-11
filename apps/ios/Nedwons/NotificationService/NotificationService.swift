@@ -20,7 +20,14 @@ import UserNotifications
 /// `UNMutableNotificationContent` and completion handler on one thread, avoiding structured
 /// concurrency here entirely. **Fail-safe:** missing shared state, a network error, or a decrypt
 /// failure falls back to the generic wake. See `docs/NOTIFICATION_EXTENSION.md`.
-final class NotificationService: UNNotificationServiceExtension {
+/// `@unchecked Sendable`, and that is a claim with a proof: every piece of mutable state lives in
+/// `pending` and is only ever touched under `lock`. The claim is needed because the deadline and
+/// the worker are `DispatchWorkItem`s, whose blocks are `@Sendable`; a plain class captured there
+/// is a strict-concurrency error on the CI toolchain (an SDK-level difference that does not
+/// reproduce on Xcode 26.6 even with `-strict-concurrency=complete`). Rather than silence the
+/// diagnostic, the state is actually made safe — the previous shape mutated `contentHandler`,
+/// `bestAttempt` and `work` from three threads with no lock at all.
+final class NotificationService: UNNotificationServiceExtension, @unchecked Sendable {
     /// The extension's own budget, deliberately under the ~30s the system allows.
     ///
     /// Finishing on OUR deadline rather than the system's is the whole point: when iOS runs the
@@ -33,29 +40,40 @@ final class NotificationService: UNNotificationServiceExtension {
     /// inside `budget`.
     static let networkTimeout: TimeInterval = 8
 
-    /// Retained so `serviceExtensionTimeWillExpire` can deliver something.
-    private var contentHandler: ((UNNotificationContent) -> Void)?
-    private var bestAttempt: UNNotificationContent?
-    /// Guards exactly-once delivery. `UNNotificationServiceExtension` calls the handler at most
-    /// once by contract, and calling it twice is a hard error — but there are now two callers (the
-    /// normal path and the expiry callback) which can race, so the guarantee needs enforcing rather
-    /// than assuming.
-    private let delivered = DeliveryLatch()
-    /// Cancels in-flight work when the deadline fires, so the process is not still fetching while
-    /// the system tears it down.
-    private var work: DispatchWorkItem?
+    /// Everything mutable, in one place, behind one lock. The `UN*Content` objects are not
+    /// `Sendable`, so they must not be captured by the `@Sendable` work-item blocks directly; the
+    /// blocks capture only `self` and read these through the lock.
+    private struct Pending {
+        var handler: ((UNNotificationContent) -> Void)?
+        /// What to hand back if we run out of time: the unmodified request content.
+        var fallback: UNNotificationContent?
+        /// The copy the worker rewrites on success. `nil` when the content was not mutable.
+        var mutable: UNMutableNotificationContent?
+        var work: DispatchWorkItem?
+        /// Exactly-once delivery. `UNNotificationServiceExtension` permits the handler to be called
+        /// at most once, and there are now two racing callers (worker and deadline/expiry).
+        var delivered = false
+    }
+
+    private let lock = NSLock()
+    private var pending = Pending()
 
     override func didReceive(
         _ request: UNNotificationRequest,
         withContentHandler contentHandler: @escaping (UNNotificationContent) -> Void
     ) {
         let mutable = request.content.mutableCopy() as? UNMutableNotificationContent
-        let fallback = mutable ?? request.content
-        self.contentHandler = contentHandler
-        self.bestAttempt = fallback
+        lock.lock()
+        pending = Pending(
+            handler: contentHandler,
+            fallback: mutable ?? request.content,
+            mutable: mutable,
+            work: nil,
+            delivered: false)
+        lock.unlock()
 
         guard let shared = SharedNotificationContext.current() else {
-            deliver(fallback)  // no provisioned shared state → generic wake
+            deliverFallback()  // no provisioned shared state → generic wake
             return
         }
 
@@ -63,26 +81,33 @@ final class NotificationService: UNNotificationServiceExtension {
         // by the work item occupying a background queue.
         let deadline = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            self.work?.cancel()
-            self.deliver(self.bestAttempt ?? fallback)
+            self.cancelWork()
+            self.deliverFallback()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.budget, execute: deadline)
 
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             let resolved = Self.resolveBlocking(shared: shared)
-            // The deadline may have fired while this was running; `deliver` makes the loser a
-            // no-op rather than a duplicate-call crash.
+            // The deadline may have fired while this ran; the claim inside `deliverOnce` makes the
+            // loser a no-op rather than a duplicate-call crash.
             deadline.cancel()
-            if let resolved, let mutable {
+            guard let resolved else {
+                self.deliverFallback()  // control-only or an error → generic wake
+                return
+            }
+            self.deliverOnce { pending in
+                // Mutated only AFTER winning the claim, so the deadline path — which hands out the
+                // same object as `fallback` — can never be presenting it while it is rewritten.
+                guard let mutable = pending.mutable else { return pending.fallback }
                 mutable.title = resolved.title
                 mutable.body = resolved.body
-                self.deliver(mutable)
-            } else {
-                self.deliver(fallback)  // control-only or an error → generic wake
+                return mutable
             }
         }
-        self.work = work
+        lock.lock()
+        pending.work = work
+        lock.unlock()
         DispatchQueue.global(qos: .userInitiated).async(execute: work)
     }
 
@@ -93,18 +118,35 @@ final class NotificationService: UNNotificationServiceExtension {
     /// and "a generic wake because we were killed mid-flight", and only the first is a deliberate
     /// product behaviour.
     override func serviceExtensionTimeWillExpire() {
-        work?.cancel()
-        if let bestAttempt {
-            deliver(bestAttempt)
-        }
+        cancelWork()
+        deliverFallback()
     }
 
-    /// Exactly-once delivery. Every path funnels through here.
-    private func deliver(_ content: UNNotificationContent) {
-        guard delivered.claim() else { return }
-        let handler = contentHandler
-        contentHandler = nil
-        handler?(content)
+    private func cancelWork() {
+        lock.lock()
+        let work = pending.work
+        pending.work = nil
+        lock.unlock()
+        work?.cancel()
+    }
+
+    private func deliverFallback() {
+        deliverOnce { $0.fallback }
+    }
+
+    /// Exactly-once delivery. Every path funnels through here. `make` runs under the lock only if
+    /// this caller won the claim; the handler itself is invoked outside the lock.
+    private func deliverOnce(_ make: (Pending) -> UNNotificationContent?) {
+        lock.lock()
+        guard !pending.delivered, let handler = pending.handler else {
+            lock.unlock()
+            return
+        }
+        pending.delivered = true
+        pending.handler = nil
+        let content = make(pending)
+        lock.unlock()
+        if let content { handler(content) }
     }
 
     /// Under the cross-process store lock. Fully synchronous; the async client calls are bridged
@@ -145,23 +187,6 @@ final class NotificationService: UNNotificationServiceExtension {
             baseURL: shared.serverURL, token: shared.accessToken,
             ids: outcome.processedIDs, sealedIds: [], selfGroupIds: [])
         return outcome.content
-    }
-}
-
-/// A one-shot claim. Guards the exactly-once delivery contract: `UNNotificationServiceExtension`
-/// permits the content handler to be called at most once, and there are now two callers — the
-/// normal completion and the deadline — which can race.
-private final class DeliveryLatch: @unchecked Sendable {
-    private let lock = NSLock()
-    private var taken = false
-
-    /// `true` exactly once, for whichever caller arrives first.
-    func claim() -> Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        if taken { return false }
-        taken = true
-        return true
     }
 }
 
