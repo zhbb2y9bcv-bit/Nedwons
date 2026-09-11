@@ -20,6 +20,16 @@ public struct KeychainStore: Sendable {
     }
 
     /// Insert or replace the item for `account`.
+    ///
+    /// Update-then-add, NOT delete-then-add. The rotating refresh token is written through here,
+    /// and delete-then-add has a window in which the item does not exist at all: a crash, a jetsam
+    /// kill, or the device locking between the two calls leaves NO session, which signs the user
+    /// out and — because the rotated token is then lost while the server has already retired the
+    /// old one — cannot be recovered by retrying. `SecItemUpdate` replaces the value in place, so
+    /// a reader sees either the old blob or the new one and never absence.
+    ///
+    /// `kSecAttrAccessible` is part of the update, so a protection-class change still takes effect.
+    /// Only when no item exists yet (`errSecItemNotFound`) does this add one.
     public func save(
         _ data: Data,
         account: String,
@@ -30,8 +40,18 @@ public struct KeychainStore: Sendable {
             kSecAttrService as String: service,
             kSecAttrAccount as String: account,
         ]
-        // Replace semantics: delete any prior item, then add with the desired protection.
-        SecItemDelete(base as CFDictionary)
+        let updateStatus = SecItemUpdate(
+            base as CFDictionary,
+            [
+                kSecValueData as String: data,
+                kSecAttrAccessible as String: accessible,
+            ] as CFDictionary)
+        if updateStatus == errSecSuccess {
+            return
+        }
+        guard updateStatus == errSecItemNotFound else {
+            throw KeychainError.unexpectedStatus(updateStatus)
+        }
 
         var addQuery = base
         addQuery[kSecValueData as String] = data

@@ -40,11 +40,29 @@ public struct NedwonsClient: Sendable {
 
     private let baseURL: URL
     private let session: URLSession
+    /// Owns the live tokens and the device signer. When present, EVERY request that carries an
+    /// `Authorization` header automatically gains a matching `X-Nedwons-Proof` and is retried once
+    /// against a refreshed token if the server refuses it (ADR-0011, R-308).
+    ///
+    /// Optional so unauthenticated flows (register/login) and the UI-test fixture work unchanged.
+    /// `nil` means no proof and no auto-refresh — never a silently unsigned or forged header.
+    private let authority: SessionAuthority?
 
-    public init(baseURL: URL, session: URLSession = .shared) {
+    public init(baseURL: URL, session: URLSession = .shared, authority: SessionAuthority? = nil) {
         self.baseURL = baseURL
         self.session = session
+        self.authority = authority
     }
+
+    /// The same client bound to a session authority. Used after sign-in, once the enrolled signer
+    /// and tokens exist.
+    public func withAuthority(_ authority: SessionAuthority) -> NedwonsClient {
+        NedwonsClient(baseURL: baseURL, session: session, authority: authority)
+    }
+
+    /// The relay this client talks to. Exposed so callers building a `SessionAuthority` bind it to
+    /// the SAME origin — a refresh sent somewhere else would leak the rotating token.
+    public var serverBaseURL: URL { baseURL }
 
     // MARK: Public flows
 
@@ -125,6 +143,53 @@ public struct NedwonsClient: Sendable {
     }
 
     private func send<R: Decodable>(_ request: URLRequest) async throws -> R {
+        let data = try await execute(request)
+        do {
+            return try JSONDecoder().decode(R.self, from: data)
+        } catch {
+            throw ClientError.decoding
+        }
+    }
+
+    // MARK: The single egress point
+
+    /// Every request leaves the client through here, which is the whole point: the per-request
+    /// proof (ADR-0011) and the refresh-and-retry are applied by CONSTRUCTION rather than being
+    /// opted into endpoint by endpoint. There are ~60 authenticated calls in this file; any scheme
+    /// requiring each to remember a header is one forgotten call away from a request that a
+    /// proof-enforcing server rejects — or worse, one that a permissive server accepts on a bearer
+    /// token alone, which is exactly the property sender-constraining exists to remove.
+    private func execute(_ request: URLRequest) async throws -> Data {
+        let (data, http) = try await roundTrip(proofed(request))
+        guard http.statusCode == 401 else {
+            guard (200 ..< 300).contains(http.statusCode) else {
+                throw ClientError.http(
+                    status: http.statusCode, body: String(decoding: data, as: UTF8.self))
+            }
+            return data
+        }
+
+        // 401 with a bearer token: the access token may simply have expired. Refresh ONCE, then
+        // replay. Bounded at one retry deliberately — if the replay is refused too, the session is
+        // genuinely dead and looping would only spend more single-use refresh tokens.
+        guard let authority, let stale = Self.bearerToken(of: request) else {
+            throw ClientError.http(status: 401, body: String(decoding: data, as: UTF8.self))
+        }
+        let rotated = try await authority.refreshedSession(replacing: stale)
+        var replay = request
+        replay.setValue("Bearer \(rotated.accessToken)", forHTTPHeaderField: "Authorization")
+        // A fresh proof, not the original: the proof commits to a hash of the token it accompanies,
+        // so replaying the first one under the new token would fail verification, and its nonce is
+        // single-use in any case.
+        let (retryData, retryHTTP) = try await roundTrip(proofed(replay))
+        guard (200 ..< 300).contains(retryHTTP.statusCode) else {
+            throw ClientError.http(
+                status: retryHTTP.statusCode, body: String(decoding: retryData, as: UTF8.self))
+        }
+        return retryData
+    }
+
+    private func roundTrip(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let (data, response): (Data, URLResponse)
         do {
             (data, response) = try await session.data(for: request)
@@ -132,14 +197,42 @@ public struct NedwonsClient: Sendable {
             throw ClientError.transport(error.localizedDescription)
         }
         guard let http = response as? HTTPURLResponse else { throw ClientError.decoding }
-        guard (200 ..< 300).contains(http.statusCode) else {
-            throw ClientError.http(status: http.statusCode, body: String(decoding: data, as: UTF8.self))
-        }
-        do {
-            return try JSONDecoder().decode(R.self, from: data)
-        } catch {
-            throw ClientError.decoding
-        }
+        return (data, http)
+    }
+
+    /// Attach `X-Nedwons-Proof` when — and only when — the request presents a bearer token and an
+    /// enrolled signer exists. An unauthenticated request gets nothing, and a missing signer sends
+    /// nothing rather than an unsigned placeholder.
+    private func proofed(_ request: URLRequest) async -> URLRequest {
+        guard let authority,
+            let bearer = Self.bearerToken(of: request),
+            let tokenBytes = Hex.decode(bearer),
+            let method = request.httpMethod,
+            let url = request.url,
+            let signer = await authority.proofSigner()
+        else { return request }
+
+        // `percentEncodedPath`, not `URL.path`: the server signs over `request.uri().path()`, which
+        // is the raw, still-encoded path. `URL.path` percent-DECODES, so the two would disagree the
+        // first time any path segment contained an encoded character — and the failure would be an
+        // opaque 401, not a decoding error.
+        let path =
+            URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? url.path
+        guard
+            let header = try? RequestProof.header(
+                signer: signer, accessToken: tokenBytes, method: method, path: path)
+        else { return request }
+
+        var out = request
+        out.setValue(header, forHTTPHeaderField: "X-Nedwons-Proof")
+        return out
+    }
+
+    private static func bearerToken(of request: URLRequest) -> String? {
+        request.value(forHTTPHeaderField: "Authorization")?
+            .split(separator: " ", maxSplits: 1)
+            .last
+            .map(String.init)
     }
 
     private func hex(_ string: String) throws -> Data {
@@ -149,18 +242,10 @@ public struct NedwonsClient: Sendable {
 
     // MARK: Authenticated transport (used by the social/messaging API)
 
+    /// The social/messaging surface's transport. Routes through `execute`, so those ~60 endpoints
+    /// get the proof header and the refresh-retry without any of them mentioning either.
     func perform(_ request: URLRequest) async throws -> Data {
-        let (data, response): (Data, URLResponse)
-        do {
-            (data, response) = try await session.data(for: request)
-        } catch {
-            throw ClientError.transport(error.localizedDescription)
-        }
-        guard let http = response as? HTTPURLResponse else { throw ClientError.decoding }
-        guard (200 ..< 300).contains(http.statusCode) else {
-            throw ClientError.http(status: http.statusCode, body: String(decoding: data, as: UTF8.self))
-        }
-        return data
+        try await execute(request)
     }
 
     func decode<R: Decodable>(_ data: Data) throws -> R {

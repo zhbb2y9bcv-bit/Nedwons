@@ -58,7 +58,15 @@ public final class AppModel: ObservableObject {
     // Internal (not private) so the group-administration surface can live in its own file
     // (`GroupAdminModel.swift`) as an extension; extensions cannot add stored state, but they
     // can share this transport.
-    let client: NedwonsClient
+    //
+    // `var`, because the client is REBOUND to a `SessionAuthority` the moment a session and an
+    // enrolled signer both exist (`bindAuthority`). From then on every authenticated request it
+    // makes carries a device proof and can transparently survive an access-token expiry — without
+    // a single call site opting in (ADR-0011, R-308).
+    private(set) var client: NedwonsClient
+
+    /// Owns the live tokens and the one in-flight refresh. `nil` until sign-in or restore.
+    private var authority: SessionAuthority?
     private let deviceIdentity: DeviceIdentity
     private let sessionStore: SessionStore
 
@@ -130,6 +138,12 @@ public final class AppModel: ObservableObject {
             phase = .unauthenticated
             return
         }
+        // Bind BEFORE the first authenticated call. `whoami` below is itself authenticated, so
+        // binding afterwards would send the launch request unproofed — and against a
+        // proof-enforcing server that is a 401, i.e. every launch would look like an expired
+        // session. It also means the restore survives an access token that expired while the app
+        // was closed, which is the common case after any long gap.
+        bindAuthority(to: stored)
         do {
             let who = try await client.whoami(accessToken: stored.accessToken)
             guard who.accountID == stored.accountID, who.deviceID == stored.deviceID else {
@@ -242,6 +256,33 @@ public final class AppModel: ObservableObject {
         session = s
         acknowledgedDeviceIDs = [s.deviceID]
         try? sessionStore.save(s)
+        bindAuthority(to: s)
+    }
+
+    /// Bind the transport to a `SessionAuthority` for `s`, so from here on every authenticated
+    /// request is proof-carrying and an expired access token is refreshed once, transparently.
+    ///
+    /// Called on BOTH paths that produce a session — fresh sign-in and launch restore — and before
+    /// the first authenticated call on either, so no request ever goes out unproofed. Without the
+    /// enrolled signer there is nothing to sign with, so the client is left unbound rather than
+    /// sending an unsigned header (INV-2).
+    func bindAuthority(to s: NedwonsClient.Session) {
+        guard let enrolled = try? deviceIdentity.loadEnrolled() else { return }
+        let authority = SessionAuthority(
+            session: s,
+            store: sessionStore,
+            signer: enrolled.signer,
+            baseURL: client.serverBaseURL,
+            urlSession: .shared)
+        self.authority = authority
+        client = client.withAuthority(authority)
+        // Follow the tokens rather than holding a stale copy: a rotation performed deep inside the
+        // transport must be reflected in the model, or the next call would present the retired
+        // token and be refused.
+        let applyRotation: @Sendable (NedwonsClient.Session) -> Void = { [weak self] rotated in
+            Task { @MainActor in self?.session = rotated }
+        }
+        Task { await authority.addObserver(applyRotation) }
     }
 
     public func signOut() {
