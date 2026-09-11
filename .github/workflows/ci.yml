@@ -185,12 +185,15 @@ jobs:
     runs-on: macos-15   # provides Xcode 26 / Swift 6 toolchain
     steps:
       - uses: actions/checkout@v4
+      # Wrapped so a failure reports WHICH diagnostic. Without this the job surfaces one line —
+      # "Process completed with exit code 1" — to anyone without repo-admin rights, which is the
+      # same blindness that made the XCUITest failure take a day to identify.
       - name: Build (NedwonsKit + NedwonsUI)
         working-directory: apps/ios/NedwonsKit
-        run: swift build
+        run: bash "$GITHUB_WORKSPACE/scripts/annotate_swift.sh" swift build
       - name: Test (transcript/interop unit tests)
         working-directory: apps/ios/NedwonsKit
-        run: swift test
+        run: bash "$GITHUB_WORKSPACE/scripts/annotate_swift.sh" swift test
 
   mls-bridge:
     name: mls-ffi Apple packaging + Swift MLS integration
@@ -298,7 +301,7 @@ jobs:
         run: scripts/build_mls_ffi.sh
       - name: Test
         working-directory: apps/ios/NedwonsApp
-        run: swift test
+        run: bash "$GITHUB_WORKSPACE/scripts/annotate_swift.sh" swift test
 
   migrations:
     name: migration smoke (empty + seeded database)

@@ -15,9 +15,7 @@ use p256::ecdsa::SigningKey;
 use serde_json::json;
 
 use auth_core::ids::DeviceId;
-use nedwons_api::push::{
-    ApnsConfig, ApnsRequest, PushResponse, PushService, PushTransport,
-};
+use nedwons_api::push::{ApnsConfig, ApnsRequest, PushResponse, PushService, PushTransport};
 
 /// A transport that records requests instead of opening a socket to Apple, and replies with
 /// whatever the test scripted — so a rejection path can be driven as easily as the happy one.
@@ -185,7 +183,10 @@ fn only_a_200_is_a_send_and_only_dead_tokens_are_dropped() {
 
     let accepted = PushResponse::accepted();
     assert_eq!(accepted.status, 200);
-    assert!(!token_is_dead(&accepted), "a delivered push keeps its token");
+    assert!(
+        !token_is_dead(&accepted),
+        "a delivered push keeps its token"
+    );
 
     // 410 is unconditional: Apple returns it only for a token that is no longer active.
     let unregistered = PushResponse {
@@ -289,7 +290,10 @@ async fn a_transient_refusal_keeps_the_token() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let recording = Arc::new(Recording::replying(503, r#"{"reason":"ServiceUnavailable"}"#));
+    let recording = Arc::new(Recording::replying(
+        503,
+        r#"{"reason":"ServiceUnavailable"}"#,
+    ));
     let service = PushService::new(test_cfg(), recording.clone(), shared_relay());
     tokio::task::spawn_blocking(move || service.notify_device_blocking(&device.0))
         .await

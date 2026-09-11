@@ -83,7 +83,10 @@ async fn http_push_transport_speaks_http2_end_to_end() {
         .unwrap()
         .expect("post succeeds");
     assert_eq!(reply.status, 200);
-    assert!(reply.body.is_empty(), "an accepted push carries no error body");
+    assert!(
+        reply.body.is_empty(),
+        "an accepted push carries no error body"
+    );
 
     let seen = seen.lock().unwrap().clone().expect("server saw the push");
     // The APNs contract requires HTTP/2 — assert the connection actually negotiated it.
